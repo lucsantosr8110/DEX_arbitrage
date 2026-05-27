@@ -1,0 +1,53 @@
+# ============================================================
+# 📈 Prometheus Configuration — Flashloan Bot Monitoring
+# Versão: v1.2 — Corrigida para ambiente local (Windows)
+# ------------------------------------------------------------
+# ✅ Intervalos otimizados
+# ✅ Corrigido erro "lookup bot: no such host"
+# ✅ Redis opcional (caso tenha um exporter ativo)
+# ✅ Filtragem de métricas internas irrelevantes
+# ============================================================
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  scrape_timeout: 10s
+
+# ============================================================
+# 🔍 JOB 1 — Flashloan Bot
+# ============================================================
+scrape_configs:
+  - job_name: "flashloan_bot"
+    metrics_path: "/metrics"
+    static_configs:
+      - targets: ["localhost:9100"]   # ✅ Corrigido (antes era bot:9090)
+        labels:
+          service: "flashloan_bot"
+          instance: "local"
+
+    # 🧹 Remove métricas de runtime irrelevantes (Prometheus, Go, etc)
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: '^(go_|process_|promhttp_).*'
+        action: drop
+
+# ============================================================
+# 🧠 JOB 2 — Redis Exporter (opcional)
+# ============================================================
+  - job_name: "redis"
+    metrics_path: "/metrics"
+    static_configs:
+      - targets: ["localhost:9121"]   # ✅ Corrigido (antes era redis-exporter:9121)
+        labels:
+          service: "redis"
+          instance: "local"
+
+# ============================================================
+# 📜 RULES — Arquivos de alerta (opcional)
+# ============================================================
+# rule_files:
+#   - /etc/prometheus/alerts.yml
+
+# ============================================================
+# ✅ Fim da configuração
+# ============================================================

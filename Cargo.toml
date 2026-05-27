@@ -1,0 +1,105 @@
+[package]
+name = "flashloan-bot"
+version = "0.1.0"
+edition = "2021"
+default-run = "flashloan-bot"
+
+# ============================================================
+# DEPENDÊNCIAS PRINCIPAIS
+# ============================================================
+[dependencies]
+# =========================
+# Núcleo Assíncrono e Concurrency
+# =========================
+tokio = { version = "1.37", features = ["full"] }
+tokio-stream = "0.1"
+async-trait = "0.1"
+futures = "0.3"
+rayon = "1.7"
+regex = "1.10"
+
+# =========================
+# Erros, Logs e Utilitários
+# =========================
+anyhow = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+# No seu Cargo.toml, encontre [dependencies] e atualize esta linha:
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "ansi", "fmt", "std", "registry"] }
+log = "0.4"
+colored = "3.0.0"
+backoff = { version = "0.4", features = ["tokio"] }
+
+# =========================
+# Configuração e Serialização
+# =========================
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+dotenvy = "0.15"
+config = "0.13"
+url = "2.5"
+shellexpand = "2.1"
+once_cell = "1.19"
+lazy_static = "1.4"
+moka = { version = "0.12", features = ["sync"] }
+
+# =========================
+# Blockchain / Ethers
+# =========================
+ethers = { version = "2.0.14", features = ["abigen", "ws", "rustls", "legacy"] }
+ethers-signers = "2.0.14"
+ethers-core = "2.0.14"
+ethers-flashbots = { git = "https://github.com/onbjerg/ethers-flashbots.git", rev = "fae3d2e" }
+k256 = "0.13.4"
+
+# =========================
+# Observabilidade e Métricas
+# =========================
+metrics = "0.21"
+metrics-exporter-prometheus = "0.13"
+prometheus = "0.13"
+chrono = { version = "0.4", features = ["serde"] }
+
+# =========================
+# Web / API / Painel
+# =========================
+axum = { version = "0.7", features = ["tokio", "json"] }
+warp = "0.3"
+hyper = { version = "1.3", features = ["full"] }
+
+# =========================
+# CLI / Ferramentas / Diversos
+# =========================
+clap = { version = "4.5", features = ["derive", "env"] }
+csv = "1.3"
+rand = { version = "0.8", features = ["std", "std_rng"] }
+itertools = "0.10"
+base64ct = "=1.7.3"
+reqwest = { version = "0.12.3", features = ["json", "rustls-tls"] }
+futures-util = "0.3.31"
+hex = "0.4"  # ✅ ADICIONADO
+
+# ============================================================
+# PERFIL DE COMPILAÇÃO
+# ============================================================
+[profile.dev]
+opt-level = 1
+debug = true
+incremental = true
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+debug = false
+
+# ============================================================
+# BENCHMARKS
+# ============================================================
+[[bench]]
+name = "curve_bench"
+path = "bench/curve_bench.rs"
+harness = false

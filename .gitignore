@@ -1,0 +1,35 @@
+/target
+node_modules
+.env
+.env.*
+
+# Hardhat files
+/cache
+/artifacts
+
+# TypeChain files
+/typechain
+/typechain-types
+
+# solidity-coverage files
+/coverage
+/coverage.json
+
+# Hardhat Ignition default folder for deployments against a local node
+ignition/deployments/chain-31337
+
+# Logs
+/logs/
+*.log
+
+# Audits and logs
+/audits/
+*.csv
+
+# Local backup files and IDE configs
+*.bak
+.idea/
+.vscode/
+
+# Build artifacts in src
+/src/contracts/*.json

@@ -1,0 +1,128 @@
+PS C:\Users\lucsa\OneDrive\Desktop\Projeto_Bots\DEX_arbitrage> # Voltar para o diretório raiz do projeto
+PS C:\Users\lucsa\OneDrive\Desktop\Projeto_Bots\DEX_arbitrage> cd "C:\Users\lucsa\OneDrive\Desktop\Projeto_Bots\DEX_arbitrage"
+PS C:\Users\lucsa\OneDrive\Desktop\Projeto_Bots\DEX_arbitrage>
+PS C:\Users\lucsa\OneDrive\Desktop\Projeto_Bots\DEX_arbitrage> # Verificar se existe o arquivo Cargo.toml
+PS C:\Users\lucsa\OneDrive\Desktop\Projeto_Bots\DEX_arbitrage> Get-ChildItem -Filter "*.toml"
+
+
+    Diretório: C:\Users\lucsa\OneDrive\Desktop\Projeto_Bots\DEX_arbitrage
+
+
+Mode                 LastWriteTime         Length Name
+----                 -------------         ------ ----
+-a---l        25/10/2025     09:50           2766 Cargo.toml
+-a---l        25/10/2025     19:50           8778 config_final_micro.toml
+
+
+PS C:\Users\lucsa\OneDrive\Desktop\Projeto_Bots\DEX_arbitrage>
+PS C:\Users\lucsa\OneDrive\Desktop\Projeto_Bots\DEX_arbitrage> # Procurar por arquivos Rust no projeto
+PS C:\Users\lucsa\OneDrive\Desktop\Projeto_Bots\DEX_arbitrage> Write-Host "?? Procurando arquivos Rust no projeto..." -ForegroundColor Cyan
+?? Procurando arquivos Rust no projeto...
+PS C:\Users\lucsa\OneDrive\Desktop\Projeto_Bots\DEX_arbitrage> $rustFiles = Get-ChildItem -Recurse -Filter "*.rs" | Where-Object { $_.FullName -notlike "*target*" }
+PS C:\Users\lucsa\OneDrive\Desktop\Projeto_Bots\DEX_arbitrage>
+PS C:\Users\lucsa\OneDrive\Desktop\Projeto_Bots\DEX_arbitrage> if ($rustFiles.Count -eq 0) {
+>>     Write-Host "? Nenhum arquivo .rs encontrado fora da pasta target!" -ForegroundColor Red
+>> } else {
+>>     Write-Host "? Encontrados $($rustFiles.Count) arquivos Rust:" -ForegroundColor Green
+>>     $rustFiles | ForEach-Object {
+>>         Write-Host "   ?? $($_.FullName.Replace($pwd.Path, '').TrimStart('\'))" -ForegroundColor White
+   ?? audit\price_log.rs
+   ?? node_modules\@nomicfoundation\edr\build.rs
+   ?? node_modules\@nomicfoundation\edr\src\block.rs
+   ?? node_modules\@nomicfoundation\edr\src\call_override.rs
+   ?? node_modules\@nomicfoundation\edr\src\cast.rs
+   ?? node_modules\@nomicfoundation\edr\src\config.rs
+   ?? node_modules\@nomicfoundation\edr\src\context.rs
+   ?? node_modules\@nomicfoundation\edr\src\debug_trace.rs
+   ?? node_modules\@nomicfoundation\edr\src\lib.rs
+   ?? node_modules\@nomicfoundation\edr\src\log.rs
+   ?? node_modules\@nomicfoundation\edr\src\logger.rs
+   ?? node_modules\@nomicfoundation\edr\src\provider.rs
+   ?? node_modules\@nomicfoundation\edr\src\result.rs
+   ?? node_modules\@nomicfoundation\edr\src\scenarios.rs
+   ?? node_modules\@nomicfoundation\edr\src\subscribe.rs
+   ?? node_modules\@nomicfoundation\edr\src\trace.rs
+   ?? node_modules\@nomicfoundation\edr\src\withdrawal.rs
+   ?? node_modules\@nomicfoundation\edr\src\provider\config.rs
+   ?? node_modules\@nomicfoundation\edr\src\trace\debug.rs
+   ?? node_modules\@nomicfoundation\edr\src\trace\exit.rs
+   ?? node_modules\@nomicfoundation\edr\src\trace\library_utils.rs
+   ?? node_modules\@nomicfoundation\edr\src\trace\model.rs
+   ?? node_modules\@nomicfoundation\edr\src\trace\return_data.rs
+   ?? node_modules\@nomicfoundation\edr\src\trace\solidity_stack_trace.rs
+   ?? node_modules\@nomicfoundation\solidity-analyzer\build.rs
+   ?? node_modules\@nomicfoundation\solidity-analyzer\src\lib.rs
+   ?? src\app_middleware.rs
+   ?? src\error.rs
+   ?? src\frontend.rs
+   ?? src\lib.rs
+   ?? src\main.rs
+   ?? src\api\mod.rs
+   ?? src\config\config.rs
+   ?? src\config\mod.rs
+   ?? src\config\token_cache.rs
+   ?? src\contracts\mod.rs
+   ?? src\core\arbitrage.rs
+   ?? src\core\bot.rs
+   ?? src\core\flashloan.rs
+   ?? src\core\gas.rs
+   ?? src\core\mod.rs
+   ?? src\core\risk.rs
+   ?? src\core\smart_retry.rs
+   ?? src\core\types.rs
+   ?? src\dex\circuit_breaker.rs
+   ?? src\dex\error.rs
+   ?? src\dex\get_token_decimals.rs
+   ?? src\dex\manager.rs
+   ?? src\dex\metrics_integration.rs
+   ?? src\dex\mod.rs
+   ?? src\dex\price_cache.rs
+   ?? src\dex\radar.rs
+   ?? src\dex\rate_limiter.rs
+   ?? src\dex\resilient_dex_system.rs
+   ?? src\dex\spread.rs
+   ?? src\dex\adapters\mod.rs
+   ?? src\dex\adapters\quickswap.rs
+   ?? src\dex\adapters\sushiswap.rs
+   ?? src\dex\adapters\uniswap_v2.rs
+   ?? src\dex\adapters\uniswap_v3.rs
+   ?? src\infra\metrics.rs
+   ?? src\infra\mod.rs
+   ?? src\infra\network.rs
+   ?? src\infra\rpc_provider.rs
+   ?? src\utils\abi_loader.rs
+   ?? src\utils\check_executor_permissions.rs
+   ?? src\utils\mod.rs
+   ?? src\utils\reporting.rs
+   ?? src\utils\telegram.rs
+   ?? src\utils\utils.rs
+PS C:\Users\lucsa\OneDrive\Desktop\Projeto_Bots\DEX_arbitrage>
+PS C:\Users\lucsa\OneDrive\Desktop\Projeto_Bots\DEX_arbitrage> # Ver estrutura das pastas principais
+PS C:\Users\lucsa\OneDrive\Desktop\Projeto_Bots\DEX_arbitrage> Write-Host "`n?? Estrutura de pastas:" -ForegroundColor Magenta
+
+?? Estrutura de pastas:
+PS C:\Users\lucsa\OneDrive\Desktop\Projeto_Bots\DEX_arbitrage> Get-ChildItem -Directory | Select-Object Name
+
+Name
+----
+.cargo
+abi
+ai_models
+artifacts
+audit
+audits
+cache
+config
+contracts
+ignition
+logs
+monitoring
+node_modules
+roadmaps
+scripts
+src
+target
+test
+
+
+PS C:\Users\lucsa\OneDrive\Desktop\Projeto_Bots\DEX_arbitrage>

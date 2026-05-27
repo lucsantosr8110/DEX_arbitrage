@@ -1,0 +1,97 @@
+{
+  "id": null,
+  "uid": "flashloan-dashboard",
+  "title": "Flashloan Bot Monitor",
+  "timezone": "browser",
+  "schemaVersion": 38,
+  "version": 1,
+  "refresh": "10s",
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Bot Uptime (segundos)",
+      "gridPos": { "x": 0, "y": 0, "w": 4, "h": 4 },
+      "datasource": "Prometheus",
+      "targets": [{ "expr": "bot_uptime_seconds" }],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "type": "stat",
+      "title": "Execuções OK",
+      "gridPos": { "x": 4, "y": 0, "w": 4, "h": 4 },
+      "datasource": "Prometheus",
+      "targets": [{ "expr": "arb_executions_ok_total" }]
+    },
+    {
+      "type": "stat",
+      "title": "Execuções Falhas",
+      "gridPos": { "x": 8, "y": 0, "w": 4, "h": 4 },
+      "datasource": "Prometheus",
+      "targets": [{ "expr": "arb_executions_failed_total" }]
+    },
+    {
+      "type": "stat",
+      "title": "Oportunidades Rejeitadas",
+      "gridPos": { "x": 0, "y": 4, "w": 4, "h": 4 },
+      "datasource": "Prometheus",
+      "targets": [{ "expr": "risk_opportunity_rejected" }]
+    },
+    {
+      "type": "stat",
+      "title": "Score de Risco (último)",
+      "gridPos": { "x": 4, "y": 4, "w": 4, "h": 4 },
+      "datasource": "Prometheus",
+      "targets": [{ "expr": "risk_score" }],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": 0, "color": "green" },
+              { "value": 50, "color": "orange" },
+              { "value": 80, "color": "red" }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "graph",
+      "title": "Lucro Total USD",
+      "gridPos": { "x": 8, "y": 4, "w": 4, "h": 4 },
+      "datasource": "Prometheus",
+      "targets": [{ "expr": "last_profit_usd" }],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Latência Execução SAFE",
+      "gridPos": { "x": 0, "y": 8, "w": 4, "h": 6 },
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum(rate(arb_exec_latency_safe_ms_bucket[1m])) by (le))" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ms" } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Latência Execução FAST",
+      "gridPos": { "x": 4, "y": 8, "w": 4, "h": 6 },
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum(rate(arb_exec_latency_fast_ms_bucket[1m])) by (le))" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ms" } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Latência Execução RACE",
+      "gridPos": { "x": 8, "y": 8, "w": 4, "h": 6 },
+      "datasource": "Prometheus",
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum(rate(arb_exec_latency_race_ms_bucket[1m])) by (le))" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ms" } }
+    }
+  ]
+}

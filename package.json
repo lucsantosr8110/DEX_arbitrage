@@ -1,0 +1,55 @@
+{
+  "name": "dex_arbitrage",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Flashloan arbitrage bot for Polygon Mainnet — router approvals, executor management, nonce recovery, RPC latency tests.",
+  "author": "Lucas",
+  "license": "ISC",
+  "keywords": [
+    "flashloan",
+    "polygon",
+    "hardhat",
+    "arbitrage",
+    "bot",
+    "dex",
+    "solidity"
+  ],
+  "main": "index.js",
+  "directories": {
+    "scripts": "scripts",
+    "test": "tests"
+  },
+  "engines": {
+    "node": ">=18.18.0"
+  },
+  "scripts": {
+    "compile": "npx hardhat compile",
+    "clean": "npx hardhat clean",
+    "test": "npx hardhat test",
+    "console:polygon": "npx hardhat console --network polygon",
+    "check-permissions": "npx hardhat run scripts/checkPermissions.js --network polygon",
+    "add-executor": "npx hardhat run scripts/addExecutor.js --network polygon",
+    "remove-executor": "npx hardhat run scripts/removeExecutor.js --network polygon",
+    "authorize-executor": "npx hardhat run scripts/authorize_executor.js --network polygon",
+    "approve-routers": "npx hardhat run scripts/approve_routers.js --network polygon",
+    "set-routers-safe": "npx hardhat run scripts/approve_routers_delayed.js --network polygon",
+    "rpc-latency": "node scripts/rpc_latency_test.js",
+    "cancel-pending": "npx hardhat run scripts/cancel_pending_boost.js --network polygon",
+    "bump-nonce": "npx hardhat run scripts/bump_nonce.js --network polygon",
+    "gas-now": "node scripts/gas_polygon.js",
+    "lint": "eslint . --ext .js,.ts --max-warnings=0",
+    "format": "prettier --write ."
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^6.1.0",
+    "dotenv": "^17.2.3",
+    "eslint": "^8.57.0",
+    "hardhat": "^2.26.3",
+    "prettier": "^3.3.3"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "^5.4.0",
+    "chalk": "^5.6.2",
+    "node-fetch": "^3.3.2"
+  }
+}

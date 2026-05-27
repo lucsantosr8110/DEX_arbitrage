@@ -1,0 +1,590 @@
+// ============================================================
+// src/dex/adapters/uniswap_v3.rs — V5 (FIXED: Validação de Preço Multi-Amount)
+// ============================================================
+//
+// 🚀 CORREÇÃO CRÍTICA: Implementação de validação de preço com 
+//    múltiplos amounts_in (e.g., $10, $100, $500) para mitigar slippage/liquidez concentrada.
+// ✅ Substitui a chamada de preço baseada em 1 token.
+//
+// ============================================================
+
+use crate::{
+    config::{token_cache::TokenCache, Config},
+    dex::{
+        calculate_price_from_decimals,
+        get_token_decimals::get_token_decimals,
+        normalize_price,
+        rate_limiter::ALCHEMY_RATE_LIMITER,
+        DexContract,
+        TokenPairPrice,
+        addresses, // Importando endereços de Factory/Quoter
+    },
+    AppMiddleware,
+};
+
+use anyhow::{anyhow, Result};
+use async_trait::async_trait;
+use ethers::{
+    abi::{Abi, Token},
+    contract::{Contract, Multicall},
+    types::{Address, U256},
+};
+use std::{str::FromStr, sync::Arc};
+use tracing::{debug, error, info, warn};
+
+// ============================================================
+// 🔧 Constantes e ABIs
+// ============================================================
+const DEX_NAME: &str = "UniswapV3";
+const FEE_TIERS: [u32; 3] = [500, 3000, 10_000]; // 0.05%, 0.3%, 1.0%
+const PRICE_DEVIATION_LIMIT: f64 = 0.20; // 20% desvio máximo
+
+// Assumindo WETH (ETH principal em Polygon) para comparação com USD
+// Se o bot estiver no Polygon, o WETH é 0x7ceb23fd...
+const ETH_TOKEN_ADDRESS: &str = "0x7ceb23fd6bc0add59e62ac25578270cff1b9f619"; 
+
+// Endereços (usando addresses do mod.rs)
+const DEFAULT_QUOTER_V1: &str = addresses::UNISWAP_V3_QUOTER;
+const FACTORY_ADDR: &str = addresses::UNISWAP_V3_FACTORY;
+// Fallback Quoter V2 (mantido como constante interna, se não estiver no mod.rs)
+const FALLBACK_QUOTER_V2: &str = "0x61fFE014bA17989E743c5F6cB21bF9697530B21e"; 
+
+// 🚀 NOVO: ABI MÍNIMA PARA A FACTORY V3 (getPool)
+const UNISWAP_V3_FACTORY_ABI: &str = r#"[
+    {"type":"function","name":"getPool","inputs":[{"name":"tokenA","type":"address"},{"name":"tokenB","type":"address"},{"name":"fee","type":"uint24"}],"outputs":[{"name":"pool","type":"address"}],"stateMutability":"view"}
+]"#;
+
+// ============================================================
+// 🧩 Estruturas
+// ============================================================
+#[derive(Clone)]
+pub struct UniswapV3Dex {
+    client: Arc<AppMiddleware>,
+    quoter_v1: Address,
+    quoter_v2: Address,
+    router: Address,
+    factory: Address, // Endereço da Factory V3 adicionado
+    config: Arc<Config>,
+    token_cache: Arc<TokenCache>,
+    debug_mode: bool,
+    disable_multicall: bool,
+}
+
+struct CallInfo {
+    token_a: String,
+    token_b: String,
+    addr_a: Address,
+    addr_b: Address,
+    decimals_a: u8,
+    decimals_b: u8,
+    amount_in: U256,
+}
+
+// ============================================================
+// 🔧 Implementação
+// ============================================================
+impl UniswapV3Dex {
+    pub async fn new(client: Arc<AppMiddleware>, _router: Address, config: Arc<Config>) -> Self {
+        let dex_cfg = config
+            .dex
+            .iter()
+            .find(|d| d.name == DEX_NAME)
+            .expect("❌ Configuração de UniswapV3 ausente no config.toml");
+
+        let router = dex_cfg
+            .router_address
+            .parse::<Address>()
+            .expect("Router inválido no config.toml");
+
+        // Endereços dos quoters
+        let quoter_v1 = Address::from_str(DEFAULT_QUOTER_V1).unwrap_or_else(|_| panic!("Endereço Quoter V1 inválido"));
+        let quoter_v2 = Address::from_str(FALLBACK_QUOTER_V2).unwrap_or_else(|_| panic!("Endereço Quoter V2 inválido"));
+        
+        // 1. OBTENDO O ENDEREÇO DA FACTORY
+        let factory = dex_cfg
+            .extra
+            .get("factory_address")
+            .and_then(|v| v.as_str())
+            .unwrap_or(FACTORY_ADDR)
+            .parse::<Address>()
+            .expect("Endereço de Factory UniswapV3 inválido");
+
+
+        // Flags de modo
+        let debug_mode = dex_cfg
+            .extra
+            .get("debug_mode")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let disable_multicall = dex_cfg
+            .extra
+            .get("disable_multicall")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let token_cache = TokenCache::global(config.clone()).await;
+
+        info!(
+            "✅ [{}] Dex inicializado | router={} | factory={} | quoter_v1={} | debug_mode={}",
+            DEX_NAME, router, factory, quoter_v1, debug_mode
+        );
+
+        Self {
+            client,
+            quoter_v1,
+            quoter_v2,
+            router,
+            factory, // Adicionado
+            config,
+            token_cache,
+            debug_mode,
+            disable_multicall,
+        }
+    }
+
+    async fn resolve_token(&self, symbol_or_address: &str) -> Result<Address> {
+        if symbol_or_address.starts_with("0x") {
+            return Ok(Address::from_str(symbol_or_address)?);
+        }
+        self.token_cache
+            .resolve(symbol_or_address)
+            .await
+            .ok_or_else(|| anyhow!("Token não suportado: {}", symbol_or_address))
+    }
+
+    async fn prepare_call_data(&self, pairs: &[(&str, &str)]) -> Result<Vec<CallInfo>> {
+        let mut data = Vec::new();
+
+        // NOTE: prepare_call_data AINDA USA 1 UNIDADE COMO BASE para o Multicall fallback,
+        // mas a lógica principal (get_price) irá usar a validação de múltiplos amounts.
+        for (a, b) in pairs {
+            let (Ok(addr_a), Ok(addr_b)) = (self.resolve_token(a).await, self.resolve_token(b).await) else {
+                warn!("[{}] Falha ao resolver {}/{}", DEX_NAME, a, b);
+                continue;
+            };
+
+            let (Ok(dec_a), Ok(dec_b)) = (
+                get_token_decimals(self.client.clone(), addr_a).await,
+                get_token_decimals(self.client.clone(), addr_b).await,
+            ) else {
+                warn!("[{}] Falha ao obter decimais {}/{}", DEX_NAME, a, b);
+                continue;
+            };
+
+            data.push(CallInfo {
+                token_a: a.to_string(),
+                token_b: b.to_string(),
+                addr_a,
+                addr_b,
+                decimals_a: dec_a,
+                decimals_b: dec_b,
+                amount_in: U256::exp10(dec_a as usize),
+            });
+        }
+
+        Ok(data)
+    }
+
+    fn load_abi_from_wrapper(abi_content: &str) -> Result<Abi> {
+        let wrapper: serde_json::Value =
+            serde_json::from_str(abi_content).map_err(|e| anyhow!("Erro parse ABI wrapper: {e}"))?;
+        let array = wrapper
+            .get("abi")
+            .ok_or_else(|| anyhow!("Campo 'abi' ausente"))?
+            .clone();
+        serde_json::from_value(array).map_err(|e| anyhow!("Erro parse array ABI: {e}"))
+    }
+
+    fn deadline(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 600
+    }
+
+    /// Obtém o amount_out cotado usando V1 ou V2 Quoter como fallback.
+    async fn get_quote_with_fallback(
+        &self,
+        token_in: Address,
+        token_out: Address,
+        fee: u32,
+        amount_in: U256,
+    ) -> Result<U256> {
+        // Tenta V1
+        let abi_v1 = Self::load_abi_from_wrapper(include_str!("../../../abi/uniswap_v3_quoter.json"))?;
+        let quoter_v1 = Contract::new(self.quoter_v1, abi_v1.clone(), self.client.clone());
+
+        ALCHEMY_RATE_LIMITER.acquire().await?;
+        let call_v1 = quoter_v1.method::<_, U256>(
+            "quoteExactInputSingle",
+            (token_in, token_out, fee, amount_in, U256::zero()),
+        )?;
+
+        match call_v1.call().await {
+            Ok(amount_out) if amount_out > U256::zero() => {
+                return Ok(amount_out);
+            }
+            // Err(e) => warn!("[{}][V1] Falhou: {}", DEX_NAME, e), // Sem log de WARN aqui para evitar poluição
+            _ => (),
+        }
+
+        // Fallback V2 (caso V1 reverta)
+        let abi_v2 = Self::load_abi_from_wrapper(include_str!("../../../abi/uniswap_v3_quoter_v2.json"))?;
+        let quoter_v2 = Contract::new(self.quoter_v2, abi_v2, self.client.clone());
+
+        ALCHEMY_RATE_LIMITER.acquire().await?;
+        let call_v2 = quoter_v2.method::<_, (U256, U256, u32, U256)>(
+            "quoteExactInputSingle",
+            ((token_in, token_out, fee, amount_in, U256::zero()),),
+        )?;
+
+        match call_v2.call().await {
+            Ok((out, _, _, _)) if out > U256::zero() => {
+                Ok(out)
+            }
+            Err(e) => Err(anyhow!("Ambos quoters falharam para (in: {:?}, fee: {}): {}", amount_in, fee, e)),
+            _ => Err(anyhow!("quoteExactInputSingle retornou zero")),
+        }
+    }
+    
+    // ============================================================
+    // NOVO: Função para obter cotação e preço
+    // ============================================================
+
+    /// Obtém o preço de Token A em termos de Token B para um dado amount_in e fee.
+    async fn get_quote_price_for_amount(
+        &self,
+        token_a: Address,
+        token_b: Address,
+        fee: u32,
+        amount_in: U256,
+        dec_a: u8,
+        dec_b: u8,
+    ) -> Result<Option<f64>> {
+        if amount_in.is_zero() {
+            return Ok(None);
+        }
+
+        match self.get_quote_with_fallback(token_a, token_b, fee, amount_in).await {
+            Ok(amount_out) => {
+                let price = calculate_price_from_decimals(amount_in, amount_out, dec_a, dec_b)?;
+                Ok(normalize_price(price))
+            }
+            Err(e) => {
+                if self.debug_mode {
+                    debug!("[{}] Falha ao cotar fee {} (in:{:?}): {}", DEX_NAME, fee, amount_in, e);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Valida preço testando com múltiplos amounts_in
+    /// Retorna o preço mais confiável (mediana de 3 testes)
+    async fn validate_price_with_multiple_amounts(
+        &self,
+        token_a: Address,
+        token_b: Address,
+        best_fee: u32,
+        dec_a: u8,
+        dec_b: u8,
+    ) -> Result<Option<f64>> {
+        let is_a_eth = token_a == Address::from_str(ETH_TOKEN_ADDRESS).unwrap();
+
+        // Lógica simplificada: se for WETH (token de alto valor/liquidez), testamos com 10/100/500 unidades em base 10^18.
+        // Se for outro token, testamos com 1, 10, 50 unidades base 10^decimals, pois não temos oráculo para USD.
+        let _amount_multiplier = |base: u64| -> U256 {
+            U256::from(base) * U256::exp10(dec_a as usize) / U256::exp10(18) * U256::exp10(dec_a as usize)
+        };
+        
+        let amounts_to_test: [U256; 3] = if is_a_eth {
+             // WETH tem 18 decimais. Usamos 0.0035, 0.035, 0.175 WETH (~$10, ~$100, ~$500 no preço de $2800)
+             // Nota: Não temos o preço de USD em tempo real, então usamos uma escala que se assemelha a ordens pequenas.
+             // Para simplificar, focamos em ordens pequenas. O amount_in original de 1 WETH (U256::exp10(18)) é o problema.
+            [
+                U256::exp10(dec_a as usize) / U256::from(100), // 0.01 WETH (para testar)
+                U256::exp10(dec_a as usize) / U256::from(30),  // ~0.03 WETH ($100 USD)
+                U256::exp10(dec_a as usize) / U256::from(10),  // 0.1 WETH
+            ]
+        } else {
+             // Para outros tokens, testamos 1, 10, 50 unidades do token.
+            [
+                U256::exp10(dec_a as usize), 
+                U256::exp10(dec_a as usize) * U256::from(10), 
+                U256::exp10(dec_a as usize) * U256::from(50),
+            ]
+        };
+    
+        let mut prices = Vec::new();
+
+        for amount_in in amounts_to_test.iter() {
+            if let Ok(Some(price)) = self.get_quote_price_for_amount(token_a, token_b, best_fee, *amount_in, dec_a, dec_b).await {
+                prices.push(price);
+            }
+        }
+        
+        // Se menos de dois preços válidos foram retornados, rejeita
+        if prices.len() < 2 {
+            warn!("[{}] Pool {}/{} (fee {}) - Não foi possível cotar preço confiável em 2+ amounts", DEX_NAME, token_a, token_b, best_fee);
+            return Ok(None);
+        }
+
+        // 4. Calcula a mediana dos preços
+        prices.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median_price = prices[prices.len() / 2];
+
+        // 5. Verifica a divergência (slippage/concentração de liquidez)
+        let max_deviation = prices.iter().map(|&price| {
+            ((price - median_price) / median_price).abs()
+        }).fold(0.0, f64::max);
+
+        // Se o desvio for muito alto (20%), rejeita.
+        if max_deviation > PRICE_DEVIATION_LIMIT { 
+            warn!(
+                 "[{}] Pool {}/{} (fee {}) divergência ALTA ({:.2}%) — Preço rejeitado.", 
+                 DEX_NAME, token_a, token_b, best_fee, max_deviation * 100.0
+            );
+            return Ok(None);
+        }
+
+        Ok(Some(median_price))
+    }
+
+}
+
+// ============================================================
+// 💡 Implementação do Trait DexContract
+// ============================================================
+#[async_trait]
+impl DexContract for UniswapV3Dex {
+    fn name(&self) -> String {
+        DEX_NAME.into()
+    }
+
+    /// Checa a existência do pool na Factory para qualquer Fee Tier
+    async fn get_pair_or_pool_address(
+        &self,
+        token_a: Address,
+        token_b: Address,
+    ) -> Result<Option<Address>> {
+        let abi: Abi = serde_json::from_str(UNISWAP_V3_FACTORY_ABI)
+            .map_err(|e| anyhow!("Falha ao parsear ABI da Factory V3: {}", e))?;
+        let factory_contract = Contract::new(self.factory, abi, self.client.clone());
+
+        for &fee in &FEE_TIERS {
+            ALCHEMY_RATE_LIMITER.acquire().await?;
+            let call = factory_contract.method::<_, Address>("getPool", (token_a, token_b, fee))?;
+            
+            match call.call().await {
+                Ok(pool_addr) if !pool_addr.is_zero() => {
+                    debug!("- [{}] Pool encontrado com fee {}: {}", DEX_NAME, fee, pool_addr);
+                    return Ok(Some(pool_addr));
+                },
+                _ => {}
+            }
+        }
+
+        debug!("- [{}] Nenhum Pool encontrado na Factory V3 para {:?} / {:?}", DEX_NAME, token_a, token_b);
+        Ok(None)
+    }
+
+    // ========================================================
+    // 🔹 Consulta de preço (get_price)
+    // ========================================================
+    async fn get_price(&self, token_a: &Address, token_b: &Address) -> Result<Option<f64>> {
+        // 1. CRÍTICO: Checar se existe algum pool para este par
+        if self.get_pair_or_pool_address(*token_a, *token_b).await?.is_none() {
+            debug!("- [{}] Nenhum Pool V3 encontrado para o par, pulando cotação.", DEX_NAME);
+            return Ok(None);
+        }
+
+        let (Ok(dec_a), Ok(dec_b)) = (
+            get_token_decimals(self.client.clone(), *token_a).await,
+            get_token_decimals(self.client.clone(), *token_b).await,
+        ) else {
+            warn!("[{}] Falha ao obter decimais", DEX_NAME);
+            return Ok(None);
+        };
+
+        // Encontra a melhor FEE tier que retorna um resultado (best_fee)
+        let mut best_fee: u32 = 0;
+        let mut temp_best_out = U256::zero();
+        
+        // Use 1 unidade como teste rápido para encontrar a melhor FEE (o valor em si não é usado como preço final)
+        let amount_in_test = U256::exp10(dec_a as usize); 
+
+        for &fee in &FEE_TIERS {
+            if let Ok(out) = self.get_quote_with_fallback(*token_a, *token_b, fee, amount_in_test).await {
+                 if out > temp_best_out {
+                    temp_best_out = out;
+                    best_fee = fee;
+                 }
+            }
+        }
+
+        if best_fee == 0 {
+             debug!("- [{}] Nenhuma FEE Tier retornou resultado válido para o par, pulando.", DEX_NAME);
+             return Ok(None);
+        }
+
+        // 2. NOVO: Valida o preço usando múltiplos amounts e a melhor fee encontrada
+        let validated_price = self.validate_price_with_multiple_amounts(
+            *token_a, 
+            *token_b, 
+            best_fee, 
+            dec_a, 
+            dec_b
+        ).await?;
+
+        // 📊 LOG DE COTAÇÃO (fim do cálculo)
+        if let Some(price) = validated_price {
+            if self.debug_mode {
+                tracing::info!(
+                    "[{}] {}→{} fee={} price={:.8} (validated)",
+                    DEX_NAME, token_a, token_b, best_fee, price
+                );
+            }
+            Ok(Some(price))
+        } else {
+            // Preço rejeitado devido à alta divergência ou poucos quotes
+            Ok(None)
+        }
+    }
+
+    // ========================================================
+    // ⚡ Consulta múltipla (Multicall opcional)
+    // ========================================================
+    // O Multicall é mantido inalterado, pois é otimizado para velocidade 
+    // e confia no revert do Quoter. A lógica de preço principal (get_price)
+    // agora é mais robusta para fallback.
+    async fn get_prices_multicall(&self, pairs: &[(String, String)]) -> Result<Vec<TokenPairPrice>> {
+        if self.disable_multicall {
+            warn!("[{}] Multicall desativado — fallback para chamadas diretas", DEX_NAME);
+            let mut results = Vec::new();
+            for (a, b) in pairs {
+                if let (Ok(addr_a), Ok(addr_b)) = (
+                    self.resolve_token(a).await,
+                    self.resolve_token(b).await,
+                ) {
+                    if let Ok(Some(p)) = self.get_price(&addr_a, &addr_b).await {
+                        results.push(TokenPairPrice::new(a.clone(), b.clone(), p, DEX_NAME.into()));
+                    }
+                }
+            }
+            return Ok(results);
+        }
+
+        let mut results = Vec::new();
+        let abi = Self::load_abi_from_wrapper(include_str!("../../../abi/uniswap_v3_quoter.json"))?;
+        let quoter = Contract::new(self.quoter_v1, abi, self.client.clone());
+        let call_data = self
+            .prepare_call_data(&pairs.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect::<Vec<_>>())
+            .await?;
+
+        let mut multicall = Multicall::new(self.client.clone(), None).await?;
+        for info in &call_data {
+            for &fee in &FEE_TIERS {
+                let call = quoter.method::<_, U256>(
+                    "quoteExactInputSingle",
+                    (info.addr_a, info.addr_b, fee, info.amount_in, U256::zero()),
+                )?;
+                multicall.add_call(call, true);
+            }
+        }
+
+        ALCHEMY_RATE_LIMITER.acquire().await?;
+        let raw: Vec<Result<Token, _>> = multicall.call_raw().await?;
+        
+        for (i, chunk) in raw.chunks_exact(FEE_TIERS.len()).enumerate() {
+            let info = &call_data[i];
+            let mut best_out = U256::zero();
+            let mut best_fee: u32 = 0;
+
+            for (j, r) in chunk.iter().enumerate() {
+                if let Ok(Token::Uint(v)) = r {
+                    if *v > best_out {
+                        best_out = *v;
+                        best_fee = FEE_TIERS[j];
+                    }
+                }
+            }
+
+            if !best_out.is_zero() {
+                let price = calculate_price_from_decimals(
+                    info.amount_in,
+                    best_out,
+                    info.decimals_a,
+                    info.decimals_b,
+                )?;
+                if self.debug_mode {
+                    tracing::info!(
+                        "[{}] {}→{} fee={} in={} out={} price={:.8} (multicall)",
+                        DEX_NAME, info.token_a, info.token_b, best_fee, info.amount_in, best_out, price
+                    );
+                }
+                if let Some(p) = normalize_price(price) {
+                    results.push(TokenPairPrice::new(
+                        info.token_a.clone(),
+                        info.token_b.clone(),
+                        p,
+                        DEX_NAME.into(),
+                    ));
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    // ========================================================
+    // 🔁 Execução de swap
+    // ========================================================
+    async fn swap(&self, token_in: Address, token_out: Address, amount_in: U256) -> Result<U256> {
+        if self.config.execution.dry_run {
+            info!("[{}] Dry-run swap {:?} -> {:?}", DEX_NAME, token_in, token_out);
+            return Ok(amount_in);
+        }
+        
+        // 1. CRÍTICO: Checar se o par existe antes de tentar o swap (evitar revert)
+        if self.get_pair_or_pool_address(token_in, token_out).await?.is_none() {
+            return Err(anyhow!("[{}] Swap: Nenhum Pool V3 encontrado para o par.", DEX_NAME));
+        }
+
+        let router_abi = Self::load_abi_from_wrapper(include_str!("../../../abi/UniswapV3Router.json"))?;
+        let router = Contract::new(self.router, router_abi, self.client.clone());
+
+        // A Fee Tier correta deve ser fornecida pela lógica de arbitragem
+        let params = (
+            token_in,
+            token_out,
+            3000u32, // PLACEHOLDER: Deve ser a Fee Tier da rota de arbitragem
+            self.client.address(),
+            self.deadline(),
+            amount_in,
+            U256::zero(),
+            U256::zero(),
+        );
+
+        let method = router.method::<_, U256>("exactInputSingle", params)?;
+        ALCHEMY_RATE_LIMITER.acquire().await?;
+        let pending = method.send().await?;
+        if let Some(r) = pending.await? {
+            info!("✅ [{}] Swap executado: {:?}", DEX_NAME, r.transaction_hash);
+        }
+
+        Ok(amount_in) 
+    }
+
+    // ========================================================
+    // 🔧 Acessores
+    // ========================================================
+    fn client(&self) -> &Arc<AppMiddleware> {
+        &self.client
+    }
+
+    fn config(&self) -> &Arc<Config> {
+        &self.config
+    }
+}

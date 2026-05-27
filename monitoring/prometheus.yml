@@ -1,0 +1,28 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: "flashloan_bot"
+    metrics_path: "/metrics"
+    static_configs:
+      - targets: ["host.docker.internal:9100"]
+        labels:
+          service: "flashloan_bot"
+          instance: "local"
+
+  - job_name: "node_exporter"
+    metrics_path: "/metrics"
+    static_configs:
+      - targets: ["host.docker.internal:9100"]
+        labels:
+          service: "node_exporter"
+          instance: "local"
+
+  - job_name: "redis_exporter"
+    metrics_path: "/metrics"
+    static_configs:
+      - targets: ["host.docker.internal:9121"]
+        labels:
+          service: "redis"
+          instance: "local"
