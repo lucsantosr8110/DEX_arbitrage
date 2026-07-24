@@ -65,7 +65,38 @@
 
 ---
 
-## Arquivos Modificados (v4)
+## v5 — Radar Edge Semantics (2026-07-24)
+
+### Problema
+O radar reportava EDGEs com spread single-direction (ex: USDT-WMATIC 2.42%) que NÃO
+eram arbitráveis. A investigação provou com números que:
+- Radar detecta: USDT→WMATIC SushiSwap=12.70, UniswapV3=13.01 → spread=2.42%
+- Realidade: WMATIC→USDT é ~0.0768 em TODOS os DEXes (flat)
+- Cycle_rate máximo: 0.992 (-0.84% loss) — nenhuma combinação cross-DEX é lucrativa
+
+### Correção
+- **Arquivo**: `src/dex/radar.rs`
+- `extract_edges()` agora valida cycle_rate real antes de emitir EDGE
+- Para cada par, verifica se o reverse pair existe no price_map
+- Calcula `cycle_rate = buy_price × (1-fee_buy) × sell_price × (1-fee_sell)`
+- **EDGE só é emitido quando `cycle_rate > 1.0`** (potencial bruto positivo)
+- Spread no EDGE agora reflete `(cycle_rate - 1.0) * 100`, não spread single-direction
+- Adicionada função `dex_fee()` (0.3% para V2/V3 — TODO: usar fee tier real)
+
+### Evidência
+| Par | Antes (spread single) | Depois (cycle_rate) | Resultado |
+|-----|----------------------|---------------------|-----------|
+| USDT-WMATIC | 2.42% | 0.992 (-0.84%) | EDGE removido |
+| WMATIC-USDT | 2.42% | 0.992 (-0.84%) | EDGE removido |
+
+### Instrumentação removida
+- Logs temporários `WMATIC-TRACE`, `WMATIC-SUMMARY`, `WMATIC-PROFIT`, `WMATIC-INPUT`
+- Variável `is_wmatic_pair` e `is_wmatic_opp` removidas
+- Todo o logging de produção (info!/warn!) mantido
+
+---
+
+## Arquivos Modificados (v5)
 
 | Arquivo | Mudanças |
 |---------|----------|

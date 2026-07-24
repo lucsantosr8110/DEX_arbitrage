@@ -363,6 +363,16 @@ const MAX_SPREAD_PCT: f64 = 50.0;
 const AUDIT_SPREAD_LOW: f64 = 10.0;
 const AUDIT_SPREAD_HIGH: f64 = 50.0;
 
+/// Fee de swap por DEX (em fração). V2 = 0.3%, V3 = 0.3% default.
+/// TODO: usar fee tier real do pool quando disponível via Multicall.
+fn dex_fee(dex_name: &str) -> f64 {
+    match dex_name {
+        "QuickSwap" | "SushiSwap" => 0.003,
+        "UniswapV3" => 0.003, // V3 real: 0.05%-1%, usamos 0.3% como conservador
+        _ => 0.003,
+    }
+}
+
 /// Derruba os dois lados de todo par cujo produto recíproco esteja fora da janela.
 ///
 /// Derruba ambos de propósito: quando o produto está errado não dá para saber qual
@@ -422,6 +432,10 @@ pub struct EdgeInfo {
 }
 
 /// Conta sinais de spread E extrai os edges (> 0.01%) para logging/audit.
+///
+/// **VALIDAÇÃO CROSS-DEX**: Só emite EDGE quando o cycle_rate real (com fees
+/// dos dois DEXes) é > 1.0 — ou seja, quando existe potencial bruto de arbitragem.
+/// Spreads single-direction (ex: USDT-WMATIC 2.42% sem reverso viável) são filtrados.
 fn extract_edges(pr: &HashMap<String, HashMap<String, f64>>) -> (usize, Vec<EdgeInfo>) {
     let mut map_pairs: HashMap<String, Vec<(String, f64)>> = HashMap::new();
 
@@ -437,24 +451,21 @@ fn extract_edges(pr: &HashMap<String, HashMap<String, f64>>) -> (usize, Vec<Edge
     let mut count = 0;
     let mut edges = Vec::new();
 
-    for (pair, dex_prices) in map_pairs {
+    for (pair, dex_prices) in &map_pairs {
         if dex_prices.len() < 2 {
             continue;
         }
 
+        // Encontrar preço mínimo e máximo para este par (para buy_price/sell_price no EdgeInfo)
         let mut min_price = f64::MAX;
         let mut max_price = f64::MIN;
-        let mut min_dex = String::new();
-        let mut max_dex = String::new();
 
-        for (dex, price) in &dex_prices {
+        for (_dex, price) in dex_prices {
             if *price < min_price {
                 min_price = *price;
-                min_dex = dex.clone();
             }
             if *price > max_price {
                 max_price = *price;
-                max_dex = dex.clone();
             }
         }
 
@@ -462,28 +473,69 @@ fn extract_edges(pr: &HashMap<String, HashMap<String, f64>>) -> (usize, Vec<Edge
             continue;
         }
 
-        let spread = (max_price - min_price) / min_price * 100.0;
+        // Extrair reverse pair (ex: USDT-WMATIC → WMATIC-USDT)
+        let reverse_pair = pair.split_once('-').map(|(a, b)| format!("{}-{}", b, a));
+
+        // Buscar preços do reverse pair se existir
+        let reverse_dex_prices = reverse_pair.as_ref().and_then(|rp| map_pairs.get(rp));
+
+        // Calcular melhor cycle_rate cross-DEX com fees
+        let mut best_cycle_rate: f64 = 0.0;
+        let mut best_buy_dex = String::new();
+        let mut best_sell_dex = String::new();
+
+        if let Some(rev_prices) = reverse_dex_prices {
+            // Para cada combinação (buy_dex, sell_dex) onde buy ≠ sell
+            for (buy_dex, buy_price) in dex_prices {
+                for (sell_dex, sell_price) in rev_prices {
+                    if buy_dex == sell_dex {
+                        continue;
+                    }
+                    let fee_buy = dex_fee(buy_dex);
+                    let fee_sell = dex_fee(sell_dex);
+                    // cycle_rate = buy_price × (1-fee) × sell_price × (1-fee)
+                    let cycle_rate = buy_price * (1.0 - fee_buy) * sell_price * (1.0 - fee_sell);
+                    if cycle_rate > best_cycle_rate {
+                        best_cycle_rate = cycle_rate;
+                        best_buy_dex = buy_dex.clone();
+                        best_sell_dex = sell_dex.clone();
+                    }
+                }
+            }
+        }
+
+        // Só emitir EDGE se cycle_rate > 1.0 (potencial bruto positivo)
+        if best_cycle_rate <= 1.0 {
+            debug!(
+                "🚫 [NO-EDGE] {} cycle_rate={:.6} ≤ 1.0 — spread single-direction, não arbitrável",
+                pair, best_cycle_rate
+            );
+            continue;
+        }
+
+        // Spread real reflete o cycle_rate, não o spread single-direction
+        let spread_pct = (best_cycle_rate - 1.0) * 100.0;
 
         // Zona de auditoria: spreads entre 10-50% são logados para investigação
-        if spread >= AUDIT_SPREAD_LOW && spread <= AUDIT_SPREAD_HIGH {
+        if spread_pct >= AUDIT_SPREAD_LOW && spread_pct <= AUDIT_SPREAD_HIGH {
             warn!(
-                "🔍 [AUDIT] {} spread={:.2}% ({}→{}) buy={:.6} sell={:.6} — verificar liquidez",
-                pair, spread, min_dex, max_dex, min_price, max_price
+                "🔍 [AUDIT] {} spread={:.2}% ({}→{}) buy={:.6} sell={:.6} cycle_rate={:.6} — verificar liquidez",
+                pair, spread_pct, best_buy_dex, best_sell_dex, min_price, max_price, best_cycle_rate
             );
         }
 
-        if spread > MAX_SPREAD_PCT {
+        if spread_pct > MAX_SPREAD_PCT {
             continue;
         }
-        if spread >= 0.03 {
+        if spread_pct >= 0.03 {
             count += 1;
         }
-        if spread >= 0.01 {
+        if spread_pct >= 0.01 {
             edges.push(EdgeInfo {
-                pair,
-                buy_dex: min_dex,
-                sell_dex: max_dex,
-                spread_pct: spread,
+                pair: pair.clone(),
+                buy_dex: best_buy_dex,
+                sell_dex: best_sell_dex,
+                spread_pct,
                 buy_price: min_price,
                 sell_price: max_price,
             });

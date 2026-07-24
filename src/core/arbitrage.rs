@@ -990,7 +990,7 @@ impl ArbitrageEngine {
         }
 
         if best.is_none() {
-            info!("  ❌ {}: nenhum cycle cross-DEX viável (rates_ab={:?}, rates_ba={:?})", pair,
+            debug!("  ❌ {}: nenhum cycle cross-DEX viável (rates_ab={:?}, rates_ba={:?})", pair,
                 rates_ab.iter().map(|(r,d)| format!("{}={:.4}", d, r)).collect::<Vec<_>>(),
                 rates_ba.iter().map(|(r,d)| format!("{}={:.4}", d, r)).collect::<Vec<_>>());
         }
