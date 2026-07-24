@@ -1,4 +1,4 @@
-﻿// ================================================================
+// ================================================================
 // src/dex/mod.rs â€” v5.1.1-FINAL-SAFE-WBTC (COMPLETO E CORRIGIDO)
 // ================================================================
 //
@@ -19,7 +19,34 @@ use ethers::{
     types::{Address, U256}
 };
 use std::sync::Arc;
+use std::sync::RwLock;
+use once_cell::sync::Lazy;
 use tracing::{debug, warn};
+
+// ================================================================
+// CACHE GLOBAL DE FEE TIERS (para V3 pools)
+// ================================================================
+// Armazena o fee tier real de cada par V3, permitindo que o engine
+// use a fee correta em vez do hardcoded 0.3%.
+// Chave: "DEX_NAME:TOKEN_A-TOKEN_B" → fee_tier_bps (ex: 500, 3000, 10000)
+static FEE_TIER_CACHE: Lazy<RwLock<std::collections::HashMap<String, u32>>> =
+    Lazy::new(|| RwLock::new(std::collections::HashMap::new()));
+
+/// Registra o fee tier de um par V3 no cache global.
+pub fn cache_fee_tier(dex_name: &str, pair: &str, fee_tier_bps: u32) {
+    let key = format!("{}:{}", dex_name, pair);
+    if let Ok(mut cache) = FEE_TIER_CACHE.write() {
+        cache.insert(key, fee_tier_bps);
+        debug!("💾 [FEE TIER CACHE SET] {}:{} => {} bps", dex_name, pair, fee_tier_bps);
+    }
+}
+
+/// Retorna o fee tier de um par V3 do cache global.
+/// Retorna None se o par não estiver no cache (usar fee padrão).
+pub fn cached_fee_tier(dex_name: &str, pair: &str) -> Option<u32> {
+    let key = format!("{}:{}", dex_name, pair);
+    FEE_TIER_CACHE.read().ok()?.get(&key).cloned()
+}
 
 // ================================================================
 // TRAIT PRINCIPAL (interface comum para todos os DEX adapters)
@@ -88,6 +115,18 @@ pub trait DexContract: Send + Sync {
     fn config(&self) -> &Arc<Config>;
     
     // ðŸ”„ ImplementaÃ§Ã£o padrÃ£o usando Config (AGORA VAI ENCONTRAR O CAMPO `addresses`)
+    /// Notional em USD usado para dimensionar as cotacoes de preco.
+    ///
+    /// Ancorado em `arbitrage.default_trade_amount` para que o spread medido seja o
+    /// spread no tamanho que o bot de fato executaria. Ver `quote_amount_for_usd`.
+    fn quote_notional_usd(&self) -> f64 {
+        self.config()
+            .arbitrage
+            .default_trade_amount
+            .parse::<f64>()
+            .unwrap_or(100.0)
+    }
+
     fn get_wmatic_address(&self) -> Option<Address> {
         self.config().addresses.get("WMATIC").cloned()
     }
@@ -125,6 +164,53 @@ pub async fn calculate_price_with_decimals(
     calculate_price_from_decimals(amount_in, amount_out, decimals_in, decimals_out)
 }
 
+/// Quantidade do token equivalente a um notional em USD, para usar como `amount_in`
+/// numa cotação.
+///
+/// Antes os adapters cotavam `10^decimals` — literalmente **1 unidade do token de
+/// entrada**. Isso significa cotar $1 quando a entrada é DAI e ~$2.900 quando é
+/// WETH: dois notionais incomparáveis. Quebrava duas coisas de uma vez:
+///
+/// 1. O spread medido era o spread *naquele* tamanho, não no tamanho que o bot
+///    realmente executa (`arbitrage.default_trade_amount`). Pool que parecia
+///    lucrativa a 1 DAI escorregava a $100.
+/// 2. O produto recíproco `p(A,B) × p(B,A)` misturava price impact em dois
+///    tamanhos diferentes, então não dava para separar "cotação corrompida" de
+///    "pool rasa para o notional de entrada".
+///
+/// O preço de referência vem do `PRICE_FEED` (Coingecko, cache de 2 min, com
+/// fallback heurístico embutido). Ele só dimensiona a cotação — o preço que vale
+/// para lucro é sempre o que o DEX devolve.
+pub async fn quote_amount_for_usd(symbol: &str, decimals: u8, usd_notional: f64) -> Result<U256> {
+    use crate::infra::price_feed::PRICE_FEED;
+
+    let price_usd = PRICE_FEED.get_price(symbol).await.unwrap_or(0.0);
+
+    if !price_usd.is_finite() || price_usd <= 0.0 || !usd_notional.is_finite() || usd_notional <= 0.0
+    {
+        // Sem referência utilizável, cai no comportamento antigo (1 unidade). É um
+        // tamanho ruim, mas conhecido — melhor que uma quantidade arbitrária.
+        warn!(
+            "[quote_size] sem preço de referência para {} (usd={}), usando 1 unidade",
+            symbol, price_usd
+        );
+        return Ok(U256::exp10(decimals as usize));
+    }
+
+    let units = usd_notional / price_usd;
+    let raw = units * 10f64.powi(decimals as i32);
+
+    if !raw.is_finite() || raw < 1.0 || raw >= u128::MAX as f64 {
+        warn!(
+            "[quote_size] notional ${:.2} em {} gerou quantidade fora de faixa ({:.3e}), usando 1 unidade",
+            usd_notional, symbol, raw
+        );
+        return Ok(U256::exp10(decimals as usize));
+    }
+
+    Ok(U256::from(raw as u128))
+}
+
 pub fn calculate_price_from_decimals(
     amount_in: U256,
     amount_out: U256,
@@ -143,7 +229,10 @@ pub fn calculate_price_from_decimals(
     let price = amount_out_f64 / amount_in_f64;
     
     if price > 1_000_000.0 || price <= 1e-12 {
-        warn!("ðŸš¨ [PRICE_CALC_LOCAL] PreÃ§o invÃ¡lido (extremo ou zero): {:.6}", price);
+        // debug, nao warn: pools de poeira (reserva minima) devolvem preco extremo
+        // e sao rejeitados aqui. E esperado ao monitorar tokens menos liquidos —
+        // logar a cada ciclo por pool inundaria o log. O descarte e o correto.
+        debug!("[PRICE_CALC_LOCAL] preco extremo/zero descartado: {:.6}", price);
         return Ok(0.0);
     }
 
@@ -215,6 +304,9 @@ pub struct TokenPairPrice {
     pub price: f64,
     pub dex_name: String,
     pub timestamp: u64,
+    /// Fee tier do pool (em bps). Para V2 = 3000 (0.3%), para V3 = 500/3000/10000.
+    /// Usado para calcular fees reais no cycle_rate.
+    pub fee_tier_bps: u32,
 }
 impl TokenPairPrice {
     pub fn new(token_a: String, token_b: String, price: f64, dex_name: String) -> Self {
@@ -227,8 +319,15 @@ impl TokenPairPrice {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
+            fee_tier_bps: 3000, // Default: 0.3% (V2 e V3 mais comum)
         }
     }
+
+    pub fn with_fee_tier(mut self, fee_tier_bps: u32) -> Self {
+        self.fee_tier_bps = fee_tier_bps;
+        self
+    }
+
     pub fn is_valid(&self) -> bool {
         validate_price(self.price)
     }

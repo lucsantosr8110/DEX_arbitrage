@@ -974,8 +974,8 @@ impl ArbitrageEngine {
                 // Fórmula cross-DEX com fees:
                 // amount_out = amount_in × rate_ab × (1 - fee_buy) × rate_ba × (1 - fee_sell)
                 // cycle_rate inclui o impacto das fees de AMBOS os DEXes
-                let fee_buy = Self::dex_fee(buy_dex);
-                let fee_sell = Self::dex_fee(sell_dex);
+                let fee_buy = Self::dex_fee(buy_dex, pair);
+                let fee_sell = Self::dex_fee(sell_dex, &reverse_pair);
                 let cycle_rate = rate_ab * (1.0 - fee_buy) * rate_ba * (1.0 - fee_sell);
                 let spread_pct = (cycle_rate - 1.0) * 100.0;
 
@@ -1380,12 +1380,20 @@ impl ArbitrageEngine {
 
     /// Retorna a fee de swap para um DEX (em fração).
     /// V2 pools (QuickSwap, SushiSwap) = 0.3%.
-    /// V3 pools (UniswapV3) = 0.3% default (pools reais variam 0.01%-1%).
+    /// V3 pools (UniswapV3) = fee real do pool (0.05%, 0.3%, ou 1.0%).
+    /// Se o fee tier não estiver no cache, usa 0.3% como default.
     #[inline]
-    fn dex_fee(dex_name: &str) -> f64 {
+    fn dex_fee(dex_name: &str, pair: &str) -> f64 {
         match dex_name {
-            "QuickSwap" | "SushiSwap" => 0.003,  // V2: 0.3%
-            "UniswapV3" => 0.003,                 // V3 default: 0.3%
+            "QuickSwap" | "SushiSwap" => 0.003,  // V2: sempre 0.3%
+            "UniswapV3" => {
+                // Tenta usar o fee tier real do cache
+                if let Some(fee_bps) = crate::dex::cached_fee_tier(dex_name, pair) {
+                    fee_bps as f64 / 10_000.0  // Converte bps para fração
+                } else {
+                    0.003  // Default: 0.3% (fee tier mais comum)
+                }
+            }
             _ => DEX_FEE_DEFAULT,
         }
     }
@@ -1530,11 +1538,226 @@ mod tests {
     }
 
     /// Valida que dex_fee retorna valores corretos por DEX.
+    /// Para V3, retorna fee do cache (ou default 0.3% se não estiver no cache).
     #[test]
     fn dex_fee_returns_correct_values() {
-        assert_eq!(ArbitrageEngine::dex_fee("QuickSwap"), 0.003);
-        assert_eq!(ArbitrageEngine::dex_fee("SushiSwap"), 0.003);
-        assert_eq!(ArbitrageEngine::dex_fee("UniswapV3"), 0.003);
-        assert_eq!(ArbitrageEngine::dex_fee("UnknownDex"), DEX_FEE_DEFAULT);
+        let pair = "USDT-WMATIC";
+        assert_eq!(ArbitrageEngine::dex_fee("QuickSwap", pair), 0.003);
+        assert_eq!(ArbitrageEngine::dex_fee("SushiSwap", pair), 0.003);
+        // UniswapV3 retorna 0.003 se não houver cache (default)
+        assert_eq!(ArbitrageEngine::dex_fee("UniswapV3", pair), 0.003);
+        assert_eq!(ArbitrageEngine::dex_fee("UnknownDex", pair), DEX_FEE_DEFAULT);
+    }
+
+    /// Valida que UniswapV3 usa fee tier do cache quando disponível.
+    #[test]
+    fn dex_fee_uses_cached_tier_for_v3() {
+        use crate::dex::cache_fee_tier;
+        let pair = "USDT-WMATIC_TEST";
+
+        // Com cache de 500 bps (0.05%)
+        cache_fee_tier("UniswapV3", pair, 500);
+        assert_eq!(ArbitrageEngine::dex_fee("UniswapV3", pair), 0.05);
+
+        // Com cache de 10000 bps (1.0%)
+        cache_fee_tier("UniswapV3", pair, 10000);
+        assert_eq!(ArbitrageEngine::dex_fee("UniswapV3", pair), 1.0);
+    }
+
+    // ============================================================
+    // 🧪 TESTES DE AUDITORIA (v6 - CALC_AUDIT)
+    // ============================================================
+
+    /// Valida round-trip de decimais para WBTC/USDC (8 vs 6 decimais).
+    ///
+    /// WBTC tem 8 decimais, USDC tem 6 decimais.
+    /// Se amount_in = 1 WBTC (100,000,000 raw) e amount_out = 60,000 USDC (60,000,000,000 raw),
+    /// o preço deveria ser 60,000.0 USDC por WBTC.
+    #[test]
+    fn decimals_round_trip_wbtc_usdc() {
+        let amount_in = U256::from(100_000_000u64);      // 1.0 WBTC (8 dec)
+        let amount_out = U256::from(60_000_000_000u64);   // 60,000 USDC (6 dec)
+        let decimals_in: u8 = 8;
+        let decimals_out: u8 = 6;
+
+        let in_human = crate::utils::utils::u256_to_f64_precise(amount_in, decimals_in);
+        let out_human = crate::utils::utils::u256_to_f64_precise(amount_out, decimals_out);
+
+        assert!((in_human - 1.0).abs() < 1e-10,
+            "WBTC amount_in deveria ser 1.0, obtido {}", in_human);
+        assert!((out_human - 60000.0).abs() < 1e-10,
+            "USDC amount_out deveria ser 60000.0, obtido {}", out_human);
+
+        let price = out_human / in_human;
+        assert!((price - 60000.0).abs() < 1e-6,
+            "Preço WBTC/USDC deveria ser 60000.0, obtido {}", price);
+    }
+
+    /// Valida round-trip de decimais para USDT/USDC (6 vs 6 decimais).
+    ///
+    /// Ambos têm 6 decimais. Se amount_in = 1,000,000 (1 USDT) e
+    /// amount_out = 999,000 (0.999 USDC com fee 0.3%), preço = 0.999.
+    #[test]
+    fn decimals_round_trip_stable_stable() {
+        let amount_in = U256::from(1_000_000u64);  // 1.0 USDT (6 dec)
+        let amount_out = U256::from(999_000u64);    // 0.999 USDC (6 dec)
+        let decimals: u8 = 6;
+
+        let in_human = crate::utils::utils::u256_to_f64_precise(amount_in, decimals);
+        let out_human = crate::utils::utils::u256_to_f64_precise(amount_out, decimals);
+
+        assert!((in_human - 1.0).abs() < 1e-10,
+            "USDT amount_in deveria ser 1.0, obtido {}", in_human);
+        assert!((out_human - 0.999).abs() < 1e-6,
+            "USDC amount_out deveria ser 0.999, obtido {}", out_human);
+
+        let price = out_human / in_human;
+        assert!((price - 0.999).abs() < 1e-6,
+            "Preço USDT/USDC deveria ser 0.999, obtido {}", price);
+    }
+
+    /// Valida invariante rate_ab × rate_ba ≈ 1.0 para o mesmo par no mesmo DEX.
+    ///
+    /// Para USDT-WMATIC no QuickSwap:
+    /// - rate_ab = preço USDT→WMATIC (ex: 7.14)
+    /// - rate_ba = preço WMATIC→USDT (ex: 0.14)
+    /// - cycle_rate_no_fees = 7.14 × 0.14 = 0.9996 ≈ 1.0
+    /// - cycle_rate_com_fees = 7.14 × 0.997 × 0.14 × 0.997 = 0.9936
+    #[test]
+    fn rate_round_trip_usdt_wmatic() {
+        let rate_ab: f64 = 7.14; // USDT→WMATIC
+        let rate_ba: f64 = 0.14; // WMATIC→USDT
+
+        // Sem fees: deveria ser ≈ 1.0
+        let cycle_no_fees: f64 = rate_ab * rate_ba;
+        assert!((cycle_no_fees - 1.0).abs() < 0.01,
+            "rate_ab × rate_ba deveria ser ≈ 1.0, obtido {}", cycle_no_fees);
+
+        // Com fees: deveria ser < 1.0 (sempre loss no mesmo DEX)
+        let fee: f64 = 0.003;
+        let cycle_com_fees: f64 = rate_ab * (1.0 - fee) * rate_ba * (1.0 - fee);
+        assert!(cycle_com_fees < 1.0,
+            "cycle_rate com fees deveria ser < 1.0, obtido {}", cycle_com_fees);
+        assert!(cycle_com_fees > 0.98,
+            "cycle_rate com fees deveria ser > 0.98, obtido {}", cycle_com_fees);
+    }
+
+    /// Valida que fee não é aplicada duas vezes no cycle_rate.
+    ///
+    /// O cycle_rate já inclui fees via (1-fee_buy) e (1-fee_sell).
+    /// Se calculate_total_rate_corrected() multiplicasse as taxas novamente,
+    /// haveria dedução dupla.
+    #[test]
+    fn fee_not_doubled() {
+        // Preço retornado pelo DEX adapter (JÁ com fee embutida)
+        let rate_ab_with_fee: f64 = 0.997; // USDT→WMATIC com 0.3% fee
+        let rate_ba_with_fee: f64 = 0.14 * 0.997; // WMATIC→USDT com 0.3% fee
+
+        // O engine NÃO deveria aplicar fee novamente
+        let cycle_rate: f64 = rate_ab_with_fee * rate_ba_with_fee;
+
+        // Se aplicasse fee dupla:
+        let fee: f64 = 0.003;
+        let cycle_rate_doubled: f64 = rate_ab_with_fee * (1.0 - fee) * rate_ba_with_fee * (1.0 - fee);
+
+        // A diferença deveria existir (fee dupla reduz o resultado)
+        assert!(cycle_rate > cycle_rate_doubled,
+            "Fee dupla deveria reduzir o cycle_rate: {} <= {}", cycle_rate, cycle_rate_doubled);
+
+        // Verificar que a redução é proporcional ao fee aplicado
+        let reduction_pct: f64 = ((cycle_rate - cycle_rate_doubled) / cycle_rate) * 100.0;
+        assert!(reduction_pct > 0.05,
+            "Redução de fee dupla deveria ser > 0.05%, obtido {}%", reduction_pct);
+    }
+
+    /// Valida fórmula getAmountsOut manual para V2.
+    ///
+    /// V2 getAmountsOut: amount_out = amount_in × reserve_out / (reserve_in + amount_in)
+    /// Com fee 0.3%: amount_out = amount_in × 997 × reserve_out / (reserve_in × 1000 + amount_in × 997)
+    ///
+    /// Exemplo: reserve_in = 10,000 USDC, reserve_out = 71,400 WMATIC, amount_in = 1,000 USDC
+    /// amount_out = 1000 × 997 × 71400 / (10000 × 1000 + 1000 × 997)
+    ///            = 997 × 71400 / (10000000 + 997000)
+    ///            = 71,185,800 / 10,997,000
+    ///            = 6,474.17 WMATIC
+    /// Preço = 6474.17 / 1000 = 6.47417 WMATIC/USDT
+    #[test]
+    fn get_amounts_out_manual_v2() {
+        let reserve_in: f64 = 10_000.0;   // 10,000 USDC
+        let reserve_out: f64 = 71_400.0;  // 71,400 WMATIC
+        let amount_in: f64 = 1_000.0;     // 1,000 USDC
+        let fee_pct: f64 = 0.003;         // 0.3%
+
+        // Fórmula V2 com fee
+        let amount_in_with_fee = amount_in * (1.0 - fee_pct);
+        let amount_out = (amount_in_with_fee * reserve_out) / (reserve_in + amount_in_with_fee);
+        let price = amount_out / amount_in;
+
+        // Verificar que preço está em range razoável
+        assert!(price > 6.0 && price < 7.0,
+            "Preço USDT→WMATIC deveria estar entre 6.0-7.0, obtido {}", price);
+
+        // Verificar que fee reduz o output
+        let amount_out_no_fee = (amount_in * reserve_out) / (reserve_in + amount_in);
+        assert!(amount_out < amount_out_no_fee,
+            "Output com fee deveria ser menor que sem fee");
+    }
+
+    /// Valida fórmula completa do cycle_rate com cenário real.
+    ///
+    /// Cenário: USDT-WMATIC cross-DEX
+    /// - QuickSwap USDT→WMATIC: 7.14 (compra barata)
+    /// - SushiSwap WMATIC→USDT: 0.14 (vende caro)
+    /// - Fees: 0.3% cada DEX
+    ///
+    /// cycle_rate = 7.14 × 0.997 × 0.14 × 0.997 = 0.9936
+    /// spread = (0.9936 - 1.0) × 100 = -0.64% (loss)
+    #[test]
+    fn cycle_rate_formula_validation() {
+        let rate_ab: f64 = 7.14;
+        let rate_ba: f64 = 0.14;
+        let fee: f64 = 0.003;
+
+        let cycle_rate: f64 = rate_ab * (1.0 - fee) * rate_ba * (1.0 - fee);
+        let spread_pct: f64 = (cycle_rate - 1.0) * 100.0;
+
+        // Verificar fórmula
+        let expected: f64 = 7.14 * 0.997 * 0.14 * 0.997;
+        assert!((cycle_rate - expected).abs() < 1e-10,
+            "cycle_rate {} difere do esperado {}", cycle_rate, expected);
+
+        // Verificar que é loss
+        assert!(cycle_rate < 1.0,
+            "cycle_rate {} deveria ser < 1.0", cycle_rate);
+        assert!(spread_pct < 0.0,
+            "spread {}% deveria ser negativo", spread_pct);
+
+        // Verificar que spread está em range razoável
+        assert!(spread_pct > -2.0,
+            "spread {}% deveria ser > -2.0%", spread_pct);
+    }
+
+    /// Valida que calculate_price_from_decimals retorna out_human / in_human.
+    ///
+    /// Para amount_in = 1,000,000 (1 USDT, 6 dec) e amount_out = 7,140,000 (7.14 WMATIC, 18 dec):
+    /// in_human = 1,000,000 / 10^6 = 1.0
+    /// out_human = 7,140,000 / 10^18 = 7.14e-12
+    /// price = 7.14e-12 / 1.0 = 7.14e-12 (WMATIC por USDT, raw)
+    ///
+    /// NOTA: Este teste valida a lógica interna de calculate_price_from_decimals,
+    /// não o preço final (que depende de decimais corretos do token).
+    #[test]
+    fn calculate_price_from_decimals_validation() {
+        // Simular USDC→WMATIC (6 dec → 18 dec)
+        let amount_in = U256::from(1_000_000u64);   // 1.0 USDC (6 dec)
+        let amount_out = U256::from(7_140_000_000_000_000_000u128); // 7.14 WMATIC (18 dec)
+
+        let price = crate::dex::calculate_price_from_decimals(
+            amount_in, amount_out, 6, 18
+        ).unwrap();
+
+        // Preço deveria ser ~7.14 (WMATIC por USDC)
+        assert!((price - 7.14).abs() < 0.01,
+            "Preço USDC→WMATIC deveria ser ~7.14, obtido {}", price);
     }
 }

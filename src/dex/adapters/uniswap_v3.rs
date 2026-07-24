@@ -14,10 +14,12 @@ use crate::{
         calculate_price_from_decimals,
         get_token_decimals::get_token_decimals,
         normalize_price,
+        quote_amount_for_usd,
         rate_limiter::ALCHEMY_RATE_LIMITER,
         DexContract,
         TokenPairPrice,
         addresses, // Importando endereços de Factory/Quoter
+        cache_fee_tier,
     },
     AppMiddleware,
 };
@@ -179,7 +181,7 @@ impl UniswapV3Dex {
                 addr_b,
                 decimals_a: dec_a,
                 decimals_b: dec_b,
-                amount_in: U256::exp10(dec_a as usize),
+                amount_in: quote_amount_for_usd(a, dec_a, self.quote_notional_usd()).await?,
             });
         }
 
@@ -440,10 +442,17 @@ impl DexContract for UniswapV3Dex {
 
         // 📊 LOG DE COTAÇÃO (fim do cálculo)
         if let Some(price) = validated_price {
+            // Cacheia o fee tier real para uso no engine
+            let pair = format!("{}-{}",
+                hex::encode(token_a.as_bytes()),
+                hex::encode(token_b.as_bytes())
+            );
+            cache_fee_tier(DEX_NAME, &pair, best_fee);
+
             if self.debug_mode {
                 tracing::info!(
-                    "[{}] {}→{} fee={} price={:.8} (validated)",
-                    DEX_NAME, token_a, token_b, best_fee, price
+                    "[{}] {}→{} fee={} price={:.8} (validated, cached fee_tier={}bps)",
+                    DEX_NAME, token_a, token_b, best_fee, price, best_fee
                 );
             }
             Ok(Some(price))
@@ -525,12 +534,16 @@ impl DexContract for UniswapV3Dex {
                     );
                 }
                 if let Some(p) = normalize_price(price) {
+                    // Cacheia o fee tier real para uso no engine
+                    let pair = format!("{}-{}", info.token_a, info.token_b);
+                    cache_fee_tier(DEX_NAME, &pair, best_fee);
+
                     results.push(TokenPairPrice::new(
                         info.token_a.clone(),
                         info.token_b.clone(),
                         p,
                         DEX_NAME.into(),
-                    ));
+                    ).with_fee_tier(best_fee));
                 }
             }
         }

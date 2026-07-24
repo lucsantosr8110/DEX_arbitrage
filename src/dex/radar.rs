@@ -363,12 +363,19 @@ const MAX_SPREAD_PCT: f64 = 50.0;
 const AUDIT_SPREAD_LOW: f64 = 10.0;
 const AUDIT_SPREAD_HIGH: f64 = 50.0;
 
-/// Fee de swap por DEX (em fração). V2 = 0.3%, V3 = 0.3% default.
-/// TODO: usar fee tier real do pool quando disponível via Multicall.
-fn dex_fee(dex_name: &str) -> f64 {
+/// Fee de swap por DEX (em fração). V2 = 0.3%, V3 = fee real do pool.
+/// Usa o cache de fee tiers para V3 pools (0.05%, 0.3%, ou 1.0%).
+fn dex_fee(dex_name: &str, pair: &str) -> f64 {
     match dex_name {
-        "QuickSwap" | "SushiSwap" => 0.003,
-        "UniswapV3" => 0.003, // V3 real: 0.05%-1%, usamos 0.3% como conservador
+        "QuickSwap" | "SushiSwap" => 0.003,  // V2: sempre 0.3%
+        "UniswapV3" => {
+            // Tenta usar o fee tier real do cache
+            if let Some(fee_bps) = super::cached_fee_tier(dex_name, pair) {
+                fee_bps as f64 / 10_000.0  // Converte bps para fração
+            } else {
+                0.003  // Default: 0.3% (fee tier mais comum)
+            }
+        }
         _ => 0.003,
     }
 }
@@ -456,23 +463,6 @@ fn extract_edges(pr: &HashMap<String, HashMap<String, f64>>) -> (usize, Vec<Edge
             continue;
         }
 
-        // Encontrar preço mínimo e máximo para este par (para buy_price/sell_price no EdgeInfo)
-        let mut min_price = f64::MAX;
-        let mut max_price = f64::MIN;
-
-        for (_dex, price) in dex_prices {
-            if *price < min_price {
-                min_price = *price;
-            }
-            if *price > max_price {
-                max_price = *price;
-            }
-        }
-
-        if min_price <= 0.0 {
-            continue;
-        }
-
         // Extrair reverse pair (ex: USDT-WMATIC → WMATIC-USDT)
         let reverse_pair = pair.split_once('-').map(|(a, b)| format!("{}-{}", b, a));
 
@@ -483,22 +473,27 @@ fn extract_edges(pr: &HashMap<String, HashMap<String, f64>>) -> (usize, Vec<Edge
         let mut best_cycle_rate: f64 = 0.0;
         let mut best_buy_dex = String::new();
         let mut best_sell_dex = String::new();
+        let mut best_buy_price: f64 = 0.0;
+        let mut best_sell_price: f64 = 0.0;
 
         if let Some(rev_prices) = reverse_dex_prices {
+            let rev_pair_str = reverse_pair.as_deref().unwrap_or("");
             // Para cada combinação (buy_dex, sell_dex) onde buy ≠ sell
             for (buy_dex, buy_price) in dex_prices {
                 for (sell_dex, sell_price) in rev_prices {
                     if buy_dex == sell_dex {
                         continue;
                     }
-                    let fee_buy = dex_fee(buy_dex);
-                    let fee_sell = dex_fee(sell_dex);
+                    let fee_buy = dex_fee(buy_dex, pair);
+                    let fee_sell = dex_fee(sell_dex, rev_pair_str);
                     // cycle_rate = buy_price × (1-fee) × sell_price × (1-fee)
                     let cycle_rate = buy_price * (1.0 - fee_buy) * sell_price * (1.0 - fee_sell);
                     if cycle_rate > best_cycle_rate {
                         best_cycle_rate = cycle_rate;
                         best_buy_dex = buy_dex.clone();
                         best_sell_dex = sell_dex.clone();
+                        best_buy_price = *buy_price;
+                        best_sell_price = *sell_price;
                     }
                 }
             }
@@ -520,7 +515,7 @@ fn extract_edges(pr: &HashMap<String, HashMap<String, f64>>) -> (usize, Vec<Edge
         if spread_pct >= AUDIT_SPREAD_LOW && spread_pct <= AUDIT_SPREAD_HIGH {
             warn!(
                 "🔍 [AUDIT] {} spread={:.2}% ({}→{}) buy={:.6} sell={:.6} cycle_rate={:.6} — verificar liquidez",
-                pair, spread_pct, best_buy_dex, best_sell_dex, min_price, max_price, best_cycle_rate
+                pair, spread_pct, best_buy_dex, best_sell_dex, best_buy_price, best_sell_price, best_cycle_rate
             );
         }
 
@@ -536,8 +531,8 @@ fn extract_edges(pr: &HashMap<String, HashMap<String, f64>>) -> (usize, Vec<Edge
                 buy_dex: best_buy_dex,
                 sell_dex: best_sell_dex,
                 spread_pct,
-                buy_price: min_price,
-                sell_price: max_price,
+                buy_price: best_buy_price,
+                sell_price: best_sell_price,
             });
         }
     }
