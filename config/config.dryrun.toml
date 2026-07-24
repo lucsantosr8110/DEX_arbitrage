@@ -1,0 +1,657 @@
+# ============================================================
+# CONFIGURAÇÃO: DRY RUN (gerado de config.toml)
+# NAO EDITAR A MAO — regenerar de config/config.toml
+# CONFIGURAÇÃO BASE: STABLE-PROFIT (FINAL v3 - ALL SECTIONS RESTORED)
+# Version: v5.5.9-COMPLETE
+# Foco: Estrutura 100% validada + Filtros de Liquidez
+# ============================================================
+
+[general]
+version = "v5.5.9-COMPLETE"
+env_source = ".env"
+expand_env = true
+intermediate_tokens = ["WMATIC", "USDC", "WETH", "DAI", "USDT"]
+max_parallel_requests = 50      # 50 para estabilidade de conexão
+health_check_interval = 1
+shutdown_timeout = 180
+enable_frontend = false
+load_on_startup = true
+hot_reload = true
+
+# ======================================================================
+# FLASHLOAN
+# ======================================================================
+[flashloan]
+enabled = true
+executor_address = "0xC5B79075178866C2B29225AA0c1418464d503a08"
+wrapper_address = "0x8E3E24D1ce0d489141FA7c5C3Ed89fCc246034a8"
+provider_address = "0x794a61358D6845594F94dc1DB02A252b5b4814aD"
+capital_usd = 100.0
+min_profit_usd = 0.00
+slippage_tolerance_pct = 0.50
+slippage_bps = 15
+simulate_before_execute = true
+bundle_relay_url = "https://relay.flashbots.net"
+private_mode = false
+max_premium_bps = 18
+fee_pct = 0.0009
+flashloan_decimals = 6
+
+# ======================================================================
+# ARBITRAGE — Filtros de Realidade
+# ======================================================================
+[arbitrage]
+enabled = true
+executor_address = "0xC5B79075178866C2B29225AA0c1418464d503a08"
+advanced_filters_enabled = true
+min_profit_threshold_usd = 0.00
+min_profit_percent = "0.0"
+min_profit_absolute = "0.05"    # Mínimo real
+min_spread_percent = "0.50"
+min_liquidity = "50000"         # CRÍTICO: Filtra pools vazias
+min_volume_24h = "5000.0"
+max_slippage = "1.5"
+default_trade_amount = "100.0"
+max_position_size = "200.0"
+max_gas_cost_ratio = "60.0"
+simulate_prices = true
+execution_mode = "flashloan"
+safety_margin = "1.0"
+cooldown_seconds = 1
+max_path_length = 3
+profit_decay_factor = 0.20
+adaptive_trade_amount = true
+min_trade_amount_usd = "10.0"
+
+# ======================================================================
+# TRIANGULAR & CROSS-DEX
+# ======================================================================
+[arbitrage.triangular]
+enabled = true
+max_hops = 2
+min_triangle_profit = "0.0005"
+enforce_token_rotation = true
+
+[arbitrage.cross_dex]
+enabled = true
+min_cross_profit = "0.0004"
+max_dex_count = 2
+path_optimization = true
+
+[arbitrage.deduplication]
+enabled = true
+same_pair_timeout_ms = 3000
+similar_profit_threshold = 0.0001
+remember_reverted_txs = true
+revert_blacklist_duration_ms = 30000
+
+[arbitrage.advanced_filters]
+enabled = true
+min_effective_profit_after_slippage = 0.35
+require_price_stability = false
+max_volatility_percent = 20.0
+prefer_direct_pairs = true
+complex_route_penalty = 0.0002
+max_hops_allowed = 2
+reject_cyclic_routes = false
+
+# ======================================================================
+# ROUTE & EXECUTION
+# ======================================================================
+[arbitrage.route_validation]
+enabled = true
+max_hops = 2
+min_liquidity_per_hop = "50.0"
+reject_high_slippage_routes = false
+max_cumulative_slippage = 1.2
+require_token_rotation = false
+block_same_dex_consecutive = false
+
+[execution]
+enabled = true
+skip_permission_check = true
+dry_run = true
+use_flashloan = true
+max_slippage_bps = 50
+max_retries = 3
+retry_delay_ms = 500
+confirmation_blocks = 1
+nonce_monitoring = true
+tx_timeout_seconds = 20
+auto_replace_tx = false
+replace_multiplier = 1.15
+replace_max_retries = 2
+force_flashloan = true
+aggressive_mode = true
+validate_balance = true
+min_balance_required = "2.0"
+balance_check_interval = 5
+slippage_tolerance_pct = 0.40
+
+# --- Custos Realistas ---
+default_dex_fee_bps = 30
+default_price_impact_bps = 25
+hop_slippage_increase_bps = 5
+safety_margin_bps = 10
+estimate_base_gas_usd = 0.03
+
+[execution.simulation]
+enabled = true
+max_simulations = 2
+simulation_timeout = 8
+revert_on_fail = true
+quick_estimate = true
+
+[execution.backrun_protection]
+enabled = true
+max_slippage_increase = 0.50
+min_block_confirmations = 1
+slippage_tolerance_factor = 1.5
+
+[execution.cooldown]
+enabled = true
+global_ms = 1000
+pair_ms = 3000
+strategy_ms = 2000
+revert_penalty_ms = 15000
+max_concurrent_executions = 2
+
+[execution.rate_limiting]
+enabled = true
+max_executions_per_minute = 30
+min_interval_between_trades_ms = 1500
+burst_size = 5
+adaptive_rate_limiting = true
+
+[execution.dex_fee_bps_map]
+QuickSwap = 30
+SushiSwap = 30
+UniswapV3 = 30
+BalancerV2 = 30
+
+[execution.dex_price_impact_bps_map]
+QuickSwap = 25
+SushiSwap = 25
+UniswapV3 = 10
+BalancerV2 = 25
+
+# ======================================================================
+# LOGGING (ESTRUTURA COMPLETA)
+# ======================================================================
+[logging]
+level = "debug"
+format = "compact"
+file_enabled = true
+file_path = "logs/bot_stable.log"
+max_file_size = "50MB"
+max_files = 10
+compress_logs = true
+rust_log = "info,arbitrage=debug,execution=debug"
+
+[logging.levels]
+core = "info"
+arbitrage = "debug"
+execution = "debug"
+flashloan = "debug"
+network = "warn"
+risk = "info"
+infra = "info"
+metrics = "info"
+
+[log]
+show_opportunities = true
+show_best_paths = true
+show_rejections = true
+show_profit_estimates = true
+show_gas_details = true
+show_dex_responses = false
+export_trades_csv = true
+export_prices_csv = false
+
+# ======================================================================
+# NETWORK
+# ======================================================================
+[network]
+name = "polygon"
+chain_id = 137
+# Segredos vêm do .env via expansão ${VAR} (ver Config::from_file).
+# Se ALCHEMY_RPC_URL/ALCHEMY_WS_URL não estiverem definidos, o literal "${...}"
+# permanece e o fallback público abaixo assume. Nunca versione chaves aqui.
+rpc_url = "${ALCHEMY_RPC_URL}"
+rpc_endpoints = [
+    "${ALCHEMY_RPC_URL}",
+    "https://polygon-bor-rpc.publicnode.com",
+    "https://1rpc.io/matic",
+]
+ws_endpoints = [
+    "${ALCHEMY_WS_URL}",
+    "wss://polygon-bor-rpc.publicnode.com",
+    "wss://polygon.drpc.org",
+]
+timeout_ms = 5000
+max_reorg_depth = 64
+block_delay_max = 2
+chain_monitoring = true
+enable_rpc_fallback = true
+max_rpc_retries = 3
+rpc_health_check_interval = 2
+rpc_latency_threshold_ms = 1500
+
+# ======================================================================
+# WALLET
+# ======================================================================
+[wallet]
+private_key = "${PRIVATE_KEY}"
+address = "0x78fE0EA127cE9e07DC872EF3C47A6e1f6e20A472"
+min_balance_eth = "0.5"
+max_gas_price_gwei = 500
+auto_sweep = false
+sweep_threshold = "0.1"
+max_tx_value = "0.0"
+nonce_monitoring = true
+enable_tx_signing = true
+validate_balance_before_tx = true
+min_balance_required_usd = "2.0"
+
+[wallet.multisig]
+enabled = false
+address = "0x0000000000000000000000000000000000000000"
+threshold = 2
+owners = []
+
+# ======================================================================
+# WRAPPER & MEV
+# ======================================================================
+[wrapper]
+enabled = true
+address = "0x8E3E24D1ce0d489141FA7c5C3Ed89fCc246034a8"
+owner_address = "0x78fE0EA127cE9e07DC872EF3C47A6e1f6e20A472"
+executor_allowed = true
+auto_authorize_executor = true
+authorization_check_enabled = true
+contract_type = "FlashloanCaller"
+
+[mev]
+enabled = false
+relay_urls = ["https://relay.flashbots.net"]
+signer_address = "0x78fE0EA127cE9e07DC872EF3C47A6e1f6e20A472"
+min_tip_matic = "0.00"
+target_block_offset = 0
+timeout_seconds = 8
+enable_private_tx = false
+validate_bundle_delivery = false
+
+# ======================================================================
+# EXECUTOR / GAS (CORRIGIDO: "stations" restaurado)
+# ======================================================================
+[executor]
+address = "0xC5B79075178866C2B29225AA0c1418464d503a08"
+validate_signature_hash = true
+max_flashloan_premium = 2
+contract_type = "StandardExecutor"
+timeout_seconds = 10
+use_direct_calls = true
+skip_wrapper_validation = true
+auto_recover = true
+mev_mode = true
+
+[gas]
+mode = "balanced"
+use_polygon_oracle = true
+max_gwei = 500
+priority_gwei = 60.0
+default_gas_price_gwei = 50.0
+default_gas_limit = 300000
+max_gas_limit = 700000
+fallback_strategy = "conservative"
+prediction_window = 2
+eth_price_usd = 0.102083
+gas_buffer_percent = 110
+gas_cost_limit_usd = 0.50
+eip1559_enabled = true
+max_fee_multiplier = 1.5
+priority_fee_multiplier = 1.2
+
+# SEÇÃO RESTAURADA - OBRIGATÓRIA PARA O RUST
+[gas.stations]
+etherchain = false
+blocknative = false
+pokt = false
+
+[gas.optimization]
+auto_adjust = true
+min_gas_savings = 0.001
+max_gas_price_impact = 5.0
+aggressive_multiplier = 1.3
+
+# ======================================================================
+# CAPITAL / OPTIMIZATION / RISK
+# ======================================================================
+[capital]
+use_own_capital = false
+capital_amount_usd = 0.0
+max_utilization_pct = 100.0
+min_balance_buffer_usd = 0.0
+position_sizing = "aggressive"
+max_single_trade_usd = 0.0
+min_single_trade_usd = 0.0
+auto_rebalance = false
+dynamic_sizing = false
+balance_monitoring = true
+low_balance_alert_usd = "3.0"
+
+[optimization]
+quick_filter_enabled = true
+pre_filter_opportunities = true
+adaptive_radar_mode = false
+spread_decay_window = 0
+batch_processing_size = 200
+ultra_fast_mode = true
+auto_tune_execution = true
+auto_retry_failed_swaps = true
+retry_limit = 3
+min_spread_percent = 0.0020
+min_profit_after_gas = 0.0000
+max_gas_ratio = 15.0
+min_profit_per_tx = 0.0000
+dynamic_slippage_enabled = true
+slippage_multiplier = 1.1
+cooldown_after_fail_seconds = 1
+parallel_processing = true
+
+[risk]
+min_profit_usd = 0.00
+normal_min_profit_percent = 0.0001
+adaptive_min_profit_percent = 0.00005
+normal_gas_ratio = 10.0
+adaptive_gas_ratio = 15.0
+min_confidence = 0.70
+min_volume_usd = 5000.0
+max_execution_risk = 0.50
+max_risk_score = 40.0
+default_token_decimals = 18
+balance_risk_threshold = "3.0"
+gas_dynamic_k = 0.000025
+gas_min_usd = 0.000015
+gas_max_usd = 0.10
+gas_multiplier = 2.2
+gas_dynamic_k_adaptive = 0.00002
+gas_min_usd_adaptive = 0.00001
+gas_max_usd_adaptive = 0.10
+gas_multiplier_adaptive = 2.8
+slippage_coef_aggressive = 3.0
+slippage_min_abs_aggressive = 0.000002
+slippage_max_abs_aggressive = 0.06000
+slippage_coef_adaptive = 3.5
+slippage_min_abs_adaptive = 0.000002
+slippage_max_abs_adaptive = 0.08000
+premium_usd_aggressive = 0.0
+premium_usd_adaptive = 0.0
+weight_negative_profit = 0.8
+weight_profit_too_low = 0.02
+weight_gas_too_high = 0.03
+weight_low_confidence = 0.05
+weight_low_volume = 0.05
+weight_high_execution_risk = 0.6
+weight_low_balance = 1.2
+weight_negative_profit_adaptive = 0.6
+weight_profit_too_low_adaptive = 0.01
+weight_gas_too_high_adaptive = 0.05
+weight_low_confidence_adaptive = 0.03
+weight_low_volume_adaptive = 0.03
+weight_high_execution_risk_adaptive = 0.4
+weight_low_balance_adaptive = 0.8
+weight_step_penalty = 0.1
+adaptive_check_secs = 15
+adaptive_check_every_ops = 1
+adaptive_activate_below_hitrate = 0.25
+adaptive_confidence_factor = 0.03
+adaptive_volume_factor = 0.008
+adaptive_score_relax_factor = 0.50
+
+# ======================================================================
+# MONITORING
+# ======================================================================
+[monitoring]
+enabled = true
+interval_sec = 1
+health_check = true
+performance_metrics = true
+balance_monitoring = true
+
+[prometheus]
+enabled = true
+port = 9100
+endpoint = "/metrics"
+namespace = "micro_profit_bot"
+
+[metrics]
+enabled = true
+port = 9101
+endpoint = "/metrics"
+export_interval = 15
+include_balance_metrics = true
+
+[analytics]
+enabled = true
+export_csv = true
+export_path = "logs/analytics"
+save_interval_sec = 10
+include_profitability = true
+daily_summary_enabled = true
+include_gas_costs = true
+include_slippage = true
+report_currency = "USD"
+trade_analytics = true
+balance_tracking = true
+
+[analytics.dashboard]
+enabled = false
+port = 8088
+auto_open_browser = false
+refresh_interval_sec = 2
+theme = "dark"
+show_flashloan_stats = true
+show_profit_chart = true
+show_rpc_health = true
+show_balance_chart = true
+
+[performance]
+enabled = true
+save_interval_sec = 1
+max_records = 2000
+latency_tracking = true
+balance_tracking = true
+
+[telegram]
+enabled = false
+bot_token = "${TELEGRAM_TOKEN}"
+chat_id = "1236942420"
+notify_on_profit = true
+notify_on_fail = true
+notify_on_startup = true
+notify_on_opportunity = true
+notify_on_rpc_switch = true
+notify_on_low_balance = true
+min_profit_notification = "0.30"
+low_balance_threshold = "4.0"
+alert_cooldown = 2
+verbose_alerts = true
+
+[telegram.commands]
+enable_controls = true
+allowed_users = ["1236942420"]
+admin_chat_id = "1236942420"
+execution_commands = true
+monitoring_commands = true
+balance_commands = true
+
+[emergency]
+enabled = true
+stop_on_error = false
+auto_restart = true
+restart_delay_sec = 1
+max_restarts_per_hour = 20
+panic_recovery = true
+low_balance_shutdown = true
+low_balance_threshold = "2.0"
+
+# ======================================================================
+# ADVANCED INFRA
+# ======================================================================
+[advanced]
+debug_mode = false
+enable_verbose_logging = false
+max_memory_usage_mb = 1024
+thread_pool_size = 32
+panic_recovery = true
+tracing_spans = false
+cache_size = 5000
+enable_jemalloc = true
+optimize_performance = true
+balance_check_enabled = true
+
+[advanced.performance]
+enable_rayon = true
+rayon_threads = 32
+enable_async_io = true
+io_uring_enabled = false
+batch_size = 200
+prefetch_enabled = true
+
+[advanced.cache]
+price_cache_ttl = 2
+opportunity_cache_ttl = 1
+gas_cache_ttl = 5
+token_cache_ttl = 3600
+balance_cache_ttl = 10
+
+[advanced.network]
+keep_alive = true
+tcp_nodelay = true
+connection_pool_size = 100
+request_timeout = 3
+retry_delay = 0.2
+
+# ======================================================================
+# DEX CONFIG
+# ======================================================================
+[[dex]]
+name = "QuickSwap"
+router_address = "0xa5E0829CaCEd8fFDD4De3c43696c57F7D7A678ff"
+factory_address = "0x5757371414417b8C6CAad45bAeF941aBc7d3Ab32"
+enabled = true
+priority = 1
+max_slippage = 1.5
+liquidity_threshold_usd = 5000.0
+fee_tier = 300
+
+[[dex]]
+name = "SushiSwap"
+router_address = "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506"
+factory_address = "0xc35DADB65012eC5796536bD9864eD8773aBc74C4"
+enabled = true
+priority = 2
+max_slippage = 1.5
+liquidity_threshold_usd = 5000.0
+fee_tier = 300
+
+[[dex]]
+name = "UniswapV3"
+router_address = "0xE592427A0AEce92De3Edee1F18E0157C05861564"
+factory_address = "0x1F98431c8aD98523631AE4a59f267346ea31F984"
+enabled = true
+priority = 3
+max_slippage = 1.0
+liquidity_threshold_usd = 10000.0
+fee_tier = 500
+
+# ======================================================================
+# PAIRS
+# ======================================================================
+[pairs]
+enabled = true
+monitor = [
+    # --- Base Stables & Majors ---
+    "USDC-WMATIC",
+    "USDC-WETH",
+    "USDT-WMATIC",
+    "USDT-WETH",
+    "DAI-WMATIC",
+    "DAI-WETH",
+    "WMATIC-WETH",
+
+    # --- Volatilidade ---
+    "WBTC-WETH",
+    "WBTC-USDC",
+    "WBTC-WMATIC",
+    "LINK-WETH",
+    "LINK-WMATIC",
+    "LINK-USDC",
+    "AAVE-WETH",
+    "AAVE-WMATIC",
+    "CRV-WETH",
+    "CRV-WMATIC",
+    "GHST-WMATIC",
+    "GHST-USDC",
+
+    # --- HFT Pairs ---
+    "UNI-WETH",
+    "UNI-USDC",
+    "UNI-WMATIC",
+    "SUSHI-WETH",
+    "SUSHI-WMATIC",
+    "GRT-WETH",
+    "GRT-WMATIC",
+    "SAND-WMATIC",
+    "SAND-USDC",
+    "MANA-WMATIC",
+    "MANA-USDC",
+    "LDO-WETH",
+    "LDO-WMATIC"
+]
+
+auto_discovery = false
+refresh_interval = 5  # dry run: 5s para nao saturar RPC publico
+
+# ======================================================================
+# TOKEN ADDRESSES
+# ======================================================================
+[pairs.tokens]
+WMATIC = "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270"
+USDC   = "0x2791Bca1f2de4661ED88A30C99a7a9449Aa84174"
+USDT   = "0xc2132D05D31c914a87C6611C10748AEb04B58e8F"
+WETH   = "0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619"
+DAI    = "0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063"
+WBTC   = "0x1BFD67037B42Cf7962514636336322b350036159"
+LINK   = "0x53E0bca35eC356BD5ddDFebbD1Fc0fD03FaBad39"
+AAVE   = "0xD6DF932A45C0f2553776ED742056204D536D3d8e"
+CRV    = "0x172370d5Cd63279eFa6d502DAB29171933a610AF"
+GHST   = "0x385Eeac5cB85A38A9a07A70c73e0a3271CfB54A7"
+UNI    = "0xb33EaAd8d922B1083446DC23f610c2567fB5180f"
+SUSHI  = "0x0b3F868E0BE5597D5DB7fEB59E1CADBb0fdDa50a"
+GRT    = "0x5fe2B58c013d7601147DcdD68C143A77499f5531"
+SAND   = "0xBbba073C31bF03b8ACf7c28EF0738DeCF3695683"
+MANA   = "0xA1c57f48F0Deb89f569DFbE6E2B723d234256dfc"
+LDO    = "0xC3C7d422809852031b44ab29EEC9F1EfF2A58756"
+
+# ======================================================================
+# METADATA
+# ======================================================================
+[pairs.metadata]
+WMATIC = { symbol = "WMATIC", decimals = 18 }
+USDC   = { symbol = "USDC", decimals = 6 }
+USDT   = { symbol = "USDT", decimals = 6 }
+WETH   = { symbol = "WETH", decimals = 18 }
+DAI    = { symbol = "DAI", decimals = 18 }
+WBTC   = { symbol = "WBTC", decimals = 8 }
+LINK   = { symbol = "LINK", decimals = 18 }
+AAVE   = { symbol = "AAVE", decimals = 18 }
+CRV    = { symbol = "CRV", decimals = 18 }
+GHST   = { symbol = "GHST", decimals = 18 }
+UNI    = { symbol = "UNI", decimals = 18 }
+SUSHI  = { symbol = "SUSHI", decimals = 18 }
+GRT    = { symbol = "GRT", decimals = 18 }
+SAND   = { symbol = "SAND", decimals = 18 }
+MANA   = { symbol = "MANA", decimals = 18 }
+LDO    = { symbol = "LDO", decimals = 18 }

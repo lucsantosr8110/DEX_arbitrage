@@ -10,7 +10,7 @@ use ethers::{
 use futures::future;
 use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc, time::Duration};
 use tokio::sync::{broadcast, mpsc, Mutex};
-use tracing::{error, info, warn, Level};
+use tracing::{debug, error, info, warn, Level};
 use tracing_subscriber::{
     filter::LevelFilter,
     fmt::{self, writer::MakeWriterExt},
@@ -25,7 +25,10 @@ use flashloan_bot::{
         radar::start_high_hit_rate_radar,
     },
     execution::{bundle_sender::MevConfig, gwei, ExecutionEngine},
-    infra::{metrics, rpc_provider::RpcProvider},
+    infra::{
+        metrics,
+        rpc_provider::{is_usable_endpoint, RpcProvider},
+    },
     utils::telegram::TelegramNotifier,
 };
 
@@ -33,31 +36,26 @@ use flashloan_bot::{
 // 0️⃣ FUNÇÃO AUXILIAR PARA LOG DE CONFIGURAÇÃO
 // ============================================================
 fn log_config_snapshot(config: &Config) {
-    info!("🧩 ===================================================");
-    info!("🧩 CONFIGURAÇÃO INICIAL - SNAPSHOT");
-    info!("🧩 ===================================================");
+    info!("═══════════════════════════════════════════════════════════════════");
+    info!("⚙️  CONFIGURAÇÃO DO BOT");
+    info!("═══════════════════════════════════════════════════════════════════");
     info!(
-        "🧩 Versão: {}",
+        "  Versão: {}",
         config.general.version.as_deref().unwrap_or("unknown")
     );
-    info!("🧩 Dry Run: {}", config.execution.dry_run);
-    info!("🧩 Auto Replace TX: {}", config.execution.auto_replace_tx);
+    info!("  Modo: {} | Dry Run: {}", if config.flashloan.enabled { "FLASHLOAN" } else { "DIRECT" }, config.execution.dry_run);
+    info!("  Gas: priority={:.1} gwei, max={} gwei", config.gas.priority_gwei, config.gas.max_gwei);
     info!(
-        "🧩 Replace Multiplier: {:.2}",
-        config.execution.replace_multiplier.unwrap_or(1.0)
-    );
-    info!("🧩 Priority Gwei: {:.2}", config.gas.priority_gwei);
-    info!("🧩 Max Gwei: {}", config.gas.max_gwei);
-    info!(
-        "🧩 Min Profit: ${:.4}",
+        "  Min Profit: ${:.4} | Min Spread: {}%",
         config
             .arbitrage
             .min_profit_absolute
             .parse::<f64>()
-            .unwrap_or(0.0)
+            .unwrap_or(0.0),
+        config.arbitrage.min_spread_percent
     );
-    info!("🧩 Flashloan Capital: ${}", config.flashloan.capital_usd);
-    info!("🧩 ===================================================");
+    info!("  Capital: ${}", config.flashloan.capital_usd);
+    info!("═══════════════════════════════════════════════════════════════════");
 }
 
 // ============================================================
@@ -156,12 +154,43 @@ async fn main() -> Result<()> {
     // ============================================================
     // 4️⃣ RPC Providers (HTTP e WS)
     // ============================================================
-    let rpc_endpoints_env =
-        std::env::var("BOT_RPC_ENDPOINTS").context("❌ BOT_RPC_ENDPOINTS ausente no .env")?;
-    let rpc_endpoints: Vec<String> = rpc_endpoints_env
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .collect();
+    // Fonte única de endpoints: o `.env` sobrepõe o TOML quando presente, senão o
+    // bloco [network] do config manda. Antes o `.env` era obrigatório e o TOML era
+    // silenciosamente ignorado — duas fontes de verdade para a mesma coisa.
+    let rpc_endpoints: Vec<String> = match std::env::var("BOT_RPC_ENDPOINTS") {
+        Ok(raw) if !raw.trim().is_empty() => {
+            let list: Vec<String> = raw
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            info!(
+                "🌐 Endpoints RPC vindos de BOT_RPC_ENDPOINTS ({} entradas).",
+                list.len()
+            );
+            list
+        }
+        _ => {
+            let list = cfg_unlocked
+                .network
+                .rpc_endpoints
+                .clone()
+                .unwrap_or_default();
+            info!(
+                "🌐 BOT_RPC_ENDPOINTS ausente — usando [network].rpc_endpoints do config ({} entradas).",
+                list.len()
+            );
+            list
+        }
+    };
+
+    if !rpc_endpoints.iter().any(|u| is_usable_endpoint(u)) {
+        anyhow::bail!(
+            "❌ Nenhum endpoint RPC utilizável. Defina BOT_RPC_ENDPOINTS no .env ou \
+             [network].rpc_endpoints no config (placeholders ${{VAR}} não resolvidos não contam)."
+        );
+    }
+
     let private_key = std::env::var("PRIVATE_KEY").context("❌ PRIVATE_KEY ausente no .env")?;
 
     let client_http = RpcProvider::connect_http_with_fallback(
@@ -330,7 +359,7 @@ async fn main() -> Result<()> {
                         if let Some(prices) = result {
                             cycle_count += 1;
                             if cycle_count % 10 == 0 {
-                                info!("📊 Ciclo #{} — {} DEXs", cycle_count, prices.len());
+                                debug!("📊 Ciclo #{} — {} DEXs", cycle_count, prices.len());
                             }
                             let mut bot_guard = bot.lock().await;
                             if let Err(e) = bot_guard.process_prices(prices).await {
@@ -371,39 +400,6 @@ async fn main() -> Result<()> {
     
     // Configura a lista de tasks principais
     let tasks = vec![radar_task, bot_task, shutdown_task];
-    
-    // --- DEBUG AUTOMÁTICO (Início) ---
-    // Executa 1 vez, 3 segundos após o start, para exibir DELTAS.
-    {
-        let cfg_clone = cfg_unlocked.clone();
-        let bot_ref = bot.clone();
-
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(3)).await;
-
-            info!("🧪 DEBUG: executando debug_direct_analysis() para exibir DELTAS...");
-
-            let opps_count = {
-                // 🔒 Mantém o lock DURANTE todo o uso do engine para segurança
-                let bot_guard = bot_ref.lock().await;
-                
-                // CORREÇÃO: O método retorna &ArbitrageEngine diretamente, não Option.
-                // Acessamos diretamente.
-                let engine = bot_guard.get_arbitrage_engine();
-                
-                engine
-                    .debug_direct_analysis(&cfg_clone)
-                    .await
-                    .len()
-            };
-
-            info!(
-                "🧪 DEBUG: {} oportunidades sintéticas analisadas.",
-                opps_count
-            );
-        });
-    }
-    // --- DEBUG AUTOMÁTICO (Fim) ---
 
     info!("🎯 Sistema pronto (modo hot-reload).");
 

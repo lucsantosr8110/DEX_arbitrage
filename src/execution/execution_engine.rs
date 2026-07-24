@@ -224,31 +224,7 @@ where
             nonce_mgr: nonce_mgr.clone(),
         });
 
-        let interval = std::env::var("ENGINE_RESYNC_SECS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(20);
-
-        tokio::spawn(Self::periodic_resync_task(
-            nonce_mgr,
-            provider,
-            signer.address(),
-            interval,
-        ));
-
         Ok(engine)
-    }
-
-    async fn periodic_resync_task(
-        nonce_mgr: Arc<NonceManager>,
-        provider: Arc<M>,
-        sender: Address,
-        interval_secs: u64,
-    ) {
-        loop {
-            tokio::time::sleep(Duration::from_secs(interval_secs)).await;
-            nonce_mgr.trigger_resync(provider.clone(), sender).await;
-        }
     }
 
     /// ✅ CORREÇÃO CRÍTICA: Execução com cooldown TOTALMENTE ATÔMICO

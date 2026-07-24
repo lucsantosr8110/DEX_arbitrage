@@ -283,9 +283,10 @@ impl ArbitrageClient {
             Err(_) => opp.gas_cost_usd,
         };
 
-        // Valida profit após fees
+        // Valida profit após fees — usa net_profit (já com gas/flashloan/slippage
+        // deduzidos pelo arbitrage engine) para evitar dedução dupla.
         if let Err(e) = self.validate_profit_after_fees(
-    opp.estimated_profit_usd,
+    opp.net_profit_usd,
     gas_cost,
     opp.token_price_usd.unwrap_or(0.0),
     opp.amount_in,
@@ -350,11 +351,15 @@ impl ArbitrageClient {
         _opp: &ArbitrageOpportunity,
         cfg: &Config
     ) -> ExecutionStrategy {
-
-        if cfg.execution.dry_run {
-            return ExecutionStrategy::Skip;
-        }
-
+        // `dry_run` NÃO é mais um curto-circuito aqui. Antes ele retornava `Skip`
+        // antes de qualquer coisa, então `simulate_before_execute` nunca rodava — o
+        // dry run só validava aritmética de spread, nunca se a rota executaria.
+        //
+        // Agora o dry run escolhe a mesma estratégia da execução real e segue o
+        // caminho normal; cada `execute_*` tem uma guarda `if dry { return }` DEPOIS
+        // da simulação e ANTES do envio (ver execute_flashloan / execute_direct /
+        // execute_wrapper). Ou seja: simula de verdade, mede a executabilidade e
+        // para antes de assinar qualquer transação.
         if cfg.flashloan.enabled && cfg.execution.use_flashloan {
             if cfg.wrapper.enabled {
                 return ExecutionStrategy::WrapperFlashloan;

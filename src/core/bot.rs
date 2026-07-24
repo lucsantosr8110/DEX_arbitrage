@@ -6,7 +6,7 @@ use crate::{
     config::Config,
     core::{
         arbitrage::ArbitrageEngine,
-        flashloan::{ArbitrageClient, ExecutionStrategy},
+        flashloan::ArbitrageClient,
         gas::GasEstimator,
         risk::RiskManager,
         types::{ArbitrageOpportunity, BundleResult},
@@ -26,7 +26,7 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::{broadcast, mpsc, Mutex};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info};
 
 /// ============================================================
 /// 🤖 Estrutura principal do Bot
@@ -174,40 +174,20 @@ impl Bot {
     }
 
     // ============================================================
-    // 🧠 Estratégia híbrida — Decide a melhor execução
-    // ============================================================
-    async fn determine_execution_strategy(
-        &self,
-        _opp: &ArbitrageOpportunity,
-    ) -> ExecutionStrategy {
-        let config = self.config.lock().await;
-
-        if config.execution.dry_run {
-            info!("💤 DryRun: Executando em modo de simulação controlada.");
-        }
-
-        if config.flashloan.enabled {
-            if config.flashloan.wrapper_address.is_some() {
-                ExecutionStrategy::WrapperFlashloan
-            } else {
-                ExecutionStrategy::Flashloan
-            }
-        } else if !config.execution.dry_run {
-            ExecutionStrategy::Direct
-        } else {
-            ExecutionStrategy::Skip
-        }
-    }
-
-    // ============================================================
     // 🎯 Execução de oportunidade (com Telegram)
     // ============================================================
+    //
+    // A escolha de estratégia — incluindo o gate de `dry_run` — acontece num único
+    // lugar: `ArbitrageClient::determine_execution_strategy` (core/flashloan.rs).
+    // Existia aqui uma segunda cópia que *logava* `dry_run` mas devolvia
+    // `WrapperFlashloan` mesmo assim; era inofensiva só porque a de `flashloan.rs`
+    // decidia por último. O efeito visível era um log mentindo ("🚀 Executando via
+    // WrapperFlashloan" seguido de nada) e o risco de que qualquer refactor que
+    // invertesse a ordem virasse envio real de transação em dry run.
     pub async fn handle_opportunity(
         &mut self,
         mut opportunity: ArbitrageOpportunity,
     ) -> Result<BundleResult> {
-        let strategy = self.determine_execution_strategy(&opportunity).await;
-
         if self.telegram.is_enabled() {
             let _ = self.telegram.notify_opportunity(
                 opportunity.spread_percent,
@@ -217,28 +197,9 @@ impl Bot {
             ).await;
         }
 
-        let result = match strategy {
-            ExecutionStrategy::Direct
-            | ExecutionStrategy::WrapperFlashloan
-            | ExecutionStrategy::Flashloan => {
-                info!(
-                    "🚀 Executando via {:?} — Lucro Estimado: ${:.6}",
-                    strategy, opportunity.estimated_profit_usd
-                );
-                self.arbitrage_client
-                    .execute_opportunity(&mut opportunity)
-                    .await
-            }
-            ExecutionStrategy::Skip => {
-                info!(
-                    "⏭️ Pulando (lucro baixo: ${:.4}).",
-                    opportunity.estimated_profit_usd
-                );
-                Ok(BundleResult::skipped())
-            }
-        };
-
-        result
+        self.arbitrage_client
+            .execute_opportunity(&mut opportunity)
+            .await
     }
 
     // ============================================================
@@ -278,12 +239,23 @@ impl Bot {
             .find_arbitrage_opportunities(&prices, &cfg_snapshot)
             .await;
 
-        if let Some(opportunity) = opportunities.into_iter().next() {
+        if opportunities.is_empty() {
+            info!("📭 Ciclo sem oportunidades acima do threshold");
+        } else {
+            let best = &opportunities[0];
+            let all_pairs: Vec<String> = opportunities
+                .iter()
+                .map(|o| format!("{}@{:.2}%", o.pair, o.spread_percent))
+                .collect();
             info!(
-                "✅ Oportunidade detectada: {} (Spread: {:.4}%)",
-                opportunity.pair, opportunity.spread_percent
+                "🎯 {} oportunidades | melhor: {} spread={:.4}% net=${:.6} | [{}]",
+                opportunities.len(),
+                best.pair,
+                best.spread_percent,
+                best.net_profit_usd,
+                all_pairs.join(", ")
             );
-            let _ = self.handle_opportunity(opportunity).await;
+            let _ = self.handle_opportunity(opportunities.into_iter().next().unwrap()).await;
         }
 
         Ok(())
