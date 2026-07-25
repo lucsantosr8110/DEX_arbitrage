@@ -1,11 +1,10 @@
-//! Replay scan: varrer blocos históricos (horário ativo) e medir edges triangulares.
+//! Replay scan denso: janelas contíguas (`step=1`), multicall@blockTag, paper-only.
 //!
-//! Quote e eth_call usam o **mesmo** `blockTag`. Paper-only (`observation_active`);
-//! envio permanece bloqueado. Não altera o finder — só alimenta price_map@block.
+//! Quote e eth_call usam o **mesmo** `blockTag`. Envio permanece bloqueado.
+//! Não altera o finder — só alimenta price_map@block.
 
 use crate::{
-    config::{token_cache::TokenCache, Config, ReplayConfig},
-    contracts::ERC20,
+    config::{token_cache::TokenCache, Config, ReplayConfig, ReplayWindow},
     core::{
         arbitrage::ArbitrageEngine,
         flashloan::ArbitrageClient,
@@ -14,7 +13,7 @@ use crate::{
     },
     dex::{
         cache_fee_tier, calculate_price_from_decimals, quote_amount_for_usd,
-        EXECUTABLE_V3_FEE_TIERS,
+        rate_limiter::ALCHEMY_RATE_LIMITER, select_executable_v3_best_out, EXECUTABLE_V3_FEE_TIERS,
     },
     AppMiddleware,
 };
@@ -22,8 +21,8 @@ use crate::{
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{Datelike, Duration as ChronoDuration, TimeZone, Utc, Weekday};
 use ethers::{
-    abi::Abi,
-    contract::Contract,
+    abi::{Abi, Token},
+    contract::{Contract, Multicall},
     prelude::*,
     types::{Address, BlockId, BlockNumber, U256},
 };
@@ -35,6 +34,7 @@ use std::{
     path::Path,
     str::FromStr,
     sync::Arc,
+    time::{Duration, Instant},
 };
 use tracing::{info, warn};
 
@@ -47,11 +47,13 @@ const V3_QUOTER: &str = "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6";
 const QUICKSWAP_ROUTER: &str = "0xa5E0829CaCEd8fFDD4De3c43696c57F7D7A678ff";
 const SUSHISWAP_ROUTER: &str = "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506";
 
+const MULTICALL_BATCH_PAIRS: usize = 12;
+const THROUGHPUT_LOG_EVERY: u64 = 50;
+
 // ---------------------------------------------------------------------------
-// Gate
+// Gate / helpers
 // ---------------------------------------------------------------------------
 
-/// Scan só com paper observation ativo; envio continua proibido.
 pub fn replay_scan_allowed(cfg: &Config) -> bool {
     let env_on = std::env::var(ENV_REPLAY_SCAN)
         .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
@@ -64,7 +66,6 @@ pub fn should_run(cfg: &Config) -> bool {
     replay_scan_allowed(cfg)
 }
 
-/// Piso teórico: ∏(1 − fee_i) com fees dos steps (V3=tier/1e6, V2=30bps).
 pub fn theoretical_fee_floor(steps: &[ArbitrageStep]) -> f64 {
     let mut p = 1.0_f64;
     for s in steps {
@@ -82,7 +83,6 @@ pub fn edge_exists(cycle_rate: f64) -> bool {
     cycle_rate.is_finite() && cycle_rate > 1.0
 }
 
-/// Invariante: quote e eth_call no mesmo blockTag.
 pub fn assert_same_block_tag(quote_block: u64, eth_call_block: u64) -> Result<()> {
     if quote_block != eth_call_block {
         bail!(
@@ -94,12 +94,76 @@ pub fn assert_same_block_tag(quote_block: u64, eth_call_block: u64) -> Result<()
     Ok(())
 }
 
+/// eth_call só em edge e sob o cap global de simulações.
+pub fn should_eth_call(edge: bool, eth_calls_so_far: u64, max_eth_calls: u64) -> bool {
+    edge && eth_calls_so_far < max_eth_calls
+}
+
+/// Blocos amostrados em `[from, to]` com `step` (inclusive).
+pub fn sample_block_list(from: u64, to: u64, step: u64) -> Vec<u64> {
+    let step = step.max(1);
+    let (lo, hi) = if from <= to { (from, to) } else { (to, from) };
+    let mut out = Vec::new();
+    let mut b = lo;
+    while b <= hi {
+        out.push(b);
+        b = b.saturating_add(step);
+    }
+    out
+}
+
+pub fn expected_contiguous_count(from: u64, to: u64) -> u64 {
+    let (lo, hi) = if from <= to { (from, to) } else { (to, from) };
+    hi.saturating_sub(lo).saturating_add(1)
+}
+
 // ---------------------------------------------------------------------------
-// Sample + aggregate
+// Histogram
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CycleRateHistogram {
+    pub lt_0_99: u64,
+    pub b_0_99_0_995: u64,
+    pub b_0_995_1_0: u64,
+    pub gte_1_0: u64,
+}
+
+impl CycleRateHistogram {
+    pub fn from_rates(rates: &[f64]) -> Self {
+        let mut h = Self::default();
+        for &r in rates {
+            if !r.is_finite() || r <= 0.0 {
+                continue;
+            }
+            if r < 0.99 {
+                h.lt_0_99 += 1;
+            } else if r < 0.995 {
+                h.b_0_99_0_995 += 1;
+            } else if r < 1.0 {
+                h.b_0_995_1_0 += 1;
+            } else {
+                h.gte_1_0 += 1;
+            }
+        }
+        h
+    }
+
+    pub fn merge(&mut self, other: &Self) {
+        self.lt_0_99 += other.lt_0_99;
+        self.b_0_99_0_995 += other.b_0_99_0_995;
+        self.b_0_995_1_0 += other.b_0_995_1_0;
+        self.gte_1_0 += other.gte_1_0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sample + summaries
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ReplayBlockSample {
+    pub window_label: String,
     pub block: u64,
     pub quote_block: u64,
     pub eth_call_block: Option<u64>,
@@ -119,7 +183,13 @@ pub struct ReplayBlockSample {
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ReplayScanSummary {
+    pub label: String,
+    pub profile: String,
     pub n_blocos_amostrados: u64,
+    /// `to - from + 1` do range configurado.
+    pub n_blocos_range: u64,
+    /// True se step=1 e n_amostrados == n_range (cobertura contígua real).
+    pub contiguous_full: bool,
     pub block_from: u64,
     pub block_to: u64,
     pub step: u64,
@@ -127,6 +197,7 @@ pub struct ReplayScanSummary {
     pub best_cycle_rate_p50: Option<f64>,
     pub best_cycle_rate_p95: Option<f64>,
     pub best_cycle_rate_max: Option<f64>,
+    pub histogram: CycleRateHistogram,
     pub n_blocos_com_edge: u64,
     pub n_blocos_lucrativos_pos_custos: u64,
     pub n_reached_eth_call: u64,
@@ -136,11 +207,21 @@ pub struct ReplayScanSummary {
     pub n_archive_abort: u64,
     pub erro_rel_pct_p50: Option<f64>,
     pub erro_rel_pct_p95: Option<f64>,
-    pub top5: Vec<(u64, f64, String)>,
+    pub top10: Vec<(u64, f64, String)>,
+    pub throughput_blocks_per_sec: Option<f64>,
+    pub elapsed_secs: Option<f64>,
 }
 
 impl ReplayScanSummary {
-    pub fn from_samples(samples: &[ReplayBlockSample], from: u64, to: u64, step: u64) -> Self {
+    pub fn from_samples(
+        samples: &[ReplayBlockSample],
+        from: u64,
+        to: u64,
+        step: u64,
+        label: &str,
+        profile: &str,
+        elapsed: Option<Duration>,
+    ) -> Self {
         let mut rates: Vec<f64> = samples
             .iter()
             .map(|s| s.best_cycle_rate)
@@ -152,8 +233,7 @@ impl ReplayScanSummary {
         let n_prof = samples
             .iter()
             .filter(|s| {
-                s.sim_ok == Some(true)
-                    && s.profit_realizado_usd.map(|p| p > 0.0).unwrap_or(false)
+                s.sim_ok == Some(true) && s.profit_realizado_usd.map(|p| p > 0.0).unwrap_or(false)
             })
             .count() as u64;
         let n_eth = samples.iter().filter(|s| s.eth_call_block.is_some()).count() as u64;
@@ -187,17 +267,35 @@ impl ReplayScanSummary {
             .map(|s| (s.block, s.best_cycle_rate, s.pair.clone()))
             .collect();
         top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        top.truncate(5);
+        top.truncate(10);
+
+        let n_range = expected_contiguous_count(from, to);
+        let n_samp = samples.len() as u64;
+        let contiguous_full = step <= 1 && n_samp == n_range;
+
+        let elapsed_secs = elapsed.map(|d| d.as_secs_f64());
+        let throughput = elapsed_secs.and_then(|s| {
+            if s > 0.0 {
+                Some(n_samp as f64 / s)
+            } else {
+                None
+            }
+        });
 
         Self {
-            n_blocos_amostrados: samples.len() as u64,
-            block_from: from,
-            block_to: to,
+            label: label.to_string(),
+            profile: profile.to_string(),
+            n_blocos_amostrados: n_samp,
+            n_blocos_range: n_range,
+            contiguous_full,
+            block_from: from.min(to),
+            block_to: from.max(to),
             step,
             best_cycle_rate_min: rates.first().copied(),
             best_cycle_rate_p50: percentile(&rates, 50.0),
             best_cycle_rate_p95: percentile(&rates, 95.0),
             best_cycle_rate_max: rates.last().copied(),
+            histogram: CycleRateHistogram::from_rates(&rates),
             n_blocos_com_edge: n_edge,
             n_blocos_lucrativos_pos_custos: n_prof,
             n_reached_eth_call: n_eth,
@@ -207,15 +305,140 @@ impl ReplayScanSummary {
             n_archive_abort: n_arch,
             erro_rel_pct_p50: percentile(&errs, 50.0),
             erro_rel_pct_p95: percentile(&errs, 95.0),
-            top5: top,
+            top10: top,
+            throughput_blocks_per_sec: throughput,
+            elapsed_secs,
         }
     }
 
-    pub fn log(&self) {
+    pub fn merge_aggregate(parts: &[ReplayScanSummary], step: u64) -> Self {
+        let mut all_rates: Vec<f64> = Vec::new();
+        let mut hist = CycleRateHistogram::default();
+        let mut n_samp = 0u64;
+        let mut n_range = 0u64;
+        let mut n_edge = 0u64;
+        let mut n_prof = 0u64;
+        let mut n_eth = 0u64;
+        let mut n_ok = 0u64;
+        let mut n_reverts = 0u64;
+        let mut n_arch = 0u64;
+        let mut reason_counts: HashMap<String, u64> = HashMap::new();
+        let mut errs: Vec<f64> = Vec::new();
+        let mut top: Vec<(u64, f64, String)> = Vec::new();
+        let mut elapsed = 0.0_f64;
+        let mut from_min = u64::MAX;
+        let mut to_max = 0u64;
+        let mut contiguous_all = !parts.is_empty();
+
+        for p in parts {
+            n_samp += p.n_blocos_amostrados;
+            n_range += p.n_blocos_range;
+            n_edge += p.n_blocos_com_edge;
+            n_prof += p.n_blocos_lucrativos_pos_custos;
+            n_eth += p.n_reached_eth_call;
+            n_ok += p.n_sim_ok;
+            n_reverts += p.n_reverts;
+            n_arch += p.n_archive_abort;
+            hist.merge(&p.histogram);
+            contiguous_all &= p.contiguous_full;
+            from_min = from_min.min(p.block_from);
+            to_max = to_max.max(p.block_to);
+            if let Some(s) = p.elapsed_secs {
+                elapsed += s;
+            }
+            top.extend(p.top10.iter().cloned());
+            for (r, n) in &p.revert_reasons {
+                *reason_counts.entry(r.clone()).or_default() += n;
+            }
+            if let Some(v) = p.best_cycle_rate_min {
+                all_rates.push(v);
+            }
+            if let Some(v) = p.best_cycle_rate_max {
+                all_rates.push(v);
+            }
+            if let Some(v) = p.best_cycle_rate_p50 {
+                all_rates.push(v);
+            }
+            if let Some(v) = p.erro_rel_pct_p50 {
+                errs.push(v);
+            }
+            if let Some(v) = p.erro_rel_pct_p95 {
+                errs.push(v);
+            }
+        }
+
+        // Recompute min/max/p50/p95 from window extrema is weak; prefer re-scan
+        // rates via top10 + extrema already collected. For aggregate we keep
+        // extrema from parts:
+        let mut mins: Vec<f64> = parts.iter().filter_map(|p| p.best_cycle_rate_min).collect();
+        let mut maxs: Vec<f64> = parts.iter().filter_map(|p| p.best_cycle_rate_max).collect();
+        mins.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        maxs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Weighted-ish p50/p95: use per-window p50/p95 list
+        let mut p50s: Vec<f64> = parts.iter().filter_map(|p| p.best_cycle_rate_p50).collect();
+        let mut p95s: Vec<f64> = parts.iter().filter_map(|p| p.best_cycle_rate_p95).collect();
+        p50s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        p95s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut err_p50s: Vec<f64> = parts.iter().filter_map(|p| p.erro_rel_pct_p50).collect();
+        let mut err_p95s: Vec<f64> = parts.iter().filter_map(|p| p.erro_rel_pct_p95).collect();
+        err_p50s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        err_p95s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        top.truncate(10);
+
+        let mut revert_reasons: Vec<(String, u64)> = reason_counts.into_iter().collect();
+        revert_reasons.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        revert_reasons.truncate(10);
+
+        let _ = all_rates;
+        let _ = errs;
+
+        Self {
+            label: "AGGREGATE".into(),
+            profile: "multi_window".into(),
+            n_blocos_amostrados: n_samp,
+            n_blocos_range: n_range,
+            contiguous_full: contiguous_all,
+            block_from: if from_min == u64::MAX { 0 } else { from_min },
+            block_to: to_max,
+            step,
+            best_cycle_rate_min: mins.first().copied(),
+            best_cycle_rate_p50: percentile(&p50s, 50.0),
+            best_cycle_rate_p95: percentile(&p95s, 50.0),
+            best_cycle_rate_max: maxs.last().copied(),
+            histogram: hist,
+            n_blocos_com_edge: n_edge,
+            n_blocos_lucrativos_pos_custos: n_prof,
+            n_reached_eth_call: n_eth,
+            n_sim_ok: n_ok,
+            n_reverts,
+            revert_reasons,
+            n_archive_abort: n_arch,
+            erro_rel_pct_p50: percentile(&err_p50s, 50.0),
+            erro_rel_pct_p95: percentile(&err_p95s, 50.0),
+            top10: top,
+            throughput_blocks_per_sec: if elapsed > 0.0 {
+                Some(n_samp as f64 / elapsed)
+            } else {
+                None
+            },
+            elapsed_secs: if elapsed > 0.0 { Some(elapsed) } else { None },
+        }
+    }
+
+    pub fn log(&self, prefix: &str) {
         info!(
             target: "replay_scan",
-            "📊 REPLAY SCAN SUMMARY | blocks={} range=[{}..{}] step={} | best_cycle_rate min={:?} p50={:?} p95={:?} max={:?} | n_edge={} n_lucrativos_pos_custos={} | eth_call={} sim_ok={} reverts={} archive_abort={} | erro_rel% p50={:?} p95={:?}",
+            "📊 {} SUMMARY | label={} profile={} sampled={} range_size={} contiguous_full={} range=[{}..{}] step={} | rate min={:?} p50={:?} p95={:?} max={:?} | hist[<0.99={},0.99-0.995={},0.995-1.0={},>=1.0={}] | n_edge={} n_lucrativos={} | eth_call={} sim_ok={} reverts={} archive={} | erro_rel% p50={:?} p95={:?} | thrpt={:?} blk/s elapsed={:?}",
+            prefix,
+            self.label,
+            self.profile,
             self.n_blocos_amostrados,
+            self.n_blocos_range,
+            self.contiguous_full,
             self.block_from,
             self.block_to,
             self.step,
@@ -223,6 +446,10 @@ impl ReplayScanSummary {
             self.best_cycle_rate_p50,
             self.best_cycle_rate_p95,
             self.best_cycle_rate_max,
+            self.histogram.lt_0_99,
+            self.histogram.b_0_99_0_995,
+            self.histogram.b_0_995_1_0,
+            self.histogram.gte_1_0,
             self.n_blocos_com_edge,
             self.n_blocos_lucrativos_pos_custos,
             self.n_reached_eth_call,
@@ -231,19 +458,23 @@ impl ReplayScanSummary {
             self.n_archive_abort,
             self.erro_rel_pct_p50,
             self.erro_rel_pct_p95,
+            self.throughput_blocks_per_sec,
+            self.elapsed_secs,
         );
         for (reason, n) in &self.revert_reasons {
             info!(
                 target: "replay_scan",
-                "📊 REPLAY REVERT | n={} reason={}",
+                "📊 {} REVERT | n={} reason={}",
+                prefix,
                 n,
                 reason
             );
         }
-        for (i, (b, r, p)) in self.top5.iter().enumerate() {
+        for (i, (b, r, p)) in self.top10.iter().enumerate() {
             info!(
                 target: "replay_scan",
-                "📊 REPLAY TOP{} block={} rate={:.8} pair={}",
+                "📊 {} TOP{} block={} rate={:.8} pair={}",
+                prefix,
                 i + 1,
                 b,
                 r,
@@ -262,10 +493,9 @@ fn percentile(sorted: &[f64], p: f64) -> Option<f64> {
 }
 
 // ---------------------------------------------------------------------------
-// Block range
+// Block range / windows
 // ---------------------------------------------------------------------------
 
-/// Última janela útil 14:30–17:30 UTC (abertura mercados US / overlap líquido).
 pub fn resolve_us_session_window(latest_block: u64, latest_ts: u64) -> (u64, u64, String) {
     let now = Utc
         .timestamp_opt(latest_ts as i64, 0)
@@ -305,25 +535,58 @@ pub fn estimate_block_at(latest_block: u64, latest_ts: u64, target_ts: u64) -> u
     (latest_block as i64 - delta).max(1) as u64
 }
 
-pub fn resolve_block_range(
+/// Resolve lista de janelas. `windows` no config tem prioridade.
+pub fn resolve_windows(
     cfg: &ReplayConfig,
     latest_block: u64,
     latest_ts: u64,
-) -> Result<(u64, u64, String)> {
+) -> Result<Vec<(u64, u64, String, String)>> {
+    if !cfg.windows.is_empty() {
+        let mut out = Vec::new();
+        for w in &cfg.windows {
+            if w.from == 0 && w.to == 0 {
+                continue;
+            }
+            let (lo, hi) = if w.from <= w.to {
+                (w.from, w.to)
+            } else {
+                (w.to, w.from)
+            };
+            let label = if w.label.is_empty() {
+                format!("window_{lo}_{hi}")
+            } else {
+                w.label.clone()
+            };
+            out.push((lo, hi, label, w.profile.clone()));
+        }
+        if out.is_empty() {
+            bail!("replay: windows presentes mas vazias/zeradas");
+        }
+        return Ok(out);
+    }
+
     let from = cfg.block_from.filter(|&b| b > 0);
     let to = cfg.block_to.filter(|&b| b > 0);
     match (from, to) {
         (Some(a), Some(b)) => {
             let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-            Ok((lo, hi, format!("config range [{lo}..{hi}]")))
+            Ok(vec![(
+                lo,
+                hi,
+                format!("config range [{lo}..{hi}]"),
+                "legacy".into(),
+            )])
         }
-        _ if cfg.auto_us_session => Ok(resolve_us_session_window(latest_block, latest_ts)),
-        _ => bail!("replay: block_from/block_to ausentes e auto_us_session=false"),
+        _ if cfg.auto_us_session => {
+            let (lo, hi, label) = resolve_us_session_window(latest_block, latest_ts);
+            Ok(vec![(lo, hi, label, "auto_us_session".into())])
+        }
+        _ => bail!("replay: windows/block_from/to ausentes e auto_us_session=false"),
     }
 }
 
 // ---------------------------------------------------------------------------
-// Historical quotes
+// Historical quotes (multicall@block)
 // ---------------------------------------------------------------------------
 
 fn parse_abi_flexible(raw: &str) -> Result<Abi> {
@@ -338,12 +601,23 @@ fn parse_abi_flexible(raw: &str) -> Result<Abi> {
     serde_json::from_value(arr).context("parse ABI array")
 }
 
+struct PairMeta {
+    token_a: String,
+    token_b: String,
+    addr_a: Address,
+    addr_b: Address,
+    dec_a: u8,
+    dec_b: u8,
+    amount_in: U256,
+}
+
 struct HistQuoter {
     client: Arc<AppMiddleware>,
     token_cache: Arc<TokenCache>,
     quoter_abi: Abi,
     router_abi: Abi,
     notional_usd: f64,
+    min_interval: Duration,
 }
 
 impl HistQuoter {
@@ -352,14 +626,23 @@ impl HistQuoter {
             .context("parse uniswap_v3_quoter abi")?;
         let router_abi = parse_abi_flexible(include_str!("../../abi/uniswap_v2_router.json"))
             .context("parse uniswap_v2_router abi")?;
-        let token_cache = TokenCache::global(cfg).await;
+        let token_cache = TokenCache::global(cfg.clone()).await;
+        let min_interval = Duration::from_millis(cfg.validation.replay.min_interval_ms);
         Ok(Self {
             client,
             token_cache,
             quoter_abi,
             router_abi,
             notional_usd: 100.0,
+            min_interval,
         })
+    }
+
+    async fn pace(&self) {
+        let _ = ALCHEMY_RATE_LIMITER.acquire().await;
+        if !self.min_interval.is_zero() {
+            tokio::time::sleep(self.min_interval).await;
+        }
     }
 
     async fn resolve(&self, symbol: &str) -> Result<(Address, u8)> {
@@ -371,118 +654,147 @@ impl HistQuoter {
         Ok((info.address, info.decimals))
     }
 
-    async fn quote_v3_best(
+    async fn prepare_pairs(&self, pairs: &[(String, String)]) -> Result<Vec<PairMeta>> {
+        let mut out = Vec::with_capacity(pairs.len());
+        for (a, b) in pairs {
+            let (addr_a, dec_a) = self.resolve(a).await?;
+            let (addr_b, dec_b) = self.resolve(b).await?;
+            let amount_in = quote_amount_for_usd(a, dec_a, self.notional_usd).await?;
+            out.push(PairMeta {
+                token_a: a.clone(),
+                token_b: b.clone(),
+                addr_a,
+                addr_b,
+                dec_a,
+                dec_b,
+                amount_in,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn quote_v3_multicall(
         &self,
-        token_in: &str,
-        token_out: &str,
-        block: BlockId,
-    ) -> Result<Option<(f64, u32)>> {
-        let (addr_in, dec_in) = self.resolve(token_in).await?;
-        let (addr_out, dec_out) = self.resolve(token_out).await?;
-        let amount_in = quote_amount_for_usd(token_in, dec_in, self.notional_usd).await?;
+        metas: &[PairMeta],
+        block_num: u64,
+    ) -> Result<HashMap<(String, String), (f64, u32)>> {
+        let block = BlockNumber::Number(block_num.into());
         let quoter = Contract::new(
             Address::from_str(V3_QUOTER)?,
             self.quoter_abi.clone(),
             self.client.clone(),
         );
+        let n_fees = EXECUTABLE_V3_FEE_TIERS.len();
+        let mut results = HashMap::new();
 
-        let mut best: Option<(U256, u32)> = None;
-        for &fee in &EXECUTABLE_V3_FEE_TIERS {
-            let call = quoter.method::<_, U256>(
-                "quoteExactInputSingle",
-                (addr_in, addr_out, fee, amount_in, U256::zero()),
-            )?;
-            match call.block(block).call().await {
-                Ok(out) if !out.is_zero() => {
-                    if best.map(|(o, _)| out > o).unwrap_or(true) {
-                        best = Some((out, fee));
-                    }
+        for batch in metas.chunks(MULTICALL_BATCH_PAIRS) {
+            let mut multicall = Multicall::new(self.client.clone(), None).await?;
+            multicall = multicall.block(block);
+            for m in batch {
+                for &fee in &EXECUTABLE_V3_FEE_TIERS {
+                    let call = quoter.method::<_, U256>(
+                        "quoteExactInputSingle",
+                        (m.addr_a, m.addr_b, fee, m.amount_in, U256::zero()),
+                    )?;
+                    multicall.add_call(call, true);
                 }
-                Ok(_) => {}
+            }
+            self.pace().await;
+            let raw: Vec<Result<Token, _>> = match multicall.call_raw().await {
+                Ok(r) => r,
                 Err(e) => {
                     let s = e.to_string();
                     if paper_validation::is_archive_state_error(&s) {
                         return Err(anyhow!("archive state unavailable: {s}"));
                     }
+                    warn!(target: "replay_scan", block = block_num, error = %s, "v3 multicall batch fail");
+                    continue;
+                }
+            };
+
+            for (i, chunk) in raw.chunks_exact(n_fees).enumerate() {
+                let m = &batch[i];
+                let mut quotes: Vec<(u32, U256)> = Vec::new();
+                for (j, r) in chunk.iter().enumerate() {
+                    if let Ok(Token::Uint(v)) = r {
+                        if !v.is_zero() {
+                            quotes.push((EXECUTABLE_V3_FEE_TIERS[j], *v));
+                        }
+                    }
+                }
+                let Some((best_fee, best_out)) = select_executable_v3_best_out(&quotes) else {
+                    continue;
+                };
+                let price = calculate_price_from_decimals(
+                    m.amount_in,
+                    best_out,
+                    m.dec_a,
+                    m.dec_b,
+                )?;
+                if price > 0.0 {
+                    cache_fee_tier("UniswapV3", &m.token_a, &m.token_b, best_fee);
+                    results.insert((m.token_a.clone(), m.token_b.clone()), (price, best_fee));
                 }
             }
         }
-        let Some((out, fee)) = best else {
-            return Ok(None);
-        };
-        let price = calculate_price_from_decimals(amount_in, out, dec_in, dec_out)?;
-        if price <= 0.0 {
-            return Ok(None);
-        }
-        cache_fee_tier("UniswapV3", token_in, token_out, fee);
-        Ok(Some((price, fee)))
+        Ok(results)
     }
 
-    async fn quote_v2(
+    async fn quote_v2_multicall(
         &self,
         dex: &str,
         router: Address,
-        token_in: &str,
-        token_out: &str,
-        block: BlockId,
-    ) -> Result<Option<f64>> {
-        let (addr_in, dec_in) = self.resolve(token_in).await?;
-        let (addr_out, dec_out) = self.resolve(token_out).await?;
-        let amount_in = quote_amount_for_usd(token_in, dec_in, self.notional_usd).await?;
+        metas: &[PairMeta],
+        block_num: u64,
+    ) -> Result<HashMap<(String, String), f64>> {
+        let block = BlockNumber::Number(block_num.into());
         let router_c = Contract::new(router, self.router_abi.clone(), self.client.clone());
-        let call = router_c.method::<_, Vec<U256>>(
-            "getAmountsOut",
-            (amount_in, vec![addr_in, addr_out]),
-        )?;
-        match call.block(block).call().await {
-            Ok(amounts) if amounts.len() >= 2 && !amounts[1].is_zero() => {
-                let price =
-                    calculate_price_from_decimals(amount_in, amounts[1], dec_in, dec_out)?;
-                Ok(if price > 0.0 { Some(price) } else { None })
+        let mut results = HashMap::new();
+
+        for batch in metas.chunks(MULTICALL_BATCH_PAIRS * 2) {
+            let mut multicall = Multicall::new(self.client.clone(), None).await?;
+            multicall = multicall.block(block);
+            for m in batch {
+                let call = router_c.method::<_, Vec<U256>>(
+                    "getAmountsOut",
+                    (m.amount_in, vec![m.addr_a, m.addr_b]),
+                )?;
+                multicall.add_call(call, true);
             }
-            Ok(_) => Ok(None),
-            Err(e) => {
-                let s = e.to_string();
-                if paper_validation::is_archive_state_error(&s) {
-                    return Err(anyhow!("archive state unavailable ({dex}): {s}"));
+            self.pace().await;
+            let raw: Vec<Result<Token, _>> = match multicall.call_raw().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let s = e.to_string();
+                    if paper_validation::is_archive_state_error(&s) {
+                        return Err(anyhow!("archive state unavailable ({dex}): {s}"));
+                    }
+                    warn!(target: "replay_scan", block = block_num, dex, error = %s, "v2 multicall batch fail");
+                    continue;
                 }
-                Ok(None)
+            };
+            for (i, r) in raw.into_iter().enumerate() {
+                let m = &batch[i];
+                let Ok(Token::Array(arr)) = r else {
+                    continue;
+                };
+                if arr.len() < 2 {
+                    continue;
+                }
+                let Token::Uint(out) = &arr[1] else {
+                    continue;
+                };
+                if out.is_zero() {
+                    continue;
+                }
+                let price =
+                    calculate_price_from_decimals(m.amount_in, *out, m.dec_a, m.dec_b)?;
+                if price > 0.0 {
+                    results.insert((m.token_a.clone(), m.token_b.clone()), price);
+                }
             }
         }
-    }
-
-    async fn pool_tvl_usd(
-        &self,
-        pool: Address,
-        token_a: Address,
-        dec_a: u8,
-        price_a: f64,
-        token_b: Address,
-        dec_b: u8,
-        price_b: f64,
-        block: BlockId,
-    ) -> Result<f64> {
-        let erc_a = ERC20::new(token_a, self.client.clone());
-        let erc_b = ERC20::new(token_b, self.client.clone());
-        let bal_a = erc_a.balance_of(pool).block(block).call().await.map_err(|e| {
-            let s = e.to_string();
-            if paper_validation::is_archive_state_error(&s) {
-                anyhow!("archive state unavailable (balanceOf): {s}")
-            } else {
-                anyhow!("balanceOf A: {s}")
-            }
-        })?;
-        let bal_b = erc_b.balance_of(pool).block(block).call().await.map_err(|e| {
-            let s = e.to_string();
-            if paper_validation::is_archive_state_error(&s) {
-                anyhow!("archive state unavailable (balanceOf): {s}")
-            } else {
-                anyhow!("balanceOf B: {s}")
-            }
-        })?;
-        Ok(crate::dex::liquidity::pool_tvl_usd_from_balances(
-            bal_a, dec_a, price_a, bal_b, dec_b, price_b,
-        ))
+        Ok(results)
     }
 }
 
@@ -511,75 +823,28 @@ fn triangular_pairs(cfg: &Config) -> Vec<(String, String)> {
 
 async fn build_price_map_at_block(
     quoter: &HistQuoter,
-    cfg: &Config,
+    metas: &[PairMeta],
     block_num: u64,
 ) -> Result<HashMap<String, HashMap<String, f64>>> {
-    let block = BlockId::Number(BlockNumber::Number(block_num.into()));
-    let pairs = triangular_pairs(cfg);
-    let min_liq = crate::dex::liquidity::min_pool_liquidity_usd(cfg);
     let mut out: HashMap<String, HashMap<String, f64>> = HashMap::new();
+
+    let v3 = quoter.quote_v3_multicall(metas, block_num).await?;
+    for ((a, b), (price, _)) in v3 {
+        out.entry("UniswapV3".into())
+            .or_default()
+            .insert(format!("{a}-{b}"), price);
+    }
+
     let qs = Address::from_str(QUICKSWAP_ROUTER)?;
     let sushi = Address::from_str(SUSHISWAP_ROUTER)?;
-
-    for (a, b) in &pairs {
-        match quoter.quote_v3_best(a, b, block).await {
-            Ok(Some((price, fee))) => {
-                let keep = match (
-                    quoter.resolve(a).await,
-                    quoter.resolve(b).await,
-                    crate::dex::liquidity::cached_pool_address("UniswapV3", a, b, fee),
-                ) {
-                    (Ok((aa, da)), Ok((bb, db)), Some(pool)) => {
-                        let pa = crate::infra::price_feed::PRICE_FEED
-                            .get_price(a)
-                            .await
-                            .unwrap_or(0.0);
-                        let pb = crate::infra::price_feed::PRICE_FEED
-                            .get_price(b)
-                            .await
-                            .unwrap_or(0.0);
-                        match quoter
-                            .pool_tvl_usd(pool, aa, da, pa, bb, db, pb, block)
-                            .await
-                        {
-                            Ok(tvl) => {
-                                let pass =
-                                    crate::dex::liquidity::passes_liquidity_gate(tvl, min_liq);
-                                if !pass {
-                                    crate::dex::liquidity::note_low_liquidity_discarded_pub(1);
-                                }
-                                pass
-                            }
-                            Err(e)
-                                if paper_validation::is_archive_state_error(&e.to_string()) =>
-                            {
-                                return Err(e);
-                            }
-                            Err(_) => true,
-                        }
-                    }
-                    _ => true,
-                };
-                if keep {
-                    out.entry("UniswapV3".into())
-                        .or_default()
-                        .insert(format!("{a}-{b}"), price);
-                }
-            }
-            Ok(None) => {}
-            Err(e) => return Err(e),
-        }
-
-        for (dex, router) in [("QuickSwap", qs), ("SushiSwap", sushi)] {
-            match quoter.quote_v2(dex, router, a, b, block).await {
-                Ok(Some(price)) => {
-                    out.entry(dex.into())
-                        .or_default()
-                        .insert(format!("{a}-{b}"), price);
-                }
-                Ok(None) => {}
-                Err(e) => return Err(e),
-            }
+    for (dex, router) in [("QuickSwap", qs), ("SushiSwap", sushi)] {
+        let map = quoter
+            .quote_v2_multicall(dex, router, metas, block_num)
+            .await?;
+        for ((a, b), price) in map {
+            out.entry(dex.into())
+                .or_default()
+                .insert(format!("{a}-{b}"), price);
         }
     }
     Ok(out)
@@ -625,12 +890,13 @@ fn append_csv(path: &Path, sample: &ReplayBlockSample, header: bool) -> Result<(
     if header {
         writeln!(
             f,
-            "block,quote_block,eth_call_block,best_cycle_rate,fee_floor,edge_exists,pair,route,fee_tiers,net_previsto_usd,profit_realizado_usd,erro_rel_pct,sim_ok,revert_reason,archive_error"
+            "window,block,quote_block,eth_call_block,best_cycle_rate,fee_floor,edge_exists,pair,route,fee_tiers,net_previsto_usd,profit_realizado_usd,erro_rel_pct,sim_ok,revert_reason,archive_error"
         )?;
     }
     writeln!(
         f,
-        "{},{},{},{:.10},{:.10},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{:.10},{:.10},{},{},{},{},{},{},{},{},{},{}",
+        sample.window_label.replace(',', ";"),
         sample.block,
         sample.quote_block,
         sample
@@ -674,61 +940,57 @@ fn append_csv(path: &Path, sample: &ReplayBlockSample, header: bool) -> Result<(
 }
 
 // ---------------------------------------------------------------------------
-// Main entry
+// Scan one window
 // ---------------------------------------------------------------------------
 
-pub async fn run(
-    client: Arc<AppMiddleware>,
-    cfg: Arc<Config>,
+async fn scan_window(
+    quoter: &HistQuoter,
+    metas: &[PairMeta],
+    cfg: &Config,
+    discovery: &Config,
     engine: &ArbitrageEngine,
     arb_client: &ArbitrageClient,
-) -> Result<ReplayScanSummary> {
-    if !replay_scan_allowed(&cfg) {
-        bail!("replay_scan: blocked (need observation_active + REPLAY_SCAN/config)");
+    from: u64,
+    to: u64,
+    step: u64,
+    label: &str,
+    profile: &str,
+    max_eth: u64,
+    eth_calls: &mut u64,
+    csv_path: &Path,
+    first_csv: &mut bool,
+) -> Result<(ReplayScanSummary, Vec<ReplayBlockSample>)> {
+    let blocks = sample_block_list(from, to, step);
+    if step <= 1 {
+        let expect = expected_contiguous_count(from, to);
+        if blocks.len() as u64 != expect {
+            bail!(
+                "contiguous undersample: got {} expected {} for [{from}..{to}] step={step}",
+                blocks.len(),
+                expect
+            );
+        }
     }
-    if !paper_validation::sends_forbidden(&cfg) {
-        bail!("replay_scan: sends_forbidden required");
-    }
-
-    let latest = client.get_block_number().await?.as_u64();
-    let latest_block = client
-        .get_block(BlockId::Number(BlockNumber::Number(latest.into())))
-        .await?
-        .ok_or_else(|| anyhow!("latest block missing"))?;
-    let latest_ts = latest_block.timestamp.as_u64();
-
-    let replay = &cfg.validation.replay;
-    let (from, to, label) = resolve_block_range(replay, latest, latest_ts)?;
-    let step = replay.step.max(1);
-    let max_eth = replay.max_eth_calls;
 
     info!(
         target: "replay_scan",
-        %label,
+        label,
+        profile,
         from,
         to,
         step,
-        max_eth,
-        "📼 REPLAY SCAN start (paper-only, archive required)"
+        n_blocks = blocks.len(),
+        range_size = expected_contiguous_count(from, to),
+        "📼 REPLAY WINDOW start (dense contiguous={})",
+        step <= 1
     );
 
-    let quoter = HistQuoter::new(client.clone(), cfg.clone()).await?;
-    let csv_path = Path::new(&replay.csv_path);
-    let _ = std::fs::remove_file(csv_path);
+    let t0 = Instant::now();
+    let mut samples = Vec::with_capacity(blocks.len());
 
-    let mut discovery = (*cfg).clone();
-    // Scan precisa ver cycle_rate abaixo de 1.0 (piso de fee) — floor negativo
-    // só na discovery desta corrida; não altera config de execução.
-    discovery.arbitrage.min_spread_percent = "-50.0".into();
-    discovery.arbitrage.min_profit_threshold_usd = Some(-1.0e9);
-
-    let mut samples = Vec::new();
-    let mut eth_calls = 0u64;
-    let mut first_csv = true;
-
-    let mut block = from;
-    while block <= to {
+    for (i, &block) in blocks.iter().enumerate() {
         let mut sample = ReplayBlockSample {
+            window_label: label.to_string(),
             block,
             quote_block: block,
             eth_call_block: None,
@@ -746,10 +1008,10 @@ pub async fn run(
             archive_error: None,
         };
 
-        match build_price_map_at_block(&quoter, &cfg, block).await {
+        match build_price_map_at_block(quoter, metas, block).await {
             Ok(prices) => {
                 let opps = engine
-                    .find_arbitrage_opportunities(&prices, &discovery)
+                    .find_arbitrage_opportunities(&prices, discovery)
                     .await;
                 if let Some((rate, opp)) = best_tri_from_opps(&opps) {
                     let (route, fees) = route_and_fees(opp);
@@ -761,7 +1023,7 @@ pub async fn run(
                     sample.fee_tiers = fees;
                     sample.net_previsto_usd = Some(opp.net_profit_usd);
 
-                    if sample.edge_exists && eth_calls < max_eth {
+                    if should_eth_call(sample.edge_exists, *eth_calls, max_eth) {
                         assert_same_block_tag(sample.quote_block, block)?;
                         let slip = cfg.flashloan.slippage_bps.unwrap_or(15) as u64;
                         let fl_fee = if cfg.flashloan.enabled {
@@ -769,13 +1031,13 @@ pub async fn run(
                         } else {
                             0.0
                         };
-                        let would = paper_validation::would_execute(opp.spread_percent, &cfg);
+                        let would = paper_validation::would_execute(opp.spread_percent, cfg);
                         match arb_client
                             .paper_validate_at_block(opp, block, slip, fl_fee, would)
                             .await
                         {
                             Ok(ps) => {
-                                eth_calls += 1;
+                                *eth_calls += 1;
                                 sample.eth_call_block = Some(ps.block_number);
                                 let _ = assert_same_block_tag(sample.quote_block, ps.block_number);
                                 sample.sim_ok = Some(ps.sim_ok);
@@ -809,17 +1071,157 @@ pub async fn run(
             }
         }
 
-        if let Err(e) = append_csv(csv_path, &sample, first_csv) {
+        if let Err(e) = append_csv(csv_path, &sample, *first_csv) {
             warn!(target: "replay_scan", "csv: {e}");
         }
-        first_csv = false;
+        *first_csv = false;
         samples.push(sample);
-        block = block.saturating_add(step);
+
+        let n_done = (i as u64) + 1;
+        if n_done % THROUGHPUT_LOG_EVERY == 0 || n_done == blocks.len() as u64 {
+            let elapsed = t0.elapsed().as_secs_f64().max(1e-9);
+            info!(
+                target: "replay_scan",
+                label,
+                done = n_done,
+                total = blocks.len(),
+                thrpt = format!("{:.2} blk/s", n_done as f64 / elapsed),
+                "📼 REPLAY progress"
+            );
+        }
     }
 
-    let summary = ReplayScanSummary::from_samples(&samples, from, to, step);
-    summary.log();
-    Ok(summary)
+    let elapsed = t0.elapsed();
+    let summary =
+        ReplayScanSummary::from_samples(&samples, from, to, step, label, profile, Some(elapsed));
+    summary.log("WINDOW");
+    Ok((summary, samples))
+}
+
+// ---------------------------------------------------------------------------
+// Main entry
+// ---------------------------------------------------------------------------
+
+pub async fn run(
+    client: Arc<AppMiddleware>,
+    cfg: Arc<Config>,
+    engine: &ArbitrageEngine,
+    arb_client: &ArbitrageClient,
+) -> Result<ReplayScanSummary> {
+    if !replay_scan_allowed(&cfg) {
+        bail!("replay_scan: blocked (need observation_active + REPLAY_SCAN/config)");
+    }
+    if !paper_validation::sends_forbidden(&cfg) {
+        bail!("replay_scan: sends_forbidden required");
+    }
+
+    let latest = client.get_block_number().await?.as_u64();
+    let latest_block = client
+        .get_block(BlockId::Number(BlockNumber::Number(latest.into())))
+        .await?
+        .ok_or_else(|| anyhow!("latest block missing"))?;
+    let latest_ts = latest_block.timestamp.as_u64();
+
+    let replay = &cfg.validation.replay;
+    let windows = resolve_windows(replay, latest, latest_ts)?;
+    let step = replay.step.max(1);
+    let max_eth = replay.max_eth_calls;
+
+    info!(
+        target: "replay_scan",
+        n_windows = windows.len(),
+        step,
+        max_eth,
+        "📼 REPLAY SCAN start (paper-only, archive required, multicall@block)"
+    );
+    for (lo, hi, label, profile) in &windows {
+        info!(
+            target: "replay_scan",
+            %label,
+            %profile,
+            from = lo,
+            to = hi,
+            n = expected_contiguous_count(*lo, *hi),
+            "📼 REPLAY window planned"
+        );
+    }
+
+    let quoter = HistQuoter::new(client.clone(), cfg.clone()).await?;
+    let pairs = triangular_pairs(&cfg);
+    let metas = quoter.prepare_pairs(&pairs).await?;
+    let csv_path = Path::new(&replay.csv_path);
+    let _ = std::fs::remove_file(csv_path);
+
+    let mut discovery = (*cfg).clone();
+    discovery.arbitrage.min_spread_percent = "-50.0".into();
+    discovery.arbitrage.min_profit_threshold_usd = Some(-1.0e9);
+
+    let mut eth_calls = 0u64;
+    let mut first_csv = true;
+    let mut window_summaries = Vec::new();
+    let mut all_samples = Vec::new();
+
+    for (from, to, label, profile) in windows {
+        let (sum, samples) = scan_window(
+            &quoter,
+            &metas,
+            &cfg,
+            &discovery,
+            engine,
+            arb_client,
+            from,
+            to,
+            step,
+            &label,
+            &profile,
+            max_eth,
+            &mut eth_calls,
+            csv_path,
+            &mut first_csv,
+        )
+        .await?;
+        all_samples.extend(samples);
+        window_summaries.push(sum);
+    }
+
+    let aggregate = if window_summaries.len() == 1 {
+        window_summaries.pop().unwrap()
+    } else {
+        // Prefer aggregate from all samples for accurate percentiles/histogram
+        let from = window_summaries
+            .iter()
+            .map(|s| s.block_from)
+            .min()
+            .unwrap_or(0);
+        let to = window_summaries
+            .iter()
+            .map(|s| s.block_to)
+            .max()
+            .unwrap_or(0);
+        let elapsed: Duration = window_summaries
+            .iter()
+            .filter_map(|s| s.elapsed_secs.map(Duration::from_secs_f64))
+            .sum();
+        let mut agg = ReplayScanSummary::from_samples(
+            &all_samples,
+            from,
+            to,
+            step,
+            "AGGREGATE",
+            "multi_window",
+            Some(elapsed),
+        );
+        // Contiguous full only if every window was full AND step=1
+        agg.contiguous_full = window_summaries.iter().all(|w| w.contiguous_full);
+        agg.n_blocos_range = window_summaries.iter().map(|w| w.n_blocos_range).sum();
+        for w in &window_summaries {
+            w.log("WINDOW_FINAL");
+        }
+        agg
+    };
+
+    aggregate.log("AGGREGATE");
+    Ok(aggregate)
 }
 
 #[cfg(test)]
@@ -902,5 +1304,145 @@ mod tests {
         assert!(from < to);
         assert!(label.contains("14:30"));
         assert!(to - from > 1000);
+    }
+
+    #[test]
+    fn step1_samples_all_contiguous_blocks() {
+        let from = 100u64;
+        let to = 105u64;
+        let blocks = sample_block_list(from, to, 1);
+        assert_eq!(blocks.len() as u64, expected_contiguous_count(from, to));
+        assert_eq!(blocks, vec![100, 101, 102, 103, 104, 105]);
+        // step>1 undersamples — must NOT claim contiguous_full
+        let sparse = sample_block_list(from, to, 2);
+        assert!((sparse.len() as u64) < expected_contiguous_count(from, to));
+    }
+
+    #[test]
+    fn eth_call_only_on_edge_and_under_cap() {
+        assert!(!should_eth_call(false, 0, 40));
+        assert!(should_eth_call(true, 0, 40));
+        assert!(should_eth_call(true, 39, 40));
+        assert!(!should_eth_call(true, 40, 40));
+        assert!(!should_eth_call(true, 100, 40));
+    }
+
+    #[test]
+    fn windows_priority_over_legacy_range() {
+        let mut cfg = ReplayConfig::default();
+        cfg.block_from = Some(1);
+        cfg.block_to = Some(10);
+        cfg.windows = vec![
+            ReplayWindow {
+                from: 50,
+                to: 52,
+                label: "a".into(),
+                profile: "high_vol".into(),
+            },
+            ReplayWindow {
+                from: 90,
+                to: 91,
+                label: "b".into(),
+                profile: "control".into(),
+            },
+        ];
+        let wins = resolve_windows(&cfg, 1000, 1_700_000_000).unwrap();
+        assert_eq!(wins.len(), 2);
+        assert_eq!(wins[0].0, 50);
+        assert_eq!(wins[0].1, 52);
+        assert_eq!(wins[0].2, "a");
+        assert_eq!(wins[1].0, 90);
+    }
+
+    #[test]
+    fn multi_window_aggregate_sums_counts() {
+        let s1 = vec![
+            ReplayBlockSample {
+                window_label: "w1".into(),
+                block: 1,
+                quote_block: 1,
+                eth_call_block: Some(1),
+                best_cycle_rate: 1.001,
+                fee_floor: 0.99,
+                edge_exists: true,
+                pair: "A".into(),
+                route: String::new(),
+                fee_tiers: String::new(),
+                net_previsto_usd: Some(1.0),
+                profit_realizado_usd: Some(0.5),
+                erro_rel_pct: Some(10.0),
+                sim_ok: Some(true),
+                revert_reason: None,
+                archive_error: None,
+            },
+            ReplayBlockSample {
+                window_label: "w1".into(),
+                block: 2,
+                quote_block: 2,
+                eth_call_block: None,
+                best_cycle_rate: 0.996,
+                fee_floor: 0.99,
+                edge_exists: false,
+                pair: "B".into(),
+                route: String::new(),
+                fee_tiers: String::new(),
+                net_previsto_usd: None,
+                profit_realizado_usd: None,
+                erro_rel_pct: None,
+                sim_ok: None,
+                revert_reason: None,
+                archive_error: None,
+            },
+        ];
+        let s2 = vec![ReplayBlockSample {
+            window_label: "w2".into(),
+            block: 10,
+            quote_block: 10,
+            eth_call_block: None,
+            best_cycle_rate: 0.994,
+            fee_floor: 0.99,
+            edge_exists: false,
+            pair: "C".into(),
+            route: String::new(),
+            fee_tiers: String::new(),
+            net_previsto_usd: None,
+            profit_realizado_usd: None,
+            erro_rel_pct: None,
+            sim_ok: None,
+            revert_reason: None,
+            archive_error: None,
+        }];
+        let w1 = ReplayScanSummary::from_samples(&s1, 1, 2, 1, "w1", "high_vol", None);
+        let w2 = ReplayScanSummary::from_samples(&s2, 10, 10, 1, "w2", "control", None);
+        assert!(w1.contiguous_full);
+        assert!(w2.contiguous_full);
+        assert_eq!(w1.n_blocos_com_edge, 1);
+        assert_eq!(w1.n_sim_ok, 1);
+        assert_eq!(w1.histogram.gte_1_0, 1);
+
+        let mut all = s1;
+        all.extend(s2);
+        let agg = ReplayScanSummary::from_samples(&all, 1, 10, 1, "AGGREGATE", "multi_window", None);
+        assert_eq!(agg.n_blocos_amostrados, 3);
+        assert_eq!(agg.n_blocos_com_edge, 1);
+        assert_eq!(agg.n_sim_ok, 1);
+        assert_eq!(agg.n_blocos_lucrativos_pos_custos, 1);
+        assert_eq!(agg.histogram.gte_1_0, 1);
+        assert_eq!(agg.histogram.b_0_995_1_0, 1);
+        assert_eq!(agg.histogram.b_0_99_0_995, 1);
+
+        let merged = ReplayScanSummary::merge_aggregate(&[w1, w2], 1);
+        assert_eq!(merged.n_blocos_amostrados, 3);
+        assert_eq!(merged.n_blocos_com_edge, 1);
+        assert_eq!(merged.n_blocos_range, 3); // 2+1
+    }
+
+    #[test]
+    fn histogram_bins() {
+        let h = CycleRateHistogram::from_rates(&[0.98, 0.992, 0.997, 1.0, 1.002]);
+        assert_eq!(h.lt_0_99, 1);
+        assert_eq!(h.b_0_99_0_995, 1);
+        assert_eq!(h.b_0_995_1_0, 1);
+        assert_eq!(h.gte_1_0, 2);
     }
 }

@@ -457,13 +457,32 @@ observe_max_per_cycle = 8
 # Ativar com REPLAY_SCAN=1 ou enabled=true (+ PAPER_VALIDATION=1).
 [validation.replay]
 enabled = false
-# 0 = auto última sessão Sex–Qui 14:30–17:30 UTC
+# 0 = auto última sessão Sex–Qui 14:30–17:30 UTC (se windows vazio)
 block_from = 0
 block_to = 0
-step = 180
+step = 1
 max_eth_calls = 40
 csv_path = "audits/replay_scan.csv"
 auto_us_session = true
+min_interval_ms = 0
+
+[[validation.replay.windows]]
+from = 90772627
+to = 90773526
+label = "thu_us_open_high_vol"
+profile = "high_vol_us_cash"
+
+[[validation.replay.windows]]
+from = 90776227
+to = 90777126
+label = "thu_weth_vol_event"
+profile = "vol_event"
+
+[[validation.replay.windows]]
+from = 90815827
+to = 90816726
+label = "fri_us_open_low_vol"
+profile = "low_vol_control"
 
 [analytics]
 enabled = true

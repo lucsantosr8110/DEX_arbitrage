@@ -116,6 +116,19 @@ pub struct ValidationConfig {
     pub replay: ReplayConfig,
 }
 
+/// Janela contígua de blocos para replay denso (`step=1`).
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct ReplayWindow {
+    pub from: u64,
+    pub to: u64,
+    /// Rótulo curto (ex.: `us_open_high_vol`).
+    #[serde(default)]
+    pub label: String,
+    /// Perfil documentado (alta-vol / evento / controle).
+    #[serde(default)]
+    pub profile: String,
+}
+
 /// Scan de blocos históricos para calibrar triangular (eth_call@blockTag).
 /// Só ativo com observation_active (paper). Requer archive node.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -123,25 +136,34 @@ pub struct ReplayConfig {
     #[serde(default)]
     pub enabled: bool,
     /// Inclusive. `None`/`0` + auto_us_session → resolve horário ativo.
+    /// Ignorado quando `windows` não-vazio (prioridade).
     #[serde(default)]
     pub block_from: Option<u64>,
     #[serde(default)]
     pub block_to: Option<u64>,
-    /// Amostrar 1 a cada `step` blocos (ex.: 120 ≈ 4 min em Polygon).
+    /// Janelas contíguas. Se presente e não-vazio, tem prioridade sobre
+    /// `block_from`/`block_to`/`auto_us_session`.
+    #[serde(default)]
+    pub windows: Vec<ReplayWindow>,
+    /// Amostrar 1 a cada `step` blocos. Dense = 1 (todo bloco).
     #[serde(default = "default_replay_step")]
     pub step: u64,
-    /// Cap de eth_calls nos blocos com edge (RPC cost).
+    /// Cap de eth_calls **só** nos blocos com edge (RPC cost). Scan de
+    /// cycle_rate roda em todos os blocos amostrados.
     #[serde(default = "default_replay_max_eth_calls")]
     pub max_eth_calls: u64,
     #[serde(default = "default_replay_csv")]
     pub csv_path: String,
-    /// Se from/to vazios: última sessão US cash (sex–qui 14:30–17:30 UTC).
+    /// Se from/to vazios e sem windows: última sessão US cash.
     #[serde(default = "default_true_replay_auto")]
     pub auto_us_session: bool,
+    /// Pace mínimo entre batches RPC (ms). 0 = só o UltraRateLimiter global.
+    #[serde(default = "default_replay_min_interval_ms")]
+    pub min_interval_ms: u64,
 }
 
 fn default_replay_step() -> u64 {
-    120
+    1
 }
 fn default_replay_max_eth_calls() -> u64 {
     40
@@ -152,6 +174,9 @@ fn default_replay_csv() -> String {
 fn default_true_replay_auto() -> bool {
     true
 }
+fn default_replay_min_interval_ms() -> u64 {
+    0
+}
 
 impl Default for ReplayConfig {
     fn default() -> Self {
@@ -159,10 +184,12 @@ impl Default for ReplayConfig {
             enabled: false,
             block_from: None,
             block_to: None,
+            windows: Vec::new(),
             step: default_replay_step(),
             max_eth_calls: default_replay_max_eth_calls(),
             csv_path: default_replay_csv(),
             auto_us_session: true,
+            min_interval_ms: default_replay_min_interval_ms(),
         }
     }
 }
