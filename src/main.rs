@@ -346,7 +346,13 @@ async fn main() -> Result<()> {
     let (shutdown_tx, _) = broadcast::channel::<()>(4);
 
     let tui_state = Arc::new(std::sync::RwLock::new(tui::TuiState::default()));
-    tui::spawn_tui(tui_state.clone());
+    // Paper/headless: TUI precisa de TTY; skip quando PAPER_VALIDATION=1.
+    let tui_enabled = !flashloan_bot::core::paper_validation::env_paper_flag();
+    if tui_enabled {
+        tui::spawn_tui(tui_state.clone());
+    } else {
+        info!("📄 PAPER mode: TUI desabilitado (headless)");
+    }
 
     let radar_task = {
         let client_ws = client_ws.clone();
@@ -445,7 +451,11 @@ async fn main() -> Result<()> {
         })
     };
 
-    info!("🎯 TUI iniciado. Pressione 'q' no terminal da TUI para sair.");
+    if tui_enabled {
+        info!("🎯 TUI iniciado. Pressione 'q' no terminal da TUI para sair.");
+    } else {
+        info!("🎯 Headless (paper) — Ctrl-C para sair.");
+    }
 
     // ============================================================
     // 1️⃣3️⃣ Execução Concorrente e Debug

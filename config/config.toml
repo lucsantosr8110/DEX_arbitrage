@@ -430,6 +430,15 @@ endpoint = "/metrics"
 export_interval = 15
 include_balance_metrics = true
 
+[validation]
+# Paper gate: eth_call + balance delta vs net do engine. Envio OFF.
+# Env PAPER_VALIDATION=1 sobrescreve paper_enabled.
+paper_enabled = false
+dry_run_only = false
+csv_path = "audits/paper_validation.csv"
+summary_window = 50
+# paper_from = ""  # opcional; env PAPER_FROM tem prioridade (nunca keypair)
+
 [analytics]
 enabled = true
 export_csv = true

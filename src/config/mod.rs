@@ -80,6 +80,45 @@ pub struct WrapperConfig {
     #[serde(default)] pub contract_type: String,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ValidationConfig {
+    /// Ativa paper validation (eth_call + balance delta, sem envio).
+    /// Também respeita env `PAPER_VALIDATION=1`.
+    #[serde(default)]
+    pub paper_enabled: bool,
+    /// Quando true, torna fisicamente impossível enviar TX (early-return no send).
+    #[serde(default)]
+    pub dry_run_only: bool,
+    /// CSV de amostras (escrito por task async, fora do hot path do radar).
+    #[serde(default = "default_paper_csv")]
+    pub csv_path: String,
+    /// A cada N amostras, emite resumo agregado (p50/p95).
+    #[serde(default = "default_summary_window")]
+    pub summary_window: u64,
+    /// Endereço `from` opcional para eth_call (nunca keypair). Env `PAPER_FROM` tem prioridade.
+    #[serde(default)]
+    pub paper_from: String,
+}
+
+fn default_paper_csv() -> String {
+    "audits/paper_validation.csv".into()
+}
+fn default_summary_window() -> u64 {
+    50
+}
+
+impl Default for ValidationConfig {
+    fn default() -> Self {
+        Self {
+            paper_enabled: false,
+            dry_run_only: false,
+            csv_path: default_paper_csv(),
+            summary_window: default_summary_window(),
+            paper_from: String::new(),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct AnalyticsConfig {
     pub enabled: bool,
@@ -1657,6 +1696,7 @@ pub struct Config {
     #[serde(default)] pub radar: RadarConfig,
     #[serde(default)] pub wrapper: WrapperConfig,
     #[serde(default)] pub analytics: AnalyticsConfig,
+    #[serde(default)] pub validation: ValidationConfig,
     #[serde(default)] pub alerts: AlertsConfig,
     #[serde(default)] pub debug: DebugConfig,
     #[serde(default)] pub summary: SummaryConfig,
@@ -1963,6 +2003,7 @@ impl Default for Config {
             radar: RadarConfig::default(),
             wrapper: WrapperConfig::default(),
             analytics: AnalyticsConfig::default(),
+            validation: ValidationConfig::default(),
             alerts: AlertsConfig::default(),
             debug: DebugConfig::default(),
             summary: SummaryConfig::default(),

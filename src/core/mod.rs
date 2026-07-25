@@ -6,6 +6,7 @@ pub mod arbitrage;
 pub mod bot;
 pub mod flashloan;
 pub mod gas;
+pub mod paper_validation;
 pub mod risk;
 pub mod smart_retry;
 pub mod types;

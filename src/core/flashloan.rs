@@ -7,9 +7,10 @@ use crate::{
     config::Config,
     contracts::{FlashloanCaller, FlashloanExecutor, SwapStep as AbiSwapStep, ERC20},
     core::{
-        gas::GasEstimator,
-        types::{ArbitrageOpportunity, BundleResult},
         arbitrage::ArbitrageEngine,
+        gas::GasEstimator,
+        paper_validation::{self, PaperValidationHub},
+        types::{ArbitrageOpportunity, BundleResult},
     },
     infra::metrics,
     AppMiddleware,
@@ -83,6 +84,8 @@ pub struct ArbitrageClient {
     pub execution_engine: Option<
         Arc<crate::execution::ExecutionEngine<AppMiddleware, Wallet<SigningKey>>>
     >,
+    /// Hub paper (CSV async). Lazy-init sob flag.
+    paper_hub: Arc<Mutex<Option<Arc<PaperValidationHub>>>>,
 }
 
 impl ArbitrageClient {
@@ -99,6 +102,17 @@ impl ArbitrageClient {
         let executor = FlashloanExecutor::new(executor_address, middleware.clone());
         let gas_estimator = GasEstimator::new(middleware.clone(), config.clone());
 
+        // Env liga hub cedo; config.paper_enabled faz lazy-init no primeiro paper run.
+        let paper_hub = if paper_validation::env_paper_flag() {
+            info!("📄 PAPER_VALIDATION=1 | SENDS DISABLED | hub CSV ready");
+            Arc::new(Mutex::new(Some(PaperValidationHub::spawn(
+                std::path::PathBuf::from("audits/paper_validation.csv"),
+                50,
+            ))))
+        } else {
+            Arc::new(Mutex::new(None))
+        };
+
         Self {
             executor,
             middleware,
@@ -106,7 +120,34 @@ impl ArbitrageClient {
             config,
             execution_engine,
             last_exec_block: Arc::new(Mutex::new(None)),
+            paper_hub,
         }
+    }
+
+    async fn ensure_paper_hub(&self) -> Option<Arc<PaperValidationHub>> {
+        let (enabled, path, window) = {
+            let cfg = self.config.lock().await;
+            (
+                paper_validation::paper_mode_active(&cfg) || cfg.validation.dry_run_only,
+                cfg.validation.csv_path.clone(),
+                cfg.validation.summary_window.max(1),
+            )
+        };
+        if !enabled {
+            return None;
+        }
+        let mut slot = self.paper_hub.lock().await;
+        if slot.is_none() {
+            info!(
+                "📄 PAPER hub start | csv={} | summary_window={} | SENDS DISABLED",
+                path, window
+            );
+            *slot = Some(PaperValidationHub::spawn(
+                std::path::PathBuf::from(path),
+                window,
+            ));
+        }
+        slot.clone()
     }
 
     // ========================================================================
@@ -395,6 +436,19 @@ impl ArbitrageClient {
             }
         }
 
+        // PAPER GATE: eth_call + delta; nunca chega em send.
+        {
+            let paper_on = {
+                let cfg = self.config.lock().await;
+                paper_validation::paper_mode_active(&cfg)
+            };
+            if paper_on {
+                return self
+                    .run_paper_validation(opp, slippage_bps, flashloan_fee_usd)
+                    .await;
+            }
+        }
+
         info!("🔄 Executando rota: {} hops | Profit: ${:.4}", 
               opp.steps.0.len(), opp.net_profit_usd);
 
@@ -405,6 +459,104 @@ impl ArbitrageClient {
             ExecutionStrategy::WrapperFlashloan => self.execute_wrapper(opp, slippage_bps).await,
             ExecutionStrategy::Skip => Ok(BundleResult::skipped()),
         }
+    }
+
+    /// Paper: mesmo calldata/extraData da exec real; só eth_call; CSV async.
+    async fn run_paper_validation(
+        &self,
+        opp: &ArbitrageOpportunity,
+        slippage_bps: u64,
+        flashloan_fee_usd: f64,
+    ) -> Result<BundleResult> {
+        let hub = self.ensure_paper_hub().await;
+
+        let (asset, amount, steps, decimals, token_price) = {
+            let cfg = self.config.lock().await;
+            let (asset, amount, steps) =
+                self.extract_and_convert_opp_data(opp, &cfg, slippage_bps)?;
+            (
+                asset,
+                amount,
+                steps,
+                cfg.flashloan.flashloan_decimals.unwrap_or(6) as u32,
+                opp.token_price_usd.unwrap_or(1.0),
+            )
+        };
+
+        let block = paper_validation::current_block_number(&self.middleware)
+            .await
+            .unwrap_or(0);
+        let block_id = paper_validation::block_id(block);
+        let wallet = self.get_wallet_address()?;
+        let holder = {
+            let cfg = self.config.lock().await;
+            paper_validation::resolve_paper_from(&cfg, wallet)
+        };
+
+        let _bal_before = paper_validation::erc20_balance(
+            self.middleware.clone(),
+            asset,
+            holder,
+            block_id,
+        )
+        .await
+        .ok();
+
+        let call = self
+            .executor
+            .execute_flashloan(asset, amount, steps)
+            .block(block_id);
+
+        let (sim_ok, revert_reason) = match self.simulate_bool_transaction(&call).await {
+            Ok(()) => (true, None),
+            Err(e) => (false, Some(e.to_string())),
+        };
+
+        // Delta: Alchemy asset changes (mesma tx que seria enviada). Sem send.
+        let mut profit_realizado_usd = None;
+        if let Some(data) = call.tx.data().cloned() {
+            let to = match call.tx.to() {
+                Some(NameOrAddress::Address(a)) => *a,
+                _ => self.executor.address(),
+            };
+            if let Some(delta_raw) = paper_validation::try_alchemy_asset_delta(
+                &self.middleware,
+                holder,
+                to,
+                data,
+                asset,
+                holder,
+            )
+            .await
+            {
+                profit_realizado_usd = Some(paper_validation::balance_delta_usd(
+                    delta_raw,
+                    decimals,
+                    token_price,
+                ));
+            }
+        }
+
+        // Se sim ok mas sem tracer: ainda registramos amostra (real=None).
+        // Parser ABI (before,after) disponível via testes / fixtures.
+        if !sim_ok {
+            profit_realizado_usd = Some(0.0);
+        }
+
+        let sample = paper_validation::build_sample(
+            opp,
+            block,
+            flashloan_fee_usd,
+            profit_realizado_usd,
+            sim_ok,
+            revert_reason,
+        );
+        paper_validation::log_sample(&sample);
+        if let Some(h) = hub {
+            h.try_submit(sample);
+        }
+
+        Ok(BundleResult::skipped().with_execution_mode("paper_validated"))
     }
 
     // ========================================================================
@@ -682,6 +834,14 @@ impl ArbitrageClient {
     // APPROVE
     // ========================================================================
     async fn approve_token_for_execution(&self, token_addr: Address, spender: Address, amount: U256) -> Result<()> {
+        {
+            let cfg = self.config.lock().await;
+            if paper_validation::sends_forbidden(&cfg) {
+                warn!("🚫 APPROVE/SEND BLOCKED (paper/dry_run_only)");
+                return Ok(());
+            }
+        }
+
         let wallet_addr = self.get_wallet_address()?;
         let token_contract = ERC20::new(token_addr, self.middleware.clone());
 
@@ -785,6 +945,18 @@ impl ArbitrageClient {
         opp: &ArbitrageOpportunity,
         mode: &'static str
     ) -> Result<BundleResult> {
+
+        // HARD GATE: paper / dry_run_only / dry_run — fisicamente impossível broadcast.
+        {
+            let cfg = self.config.lock().await;
+            if paper_validation::sends_forbidden(&cfg) {
+                warn!(
+                    "🚫 SEND BLOCKED mode={} (paper/dry_run_only/dry_run) — nenhum broadcast",
+                    mode
+                );
+                return Ok(BundleResult::skipped().with_execution_mode("paper_send_blocked"));
+            }
+        }
 
         let mut tx_req = Eip1559TransactionRequest::new();
         let (mut max_fee, mut max_priority) =
