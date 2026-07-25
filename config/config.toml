@@ -21,8 +21,8 @@ hot_reload = true
 # ======================================================================
 [flashloan]
 enabled = true
-executor_address = "0xC5B79075178866C2B29225AA0c1418464d503a08"
-wrapper_address = "0x8E3E24D1ce0d489141FA7c5C3Ed89fCc246034a8"
+executor_address = "0x9AA152D9b78BF5daF82827D207cc2D04482CA32f"
+wrapper_address = "0xa7bbBa00Ac6776bDF79e55411D28c7Ee09dCA5C1"
 provider_address = "0x794a61358D6845594F94dc1DB02A252b5b4814aD"
 capital_usd = 100.0
 min_profit_usd = 0.00
@@ -40,7 +40,7 @@ flashloan_decimals = 6
 # ======================================================================
 [arbitrage]
 enabled = true
-executor_address = "0xC5B79075178866C2B29225AA0c1418464d503a08"
+executor_address = "0x9AA152D9b78BF5daF82827D207cc2D04482CA32f"
 advanced_filters_enabled = true
 min_profit_threshold_usd = 0.00
 min_profit_percent = "0.0"
@@ -240,7 +240,7 @@ rpc_latency_threshold_ms = 1500
 # ======================================================================
 [wallet]
 private_key = "${PRIVATE_KEY}"
-address = "0x78fE0EA127cE9e07DC872EF3C47A6e1f6e20A472"
+address = "0x152Aa7ecC490860115C4d1369a19C970f9e9eFFf"
 min_balance_eth = "0.5"
 max_gas_price_gwei = 500
 auto_sweep = false
@@ -262,8 +262,8 @@ owners = []
 # ======================================================================
 [wrapper]
 enabled = false
-address = "0x8E3E24D1ce0d489141FA7c5C3Ed89fCc246034a8"
-owner_address = "0x78fE0EA127cE9e07DC872EF3C47A6e1f6e20A472"
+address = "0xa7bbBa00Ac6776bDF79e55411D28c7Ee09dCA5C1"
+owner_address = "0x152Aa7ecC490860115C4d1369a19C970f9e9eFFf"
 executor_allowed = true
 auto_authorize_executor = true
 authorization_check_enabled = true
@@ -272,7 +272,7 @@ contract_type = "FlashloanCaller"
 [mev]
 enabled = false
 relay_urls = ["https://relay.flashbots.net"]
-signer_address = "0x78fE0EA127cE9e07DC872EF3C47A6e1f6e20A472"
+signer_address = "0x152Aa7ecC490860115C4d1369a19C970f9e9eFFf"
 min_tip_matic = "0.00"
 target_block_offset = 0
 timeout_seconds = 8
@@ -283,7 +283,7 @@ validate_bundle_delivery = false
 # EXECUTOR / GAS (CORRIGIDO: "stations" restaurado)
 # ======================================================================
 [executor]
-address = "0xC5B79075178866C2B29225AA0c1418464d503a08"
+address = "0x9AA152D9b78BF5daF82827D207cc2D04482CA32f"
 validate_signature_hash = true
 max_flashloan_premium = 2
 contract_type = "StandardExecutor"

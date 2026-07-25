@@ -843,6 +843,443 @@ impl ArbitrageClient {
     }
 }
 
+// ============================================================================
+// TESTES — src/core/flashloan.rs
+// ----------------------------------------------------------------------------
+// ArbitrageClient usa AppMiddleware concreto (não trait). Os métodos puros
+// abaixo (que não tocam middleware) são testados construindo um client com
+// provider/wallet dummy. Métodos async que chamam middleware/contract não são
+// cobertos aqui (precisariam de fork anvil + RPC real, fora do escopo).
+// ============================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use ethers::providers::{Http, Provider};
+    use ethers::signers::LocalWallet;
+    use std::str::FromStr;
+
+    // Chave de teste hardhat account #0 — bem conhecida, sem valor.
+    const TEST_PK: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+
+    /// Constrói um ArbitrageClient com middleware dummy (RPC localhost).
+    /// Nenhum método testado abaixo realiza chamadas de rede.
+    fn make_client() -> ArbitrageClient {
+        let provider = Provider::<Http>::try_from("http://127.0.0.1:8545")
+            .expect("URL dummy válida");
+        let provider = Arc::new(provider);
+        let wallet = LocalWallet::from_str(TEST_PK).expect("PK teste válida");
+        let middleware = Arc::new(AppMiddleware::new(provider, wallet));
+        let config = Arc::new(Mutex::new(Config::default()));
+        ArbitrageClient::new(Address::zero(), middleware, config, None)
+    }
+
+    /// Helper: constrói um AbiSwapStep com extra_data vazio.
+    fn step(dex: u8, token_in: Address, token_out: Address, amount_out_min: U256) -> AbiSwapStep {
+        AbiSwapStep {
+            dex_type: dex,
+            token_in,
+            token_out,
+            amount_out_min,
+            extra_data: Bytes::new(),
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // calculate_flashloan_fee — 0.09% (9 bps)
+    // ------------------------------------------------------------------------
+    #[test]
+    fn flashloan_fee_is_nine_bps() {
+        let client = make_client();
+        // 1e18 * 9 / 10000 = 9e14 = 900_000_000_000_000
+        let amount = U256::from(10).pow(U256::from(18));
+        let fee = client.calculate_flashloan_fee(amount);
+        assert_eq!(fee, U256::from(900_000_000_000_000u64));
+        // sanity: fee = 0.0009 * amount
+        assert_eq!(fee * U256::from(10000), amount * U256::from(9));
+    }
+
+    #[test]
+    fn flashloan_fee_zero_amount() {
+        let client = make_client();
+        assert_eq!(client.calculate_flashloan_fee(U256::zero()), U256::zero());
+    }
+
+    // ------------------------------------------------------------------------
+    // apply_slippage
+    // ------------------------------------------------------------------------
+    #[test]
+    fn apply_slippage_reduces_by_bps() {
+        let client = make_client();
+        let amount = U256::from(1_000_000);
+        // 50 bps => 995000
+        assert_eq!(client.apply_slippage(amount, 50), U256::from(995_000));
+    }
+
+    #[test]
+    fn apply_slippage_zero_bps_noop() {
+        let client = make_client();
+        let amount = U256::from(1_000_000);
+        assert_eq!(client.apply_slippage(amount, 0), amount);
+    }
+
+    #[test]
+    fn apply_slippage_full_amount_bps() {
+        let client = make_client();
+        // 10000 bps = 100% => 0
+        assert_eq!(client.apply_slippage(U256::from(1_000_000), 10000), U256::zero());
+    }
+
+    // ------------------------------------------------------------------------
+    // token_amount_to_usd
+    // ------------------------------------------------------------------------
+    #[test]
+    fn token_amount_to_usd_6_decimals() {
+        let client = make_client();
+        // 1_000_000 units @ 6 decimals, price $1 => $1.00
+        let usd = client.token_amount_to_usd(U256::from(1_000_000), 1.0, 6);
+        assert!((usd - 1.0).abs() < 1e-9, "usd={usd}");
+    }
+
+    #[test]
+    fn token_amount_to_usd_18_decimals() {
+        let client = make_client();
+        // 1e18 units @ 18 decimals, price $2 => $2.00
+        let amount = U256::from(10).pow(U256::from(18));
+        let usd = client.token_amount_to_usd(amount, 2.0, 18);
+        assert!((usd - 2.0).abs() < 1e-9, "usd={usd}");
+    }
+
+    // ------------------------------------------------------------------------
+    // validate_profit_after_fees
+    // ------------------------------------------------------------------------
+    #[test]
+    fn profit_validation_ok_when_net_positive() {
+        let client = make_client();
+        // flashloan 1000 USDC (6 dec), price $1
+        // profit $5, gas $0.50, fee = 1000 * 0.0009 = $0.90 => net $3.60
+        let res = client.validate_profit_after_fees(
+            5.0,
+            0.50,
+            1.0,
+            U256::from(1_000_000_000), // 1000 * 1e6
+            6,
+        );
+        assert!(res.is_ok(), "deveria aceitar profit positivo: {:?}", res);
+    }
+
+    #[test]
+    fn profit_validation_rejects_net_zero_or_negative() {
+        let client = make_client();
+        // profit $1, gas $0.50, fee $0.90 => net -$0.40
+        let res = client.validate_profit_after_fees(
+            1.0,
+            0.50,
+            1.0,
+            U256::from(1_000_000_000),
+            6,
+        );
+        let err = res.expect_err("deveria rejeitar net negativo");
+        assert!(matches!(err, FlashloanError::InsufficientProfit(_)));
+        assert!(err.to_string().contains("Net profit"));
+    }
+
+    // ------------------------------------------------------------------------
+    // validate_route_consistency
+    // ------------------------------------------------------------------------
+    #[test]
+    fn route_consistency_ok_for_valid_cycle() {
+        let client = make_client();
+        let a = Address::from_low_u64_be(1);
+        let b = Address::from_low_u64_be(2);
+        let steps = vec![
+            step(0, a, b, U256::from(100)),
+            step(0, b, a, U256::from(99)),
+        ];
+        assert!(client.validate_route_consistency(&steps).is_ok());
+    }
+
+    #[test]
+    fn route_consistency_rejects_broken_chain() {
+        let client = make_client();
+        let a = Address::from_low_u64_be(1);
+        let b = Address::from_low_u64_be(2);
+        let c = Address::from_low_u64_be(3);
+        let steps = vec![
+            step(0, a, b, U256::from(100)),
+            // token_in c != prev token_out b
+            step(0, c, a, U256::from(99)),
+        ];
+        let err = client.validate_route_consistency(&steps).expect_err("cadeia quebrada");
+        assert!(matches!(err, FlashloanError::InvalidRoute(_)));
+    }
+
+    #[test]
+    fn route_consistency_rejects_non_cycle() {
+        let client = make_client();
+        let a = Address::from_low_u64_be(1);
+        let b = Address::from_low_u64_be(2);
+        let steps = vec![
+            step(0, a, b, U256::from(100)),
+            step(0, b, a, U256::from(99)),
+        ];
+        // Quebra o ciclo: último token_out != primeiro token_in
+        let mut broken = steps.clone();
+        broken[1].token_out = Address::from_low_u64_be(3);
+        let err = client.validate_route_consistency(&broken).expect_err("não fecha ciclo");
+        assert!(err.to_string().contains("return to initial token"));
+    }
+
+    // ------------------------------------------------------------------------
+    // validate_steps_critical
+    // ------------------------------------------------------------------------
+    #[test]
+    fn steps_critical_rejects_empty() {
+        let client = make_client();
+        let err = client.validate_steps_critical(&[]).expect_err("steps vazios");
+        assert!(matches!(err, FlashloanError::InvalidRoute(_)));
+        assert!(err.to_string().contains("Empty steps"));
+    }
+
+    #[test]
+    fn steps_critical_rejects_zero_amount_out_min() {
+        let client = make_client();
+        let a = Address::from_low_u64_be(1);
+        let b = Address::from_low_u64_be(2);
+        let steps = vec![
+            step(0, a, b, U256::zero()), // amount_out_min zero
+            step(0, b, a, U256::from(99)),
+        ];
+        let err = client.validate_steps_critical(&steps).expect_err("amount_out_min zero");
+        assert!(err.to_string().contains("amount_out_min is zero"));
+    }
+
+    #[test]
+    fn steps_critical_ok_valid_cycle() {
+        let client = make_client();
+        let a = Address::from_low_u64_be(1);
+        let b = Address::from_low_u64_be(2);
+        let steps = vec![
+            step(0, a, b, U256::from(100)),
+            step(0, b, a, U256::from(99)),
+        ];
+        assert!(client.validate_steps_critical(&steps).is_ok());
+    }
+
+    // ------------------------------------------------------------------------
+    // validate_route_complexity
+    // ------------------------------------------------------------------------
+    #[test]
+    fn route_complexity_ok_within_max() {
+        let client = make_client();
+        let cfg = Config::default(); // max_path_length = 3
+        let a = Address::from_low_u64_be(1);
+        let b = Address::from_low_u64_be(2);
+        let steps = vec![
+            step(0, a, b, U256::from(100)),
+            step(0, b, a, U256::from(99)),
+        ];
+        assert!(client.validate_route_complexity(&steps, &cfg).is_ok());
+    }
+
+    #[test]
+    fn route_complexity_rejects_exceeding_max() {
+        let client = make_client();
+        let cfg = Config::default(); // max_path_length = 3
+        let a = Address::from_low_u64_be(1);
+        let b = Address::from_low_u64_be(2);
+        let c = Address::from_low_u64_be(3);
+        let d = Address::from_low_u64_be(4);
+        // 4 steps > max 3
+        let steps = vec![
+            step(0, a, b, U256::from(100)),
+            step(0, b, c, U256::from(99)),
+            step(0, c, d, U256::from(98)),
+            step(0, d, a, U256::from(97)),
+        ];
+        let err = client.validate_route_complexity(&steps, &cfg)
+            .expect_err("excede max hops");
+        assert!(matches!(err, FlashloanError::RouteTooComplex(_)));
+        assert!(err.to_string().contains("exceeds maximum"));
+    }
+
+    // ------------------------------------------------------------------------
+    // validate_wrapper_steps
+    // ------------------------------------------------------------------------
+    #[test]
+    fn wrapper_steps_ok_when_first_and_last_match_asset() {
+        let client = make_client();
+        let asset = Address::from_low_u64_be(1);
+        let b = Address::from_low_u64_be(2);
+        let steps = vec![
+            step(0, asset, b, U256::from(100)),
+            step(0, b, asset, U256::from(99)),
+        ];
+        assert!(client.validate_wrapper_steps(&steps, asset).is_ok());
+    }
+
+    #[test]
+    fn wrapper_steps_rejects_first_mismatch() {
+        let client = make_client();
+        let asset = Address::from_low_u64_be(1);
+        let b = Address::from_low_u64_be(2);
+        let steps = vec![
+            step(0, b, asset, U256::from(99)), // token_in != asset
+        ];
+        let err = client.validate_wrapper_steps(&steps, asset)
+            .expect_err("primeiro step não casa com asset");
+        assert!(err.to_string().contains("First step token_in"));
+    }
+
+    #[test]
+    fn wrapper_steps_rejects_last_mismatch() {
+        let client = make_client();
+        let asset = Address::from_low_u64_be(1);
+        let b = Address::from_low_u64_be(2);
+        let c = Address::from_low_u64_be(3);
+        let steps = vec![
+            step(0, asset, b, U256::from(100)),
+            step(0, b, c, U256::from(99)), // token_out != asset
+        ];
+        let err = client.validate_wrapper_steps(&steps, asset)
+            .expect_err("último step não fecha no asset");
+        assert!(err.to_string().contains("Last step token_out"));
+    }
+
+    #[test]
+    fn wrapper_steps_rejects_empty() {
+        let client = make_client();
+        let asset = Address::from_low_u64_be(1);
+        let err = client.validate_wrapper_steps(&[], asset).expect_err("steps vazios");
+        assert!(err.to_string().contains("Empty steps"));
+    }
+
+    // ------------------------------------------------------------------------
+    // map_dex_type
+    // ------------------------------------------------------------------------
+    #[test]
+    fn map_dex_type_known_dexes() {
+        let client = make_client();
+        assert_eq!(client.map_dex_type("QuickSwap").unwrap(), 0);
+        assert_eq!(client.map_dex_type("SushiSwap").unwrap(), 1);
+        assert_eq!(client.map_dex_type("Uniswap").unwrap(), 2);
+    }
+
+    #[test]
+    fn map_dex_type_normalizes_variants() {
+        let client = make_client();
+        // normalização remove espaços/underscores/v2/v3
+        assert_eq!(client.map_dex_type("Quick Swap").unwrap(), 0);
+        assert_eq!(client.map_dex_type("Quick_Swap").unwrap(), 0);
+        assert_eq!(client.map_dex_type("UniswapV3").unwrap(), 2);
+        assert_eq!(client.map_dex_type("Uniswap V2").unwrap(), 2);
+    }
+
+    #[test]
+    fn map_dex_type_rejects_unknown() {
+        let client = make_client();
+        assert!(client.map_dex_type("CurveFi").is_err());
+        assert!(client.map_dex_type("").is_err());
+    }
+
+    // ------------------------------------------------------------------------
+    // format_route_for_log
+    // ------------------------------------------------------------------------
+    #[test]
+    fn format_route_empty() {
+        let client = make_client();
+        assert_eq!(client.format_route_for_log(&[]), "Empty");
+    }
+
+    #[test]
+    fn format_route_chains_tokens() {
+        let client = make_client();
+        let a = Address::from_low_u64_be(1);
+        let b = Address::from_low_u64_be(2);
+        let steps = vec![
+            step(0, a, b, U256::from(100)),
+            step(0, b, a, U256::from(99)),
+        ];
+        let out = client.format_route_for_log(&steps);
+        assert!(out.contains(format!("{:?}", a).as_str()));
+        assert!(out.contains("→"));
+    }
+
+    // ------------------------------------------------------------------------
+    // decode_revert_reason
+    // ------------------------------------------------------------------------
+    #[test]
+    fn decode_revert_error_string_selector() {
+        let client = make_client();
+        let msg = client.decode_revert_reason("execution reverted: data: 0x08c379a0...");
+        assert_eq!(msg, "Revert: Error(string)");
+    }
+
+    #[test]
+    fn decode_revert_panic_selector() {
+        let client = make_client();
+        let msg = client.decode_revert_reason("execution reverted: data: 0x4e487b71...");
+        assert_eq!(msg, "Revert: Panic(uint256)");
+    }
+
+    #[test]
+    fn decode_revert_unknown_selector() {
+        let client = make_client();
+        let msg = client.decode_revert_reason("execution reverted: data: 0xdeadbeef...");
+        assert!(msg.starts_with("Revert: 0xdeadbeef") || msg.contains("deadbeef"));
+    }
+
+    #[test]
+    fn decode_revert_non_revert_passthrough() {
+        let client = make_client();
+        let msg = client.decode_revert_reason("some other rpc error");
+        assert_eq!(msg, "some other rpc error");
+    }
+
+    // ------------------------------------------------------------------------
+    // apply_complexity_filters — integração das duas validações
+    // ------------------------------------------------------------------------
+    #[test]
+    fn complexity_filters_rejects_broken_route() {
+        let client = make_client();
+        let cfg = Config::default();
+        let a = Address::from_low_u64_be(1);
+        let b = Address::from_low_u64_be(2);
+        let c = Address::from_low_u64_be(3);
+        let steps = vec![
+            step(0, a, b, U256::from(100)),
+            step(0, c, a, U256::from(99)), // cadeia quebrada
+        ];
+        assert!(client.apply_complexity_filters(&steps, &cfg).is_err());
+    }
+
+    #[test]
+    fn complexity_filters_rejects_zero_min_out() {
+        let client = make_client();
+        let cfg = Config::default();
+        let a = Address::from_low_u64_be(1);
+        let b = Address::from_low_u64_be(2);
+        let steps = vec![
+            step(0, a, b, U256::zero()),
+            step(0, b, a, U256::from(99)),
+        ];
+        assert!(client.apply_complexity_filters(&steps, &cfg).is_err());
+    }
+
+    #[test]
+    fn complexity_filters_ok_valid_cycle() {
+        let client = make_client();
+        let cfg = Config::default();
+        let a = Address::from_low_u64_be(1);
+        let b = Address::from_low_u64_be(2);
+        let steps = vec![
+            step(0, a, b, U256::from(100)),
+            step(0, b, a, U256::from(99)),
+        ];
+        assert!(client.apply_complexity_filters(&steps, &cfg).is_ok());
+    }
+}
+
 
 
 

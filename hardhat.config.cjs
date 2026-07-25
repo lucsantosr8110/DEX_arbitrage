@@ -106,58 +106,15 @@ module.exports = {
   },
 
   // ============================================================
-  // 🔍 POLYGONSCAN — suporte direto com variável POLYGONSCAN_API_KEY
+  // 🔍 ETHERSCAN V2 — chave única multi-chain (Polygonscan V2)
+  // ------------------------------------------------------------
+  // Etherscan V2 usa endpoint unificado https://api.etherscan.io/v2
+  // com chainid query param. Uma única apiKey cobre todas as chains
+  // (polygon, amoy, base, arbitrum, mainnet). Substitui o formato v1
+  // per-network (depreciado pela Etherscan em maio/2025).
   // ============================================================
   etherscan: {
-    apiKey: {
-      polygon: POLYGONSCAN_API_KEY, // 👈 Mantém nome antigo
-      amoy: POLYGONSCAN_API_KEY,    // compatível com testnet
-      base: POLYGONSCAN_API_KEY,
-      arbitrum: POLYGONSCAN_API_KEY,
-      mainnet: POLYGONSCAN_API_KEY,
-    },
-    customChains: [
-      {
-        network: "polygon",
-        chainId: 137,
-        urls: {
-          apiURL: "https://api.polygonscan.com/api",
-          browserURL: "https://polygonscan.com",
-        },
-      },
-      {
-        network: "amoy",
-        chainId: 80002,
-        urls: {
-          apiURL: "https://api-amoy.polygonscan.com/api",
-          browserURL: "https://amoy.polygonscan.com",
-        },
-      },
-      {
-        network: "base",
-        chainId: 8453,
-        urls: {
-          apiURL: "https://api.basescan.org/api",
-          browserURL: "https://basescan.org",
-        },
-      },
-      {
-        network: "arbitrum",
-        chainId: 42161,
-        urls: {
-          apiURL: "https://api.arbiscan.io/api",
-          browserURL: "https://arbiscan.io",
-        },
-      },
-      {
-        network: "mainnet",
-        chainId: 1,
-        urls: {
-          apiURL: "https://api.etherscan.io/api",
-          browserURL: "https://etherscan.io",
-        },
-      },
-    ],
+    apiKey: POLYGONSCAN_API_KEY,
   },
 
   // ============================================================
