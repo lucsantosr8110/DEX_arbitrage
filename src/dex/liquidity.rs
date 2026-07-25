@@ -1,6 +1,7 @@
 //! Gate de liquidez on-chain (TVL proxy via ERC20 `balanceOf(pool)`).
 //!
-//! **Fonte única de threshold:** `config.arbitrage.min_liquidity` (USD).
+//! **Threshold efetivo:** máximo entre `config.arbitrage.min_liquidity`, override
+//! do venue e `arbitrage.route_validation.min_liquidity_per_hop` (USD).
 //! A constante morta `MIN_POOL_LIQUIDITY_USD` no radar foi removida — não duplicar.
 //!
 //! **Por que `balanceOf` e não `getReserves`:**
@@ -59,12 +60,25 @@ pub fn min_pool_liquidity_usd(cfg: &Config) -> f64 {
 /// genérico, daí o override por venue. A chave já existia no TOML mas não era
 /// lida — todo venue usava o global.
 pub fn min_pool_liquidity_usd_for_dex(cfg: &Config, dex_name: &str) -> f64 {
-    cfg.dex
+    let dex_threshold = cfg.dex
         .iter()
         .find(|d| d.name.eq_ignore_ascii_case(dex_name))
         .and_then(|d| d.liquidity_threshold_usd)
         .filter(|v| v.is_finite() && *v >= 0.0)
-        .unwrap_or_else(|| min_pool_liquidity_usd(cfg))
+        .unwrap_or_else(|| min_pool_liquidity_usd(cfg));
+
+    // Toda perna precisa passar tanto o threshold do venue/global quanto o
+    // mínimo explícito da validação de rota. Não existe bypass por caminho.
+    let route_threshold = cfg
+        .arbitrage
+        .route_validation
+        .min_liquidity_per_hop
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(0.0);
+
+    dex_threshold.max(route_threshold)
 }
 
 pub fn low_liquidity_discarded_count() -> u64 {

@@ -617,6 +617,10 @@ pub struct FlashloanConfig {
     #[serde(default)] pub minimum_amounts: FlashloanMinimumAmountsConfig,
     #[serde(default)] pub slippage_tolerance_pct: Option<f64>,
 
+    /// Teto de segurança para premium do provedor, em bps. A execução recusa
+    /// config cujo `fee_pct` exceda este valor.
+    #[serde(default)] pub max_premium_bps: Option<u32>,
+
     // NEW: fee percentage charged by flashloan provider (e.g. 0.0009 = 0.09%)
     #[serde(default)] pub fee_pct: Option<f64>,
 }
@@ -647,6 +651,7 @@ impl Default for FlashloanConfig {
             revert_on_negative_profit: Some(true),
             minimum_amounts: FlashloanMinimumAmountsConfig::default(),
             slippage_tolerance_pct: Some(0.5),
+            max_premium_bps: Some(10),
             fee_pct: Some(0.0005),
         }
     }
@@ -960,6 +965,42 @@ impl Default for ArbitrageCrossDexConfig {
     }
 }
 
+/// Guardas executáveis da rota. Aplicadas no gate de liquidez e imediatamente
+/// antes de simulação/envio.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct RouteValidationConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_route_max_hops")]
+    pub max_hops: u32,
+    #[serde(default)]
+    pub min_liquidity_per_hop: String,
+    #[serde(default)]
+    pub reject_high_slippage_routes: bool,
+    /// Percentual para rota inteira; ex.: `1.2` = 120 bps.
+    #[serde(default = "default_route_max_cumulative_slippage")]
+    pub max_cumulative_slippage: f64,
+    #[serde(default)]
+    pub block_same_dex_consecutive: bool,
+}
+
+fn default_true() -> bool { true }
+fn default_route_max_hops() -> u32 { 3 }
+fn default_route_max_cumulative_slippage() -> f64 { 2.0 }
+
+impl Default for RouteValidationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_hops: default_route_max_hops(),
+            min_liquidity_per_hop: "0".into(),
+            reject_high_slippage_routes: true,
+            max_cumulative_slippage: default_route_max_cumulative_slippage(),
+            block_same_dex_consecutive: false,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ArbitrageConfig {
     pub enabled: bool,
@@ -982,6 +1023,7 @@ pub struct ArbitrageConfig {
     pub min_volume_24h: String,
     pub triangular: ArbitrageTriangularConfig,
     pub cross_dex: ArbitrageCrossDexConfig,
+    #[serde(default)] pub route_validation: RouteValidationConfig,
     #[serde(default)] pub deduplication: ArbitrageDeduplicationConfig,
 }
 
@@ -1008,6 +1050,7 @@ impl Default for ArbitrageConfig {
             min_volume_24h: "10000.0".to_string(),
             triangular: ArbitrageTriangularConfig::default(),
             cross_dex: ArbitrageCrossDexConfig::default(),
+            route_validation: RouteValidationConfig::default(),
             deduplication: ArbitrageDeduplicationConfig::default(),
         }
     }
@@ -2133,6 +2176,7 @@ impl Config {
         };
         let mut new_cfg: Config = toml::from_str(&expanded)
             .context("failed to parse new TOML on reload")?;
+        report_ignored_keys(&expanded, &new_cfg, path);
 
         for (symbol, addr_str) in &new_cfg.pairs.tokens {
             if let Ok(addr) = addr_str.parse::<Address>() {
@@ -2160,6 +2204,7 @@ impl Config {
         };
         let mut new_cfg: Config = toml::from_str(&expanded)
             .context("failed to parse new TOML on reload")?;
+        report_ignored_keys(&expanded, &new_cfg, path.as_ref());
 
         for (symbol, addr_str) in &new_cfg.pairs.tokens {
             if let Ok(addr) = addr_str.parse::<Address>() {
@@ -2335,5 +2380,18 @@ mod config_parser_tests {
                 .any(|k| k.contains("liquidity_threshold_usd")),
             "não pode mais ser ignorada"
         );
+    }
+
+    #[test]
+    fn shipped_configs_have_no_ignored_keys() {
+        for (name, raw) in [
+            ("config.toml", include_str!("../../config/config.toml")),
+            ("config.dryrun.toml", include_str!("../../config/config.dryrun.toml")),
+            ("config.midtier.toml", include_str!("../../config/config.midtier.toml")),
+        ] {
+            let cfg: Config = toml::from_str(raw).expect(name);
+            let ignored = Config::ignored_toml_keys(raw, &cfg);
+            assert!(ignored.is_empty(), "{name} has ignored keys: {ignored:?}");
+        }
     }
 }

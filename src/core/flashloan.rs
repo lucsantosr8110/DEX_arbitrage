@@ -311,7 +311,12 @@ impl ArbitrageClient {
 
     /// CORREÇÃO: Valida complexidade sem bloquear arbitragem triangular
     fn validate_route_complexity(&self, steps: &[AbiSwapStep], config: &Config) -> Result<(), FlashloanError> {
-        let max_hops_allowed = config.arbitrage.max_path_length as usize;
+        let route = &config.arbitrage.route_validation;
+        let max_hops_allowed = if route.enabled {
+            config.arbitrage.max_path_length.min(route.max_hops.max(1)) as usize
+        } else {
+            config.arbitrage.max_path_length as usize
+        };
         
         // CORREÇÃO: Permitir até 4 hops para arbitragem triangular
         if steps.len() > max_hops_allowed {
@@ -320,7 +325,40 @@ impl ArbitrageClient {
             return Err(FlashloanError::RouteTooComplex(reason));
         }
         
-        // CORREÇÃO: Removida validação que bloqueia ciclos - arbitragem triangular é cíclica por natureza
+        if route.enabled && route.block_same_dex_consecutive {
+            for pair in steps.windows(2) {
+                if pair[0].dex_type == pair[1].dex_type {
+                    let reason = "consecutive hops on same DEX are blocked".to_string();
+                    self.log_route_rejection(steps, &reason);
+                    return Err(FlashloanError::InvalidRoute(reason));
+                }
+            }
+        }
+
+        if route.enabled && route.reject_high_slippage_routes {
+            // `amount_out_min` recebe no engine, no máximo, max_slippage_bps
+            // mais o incremento configurado por hop. Validar este pior caso
+            // impede que alteração de config abra margem além da rota inteira.
+            let hops = steps.len() as u64;
+            let base = config.execution.max_slippage_bps as u64;
+            let increment = config.execution.hop_slippage_increase_bps as u64;
+            let worst_cumulative_bps = hops
+                .saturating_mul(base)
+                .saturating_add(hops.saturating_sub(1).saturating_mul(hops) / 2 * increment);
+            let configured_limit_bps = (route.max_cumulative_slippage * 100.0).floor();
+            if !configured_limit_bps.is_finite()
+                || configured_limit_bps < 0.0
+                || worst_cumulative_bps > configured_limit_bps as u64
+            {
+                let reason = format!(
+                    "worst cumulative slippage {} bps exceeds route limit {:.0} bps",
+                    worst_cumulative_bps, configured_limit_bps
+                );
+                self.log_route_rejection(steps, &reason);
+                return Err(FlashloanError::SlippageTooHigh(reason));
+            }
+        }
+
         Ok(())
     }
 
@@ -389,7 +427,7 @@ impl ArbitrageClient {
         // NOTE: update_execution_block() era chamado AQUI (antes da execução),
         // o que faria debounce_same_block() sempre retornar true se fosse
         // implementado. Movido para após TX confirmada em send_and_confirm_transaction.
-        let (strategy, min_profit, risk_cfg, slippage_bps, flashloan_decimals, fee_pct) = {
+        let (strategy, min_profit, risk_cfg, slippage_bps, flashloan_decimals, fee_pct, max_premium_bps) = {
             let cfg = self.config.lock().await;
 
             (
@@ -403,8 +441,23 @@ impl ArbitrageClient {
     cfg.flashloan.flashloan_decimals.unwrap_or(6) as u32,
     // Mesma fonte do engine (`recalculate_profitability`); default 5 bps Aave V3.
     cfg.flashloan.fee_pct.unwrap_or(economics::AAVE_V3_PREMIUM_PCT),
+    cfg.flashloan.max_premium_bps,
 )
         };
+
+        let configured_premium_bps = (fee_pct * 10_000.0).round();
+        if !configured_premium_bps.is_finite()
+            || configured_premium_bps < 0.0
+            || max_premium_bps
+                .map(|limit| configured_premium_bps > limit as f64)
+                .unwrap_or(false)
+        {
+            warn!(
+                "Flashloan skip: fee_pct={} exceeds max_premium_bps={:?}",
+                fee_pct, max_premium_bps
+            );
+            return Ok(BundleResult::skipped().with_execution_mode("premium_cap"));
+        }
 
         // GAS - Estimativa atualizada
         let gas_cost = match self.gas_estimator.estimate_arbitrage_gas_usd().await {
@@ -1868,6 +1921,33 @@ mod tests {
             step(0, b, a, U256::from(99)),
         ];
         assert!(client.apply_complexity_filters(&steps, &cfg).is_ok());
+    }
+
+    #[test]
+    fn route_validation_enforces_hop_and_slippage_caps() {
+        let client = make_client();
+        let a = Address::from_low_u64_be(1);
+        let b = Address::from_low_u64_be(2);
+        let c = Address::from_low_u64_be(3);
+        let three_hops = vec![
+            step(0, a, b, U256::from(100)),
+            step(1, b, c, U256::from(99)),
+            step(2, c, a, U256::from(98)),
+        ];
+
+        let mut cfg = Config::default();
+        cfg.arbitrage.route_validation.max_hops = 2;
+        assert!(client.apply_complexity_filters(&three_hops, &cfg).is_err());
+
+        let two_hops = vec![
+            step(0, a, b, U256::from(100)),
+            step(1, b, a, U256::from(99)),
+        ];
+        cfg.arbitrage.route_validation.max_hops = 3;
+        cfg.arbitrage.route_validation.max_cumulative_slippage = 0.5;
+        cfg.execution.max_slippage_bps = 50;
+        cfg.execution.hop_slippage_increase_bps = 0;
+        assert!(client.apply_complexity_filters(&two_hops, &cfg).is_err());
     }
 }
 
