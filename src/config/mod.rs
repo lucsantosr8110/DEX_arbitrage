@@ -504,7 +504,7 @@ impl Default for FlashloanConfig {
             revert_on_negative_profit: Some(true),
             minimum_amounts: FlashloanMinimumAmountsConfig::default(),
             slippage_tolerance_pct: Some(0.5),
-            fee_pct: Some(0.0009),
+            fee_pct: Some(0.0005),
         }
     }
 }

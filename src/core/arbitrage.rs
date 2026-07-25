@@ -377,6 +377,7 @@ impl ArbitrageEngine {
                 // Propagar overrides se existirem (compatível com struct nova)
                 dex_fee_bps: s.dex_fee_bps,
                 price_impact_bps: s.price_impact_bps,
+                v3_fee_tier: s.v3_fee_tier,
             })
             .collect()
     }
@@ -1317,63 +1318,40 @@ impl ArbitrageEngine {
         }
     }
 
-    /// Cálculo realista de amount_out considerando fees e price impact vindos do Config (BPS)
-    /// e/ou overrides por step (se existirem).
+    /// Output esperado a partir de rate fee-inclusive do quoter.
+    /// NÃO reaplica fee AMM nem price-impact — o rate já os embute.
+    fn expected_output_from_fee_inclusive_rate(
+        amount_in: U256,
+        rate: f64,
+        input_decimals: u32,
+        output_decimals: u32,
+    ) -> U256 {
+        if amount_in.is_zero() || !rate.is_finite() || rate <= 0.0 {
+            return U256::zero();
+        }
+        let amount_f64 = u256_to_f64(amount_in, input_decimals);
+        f64_to_u256(amount_f64 * rate, output_decimals)
+    }
+
+    /// Cálculo de amount_out esperado. Rates do quoter/router já são fee-inclusive;
+    /// overrides de fee/impact BPS são ignorados aqui (legado da assinatura).
     async fn calculate_expected_output_with_fees(
         &self,
         amount_in: U256,
         rate: f64,
         input_decimals: u32,
         output_decimals: u32,
-        dex_name: &str,
-        app_config: &Config,
-        dex_fee_bps_override: Option<u32>,
-        price_impact_bps_override: Option<u32>,
+        _dex_name: &str,
+        _app_config: &Config,
+        _dex_fee_bps_override: Option<u32>,
+        _price_impact_bps_override: Option<u32>,
     ) -> U256 {
-        if amount_in.is_zero() || !rate.is_finite() || rate <= 0.0 {
-            return U256::zero();
-        }
-
-        // Ler fee e price impact do Config (BPS), com override por step se existir
-        let default_fee_bps = app_config.execution.default_dex_fee_bps;
-        let default_impact_bps = app_config.execution.default_price_impact_bps;
-
-        let dex_fee_bps = dex_fee_bps_override.unwrap_or_else(|| {
-            app_config
-                .execution
-                .dex_fee_bps_map
-                .get(dex_name)
-                .cloned()
-                .unwrap_or(default_fee_bps)
-        });
-
-        let price_impact_bps = price_impact_bps_override.unwrap_or_else(|| {
-            app_config
-                .execution
-                .dex_price_impact_bps_map
-                .get(dex_name)
-                .cloned()
-                .unwrap_or(default_impact_bps)
-        });
-
-        // Aplicar fee em aritmética inteira
-        let bps_base = U256::from(10_000u64);
-        let fee = U256::from(dex_fee_bps as u64);
-        let amount_after_fee = amount_in.saturating_mul(bps_base.saturating_sub(fee)) / bps_base;
-
-        // Para aplicar o rate (float) convert to f64 (usando decimals)
-        let after_fee_f64 = u256_to_f64(amount_after_fee, input_decimals);
-
-        // Aplicar rate
-        let mut expected_output_f64 = after_fee_f64 * rate;
-
-        // Aplicar price impact (bps -> factor)
-        let impact_factor =
-            (10_000u64.saturating_sub(price_impact_bps as u64)) as f64 / 10_000.0;
-        expected_output_f64 *= impact_factor;
-
-        // Converter para U256 com decimals de output
-        f64_to_u256(expected_output_f64, output_decimals)
+        Self::expected_output_from_fee_inclusive_rate(
+            amount_in,
+            rate,
+            input_decimals,
+            output_decimals,
+        )
     }
 
     /// Versão simples que delega para a versão com fees usando placeholder dex (se necessário)
@@ -1468,6 +1446,12 @@ impl ArbitrageEngine {
 
     #[inline]
     fn create_step(dex: &str, token_in: &str, token_out: &str, rate: f64) -> ArbitrageStep {
+        let v3_fee_tier = if dex.eq_ignore_ascii_case("UniswapV3") {
+            // Mesma fonte do quote: FEE_TIER_CACHE via fee_cache_key
+            crate::dex::cached_fee_tier("UniswapV3", token_in, token_out)
+        } else {
+            None
+        };
         ArbitrageStep {
             dex_name: dex.to_string(),
             dex_address: "0x0000000000000000000000000000000000000000".to_string(),
@@ -1475,9 +1459,9 @@ impl ArbitrageEngine {
             token_out: token_out.to_string(),
             amount_out_min: U256::zero(),
             expected_rate: rate,
-            // defaults (nenhum override por step)
             dex_fee_bps: None,
             price_impact_bps: None,
+            v3_fee_tier,
         }
     }
 
@@ -1919,6 +1903,35 @@ mod tests {
             id.starts_with("usdt_arb_"),
             "ID deveria começar com 'usdt_arb_', obtido: {}",
             id
+        );
+    }
+
+    /// A6: rate fee-inclusive → expected_out == amount_in * rate (sem re-fee).
+    #[test]
+    fn expected_out_equals_amount_times_fee_inclusive_rate() {
+        // 100 USDT (6 dec) * rate 2.0 = 200 token_out (6 dec)
+        let amount_in = U256::from(100_000_000u64);
+        let rate = 2.0_f64;
+        let out = ArbitrageEngine::expected_output_from_fee_inclusive_rate(amount_in, rate, 6, 6);
+        assert_eq!(out, U256::from(200_000_000u64));
+    }
+
+    /// A6: slippage+safety aplicados UMA vez; min não é duplamente descontado.
+    #[test]
+    fn amount_out_min_slippage_applied_once() {
+        let expected = U256::from(1_000_000u64);
+        let slip_bps = 50u32;
+        let safety = 9800u32;
+        let once = ArbitrageEngine::apply_slippage_safe(expected, slip_bps, safety);
+        // Segunda aplicação (bug antigo no flashloan) seria mais baixa:
+        let twice = ArbitrageEngine::apply_slippage_safe(once, slip_bps, safety);
+        assert!(once > twice, "dupla slip reduz demais: once={once} twice={twice}");
+        // expected * 0.995 * 0.98 = expected * 0.9751
+        let expected_f = 1_000_000.0 * (1.0 - 0.005) * 0.98;
+        let once_f = once.as_u128() as f64;
+        assert!(
+            (once_f - expected_f).abs() < 2.0,
+            "once={once_f} expected≈{expected_f}"
         );
     }
 

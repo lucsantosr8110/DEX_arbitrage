@@ -22,6 +22,12 @@ pub struct ArbitrageStep {
     /// Opcional: price impact estimado para esse step em BPS (base 10000). Se None, usar default do Config.
     #[serde(default)]
     pub price_impact_bps: Option<u32>,
+
+    /// Fee tier Uniswap V3 (`uint24` nativo: 500/3000/10000). Preenchido do
+    /// `FEE_TIER_CACHE` (mesma `fee_cache_key` do radar). `None` em V2/Curve
+    /// ou se o cache missar — execução V3 deve abortar, não defaultar 3000.
+    #[serde(default)]
+    pub v3_fee_tier: Option<u32>,
 }
 
 // Container serializável

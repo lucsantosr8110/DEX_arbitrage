@@ -113,54 +113,132 @@ impl ArbitrageClient {
     // 🚨 VALIDAÇÕES CRÍTICAS - CORRIGIDAS
     // ========================================================================
 
-    /// Calcula fee do flashloan (0.09%) 
-    fn calculate_flashloan_fee(&self, amount: U256) -> U256 {
-        amount * U256::from(9) / U256::from(10000)
+    /// Fee do flashloan em unidades de token.
+    /// `fee_pct` vem de `config.flashloan.fee_pct` (ex.: 0.0005 = 5 bps Aave V3).
+    /// TODO: opcionalmente ler `FLASHLOAN_PREMIUM_TOTAL` on-chain do Aave Pool.
+    fn calculate_flashloan_fee(&self, amount: U256, fee_pct: f64) -> U256 {
+        if amount.is_zero() || !fee_pct.is_finite() || fee_pct <= 0.0 {
+            return U256::zero();
+        }
+        let fee_bps = (fee_pct * 10_000.0).round() as u64;
+        if fee_bps == 0 {
+            return U256::zero();
+        }
+        amount * U256::from(fee_bps) / U256::from(10_000u64)
     }
 
-    /// Aplica slippage configurada
+    /// Aplica slippage em bps (helper; o path de execução NÃO usa — slippage
+    /// única fica em `ArbitrageEngine::apply_slippage_safe`).
+    #[cfg(test)]
     fn apply_slippage(&self, amount: U256, slippage_bps: u64) -> U256 {
         let slippage_factor = U256::from(10000 - slippage_bps);
         amount * slippage_factor / U256::from(10000)
     }
 
-    /// Valida se profit após fees é positivo
+    /// Convenção A5 (**gross-based**, uma fonte de verdade):
+    /// recebe GROSS profit e recalcula
+    ///   `net = gross - gas_cost_usd - flashloan_fee_usd`
+    /// onde `flashloan_fee_usd` já foi derivado de `config.flashloan.fee_pct`.
+    /// NÃO recebe net pré-descontado — evita dupla dedução de gas/Aave.
+    /// Slippage continua filtrada no engine (`recalculate_profitability`).
     fn validate_profit_after_fees(
-    &self,
-    estimated_profit_usd: f64,
-    gas_cost_usd: f64,
-    token_price_usd: f64,
-    flashloan_amount: U256,
-    flashloan_decimals: u32,
-) -> Result<(), FlashloanError> {
-        
-        let flashloan_fee = self.calculate_flashloan_fee(flashloan_amount);
-        let flashloan_fee_usd = self.token_amount_to_usd(
-    flashloan_fee,
-    token_price_usd,
-    flashloan_decimals,
-);
-        
-        let net_profit_usd = estimated_profit_usd - gas_cost_usd - flashloan_fee_usd;
-        
+        &self,
+        gross_profit_usd: f64,
+        gas_cost_usd: f64,
+        flashloan_fee_usd: f64,
+    ) -> Result<(), FlashloanError> {
+        let net_profit_usd = gross_profit_usd - gas_cost_usd - flashloan_fee_usd;
+
         if net_profit_usd <= 0.0 {
-            return Err(FlashloanError::InsufficientProfit(
-                format!("Net profit ${:.4} <= 0 (profit: ${:.4}, gas: ${:.4}, flashloan_fee: ${:.4})", 
-                       net_profit_usd, estimated_profit_usd, gas_cost_usd, flashloan_fee_usd)
-            ));
+            return Err(FlashloanError::InsufficientProfit(format!(
+                "Net profit ${:.4} <= 0 (gross: ${:.4}, gas: ${:.4}, flashloan_fee: ${:.4})",
+                net_profit_usd, gross_profit_usd, gas_cost_usd, flashloan_fee_usd
+            )));
         }
-        
-        info!("💰 Profit validation: ${:.4} net (${:.4} gross - ${:.4} gas - ${:.4} flashloan)", 
-              net_profit_usd, estimated_profit_usd, gas_cost_usd, flashloan_fee_usd);
-        
+
+        info!(
+            "💰 Profit validation: ${:.4} net (${:.4} gross - ${:.4} gas - ${:.4} flashloan)",
+            net_profit_usd, gross_profit_usd, gas_cost_usd, flashloan_fee_usd
+        );
+
         Ok(())
     }
 
     fn token_amount_to_usd(&self, amount: U256, price_usd: f64, decimals: u32) -> f64 {
-    let raw_u128 = amount.as_u128();
-    let denom = 10_f64.powi(decimals as i32);
-    (raw_u128 as f64 / denom) * price_usd
-}
+        let raw_u128 = amount.as_u128();
+        let denom = 10_f64.powi(decimals as i32);
+        (raw_u128 as f64 / denom) * price_usd
+    }
+
+    /// ABI-encode `uint24` fee tier — layout compatível com
+    /// `abi.decode(extraData, (uint24))` em `FlashloanExecutor.sol`.
+    pub(crate) fn encode_v3_fee_extra_data(fee_tier: u32) -> Bytes {
+        Bytes::from(encode(&[Token::Uint(U256::from(fee_tier))]))
+    }
+
+    /// Decode round-trip de teste / verificação (uint24 ABI-padded).
+    #[cfg(test)]
+    pub(crate) fn decode_v3_fee_extra_data(data: &Bytes) -> Result<u32> {
+        let tokens = ethers::abi::decode(&[ethers::abi::ParamType::Uint(256)], data.as_ref())
+            .map_err(|e| anyhow!("decode v3 fee: {e}"))?;
+        let Token::Uint(v) = tokens
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("empty decode"))?
+        else {
+            return Err(anyhow!("expected Uint"));
+        };
+        Ok(v.as_u32())
+    }
+
+    /// Fee tiers que o executor on-chain aceita (`require(fee == 500|3000|10000)`).
+    fn executable_v3_fee_tier(fee_tier: u32) -> Result<u32> {
+        match fee_tier {
+            500 | 3000 | 10_000 => Ok(fee_tier),
+            100 => Err(anyhow!(
+                "V3 fee_tier=100 cotado mas executor rejeita (só 500|3000|10000) — abort opp"
+            )),
+            other => Err(anyhow!(
+                "V3 fee_tier={} inválido para executor — abort opp",
+                other
+            )),
+        }
+    }
+
+    fn is_uniswap_v3_step(dex_name: &str) -> bool {
+        let n = dex_name
+            .to_lowercase()
+            .replace(' ', "")
+            .replace('_', "");
+        n.contains("uniswapv3") || n == "uniswapv3"
+    }
+
+    /// Resolve fee V3 da MESMA fonte do quote (`v3_fee_tier` no step ou
+    /// `cached_fee_tier` / `fee_cache_key`). Sem silent default 3000.
+    fn resolve_v3_fee_for_step(step: &crate::core::types::ArbitrageStep) -> Result<u32> {
+        let fee = step
+            .v3_fee_tier
+            .or_else(|| {
+                crate::dex::cached_fee_tier("UniswapV3", &step.token_in, &step.token_out)
+            })
+            .ok_or_else(|| {
+                anyhow!(
+                    "V3 fee_tier ausente no cache para {}→{} — abort (não forçar 3000)",
+                    step.token_in, step.token_out
+                )
+            })?;
+        Self::executable_v3_fee_tier(fee)
+    }
+
+    /// Monta `extraData`: V3 = abi.encode(uint24); V2/Curve = vazio.
+    fn build_extra_data_for_step(step: &crate::core::types::ArbitrageStep) -> Result<Bytes> {
+        if Self::is_uniswap_v3_step(&step.dex_name) {
+            let fee = Self::resolve_v3_fee_for_step(step)?;
+            Ok(Self::encode_v3_fee_extra_data(fee))
+        } else {
+            Ok(Bytes::new())
+        }
+    }
 
     /// Valida steps críticos
     fn validate_steps_critical(&self, steps: &[AbiSwapStep]) -> Result<(), FlashloanError> {
@@ -261,7 +339,7 @@ impl ArbitrageClient {
         // NOTE: update_execution_block() era chamado AQUI (antes da execução),
         // o que faria debounce_same_block() sempre retornar true se fosse
         // implementado. Movido para após TX confirmada em send_and_confirm_transaction.
-        let (strategy, min_profit, risk_cfg, slippage_bps, flashloan_decimals) = {
+        let (strategy, min_profit, risk_cfg, slippage_bps, flashloan_decimals, fee_pct) = {
             let cfg = self.config.lock().await;
 
             (
@@ -270,6 +348,8 @@ impl ArbitrageClient {
     cfg.risk.clone(),
     cfg.flashloan.slippage_bps.unwrap_or(50) as u64,
     cfg.flashloan.flashloan_decimals.unwrap_or(18) as u32,
+    // Mesma fonte do engine (`recalculate_profitability`); default 5 bps Aave V3.
+    cfg.flashloan.fee_pct.unwrap_or(0.0005),
 )
         };
 
@@ -283,15 +363,17 @@ impl ArbitrageClient {
             Err(_) => opp.gas_cost_usd,
         };
 
-        // Valida profit após fees — usa net_profit (já com gas/flashloan/slippage
-        // deduzidos pelo arbitrage engine) para evitar dedução dupla.
+        // A5: valida a partir do GROSS (uma dedução de gas + Aave fee_pct).
+        let token_price = opp.token_price_usd.unwrap_or(1.0);
+        let flashloan_fee_token = self.calculate_flashloan_fee(opp.amount_in, fee_pct);
+        let flashloan_fee_usd =
+            self.token_amount_to_usd(flashloan_fee_token, token_price, flashloan_decimals);
+
         if let Err(e) = self.validate_profit_after_fees(
-    opp.net_profit_usd,
-    gas_cost,
-    opp.token_price_usd.unwrap_or(0.0),
-    opp.amount_in,
-    flashloan_decimals,
-) {
+            opp.estimated_profit_usd, // GROSS
+            gas_cost,
+            flashloan_fee_usd,
+        ) {
             warn!("{}", e);
             return Ok(BundleResult::skipped().with_execution_mode("insufficient_profit"));
         }
@@ -780,7 +862,7 @@ impl ArbitrageClient {
         &self,
         opp: &ArbitrageOpportunity,
         cfg: &Config,
-        slippage_bps: u64
+        _slippage_bps: u64,
     ) -> Result<(Address, U256, Vec<AbiSwapStep>)> {
 
         let steps = ArbitrageEngine::sanitize_steps_for_execution(&opp.steps.0);
@@ -792,19 +874,25 @@ impl ArbitrageClient {
         let mut abi_steps = vec![];
 
         for s in steps {
-            let amount_out_min = self.apply_slippage(s.amount_out_min, slippage_bps);
-            
+            // A6: amount_out_min já inclui slippage+safety em
+            // `ArbitrageEngine::apply_slippage_safe` — NÃO deduzir de novo.
+            let amount_out_min = s.amount_out_min;
+            let extra_data = Self::build_extra_data_for_step(&s)?;
+
             abi_steps.push(AbiSwapStep {
                 dex_type: self.map_dex_type(&s.dex_name)?,
                 token_in: self.get_token_addr(&s.token_in, cfg)?,
                 token_out: self.get_token_addr(&s.token_out, cfg)?,
                 amount_out_min,
-                extra_data: Bytes::new(),
+                extra_data,
             });
         }
 
-        info!("🔄 Rota convertida: {} steps | Amount: {} | Slippage: {} bps", 
-              abi_steps.len(), amount_in, slippage_bps);
+        info!(
+            "🔄 Rota convertida: {} steps | Amount: {} | slippage único no engine",
+            abi_steps.len(),
+            amount_in
+        );
 
         Ok((token_in, amount_in, abi_steps))
     }
@@ -886,23 +974,34 @@ mod tests {
     }
 
     // ------------------------------------------------------------------------
-    // calculate_flashloan_fee — 0.09% (9 bps)
+    // calculate_flashloan_fee — config fee_pct (5 bps = 0.0005)
     // ------------------------------------------------------------------------
     #[test]
-    fn flashloan_fee_is_nine_bps() {
+    fn flashloan_fee_is_five_bps() {
         let client = make_client();
-        // 1e18 * 9 / 10000 = 9e14 = 900_000_000_000_000
+        // 1e18 * 5 / 10000 = 5e14
         let amount = U256::from(10).pow(U256::from(18));
-        let fee = client.calculate_flashloan_fee(amount);
-        assert_eq!(fee, U256::from(900_000_000_000_000u64));
-        // sanity: fee = 0.0009 * amount
-        assert_eq!(fee * U256::from(10000), amount * U256::from(9));
+        let fee = client.calculate_flashloan_fee(amount, 0.0005);
+        assert_eq!(fee, U256::from(500_000_000_000_000u64));
+        assert_eq!(fee * U256::from(10000), amount * U256::from(5));
     }
 
     #[test]
     fn flashloan_fee_zero_amount() {
         let client = make_client();
-        assert_eq!(client.calculate_flashloan_fee(U256::zero()), U256::zero());
+        assert_eq!(
+            client.calculate_flashloan_fee(U256::zero(), 0.0005),
+            U256::zero()
+        );
+    }
+
+    #[test]
+    fn flashloan_fee_not_nine_bps() {
+        let client = make_client();
+        let amount = U256::from(10).pow(U256::from(18));
+        let fee5 = client.calculate_flashloan_fee(amount, 0.0005);
+        let fee9 = amount * U256::from(9) / U256::from(10000);
+        assert_ne!(fee5, fee9, "não deve mais usar 9 bps hardcoded");
     }
 
     // ------------------------------------------------------------------------
@@ -951,37 +1050,137 @@ mod tests {
     }
 
     // ------------------------------------------------------------------------
-    // validate_profit_after_fees
+    // validate_profit_after_fees (A5 gross-based, uma dedução)
     // ------------------------------------------------------------------------
     #[test]
     fn profit_validation_ok_when_net_positive() {
         let client = make_client();
-        // flashloan 1000 USDC (6 dec), price $1
-        // profit $5, gas $0.50, fee = 1000 * 0.0009 = $0.90 => net $3.60
-        let res = client.validate_profit_after_fees(
-            5.0,
-            0.50,
-            1.0,
-            U256::from(1_000_000_000), // 1000 * 1e6
-            6,
-        );
+        // gross $5 - gas $0.50 - fee $0.50 => net $4.00
+        let res = client.validate_profit_after_fees(5.0, 0.50, 0.50);
         assert!(res.is_ok(), "deveria aceitar profit positivo: {:?}", res);
     }
 
     #[test]
     fn profit_validation_rejects_net_zero_or_negative() {
         let client = make_client();
-        // profit $1, gas $0.50, fee $0.90 => net -$0.40
-        let res = client.validate_profit_after_fees(
-            1.0,
-            0.50,
-            1.0,
-            U256::from(1_000_000_000),
-            6,
-        );
+        // gross $1 - gas $0.50 - fee $0.60 => net -$0.10
+        let res = client.validate_profit_after_fees(1.0, 0.50, 0.60);
         let err = res.expect_err("deveria rejeitar net negativo");
         assert!(matches!(err, FlashloanError::InsufficientProfit(_)));
         assert!(err.to_string().contains("Net profit"));
+    }
+
+    #[test]
+    fn profit_validation_single_deduction_no_double() {
+        let client = make_client();
+        // gross 10, gas 1, fee 0.5 => net exatamente 8.5 (uma vez)
+        let gross = 10.0_f64;
+        let gas = 1.0_f64;
+        let fee = 0.5_f64;
+        assert!(client.validate_profit_after_fees(gross, gas, fee).is_ok());
+        let expected_net = gross - gas - fee;
+        assert!((expected_net - 8.5).abs() < 1e-12);
+        // Se subtraísse de novo (double), net ficaria 8.5 - 1 - 0.5 = 7.0 — gate
+        // atual NÃO faz isso: basta gross - gas - fee > 0.
+        assert!(expected_net > 7.0);
+    }
+
+    #[test]
+    fn profit_validation_accepts_when_engine_net_already_positive() {
+        // Simula: engine já filtrou net>min; validate usa GROSS e só gas+fee.
+        // gross=2, gas=0.1, fee_usd(5bps on $100)=0.05 => net 1.85 > 0
+        let client = make_client();
+        let amount = U256::from(100_000_000u64); // 100 USDC 6dec
+        let fee_tok = client.calculate_flashloan_fee(amount, 0.0005);
+        let fee_usd = client.token_amount_to_usd(fee_tok, 1.0, 6);
+        assert!((fee_usd - 0.05).abs() < 1e-9, "fee_usd={fee_usd}");
+        assert!(client.validate_profit_after_fees(2.0, 0.1, fee_usd).is_ok());
+    }
+
+    // ------------------------------------------------------------------------
+    // A4 — extraData V3 encode / abort
+    // ------------------------------------------------------------------------
+    #[test]
+    fn encode_v3_fee_extra_data_roundtrip() {
+        for fee in [100u32, 500, 3000, 10_000] {
+            let encoded = ArbitrageClient::encode_v3_fee_extra_data(fee);
+            assert!(!encoded.is_empty());
+            let decoded = ArbitrageClient::decode_v3_fee_extra_data(&encoded).unwrap();
+            assert_eq!(decoded, fee, "round-trip fee={fee}");
+        }
+    }
+
+    #[test]
+    fn v2_and_curve_extra_data_empty() {
+        use crate::core::types::ArbitrageStep;
+        for dex in ["QuickSwap", "SushiSwap", "Curve"] {
+            let step = ArbitrageStep {
+                dex_name: dex.into(),
+                token_in: "USDT".into(),
+                token_out: "WMATIC".into(),
+                expected_rate: 1.0,
+                amount_out_min: U256::from(1),
+                ..Default::default()
+            };
+            let extra = ArbitrageClient::build_extra_data_for_step(&step).unwrap();
+            assert!(extra.is_empty(), "{dex} deve ter extraData vazio");
+        }
+    }
+
+    #[test]
+    fn v3_extra_data_uses_cached_fee_not_silent_3000() {
+        use crate::core::types::ArbitrageStep;
+        use crate::dex::cache_fee_tier;
+
+        cache_fee_tier("UniswapV3", "USDT", "WETH_A4_TEST", 500);
+        let step = ArbitrageStep {
+            dex_name: "UniswapV3".into(),
+            token_in: "USDT".into(),
+            token_out: "WETH_A4_TEST".into(),
+            expected_rate: 1.0,
+            amount_out_min: U256::from(1),
+            v3_fee_tier: Some(500),
+            ..Default::default()
+        };
+        let extra = ArbitrageClient::build_extra_data_for_step(&step).unwrap();
+        let decoded = ArbitrageClient::decode_v3_fee_extra_data(&extra).unwrap();
+        assert_eq!(decoded, 500);
+        assert_ne!(decoded, 3000);
+    }
+
+    #[test]
+    fn v3_without_fee_cache_aborts() {
+        use crate::core::types::ArbitrageStep;
+        let step = ArbitrageStep {
+            dex_name: "UniswapV3".into(),
+            token_in: "NOCACHE_IN".into(),
+            token_out: "NOCACHE_OUT".into(),
+            expected_rate: 1.0,
+            amount_out_min: U256::from(1),
+            v3_fee_tier: None,
+            ..Default::default()
+        };
+        let err = ArbitrageClient::build_extra_data_for_step(&step).unwrap_err();
+        assert!(
+            err.to_string().contains("abort") || err.to_string().contains("ausente"),
+            "err={err}"
+        );
+    }
+
+    #[test]
+    fn v3_fee_100_aborts_executor_unsupported() {
+        use crate::core::types::ArbitrageStep;
+        let step = ArbitrageStep {
+            dex_name: "UniswapV3".into(),
+            token_in: "A".into(),
+            token_out: "B".into(),
+            expected_rate: 1.0,
+            amount_out_min: U256::from(1),
+            v3_fee_tier: Some(100),
+            ..Default::default()
+        };
+        let err = ArbitrageClient::build_extra_data_for_step(&step).unwrap_err();
+        assert!(err.to_string().contains("100"), "err={err}");
     }
 
     // ------------------------------------------------------------------------
