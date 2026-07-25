@@ -470,7 +470,7 @@ impl ArbitrageClient {
 
         if simulate {
             info!("🔬 Simulando Flashloan...");
-            match self.simulate_transaction(&call).await {
+            match self.simulate_bool_transaction(&call).await {
                 Ok(_) => info!("✅ Simulação Flashloan: Sucesso"),
                 Err(e) => {
                     warn!("❌ Simulação Flashloan falhou: {}", e);
@@ -623,6 +623,36 @@ impl ArbitrageClient {
     ) -> Result<()> {
         match timeout(Duration::from_secs(10), call.call()).await {
             Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => {
+                let error_msg = self.decode_revert_reason(&e.to_string());
+                Err(anyhow!("Simulation failed: {}", error_msg))
+            },
+            Err(_) => Err(anyhow!("Simulation timeout")),
+        }
+    }
+    /// Simulacao especializada para chamadas que retornam bool.
+    ///
+    /// O contrato FlashloanExecutor.executeFlashloan() usa try/catch e retorna
+    /// false em vez de reverter quando o flashloan falha. A simulacao generica
+    /// (simulate_transaction) descarta o valor de retorno (Ok(Ok(_))), tratando
+    /// false como sucesso - falso positivo garantido.
+    ///
+    /// Este metodo inspeciona o bool: false = falha de iniciacao do flashloan.
+    ///
+    /// Limitacao: o callback executeOperation ainda engole falhas da arbitragem
+    /// interna e retorna true. Ou seja, true aqui significa "flashloan iniciou",
+    /// nao "arbitragem lucrou". Para validar a executabilidade completa seria
+    /// necessario mudar o contrato para reverter ou simular _executeArbitrage
+    /// diretamente. Ver ESTADO_ATUAL.md secao 4.3.
+    async fn simulate_bool_transaction(
+        &self,
+        call: &ContractCall<AppMiddleware, bool>,
+    ) -> Result<()> {
+        match timeout(Duration::from_secs(10), call.call()).await {
+            Ok(Ok(true)) => Ok(()),
+            Ok(Ok(false)) => Err(anyhow!(
+                "Simulation failed: contract returned false (flashloan initiation failed)"
+            )),
             Ok(Err(e)) => {
                 let error_msg = self.decode_revert_reason(&e.to_string());
                 Err(anyhow!("Simulation failed: {}", error_msg))

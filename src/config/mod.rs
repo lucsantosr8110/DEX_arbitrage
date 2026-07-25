@@ -1069,7 +1069,7 @@ impl Default for ExecutionConfig {
             default_price_impact_bps: 50,       // 0.50%
             dex_fee_bps_map: HashMap::new(),
             dex_price_impact_bps_map: HashMap::new(),
-            hop_slippage_increase_bps: 2000,    // +20.00% expressed as BPS-like convention used in logic
+            hop_slippage_increase_bps: 5,       // 5 bps = 0.05% por hop adicional
             safety_margin_bps: 9800,            // 98% safety (BPS-like)
             estimate_base_gas_usd: 0.02,
         }

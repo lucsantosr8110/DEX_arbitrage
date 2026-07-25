@@ -132,7 +132,7 @@ slippage_tolerance_pct = 0.40
 default_dex_fee_bps = 30
 default_price_impact_bps = 25
 hop_slippage_increase_bps = 5
-safety_margin_bps = 10
+safety_margin_bps = 9800  # 98% — CRÍTICO: valor < 5000 permite slippage catastrófico
 estimate_base_gas_usd = 0.008
 
 [execution.simulation]
@@ -224,9 +224,9 @@ rpc_endpoints = [
     "https://1rpc.io/matic",
 ]
 ws_endpoints = [
-    "wss://polygon-mainnet.g.alchemy.com/v2/r8SpWPMM1DNvjU87Th6DPenaowGNyzQs",
-    "wss://polygon-mainnet.infura.io/ws/v3/5d875274a90a490e9f873e0f97c46c10",
+    "${ALCHEMY_WSS_URL}",
     "wss://polygon-bor-rpc.publicnode.com",
+    "wss://polygon.drpc.org",
 ]
 timeout_ms = 5000
 max_reorg_depth = 64
@@ -263,7 +263,11 @@ owners = []
 # WRAPPER & MEV
 # ======================================================================
 [wrapper]
-enabled = true
+# DESABILITADO: FlashloanCaller.executor() aponta para 0xc9bF35C5 (executor antigo),
+# diferente do configurado em flashloan.executor_address (0xC5B79075). Usar flashloan
+# direto é mais simples e um hop a menos. Para reativar: chamar updateExecutor no
+# contrato ou alinhar o endereço. Ver ESTADO_ATUAL.md seção 4.2.
+enabled = false
 address = "0x8E3E24D1ce0d489141FA7c5C3Ed89fCc246034a8"
 owner_address = "0x78fE0EA127cE9e07DC872EF3C47A6e1f6e20A472"
 executor_allowed = true

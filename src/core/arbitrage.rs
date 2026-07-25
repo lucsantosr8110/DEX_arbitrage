@@ -15,6 +15,7 @@ use std::{
     str::FromStr,
     sync::Arc,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
 use tracing::{debug, info, instrument, warn};
 
@@ -26,8 +27,23 @@ const SANITIZED_PLACEHOLDER: &str = "QuickSwap";
 const TARGET_BASE_TOKEN: &str = "USDT";
 const MIN_TRADE_AMOUNT_USD: f64 = 0.5;
 const MAX_TRADE_AMOUNT_USD: f64 = 100.0;
+/// Limite máximo para trades com flashloan (separado do limite manual).
+/// Flashloans permitem operar com capital emprestado, então o limite pode ser maior.
+const MAX_TRADE_AMOUNT_FLASHLOAN_USD: f64 = 10_000.0;
 const MAX_REALISTIC_SPREAD: f64 = 100.0;
 const MAX_REALISTIC_PROFIT_RATIO: f64 = 0.50;
+
+/// Contador atômico global para gerar IDs únicos de oportunidades.
+/// Evita colisões quando múltiplas oportunidades são criadas no mesmo milissegundo.
+static OPP_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Gera um ID único combinando timestamp + contador atômico.
+#[inline]
+fn next_opp_id(prefix: &str) -> String {
+    let ts = Utc::now().timestamp_millis();
+    let seq = OPP_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{}_{}_{}", prefix, ts, seq)
+}
 
 /// Taxas de swap por DEX (em fração, ex: 0.003 = 0.3%).
 /// V2 pools (QuickSwap, SushiSwap) cobram 0.3%.
@@ -418,6 +434,32 @@ impl ArbitrageEngine {
         let direct_generic = self.find_direct_async(price_map, app_config).await;
         all_opportunities.extend(direct_generic);
 
+        // 🔄 Deduplicação por (pair, buy_dex, sell_dex) — find_direct_with_usdt e
+        // find_direct_async podem produzir as mesmas oportunidades para pares USDT.
+        let before_dedup = all_opportunities.len();
+        all_opportunities.sort_by(|a, b| {
+            b.spread_percent
+                .partial_cmp(&a.spread_percent)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut seen: HashSet<(String, String, String)> = HashSet::new();
+        all_opportunities.retain(|opp| {
+            let key = (opp.pair.clone(), opp.buy_dex.clone(), opp.sell_dex.clone());
+            if seen.contains(&key) {
+                return false;
+            }
+            seen.insert(key);
+            true
+        });
+        if before_dedup != all_opportunities.len() {
+            info!(
+                "📊 Deduplicação: {} → {} (removidas {} duplicadas)",
+                before_dedup,
+                all_opportunities.len(),
+                before_dedup - all_opportunities.len()
+            );
+        }
+
         info!("📊 Oportunidades iniciais: {} (pairs={})", all_opportunities.len(), total_pairs);
 
         all_opportunities.retain(|opp| opp.spread_percent >= min_spread_pct);
@@ -671,7 +713,7 @@ impl ArbitrageEngine {
             return None;
         }
 
-        let opportunity_id = format!("usdt_arb_{}", Utc::now().timestamp_millis());
+        let opportunity_id = next_opp_id("usdt_arb");
         let steps_sanitized = Self::sanitize_steps_for_execution(&steps);
 
         let mut opp = ArbitrageOpportunity {
@@ -971,12 +1013,10 @@ impl ArbitrageEngine {
                     continue;
                 }
 
-                // Fórmula cross-DEX com fees:
-                // amount_out = amount_in × rate_ab × (1 - fee_buy) × rate_ba × (1 - fee_sell)
-                // cycle_rate inclui o impacto das fees de AMBOS os DEXes
-                let fee_buy = Self::dex_fee(buy_dex, pair);
-                let fee_sell = Self::dex_fee(sell_dex, &reverse_pair);
-                let cycle_rate = rate_ab * (1.0 - fee_buy) * rate_ba * (1.0 - fee_sell);
+                // ✅ CORRIGIDO: Rates vindas de getAmountsOut (V2) / quoteExactInputSingle (V3)
+                // JÁ incluem fee e price impact. Aplicar (1-fee) novamente seria dedução dupla.
+                // cycle_rate = rate_ab × rate_ba (ambos já com fee embutida)
+                let cycle_rate = rate_ab * rate_ba;
                 let spread_pct = (cycle_rate - 1.0) * 100.0;
 
                 if spread_pct > MAX_REALISTIC_SPREAD || spread_pct <= min_spread {
@@ -1014,7 +1054,7 @@ impl ArbitrageEngine {
         let trade_amount_usd = self.calculate_safe_trade_amount(app_config);
 
         Some(ArbitrageOpportunity {
-            id: format!("direct_arb_{}", Utc::now().timestamp_millis()),
+            id: next_opp_id("direct_arb"),
             pair: format!("{}-{}", token_a, token_b),
             buy_dex,
             sell_dex,
@@ -1161,7 +1201,7 @@ impl ArbitrageEngine {
         ];
 
         let steps_sanitized = Self::sanitize_steps_for_execution(&steps);
-        let opportunity_id = format!("usdt_tri_{}", Utc::now().timestamp_millis());
+        let opportunity_id = next_opp_id("usdt_tri");
 
         let trade_amount_usd = self.calculate_safe_trade_amount(app_config);
 
@@ -1208,17 +1248,20 @@ impl ArbitrageEngine {
 
     #[inline]
     fn calculate_safe_trade_amount(&self, app_config: &Config) -> f64 {
-        let base_amount = if app_config.flashloan.enabled {
-            app_config.flashloan.capital_usd
+        let (base_amount, max_amount) = if app_config.flashloan.enabled {
+            (app_config.flashloan.capital_usd, MAX_TRADE_AMOUNT_FLASHLOAN_USD)
         } else {
-            app_config
-                .arbitrage
-                .default_trade_amount
-                .parse::<f64>()
-                .unwrap_or(1.0)
+            (
+                app_config
+                    .arbitrage
+                    .default_trade_amount
+                    .parse::<f64>()
+                    .unwrap_or(1.0),
+                MAX_TRADE_AMOUNT_USD,
+            )
         };
 
-        base_amount.clamp(MIN_TRADE_AMOUNT_USD, MAX_TRADE_AMOUNT_USD)
+        base_amount.clamp(MIN_TRADE_AMOUNT_USD, max_amount)
     }
 
     #[inline]
@@ -1231,10 +1274,27 @@ impl ArbitrageEngine {
     }
 
     /// Slippage seguro com aritmética inteira (U256).
+    ///
+    /// ⚠️ `safety_margin_bps` é interpretado como "manter X bps" (ex: 9800 = 98%).
+    /// Valores < 5000 (50%) são quase certamente erro de configuração e seriam
+    /// catastróficos — amount_out_min aceitaria < 50% do esperado, permitindo
+    /// sandwich/MEV drenar a transação. Por segurança, clamp para mínimo de 9500 (95%).
     fn apply_slippage_safe(amount: U256, slippage_bps: u32, safety_margin_bps: u32) -> U256 {
+        // 🛡️ Validação defensiva: safety_margin_bps representa "manter X bps do output"
+        // Valores baixos (ex: 10) significam aceitar 0.1% do output — catastrófico.
+        // Clamp para 9500 (95%) como piso absoluto de segurança.
+        if safety_margin_bps < 5000 {
+            warn!(
+                "🚨 safety_margin_bps={} é PERIGOSAMENTE baixo (< 5000 = 50%). Aplicando clamp para 9500 (95%). \
+                 Verifique config.toml [execution] safety_margin_bps — deve ser ~9800 (98%).",
+                safety_margin_bps
+            );
+        }
+        let safe_margin = safety_margin_bps.max(9500);
+
         let bps = U256::from(10_000u64);
         let sl_bps = U256::from(slippage_bps as u64);
-        let safety_bps = U256::from(safety_margin_bps as u64);
+        let safety_bps = U256::from(safe_margin as u64);
 
         // final = amount * (bps - slippage_bps) * safety_margin_bps / (bps * bps)
         let numer = amount
@@ -1358,6 +1418,13 @@ impl ArbitrageEngine {
                         return step.expected_rate;
                     }
                 }
+                // ⚠️ Logar em warn: oportunidade descartada por falta de taxa USDT direta.
+                // Antes era silencioso (só debug), dificultando auditoria de oportunidades perdidas.
+                warn!(
+                    "⚠️ estimate_usdt_rate: sem conversão direta USDT↔{} nos steps (is_input={}). \
+                     Oportunidade será rejeitada por preço inválido.",
+                    token, is_input
+                );
                 0.0
             }
         }
@@ -1479,54 +1546,53 @@ mod tests {
     /// Cenário real da auditoria:
     /// - SushiSwap USDT-WMATIC: 12.64 (compra barata)
     /// - UniswapV3 WMATIC-USDT: 0.0770 (vende caro)
-    /// - Fees: 0.3% cada DEX
     ///
-    /// Cálculo manual:
-    ///   amount_out = 100 × 12.64 × (1-0.003) × 0.0770 × (1-0.003)
-    ///             = 100 × 12.64 × 0.997 × 0.0770 × 0.997
-    ///             = 100 × 12.60108 × 0.0770 × 0.997
-    ///             = 100 × 0.970283 × 0.997
-    ///             = 96.737
-    ///   cycle_rate = 96.737 / 100 = 0.96737
-    ///   spread = (0.96737 - 1.0) × 100 = -3.26% (loss)
+    /// ✅ CORRIGIDO (v7): Rates dos DEX adapters (getAmountsOut/Quoter) JÁ incluem fee.
+    /// O engine NÃO aplica (1-fee) novamente. cycle_rate = rate_ab × rate_ba.
+    ///
+    /// Cálculo manual (sem double-fee):
+    ///   cycle_rate = 12.64 × 0.0770 = 0.97328
+    ///   spread = (0.97328 - 1.0) × 100 = -2.67% (loss)
     #[test]
     fn cross_dex_math_with_fees_usdt_wmatic() {
-        let rate_ab = 12.64; // USDT→WMATIC no SushiSwap (compra barata)
-        let rate_ba = 0.0770; // WMATIC→USDT no UniswapV3 (vende caro)
-        let fee_buy = 0.003; // 0.3% V2
-        let fee_sell = 0.003; // 0.3% V3 default
+        let rate_ab = 12.64; // USDT→WMATIC no SushiSwap (JÁ com fee embutida)
+        let rate_ba = 0.0770; // WMATIC→USDT no UniswapV3 (JÁ com fee embutida)
 
-        let cycle_rate = rate_ab * (1.0 - fee_buy) * rate_ba * (1.0 - fee_sell);
-
-        // Verificar que o cycle_rate está correto
-        let expected: f64 = 12.64 * 0.997 * 0.0770 * 0.997;
-        assert!((cycle_rate - expected).abs() < 1e-10,
-            "cycle_rate {} difere do esperado {}", cycle_rate, expected);
+        // ✅ CORRETO: rates já incluem fee, NÃO aplicar (1-fee) novamente
+        let cycle_rate = rate_ab * rate_ba;
 
         // Verificar que é loss (mercado eficiente)
         assert!(cycle_rate < 1.0,
             "cycle_rate {} deveria ser < 1.0 (loss)", cycle_rate);
 
-        // Verificar que sem fees seria profit
-        let cycle_rate_no_fees = rate_ab * rate_ba;
-        assert!(cycle_rate_no_fees < 1.0,
-            "mesmo sem fees, cycle_rate {} deveria ser < 1.0", cycle_rate_no_fees);
+        // Verificar valor esperado
+        let expected: f64 = 12.64 * 0.0770;
+        assert!((cycle_rate - expected).abs() < 1e-10,
+            "cycle_rate {} difere do esperado {}", cycle_rate, expected);
+
+        // Double-fee seria MENOR que o correto — prova que double-fee é bug
+        let fee = 0.003;
+        let cycle_rate_double_fee = rate_ab * (1.0 - fee) * rate_ba * (1.0 - fee);
+        assert!(cycle_rate > cycle_rate_double_fee,
+            "cycle_rate sem double-fee {} deveria ser > com double-fee {}", cycle_rate, cycle_rate_double_fee);
     }
 
     /// Testa cenário hipotético onde há profit real cross-DEX.
     ///
-    /// Se SushiSwap tivesse USDT-WMATIC = 13.50 (compra barata)
-    /// e UniswapV3 tivesse WMATIC-USDT = 0.0800 (vende caro):
-    ///   cycle_rate = 13.50 × 0.997 × 0.0800 × 0.997 = 1.0733
-    ///   spread = +7.33% (profit!)
+    /// ✅ CORRIGIDO (v7): Rates já incluem fee (getAmountsOut/Quoter).
+    /// cycle_rate = rate_ab × rate_ba (sem double-fee).
+    ///
+    /// Se SushiSwap tivesse USDT-WMATIC = 13.50 (compra barata, já com fee)
+    /// e UniswapV3 tivesse WMATIC-USDT = 0.0800 (vende caro, já com fee):
+    ///   cycle_rate = 13.50 × 0.0800 = 1.08
+    ///   spread = +8.0% (profit!)
     #[test]
     fn cross_dex_math_with_fees_profit_scenario() {
-        let rate_ab = 13.50; // USDT→WMATIC mais barato
-        let rate_ba = 0.0800; // WMATIC→USDT mais caro
-        let fee_buy = 0.003;
-        let fee_sell = 0.003;
+        let rate_ab = 13.50; // USDT→WMATIC (JÁ com fee embutida)
+        let rate_ba = 0.0800; // WMATIC→USDT (JÁ com fee embutida)
 
-        let cycle_rate = rate_ab * (1.0 - fee_buy) * rate_ba * (1.0 - fee_sell);
+        // ✅ CORRETO: rates já incluem fee
+        let cycle_rate = rate_ab * rate_ba;
 
         // Deveria ser profit
         assert!(cycle_rate > 1.0,
@@ -1706,32 +1772,34 @@ mod tests {
 
     /// Valida fórmula completa do cycle_rate com cenário real.
     ///
-    /// Cenário: USDT-WMATIC cross-DEX
-    /// - QuickSwap USDT→WMATIC: 7.14 (compra barata)
-    /// - SushiSwap WMATIC→USDT: 0.14 (vende caro)
-    /// - Fees: 0.3% cada DEX
+    /// ✅ CORRIGIDO (v7): Rates dos DEX adapters JÁ incluem fee.
+    /// cycle_rate = rate_ab × rate_ba (sem double-fee).
     ///
-    /// cycle_rate = 7.14 × 0.997 × 0.14 × 0.997 = 0.9936
-    /// spread = (0.9936 - 1.0) × 100 = -0.64% (loss)
+    /// Cenário: USDT-WMATIC cross-DEX
+    /// - QuickSwap USDT→WMATIC: 7.14 (JÁ com fee embutida via getAmountsOut)
+    /// - SushiSwap WMATIC→USDT: 0.14 (JÁ com fee embutida via getAmountsOut)
+    ///
+    /// cycle_rate = 7.14 × 0.14 = 0.9996
+    /// spread = (0.9996 - 1.0) × 100 = -0.04% (loss mínimo)
     #[test]
     fn cycle_rate_formula_validation() {
-        let rate_ab: f64 = 7.14;
-        let rate_ba: f64 = 0.14;
-        let fee: f64 = 0.003;
+        let rate_ab: f64 = 7.14;  // já inclui fee
+        let rate_ba: f64 = 0.14;  // já inclui fee
 
-        let cycle_rate: f64 = rate_ab * (1.0 - fee) * rate_ba * (1.0 - fee);
+        // ✅ CORRETO: rates já incluem fee, não aplicar (1-fee) novamente
+        let cycle_rate: f64 = rate_ab * rate_ba;
         let spread_pct: f64 = (cycle_rate - 1.0) * 100.0;
 
         // Verificar fórmula
-        let expected: f64 = 7.14 * 0.997 * 0.14 * 0.997;
+        let expected: f64 = 7.14 * 0.14;
         assert!((cycle_rate - expected).abs() < 1e-10,
             "cycle_rate {} difere do esperado {}", cycle_rate, expected);
 
-        // Verificar que é loss
-        assert!(cycle_rate < 1.0,
-            "cycle_rate {} deveria ser < 1.0", cycle_rate);
-        assert!(spread_pct < 0.0,
-            "spread {}% deveria ser negativo", spread_pct);
+        // Verificar que é loss (round-trrip no mesmo par cross-DEX sem spread)
+        assert!(cycle_rate <= 1.0,
+            "cycle_rate {} deveria ser <= 1.0 (round-trip)", cycle_rate);
+        assert!(spread_pct <= 0.0,
+            "spread {}% deveria ser <= 0", spread_pct);
 
         // Verificar que spread está em range razoável
         assert!(spread_pct > -2.0,

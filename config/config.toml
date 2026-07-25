@@ -130,7 +130,7 @@ slippage_tolerance_pct = 0.40
 default_dex_fee_bps = 30
 default_price_impact_bps = 25
 hop_slippage_increase_bps = 5
-safety_margin_bps = 10
+safety_margin_bps = 9800  # 98pct - CRITICO: valor < 5000 permite slippage catastrofico
 estimate_base_gas_usd = 0.008
 
 [execution.simulation]
@@ -261,7 +261,7 @@ owners = []
 # WRAPPER & MEV
 # ======================================================================
 [wrapper]
-enabled = true
+enabled = false
 address = "0x8E3E24D1ce0d489141FA7c5C3Ed89fCc246034a8"
 owner_address = "0x78fE0EA127cE9e07DC872EF3C47A6e1f6e20A472"
 executor_allowed = true
@@ -657,4 +657,4 @@ SUSHI  = { symbol = "SUSHI", decimals = 18 }
 GRT    = { symbol = "GRT", decimals = 18 }
 SAND   = { symbol = "SAND", decimals = 18 }
 MANA   = { symbol = "MANA", decimals = 18 }
-LDO    = { symbol = "LDO", decimals = 18 }
+LDO    = { symbol = "LDO", decimals = 18 }
