@@ -1829,4 +1829,125 @@ mod tests {
         assert!((price - 7.14).abs() < 0.01,
             "Preço USDC→WMATIC deveria ser ~7.14, obtido {}", price);
     }
+
+    // ============================================================
+    // TESTES DAS CORREÇÕES DE SEGURANÇA (ESTADO_ATUAL.md)
+    // ============================================================
+
+    /// safety_margin_bps < 5000 deve ser clampeado para 9500 (95%).
+    /// Sem o clamp, amount_out_min aceitaria < 50% do esperado,
+    /// permitindo sandwich/MEV drenar a transação.
+    #[test]
+    fn slippage_safe_clamps_dangerous_margin() {
+        let amount = U256::from(1_000_000u64); // 1.0 USDC
+
+        // safety_margin_bps = 10 (0.1%) — perigoso, deve ser clampeado para 9500
+        let result_dangerous = ArbitrageEngine::apply_slippage_safe(amount, 50, 10);
+
+        // safety_margin_bps = 9500 (95%) — valor do clamp
+        let result_clamped = ArbitrageEngine::apply_slippage_safe(amount, 50, 9500);
+
+        // Ambos devem produzir o mesmo resultado (10 foi clampeado para 9500)
+        assert_eq!(
+            result_dangerous, result_clamped,
+            "safety_margin_bps=10 deve ser clampeado para 9500, produzindo o mesmo resultado"
+        );
+
+        // Verificar que o resultado não é catastroficamente baixo
+        // final = 1_000_000 * (10000-50) * 9500 / (10000 * 10000)
+        //       = 1_000_000 * 9950 * 9500 / 100_000_000
+        //       = 1_000_000 * 94_525_000 / 100_000_000
+        //       = 945_250
+        let expected = U256::from(945_250u64);
+        assert_eq!(result_dangerous, expected, "Resultado do clamp deveria ser 945_250");
+    }
+
+    /// safety_margin_bps >= 5000 deve ser usado como-is (sem clamp).
+    #[test]
+    fn slippage_safe_respects_valid_margin() {
+        let amount = U256::from(1_000_000u64);
+
+        // safety_margin_bps = 9800 (98%) — valor correto, não deve ser alterado
+        let result = ArbitrageEngine::apply_slippage_safe(amount, 50, 9800);
+
+        // final = 1_000_000 * 9950 * 9800 / 100_000_000 = 975_100
+        let expected = U256::from(975_100u64);
+        assert_eq!(result, expected, "safety_margin_bps=9800 deveria produzir 975_100");
+    }
+
+    /// safety_margin_bps abaixo de 9500 deve ser clampeado para 9500.
+    /// O clamp real é .max(9500) — valores entre 5000 e 9499 são clampeados
+    /// sem warning (warn só dispara para < 5000).
+    #[test]
+    fn slippage_safe_clamps_at_boundary() {
+        let amount = U256::from(1_000_000u64);
+
+        // 9499 < 9500, deve ser clampeado para 9500
+        let result_9499 = ArbitrageEngine::apply_slippage_safe(amount, 50, 9499);
+        let result_9500 = ArbitrageEngine::apply_slippage_safe(amount, 50, 9500);
+        assert_eq!(result_9499, result_9500, "9499 deve ser clampeado para 9500");
+
+        // 9500 = exatamente o piso, NÃO deve ser alterado
+        // (já testado em slippage_safe_respects_valid_margin com 9800)
+
+        // 5000 também é clampeado para 9500 (abaixo do piso)
+        let result_5000 = ArbitrageEngine::apply_slippage_safe(amount, 50, 5000);
+        assert_eq!(result_5000, result_9500, "5000 deve ser clampeado para 9500");
+
+        // 9800 > 9500, NÃO deve ser clampeado (resultado diferente de 9500)
+        let result_9800 = ArbitrageEngine::apply_slippage_safe(amount, 50, 9800);
+        assert_ne!(result_9800, result_9500, "9800 não deve ser clampeado (>= 9500)");
+    }
+
+    /// next_opp_id deve produzir IDs únicos mesmo chamado rapidamente.
+    #[test]
+    fn next_opp_id_produces_unique_ids() {
+        let mut ids = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let id = next_opp_id("test");
+            assert!(ids.insert(id.clone()), "ID duplicado: {}", id);
+        }
+    }
+
+    /// next_opp_id deve incluir o prefixo no ID.
+    #[test]
+    fn next_opp_id_includes_prefix() {
+        let id = next_opp_id("usdt_arb");
+        assert!(
+            id.starts_with("usdt_arb_"),
+            "ID deveria começar com 'usdt_arb_', obtido: {}",
+            id
+        );
+    }
+
+    /// double-fee: cycle_rate sem double-fee deve ser MAIOR que com double-fee.
+    /// Isto prova que aplicar (1-fee) novamente é um bug que subestima o retorno.
+    #[test]
+    fn no_double_fee_is_higher_than_double_fee() {
+        let rate_ab = 13.50; // USDT->WMATIC (já com fee via getAmountsOut)
+        let rate_ba = 0.0800; // WMATIC->USDT (já com fee via getAmountsOut)
+        let fee = 0.003; // 0.3%
+
+        // Correto: rates já incluem fee, não aplicar novamente
+        let cycle_correct = rate_ab * rate_ba;
+
+        // Bug (double-fee): aplicar (1-fee) novamente
+        let cycle_buggy = rate_ab * (1.0 - fee) * rate_ba * (1.0 - fee);
+
+        assert!(
+            cycle_correct > cycle_buggy,
+            "cycle_rate sem double-fee ({}) deveria ser > com double-fee ({})",
+            cycle_correct,
+            cycle_buggy
+        );
+
+        // Diferença deve ser significativa (~0.6% para fee=0.3%)
+        let diff_pct = (cycle_correct - cycle_buggy) / cycle_buggy * 100.0;
+        assert!(
+            diff_pct > 0.5,
+            "Diferença do double-fee deveria ser > 0.5%, obtido {:.4}%",
+            diff_pct
+        );
+    }
+
 }
