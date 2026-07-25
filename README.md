@@ -75,16 +75,25 @@ RUST_LOG=info
 BOT_JSON_LOGS=false
 BOT_NETWORK_NAME=polygon
 BOT_NETWORK_CHAIN_ID=137
+
+# RPC: se BOT_RPC_ENDPOINTS estiver ausente, o bot usa [network].rpc_endpoints
+# do config.toml (placeholders ${ALCHEMY_RPC_URL} são expandidos automaticamente).
 BOT_RPC_ENDPOINTS=https://polygon-mainnet.g.alchemy.com/v2/SUA_API_KEY
-BOT_WS_ENDPOINTS=wss://polygon-mainnet.g.alchemy.com/v2/SUA_API_KEY
-RPC_POLYGON_URL=https://polygon-mainnet.g.alchemy.com/v2/SUA_API_KEY
+ALCHEMY_RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/SUA_API_KEY
+ALCHEMY_WS_URL=wss://polygon-mainnet.g.alchemy.com/v2/SUA_API_KEY
+
 PRIVATE_KEY=sua_chave_privada_aqui
 EXECUTOR_ADDRESS=0x0000000000000000000000000000000000000000
-WRAPPER_ADDRESS=0x0000000000000000000000000000000000000000
 TELEGRAM_TOKEN=seu_bot_token_aqui
 TELEGRAM_CHAT_ID=seu_chat_id_aqui
 POLYGONSCAN_API_KEY=sua_api_key_do_scan
 ```
+
+> **Nota:** `WRAPPER_ADDRESS` foi removido — o wrapper está desabilitado (executor
+> errado no FlashloanCaller). O bot usa flashloan direto. Ver `ESTADO_ATUAL.md` §4.2.
+>
+> **Dry run:** copie `.env.dryrun.example` para `.env` e use
+> `CONFIG_PATH=config/config.dryrun.toml` para rodar sem enviar transações.
 
 ### 3. Compilar Contratos Solidity
 
