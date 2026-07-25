@@ -462,6 +462,47 @@ impl DexManager {
         Ok(prices)
     }
 
+    /// Referência ao config (threshold de liquidez, etc.).
+    pub fn config_ref(&self) -> &Config {
+        self.config.as_ref()
+    }
+
+    /// Gate de liquidez: TVL proxy via `balanceOf(pool)` multicall.
+    /// Descarta pares abaixo de `min_usd` (`arbitrage.min_liquidity`).
+    pub async fn filter_prices_by_liquidity(
+        &self,
+        adapter_name: &str,
+        prices: Vec<crate::dex::TokenPairPrice>,
+        min_usd: f64,
+    ) -> Result<Vec<crate::dex::TokenPairPrice>> {
+        let adapters = self.active_adapters.read().await;
+        let adapter = adapters
+            .iter()
+            .find(|a| a.name() == adapter_name)
+            .cloned();
+        drop(adapters);
+
+        let Some(adapter) = adapter else {
+            return Ok(prices);
+        };
+
+        let client = self.client.clone();
+        let token_cache = self.token_cache.clone();
+        let ad = adapter.clone();
+
+        crate::dex::liquidity::filter_token_prices_by_liquidity(
+            client,
+            &token_cache,
+            prices,
+            min_usd,
+            move |_dex, a, b, fee| {
+                let ad = ad.clone();
+                async move { ad.get_pool_address_for_liquidity(a, b, fee).await }
+            },
+        )
+        .await
+    }
+
     // ✅ Método auxiliar para fallback
     async fn get_prices_fallback(
         &self,

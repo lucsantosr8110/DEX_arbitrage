@@ -577,7 +577,7 @@ impl PaperAggregate {
         let fee100_discarded = crate::dex::fee100_best_discarded_count();
         info!(
             target: "paper_validation",
-            "📊 PAPER SUMMARY | n={} would_execute={} reverts={} falsos_lucrativos={} erro_rel% mean={:?} p50={:?} p95={:?} | fee100_best_discarded={}",
+            "📊 PAPER SUMMARY | n={} would_execute={} reverts={} falsos_lucrativos={} erro_rel% mean={:?} p50={:?} p95={:?} | fee100_best_discarded={} low_liquidity_discarded={}",
             self.n_amostras,
             self.n_would_execute,
             self.n_reverts,
@@ -586,6 +586,7 @@ impl PaperAggregate {
             self.erro_rel_pct_p50,
             self.erro_rel_pct_p95,
             fee100_discarded,
+            crate::dex::liquidity::low_liquidity_discarded_count(),
         );
     }
 }

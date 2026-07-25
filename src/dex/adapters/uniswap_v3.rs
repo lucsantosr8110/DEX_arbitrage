@@ -21,6 +21,8 @@ use crate::{
         addresses, // Importando endereços de Factory/Quoter
         cache_fee_tier,
         select_executable_v3_best_out,
+        is_executable_v3_fee_tier,
+        EXECUTABLE_V3_FEE_TIERS,
         QUOTE_V3_FEE_TIERS,
     },
     AppMiddleware,
@@ -394,6 +396,46 @@ impl DexContract for UniswapV3Dex {
 
         debug!("- [{}] Nenhum Pool encontrado na Factory V3 para {:?} / {:?}", DEX_NAME, token_a, token_b);
         Ok(None)
+    }
+
+    /// Gate de liquidez: pool do fee cotado (executável), não o primeiro fee-100 raso.
+    async fn get_pool_address_for_liquidity(
+        &self,
+        token_a: Address,
+        token_b: Address,
+        fee_hint: u32,
+    ) -> Result<Option<Address>> {
+        let abi: Abi = serde_json::from_str(UNISWAP_V3_FACTORY_ABI)
+            .map_err(|e| anyhow!("Falha ao parsear ABI da Factory V3: {}", e))?;
+        let factory_contract = Contract::new(self.factory, abi, self.client.clone());
+
+        let mut fees: Vec<u32> = Vec::with_capacity(EXECUTABLE_V3_FEE_TIERS.len() + 1);
+        if is_executable_v3_fee_tier(fee_hint) {
+            fees.push(fee_hint);
+        }
+        for &f in &EXECUTABLE_V3_FEE_TIERS {
+            if !fees.contains(&f) {
+                fees.push(f);
+            }
+        }
+
+        for fee in fees {
+            // Soft-limit: não abortar o gate se o limiter estiver saturado.
+            let _ = ALCHEMY_RATE_LIMITER.acquire().await;
+            let call = factory_contract.method::<_, Address>("getPool", (token_a, token_b, fee))?;
+            match call.call().await {
+                Ok(pool_addr) if !pool_addr.is_zero() => {
+                    debug!(
+                        "- [{}] liquidity pool fee={} => {}",
+                        DEX_NAME, fee, pool_addr
+                    );
+                    return Ok(Some(pool_addr));
+                }
+                _ => {}
+            }
+        }
+        // Fallback: qualquer pool (incl. fee 100) — melhor que falhar o TVL.
+        self.get_pair_or_pool_address(token_a, token_b).await
     }
 
     // ========================================================

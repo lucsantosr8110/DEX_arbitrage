@@ -53,9 +53,9 @@ const BLUECHIPS: &[&str] = &["WMATIC", "WETH"];
 /// `AAVE`, `CRV`, `MANA`, `LDO`, `WBTC`, …) tinha pools de poeira ou nem par
 /// direto, e só gerava cotação lixo + `eth_call` desperdiçada por ciclo.
 ///
-/// O gate de liquidez por pool (`min_liquidity`, nos adapters) continua sendo a
-/// defesa geral; este allowlist só evita nem começar a cotar o que já se sabe
-/// morto. Ampliar exige reverificar o pool on-chain.
+/// O gate de liquidez por pool (`arbitrage.min_liquidity` → `dex::liquidity`)
+/// corta dust via `balanceOf(pool)` multicall no radar. Este allowlist só evita
+/// nem começar a cotar o que já se sabe morto. Ampliar exige reverificar on-chain.
 const KNOWN_LIQUID: &[&str] = &["USDC", "USDT", "DAI", "WMATIC", "WETH"];
 
 // ============================================================
@@ -306,6 +306,25 @@ async fn collect_dex_prices(
         })
         .await?;
 
+    // Gate de liquidez (TVL proxy) — multicall balanceOf no mesmo ciclo do batch.
+    let min_liq = crate::dex::liquidity::min_pool_liquidity_usd(dm.config_ref());
+    let n_before = result.len();
+    let result = dm
+        .filter_prices_by_liquidity(&adapter, result, min_liq)
+        .await?;
+    let low_liq_cut = n_before.saturating_sub(result.len());
+    if low_liq_cut > 0 {
+        info!(
+            target: "liquidity",
+            dex = %adapter,
+            discarded = low_liq_cut,
+            kept = result.len(),
+            min_usd = min_liq,
+            total = crate::dex::liquidity::low_liquidity_discarded_count(),
+            "liquidity gate: pares cortados por TVL proxy < threshold"
+        );
+    }
+
     let mut out = HashMap::new();
 
     for tp in result {
@@ -352,8 +371,8 @@ async fn collect_dex_prices(
 const RECIPROCITY_MIN: f64 = 0.95;
 const RECIPROCITY_MAX: f64 = 1.01;
 
-/// Liquidez mínima do pool em USD. Pools abaixo disso são dust pools.
-const MIN_POOL_LIQUIDITY_USD: f64 = 5000.0;
+/// Liquidez mínima do pool: **fonte única** = `config.arbitrage.min_liquidity` (USD).
+/// Ver `dex::liquidity::min_pool_liquidity_usd`. (Constante morta removida.)
 
 /// Spread máximo realista entre DEXes. Acima disso é dust pool ou erro de oracle.
 const MAX_SPREAD_PCT: f64 = 50.0;

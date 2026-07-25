@@ -58,6 +58,17 @@ impl<D: DexContract + Send + Sync + 'static> DexContract for ResilientDex<D> {
     ) -> Result<Option<Address>> {
         self.primary.get_pair_or_pool_address(token_a, token_b).await
     }
+
+    async fn get_pool_address_for_liquidity(
+        &self,
+        token_a: Address,
+        token_b: Address,
+        fee_hint: u32,
+    ) -> Result<Option<Address>> {
+        self.primary
+            .get_pool_address_for_liquidity(token_a, token_b, fee_hint)
+            .await
+    }
     
     async fn get_price(&self, token_a: &Address, token_b: &Address) -> Result<Option<f64>> {
         

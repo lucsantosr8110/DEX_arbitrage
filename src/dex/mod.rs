@@ -190,14 +190,24 @@ pub trait DexContract: Send + Sync {
 
     async fn swap(&self, token_in: Address, token_out: Address, amount_in: U256) -> Result<U256>;
     
-    // ðŸš€ NOVO MÃ‰TODO CRÃTICO: Consulta a Factory/Quoter para obter o endereÃ§o do Par/Pool.
+    // 🚀 NOVO MÉTODO CRÍTICO: Consulta a Factory/Quoter para obter o endereço do Par/Pool.
     async fn get_pair_or_pool_address(
         &self,
         token_a: Address,
         token_b: Address,
     ) -> Result<Option<Address>>;
 
-    
+    /// Pool usado no gate de liquidez. `fee_hint` = fee V3 do quote (executável).
+    /// Default: ignora fee (V2/Curve). V3 sobrescreve para bater no pool cotado.
+    async fn get_pool_address_for_liquidity(
+        &self,
+        token_a: Address,
+        token_b: Address,
+        fee_hint: u32,
+    ) -> Result<Option<Address>> {
+        let _ = fee_hint;
+        self.get_pair_or_pool_address(token_a, token_b).await
+    }
     async fn get_token_address(&self, symbol_or_address: &str) -> Result<Address> {
         use std::str::FromStr;
         let cache = TokenCache::global(self.config().clone()).await;
@@ -382,6 +392,7 @@ pub mod adapters;
 pub mod circuit_breaker;
 pub mod error;
 pub mod get_token_decimals;
+pub mod liquidity;
 pub mod manager;
 pub mod price_cache;
 pub mod radar;

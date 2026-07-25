@@ -144,6 +144,7 @@ impl ArbitrageClient {
                 path, window
             );
             crate::dex::reset_fee100_best_discarded_count();
+            crate::dex::liquidity::reset_low_liquidity_discarded_count();
             *slot = Some(PaperValidationHub::spawn(
                 std::path::PathBuf::from(path),
                 window,
