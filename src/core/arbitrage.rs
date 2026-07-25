@@ -367,6 +367,10 @@ impl ArbitrageEngine {
     pub fn sanitize_steps_for_execution(steps: &[ArbitrageStep]) -> Vec<ArbitrageStep> {
         steps
             .iter()
+            // force_usdt às vezes anexa hop no-op `USDT→USDT` → V2 IDENTICAL_ADDRESSES.
+            .filter(|s| {
+                !s.token_in.eq_ignore_ascii_case(&s.token_out) && !s.token_in.is_empty()
+            })
             .map(|s| ArbitrageStep {
                 dex_name: Self::sanitize_dex_name(&s.dex_name),
                 dex_address: s.dex_address.clone(),
@@ -1893,6 +1897,38 @@ mod tests {
             let id = next_opp_id("test");
             assert!(ids.insert(id.clone()), "ID duplicado: {}", id);
         }
+    }
+
+    #[test]
+    fn sanitize_steps_drops_identical_token_hops() {
+        let steps = vec![
+            ArbitrageStep {
+                dex_name: "QuickSwap".into(),
+                token_in: "USDT".into(),
+                token_out: "USDC".into(),
+                amount_out_min: U256::from(1),
+                ..Default::default()
+            },
+            ArbitrageStep {
+                dex_name: "UniswapV3".into(),
+                token_in: "USDC".into(),
+                token_out: "USDT".into(),
+                amount_out_min: U256::from(1),
+                v3_fee_tier: Some(500),
+                ..Default::default()
+            },
+            ArbitrageStep {
+                dex_name: "QuickSwap".into(),
+                token_in: "USDT".into(),
+                token_out: "USDT".into(), // no-op force_usdt
+                amount_out_min: U256::from(1),
+                ..Default::default()
+            },
+        ];
+        let clean = ArbitrageEngine::sanitize_steps_for_execution(&steps);
+        assert_eq!(clean.len(), 2);
+        assert_eq!(clean[0].token_out, "USDC");
+        assert_eq!(clean[1].token_out, "USDT");
     }
 
     /// next_opp_id deve incluir o prefixo no ID.

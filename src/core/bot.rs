@@ -8,6 +8,7 @@ use crate::{
         arbitrage::ArbitrageEngine,
         flashloan::ArbitrageClient,
         gas::GasEstimator,
+        paper_validation,
         risk::RiskManager,
         types::{ArbitrageOpportunity, BundleResult},
     },
@@ -26,7 +27,7 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::{broadcast, mpsc, Mutex};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// ============================================================
 /// 🤖 Estrutura principal do Bot
@@ -234,12 +235,73 @@ impl Bot {
         let cfg_snapshot = { self.config.lock().await.clone() };
         self.risk_manager.config = cfg_snapshot.risk.clone();
 
+        let observation = paper_validation::observation_active(&cfg_snapshot);
+        let exec_min = paper_validation::exec_min_spread_pct(&cfg_snapshot);
+
+        // Descoberta: em paper usa observe_min_spread; fora paper = só exec min.
+        let discovery_cfg = if observation {
+            let observe_min = paper_validation::resolve_observe_min_spread(&cfg_snapshot);
+            let mut obs = cfg_snapshot.clone();
+            obs.arbitrage.min_spread_percent = format!("{}", observe_min);
+            // Micro-edges: permite passar filtro de lucro na conversão USDT
+            // (execução real continua gateada por exec min_spread + min_profit).
+            obs.arbitrage.min_profit_threshold_usd = Some(-1.0e9);
+            obs
+        } else {
+            cfg_snapshot.clone()
+        };
+
         let opportunities = self
             .arbitrage_engine
-            .find_arbitrage_opportunities(&prices, &cfg_snapshot)
+            .find_arbitrage_opportunities(&prices, &discovery_cfg)
             .await;
 
-        if opportunities.is_empty() {
+        if observation {
+            let max_n = cfg_snapshot.validation.observe_max_per_cycle.max(1) as usize;
+            if opportunities.is_empty() {
+                info!(
+                    "📭 PAPER observe: nenhuma opp >= observe_min_spread ({:.4}%)",
+                    paper_validation::resolve_observe_min_spread(&cfg_snapshot)
+                );
+            } else {
+                info!(
+                    "📄 PAPER observe: {} opps (exec_min={:.4}% observe={:.4}%) — envio OFF",
+                    opportunities.len(),
+                    exec_min,
+                    paper_validation::resolve_observe_min_spread(&cfg_snapshot)
+                );
+                let mut observed = 0usize;
+                let mut skipped_unsupported = 0usize;
+                for mut opp in opportunities {
+                    if !paper_validation::route_executor_supported(&opp) {
+                        skipped_unsupported += 1;
+                        continue;
+                    }
+                    let would = paper_validation::would_execute(opp.spread_percent, &cfg_snapshot);
+                    if let Err(e) = self
+                        .arbitrage_client
+                        .paper_observe_opportunity(&mut opp, would)
+                        .await
+                    {
+                        warn!(
+                            target: "paper_validation",
+                            "paper observe failed pair={} would_execute={}: {:#}",
+                            opp.pair, would, e
+                        );
+                    }
+                    observed += 1;
+                    if observed >= max_n {
+                        break;
+                    }
+                }
+                if observed == 0 {
+                    info!(
+                        "📭 PAPER observe: 0 rotas executor-supported (skipped_unsupported={})",
+                        skipped_unsupported
+                    );
+                }
+            }
+        } else if opportunities.is_empty() {
             info!("📭 Ciclo sem oportunidades acima do threshold");
         } else {
             let best = &opportunities[0];
@@ -255,7 +317,9 @@ impl Bot {
                 best.net_profit_usd,
                 all_pairs.join(", ")
             );
-            let _ = self.handle_opportunity(opportunities.into_iter().next().unwrap()).await;
+            let _ = self
+                .handle_opportunity(opportunities.into_iter().next().unwrap())
+                .await;
         }
 
         Ok(())

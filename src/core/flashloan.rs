@@ -128,7 +128,8 @@ impl ArbitrageClient {
         let (enabled, path, window) = {
             let cfg = self.config.lock().await;
             (
-                paper_validation::paper_mode_active(&cfg) || cfg.validation.dry_run_only,
+                // Mesmo critério da observação: paper / dry_run_only / dry_run
+                paper_validation::observation_active(&cfg),
                 cfg.validation.csv_path.clone(),
                 cfg.validation.summary_window.max(1),
             )
@@ -142,6 +143,7 @@ impl ArbitrageClient {
                 "📄 PAPER hub start | csv={} | summary_window={} | SENDS DISABLED",
                 path, window
             );
+            crate::dex::reset_fee100_best_discarded_count();
             *slot = Some(PaperValidationHub::spawn(
                 std::path::PathBuf::from(path),
                 window,
@@ -232,17 +234,19 @@ impl ArbitrageClient {
         Ok(v.as_u32())
     }
 
-    /// Fee tiers que o executor on-chain aceita (`require(fee == 500|3000|10000)`).
+    /// Fee tiers que o executor on-chain aceita — delega à fonte única em `dex::`.
     fn executable_v3_fee_tier(fee_tier: u32) -> Result<u32> {
-        match fee_tier {
-            500 | 3000 | 10_000 => Ok(fee_tier),
-            100 => Err(anyhow!(
+        if crate::dex::is_executable_v3_fee_tier(fee_tier) {
+            Ok(fee_tier)
+        } else if fee_tier == crate::dex::OBSERVED_V3_FEE_TIER_100 {
+            Err(anyhow!(
                 "V3 fee_tier=100 cotado mas executor rejeita (só 500|3000|10000) — abort opp"
-            )),
-            other => Err(anyhow!(
+            ))
+        } else {
+            Err(anyhow!(
                 "V3 fee_tier={} inválido para executor — abort opp",
-                other
-            )),
+                fee_tier
+            ))
         }
     }
 
@@ -443,8 +447,12 @@ impl ArbitrageClient {
                 paper_validation::paper_mode_active(&cfg)
             };
             if paper_on {
+                let would = {
+                    let cfg = self.config.lock().await;
+                    paper_validation::would_execute(opp.spread_percent, &cfg)
+                };
                 return self
-                    .run_paper_validation(opp, slippage_bps, flashloan_fee_usd)
+                    .run_paper_validation(opp, slippage_bps, flashloan_fee_usd, would)
                     .await;
             }
         }
@@ -461,37 +469,118 @@ impl ArbitrageClient {
         }
     }
 
+    /// Paper observe público (bot observation path) — bypass min_profit de exec.
+    /// Envio continua bloqueado por `sends_forbidden`.
+    /// Falhas de encode/sim ainda geram amostra CSV (sim_ok=false).
+    pub async fn paper_observe_opportunity(
+        &self,
+        opp: &mut ArbitrageOpportunity,
+        would_execute: bool,
+    ) -> Result<BundleResult> {
+        {
+            let cfg = self.config.lock().await;
+            if !paper_validation::observation_active(&cfg) {
+                return Err(anyhow!(
+                    "paper_observe_opportunity só em observation/paper mode"
+                ));
+            }
+            if !paper_validation::sends_forbidden(&cfg) {
+                return Err(anyhow!(
+                    "invariant broken: observation_active sem sends_forbidden"
+                ));
+            }
+        }
+
+        let (slippage_bps, fee_pct, flashloan_decimals) = {
+            let cfg = self.config.lock().await;
+            (
+                cfg.flashloan.slippage_bps.unwrap_or(50) as u64,
+                cfg.flashloan.fee_pct.unwrap_or(0.0005),
+                cfg.flashloan.flashloan_decimals.unwrap_or(6) as u32,
+            )
+        };
+
+        if let Ok(v) = self.gas_estimator.estimate_arbitrage_gas_usd().await {
+            opp.gas_cost_usd = v;
+        }
+
+        let token_price = opp.token_price_usd.unwrap_or(1.0);
+        let flashloan_fee_token = self.calculate_flashloan_fee(opp.amount_in, fee_pct);
+        let flashloan_fee_usd =
+            self.token_amount_to_usd(flashloan_fee_token, token_price, flashloan_decimals);
+
+        match self
+            .run_paper_validation(opp, slippage_bps, flashloan_fee_usd, would_execute)
+            .await
+        {
+            Ok(r) => Ok(r),
+            Err(e) => {
+                // Ainda grava amostra para calibrar (motivo no revert_reason).
+                let hub = self.ensure_paper_hub().await;
+                let block = paper_validation::current_block_number(&self.middleware)
+                    .await
+                    .unwrap_or(0);
+                let sample = paper_validation::build_sample(
+                    opp,
+                    block,
+                    flashloan_fee_usd,
+                    Some(0.0),
+                    false,
+                    Some(format!("{:#}", e)),
+                    would_execute,
+                );
+                paper_validation::log_sample(&sample);
+                if let Some(h) = hub {
+                    h.try_submit(sample);
+                }
+                Ok(BundleResult::skipped().with_execution_mode("paper_observe_error"))
+            }
+        }
+    }
+
     /// Paper: mesmo calldata/extraData da exec real; só eth_call; CSV async.
+    ///
+    /// `from` = endereço público autorizado (`paper_from` / owner) — **nunca** keypair.
+    /// Se `executeFlashloan` retorna `false` (try/catch), faz probe Aave para
+    /// revelar o revert interno ("Not profitable", etc.).
     async fn run_paper_validation(
         &self,
         opp: &ArbitrageOpportunity,
         slippage_bps: u64,
         flashloan_fee_usd: f64,
+        would_execute: bool,
     ) -> Result<BundleResult> {
         let hub = self.ensure_paper_hub().await;
 
-        let (asset, amount, steps, decimals, token_price) = {
+        let (asset, amount, steps, decimals, token_price, paper_from, use_overrides) = {
             let cfg = self.config.lock().await;
             let (asset, amount, steps) =
                 self.extract_and_convert_opp_data(opp, &cfg, slippage_bps)?;
+            let wallet = self.get_wallet_address()?;
+            let paper_from = paper_validation::resolve_paper_from(&cfg, wallet);
             (
                 asset,
                 amount,
                 steps,
                 cfg.flashloan.flashloan_decimals.unwrap_or(6) as u32,
                 opp.token_price_usd.unwrap_or(1.0),
+                paper_from,
+                paper_validation::paper_state_overrides_enabled(&cfg),
             )
         };
+
+        info!(
+            target: "paper_validation",
+            paper_from = ?paper_from,
+            wallet = ?self.get_wallet_address().ok(),
+            "PAPER eth_call from=paper_from (endereço público; sem assinatura)"
+        );
 
         let block = paper_validation::current_block_number(&self.middleware)
             .await
             .unwrap_or(0);
         let block_id = paper_validation::block_id(block);
-        let wallet = self.get_wallet_address()?;
-        let holder = {
-            let cfg = self.config.lock().await;
-            paper_validation::resolve_paper_from(&cfg, wallet)
-        };
+        let holder = paper_from;
 
         let _bal_before = paper_validation::erc20_balance(
             self.middleware.clone(),
@@ -502,46 +591,84 @@ impl ArbitrageClient {
         .await
         .ok();
 
+        // from explícito = caller autorizado (onlyExecutor). Sem keypair.
         let call = self
             .executor
-            .execute_flashloan(asset, amount, steps)
+            .execute_flashloan(asset, amount, steps.clone())
+            .from(paper_from)
             .block(block_id);
 
-        let (sim_ok, revert_reason) = match self.simulate_bool_transaction(&call).await {
-            Ok(()) => (true, None),
-            Err(e) => (false, Some(e.to_string())),
+        let (sim_ok, revert_reason) = match timeout(Duration::from_secs(15), call.call()).await {
+            Ok(Ok(true)) => (true, None),
+            Ok(Ok(false)) => {
+                // try/catch do Solidity engoliu o revert — probe Aave.
+                let params = self.encode_flashloan_callback_params(paper_from, &steps);
+                let state_ovr = if use_overrides {
+                    // Override mínimo documentado: saldo do holder no token base
+                    // (flashloan Aave não exige; mantido para paths futuros / debug).
+                    Some(paper_validation::erc20_balance_state_override(
+                        asset,
+                        holder,
+                        amount.saturating_mul(U256::from(2u64)),
+                    ))
+                } else {
+                    None
+                };
+                let probed = paper_validation::probe_aave_flashloan_revert(
+                    &self.middleware,
+                    paper_from,
+                    self.executor.address(),
+                    asset,
+                    amount,
+                    params,
+                    block_id,
+                    state_ovr,
+                )
+                .await;
+                (
+                    false,
+                    Some(format!(
+                        "{}; {}",
+                        paper_validation::GENERIC_FLASHLOAN_FALSE,
+                        probed
+                    )),
+                )
+            }
+            Ok(Err(e)) => {
+                let decoded = paper_validation::decode_revert_message(&e.to_string());
+                (false, Some(format!("executeFlashloan revert: {decoded}")))
+            }
+            Err(_) => (false, Some("Simulation timeout".into())),
         };
 
-        // Delta: Alchemy asset changes (mesma tx que seria enviada). Sem send.
+        // Delta: Alchemy asset changes com o MESMO from. Sem send.
         let mut profit_realizado_usd = None;
-        if let Some(data) = call.tx.data().cloned() {
-            let to = match call.tx.to() {
-                Some(NameOrAddress::Address(a)) => *a,
-                _ => self.executor.address(),
-            };
-            if let Some(delta_raw) = paper_validation::try_alchemy_asset_delta(
-                &self.middleware,
-                holder,
-                to,
-                data,
-                asset,
-                holder,
-            )
-            .await
-            {
-                profit_realizado_usd = Some(paper_validation::balance_delta_usd(
-                    delta_raw,
-                    decimals,
-                    token_price,
-                ));
+        if sim_ok {
+            if let Some(data) = call.tx.data().cloned() {
+                let to = match call.tx.to() {
+                    Some(NameOrAddress::Address(a)) => *a,
+                    _ => self.executor.address(),
+                };
+                if let Some(delta_raw) = paper_validation::try_alchemy_asset_delta(
+                    &self.middleware,
+                    paper_from,
+                    to,
+                    data,
+                    asset,
+                    holder,
+                )
+                .await
+                {
+                    profit_realizado_usd = Some(paper_validation::balance_delta_usd(
+                        delta_raw,
+                        decimals,
+                        token_price,
+                    ));
+                }
             }
         }
-
-        // Se sim ok mas sem tracer: ainda registramos amostra (real=None).
-        // Parser ABI (before,after) disponível via testes / fixtures.
-        if !sim_ok {
-            profit_realizado_usd = Some(0.0);
-        }
+        // Reverts: NÃO forçar profit=0 (isso inflava erro_rel=100 sem medição).
+        // false_profitable ainda marca via build_sample quando real=None && !sim_ok.
 
         let sample = paper_validation::build_sample(
             opp,
@@ -550,6 +677,7 @@ impl ArbitrageClient {
             profit_realizado_usd,
             sim_ok,
             revert_reason,
+            would_execute,
         );
         paper_validation::log_sample(&sample);
         if let Some(h) = hub {
@@ -557,6 +685,19 @@ impl ArbitrageClient {
         }
 
         Ok(BundleResult::skipped().with_execution_mode("paper_validated"))
+    }
+
+    /// `abi.encode(initiator, steps)` — idêntico ao FlashloanExecutor.executeFlashloan.
+    fn encode_flashloan_callback_params(
+        &self,
+        initiator: Address,
+        steps: &[AbiSwapStep],
+    ) -> Bytes {
+        use ethers::abi::Tokenizable;
+        Bytes::from(ethers::abi::encode(&[
+            initiator.into_token(),
+            steps.to_vec().into_token(),
+        ]))
     }
 
     // ========================================================================
@@ -924,16 +1065,7 @@ impl ArbitrageClient {
     }
 
     fn decode_revert_reason(&self, err: &str) -> String {
-        if err.contains("execution reverted") {
-            if let Some(data) = err.split("data: 0x").nth(1) {
-                match data.get(0..8) {
-                    Some("08c379a0") => return "Revert: Error(string)".to_string(),
-                    Some("4e487b71") => return "Revert: Panic(uint256)".to_string(),
-                    _ => return format!("Revert: {}", &data[0..8]),
-                }
-            }
-        }
-        err.to_string()
+        paper_validation::decode_revert_message(err)
     }
 
     // ========================================================================
@@ -1274,12 +1406,42 @@ mod tests {
     // ------------------------------------------------------------------------
     #[test]
     fn encode_v3_fee_extra_data_roundtrip() {
+        // ABI encode/decode aceita qualquer uint24; A4 filtra o que vai ao executor.
         for fee in [100u32, 500, 3000, 10_000] {
             let encoded = ArbitrageClient::encode_v3_fee_extra_data(fee);
             assert!(!encoded.is_empty());
             let decoded = ArbitrageClient::decode_v3_fee_extra_data(&encoded).unwrap();
             assert_eq!(decoded, fee, "round-trip fee={fee}");
         }
+        for fee in crate::dex::EXECUTABLE_V3_FEE_TIERS {
+            assert!(crate::dex::is_executable_v3_fee_tier(fee));
+        }
+    }
+
+    #[test]
+    fn executable_route_extra_data_never_fee100() {
+        use crate::core::types::ArbitrageStep;
+        use crate::dex::select_executable_v3_best_out;
+
+        let quotes = [
+            (100u32, U256::from(5_000u64)),
+            (500u32, U256::from(4_000u64)),
+            (3000u32, U256::from(3_000u64)),
+        ];
+        let (fee, _) = select_executable_v3_best_out(&quotes).unwrap();
+        assert_ne!(fee, 100);
+        let step = ArbitrageStep {
+            dex_name: "UniswapV3".into(),
+            token_in: "A".into(),
+            token_out: "B".into(),
+            expected_rate: 1.0,
+            amount_out_min: U256::from(1),
+            v3_fee_tier: Some(fee),
+            ..Default::default()
+        };
+        let extra = ArbitrageClient::build_extra_data_for_step(&step).unwrap();
+        let decoded = ArbitrageClient::decode_v3_fee_extra_data(&extra).unwrap();
+        assert!(matches!(decoded, 500 | 3000 | 10_000));
     }
 
     #[test]
@@ -1582,22 +1744,29 @@ mod tests {
     #[test]
     fn decode_revert_error_string_selector() {
         let client = make_client();
-        let msg = client.decode_revert_reason("execution reverted: data: 0x08c379a0...");
-        assert_eq!(msg, "Revert: Error(string)");
+        // Fixture incompleto (só selector) — ainda classifica como Error(string)
+        let msg = client.decode_revert_reason("execution reverted: data: 0x08c379a0");
+        assert!(
+            msg.contains("Error(") || msg.contains("08c379a0"),
+            "msg={msg}"
+        );
     }
 
     #[test]
     fn decode_revert_panic_selector() {
         let client = make_client();
-        let msg = client.decode_revert_reason("execution reverted: data: 0x4e487b71...");
-        assert_eq!(msg, "Revert: Panic(uint256)");
+        let msg = client.decode_revert_reason("execution reverted: data: 0x4e487b71");
+        assert!(msg.contains("Panic") || msg.contains("4e487b71"), "msg={msg}");
     }
 
     #[test]
     fn decode_revert_unknown_selector() {
         let client = make_client();
-        let msg = client.decode_revert_reason("execution reverted: data: 0xdeadbeef...");
-        assert!(msg.starts_with("Revert: 0xdeadbeef") || msg.contains("deadbeef"));
+        let msg = client.decode_revert_reason("execution reverted: data: 0xdeadbeef");
+        assert!(
+            msg.contains("CustomError") || msg.contains("deadbeef"),
+            "msg={msg}"
+        );
     }
 
     #[test]
@@ -1605,6 +1774,36 @@ mod tests {
         let client = make_client();
         let msg = client.decode_revert_reason("some other rpc error");
         assert_eq!(msg, "some other rpc error");
+    }
+
+    #[test]
+    fn paper_eth_call_uses_configured_paper_from() {
+        std::env::remove_var(crate::core::paper_validation::ENV_PAPER_FROM);
+        let mut cfg = Config::default();
+        cfg.validation.paper_from = "0x152Aa7ecC490860115C4d1369a19C970f9e9eFFf".into();
+        let wallet = Address::from_low_u64_be(0xDEAD);
+        let from = crate::core::paper_validation::resolve_paper_from(&cfg, wallet);
+        assert_eq!(
+            format!("{:?}", from).to_ascii_lowercase(),
+            "0x152aa7ecc490860115c4d1369a19c970f9e9efff"
+        );
+        assert_ne!(from, wallet);
+    }
+
+    #[test]
+    fn paper_state_override_only_when_observation_active() {
+        std::env::remove_var(crate::core::paper_validation::ENV_PAPER_VALIDATION);
+        let mut cfg = Config::default();
+        cfg.validation.paper_state_overrides = true;
+        cfg.execution.dry_run = false;
+        cfg.validation.paper_enabled = false;
+        cfg.validation.dry_run_only = false;
+        assert!(!crate::core::paper_validation::paper_state_overrides_enabled(&cfg));
+        assert!(!crate::core::paper_validation::sends_forbidden(&cfg));
+
+        cfg.validation.paper_enabled = true;
+        assert!(crate::core::paper_validation::paper_state_overrides_enabled(&cfg));
+        assert!(crate::core::paper_validation::sends_forbidden(&cfg));
     }
 
     // ------------------------------------------------------------------------

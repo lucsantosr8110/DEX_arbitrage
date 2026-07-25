@@ -95,9 +95,22 @@ pub struct ValidationConfig {
     /// A cada N amostras, emite resumo agregado (p50/p95).
     #[serde(default = "default_summary_window")]
     pub summary_window: u64,
-    /// Endereço `from` opcional para eth_call (nunca keypair). Env `PAPER_FROM` tem prioridade.
-    #[serde(default)]
+    /// Endereço `from` para eth_call (público; nunca keypair).
+    /// Alias `paper_from_address`. Env `PAPER_FROM` tem prioridade.
+    #[serde(default, alias = "paper_from_address")]
     pub paper_from: String,
+    /// Em paper: permite state override mínimo em eth_call (simulação apenas).
+    /// Nunca habilita send. Default true.
+    #[serde(default = "default_paper_state_overrides")]
+    pub paper_state_overrides: bool,
+    /// Spread mínimo (%) **só para OBSERVAÇÃO paper**. Não gateia execução.
+    /// `None` = usa o mesmo valor de `arbitrage.min_spread_percent` (comportamento antigo).
+    /// Em paper, tipicamente menor que o min_spread de execução (ex.: 0.05 vs 0.50).
+    #[serde(default)]
+    pub observe_min_spread: Option<f64>,
+    /// Máximo de eth_calls paper por ciclo de preços (evita spam RPC).
+    #[serde(default = "default_observe_max_per_cycle")]
+    pub observe_max_per_cycle: u64,
 }
 
 fn default_paper_csv() -> String {
@@ -105,6 +118,12 @@ fn default_paper_csv() -> String {
 }
 fn default_summary_window() -> u64 {
     50
+}
+fn default_observe_max_per_cycle() -> u64 {
+    5
+}
+fn default_paper_state_overrides() -> bool {
+    true
 }
 
 impl Default for ValidationConfig {
@@ -115,6 +134,9 @@ impl Default for ValidationConfig {
             csv_path: default_paper_csv(),
             summary_window: default_summary_window(),
             paper_from: String::new(),
+            paper_state_overrides: default_paper_state_overrides(),
+            observe_min_spread: None,
+            observe_max_per_cycle: default_observe_max_per_cycle(),
         }
     }
 }

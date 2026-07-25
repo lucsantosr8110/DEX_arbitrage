@@ -18,17 +18,104 @@ use async_trait::async_trait;
 use ethers::{
     types::{Address, U256}
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::RwLock;
 use once_cell::sync::Lazy;
 use tracing::{debug, warn};
 
 // ================================================================
+// V3 FEE TIERS — fonte única (executor vs observação)
+// ================================================================
+// FlashloanExecutor on-chain: `require(fee == 500 || fee == 3000 || fee == 10000)`.
+// Fee 100 (1 bps) existe no Quoter/Factory, mas **não** é executável sem redeploy.
+// Rota EXECUTÁVEL = só EXECUTABLE_V3_FEE_TIERS.
+// Fee 100 pode ser cotado para métrica (descartes), nunca cacheado para exec/extraData.
+
+/// Tiers que o `FlashloanExecutor` aceita — única fonte para seleção + A4.
+pub const EXECUTABLE_V3_FEE_TIERS: [u32; 3] = [500, 3000, 10_000];
+
+/// Fee 100: só observação/métrica. Nunca alimenta cache executável nem extraData.
+pub const OBSERVED_V3_FEE_TIER_100: u32 = 100;
+
+/// Todos os tiers cotáveis no Quoter (métrica + seleção). Seleção filtra via
+/// [`select_executable_v3_best_out`].
+pub const QUOTE_V3_FEE_TIERS: [u32; 4] = [100, 500, 3000, 10_000];
+
+static FEE100_BEST_DISCARDED: AtomicU64 = AtomicU64::new(0);
+
+/// True se o tier é aceito pelo executor on-chain.
+#[inline]
+pub fn is_executable_v3_fee_tier(fee: u32) -> bool {
+    matches!(fee, 500 | 3000 | 10_000)
+}
+
+/// Contador: vezes em que fee 100 teria sido o best-out absoluto mas foi
+/// descartado da rota executável (alternativa exec ou nenhuma).
+pub fn fee100_best_discarded_count() -> u64 {
+    FEE100_BEST_DISCARDED.load(Ordering::Relaxed)
+}
+
+pub fn reset_fee100_best_discarded_count() {
+    FEE100_BEST_DISCARDED.store(0, Ordering::Relaxed)
+}
+
+fn note_fee100_best_discarded() {
+    FEE100_BEST_DISCARDED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Escolhe o melhor `(fee, amount_out)` **somente** entre tiers executáveis.
+///
+/// - Se fee 100 teria o maior `amountOut` (global), incrementa métrica + log warn.
+/// - Se nenhum tier executável tem quote > 0 → `None` (opp descartada; sem fallback 100).
+pub fn select_executable_v3_best_out(quotes: &[(u32, U256)]) -> Option<(u32, U256)> {
+    let mut best_any: Option<(u32, U256)> = None;
+    let mut best_exec: Option<(u32, U256)> = None;
+
+    for &(fee, out) in quotes {
+        if out.is_zero() {
+            continue;
+        }
+        if best_any.map(|(_, o)| out > o).unwrap_or(true) {
+            best_any = Some((fee, out));
+        }
+        if is_executable_v3_fee_tier(fee) && best_exec.map(|(_, o)| out > o).unwrap_or(true) {
+            best_exec = Some((fee, out));
+        }
+    }
+
+    if let Some((fee, out100)) = best_any {
+        if fee == OBSERVED_V3_FEE_TIER_100 {
+            note_fee100_best_discarded();
+            match best_exec {
+                Some((exec_fee, exec_out)) => {
+                    warn!(
+                        target: "v3_fee_select",
+                        fee100_out = %out100,
+                        exec_fee,
+                        exec_out = %exec_out,
+                        "V3 fee=100 seria best-out mas descartado (não executável); usando tier executável"
+                    );
+                }
+                None => {
+                    warn!(
+                        target: "v3_fee_select",
+                        fee100_out = %out100,
+                        "V3 fee=100 seria best-out e nenhum tier executável cotou — par descartado"
+                    );
+                }
+            }
+        }
+    }
+
+    best_exec
+}
+
+// ================================================================
 // CACHE GLOBAL DE FEE TIERS (para V3 pools)
 // ================================================================
-// Armazena o fee tier real de cada par V3 (unidade nativa uint24 Uniswap:
-// hundredths of a bip — 500=0.05%, 3000=0.3%, 10000=1%).
-// Chave completa: "DEX_NAME:{fee_cache_key}" → fee_tier (ex: 500, 3000, 10000)
+// Armazena o fee tier **executável** de cada par V3 (uint24: 500/3000/10000).
+// Nunca deve gravar 100. Chave: "DEX_NAME:{fee_cache_key}" → fee_tier.
 static FEE_TIER_CACHE: Lazy<RwLock<std::collections::HashMap<String, u32>>> =
     Lazy::new(|| RwLock::new(std::collections::HashMap::new()));
 
@@ -51,7 +138,16 @@ pub fn fee_cache_key(token_a: &str, token_b: &str) -> String {
 }
 
 /// Registra o fee tier V3 (`uint24` nativo) no cache global.
+/// Recusa fee 100 / não-executável (não alimenta A4/extraData com tier inválido).
 pub fn cache_fee_tier(dex_name: &str, token_a: &str, token_b: &str, fee_tier: u32) {
+    if !is_executable_v3_fee_tier(fee_tier) {
+        warn!(
+            target: "v3_fee_select",
+            fee_tier,
+            "cache_fee_tier recusou tier não-executável (não gravar 100 no cache)"
+        );
+        return;
+    }
     let pair = fee_cache_key(token_a, token_b);
     let key = format!("{}:{}", dex_name, pair);
     if let Ok(mut cache) = FEE_TIER_CACHE.write() {
@@ -428,7 +524,12 @@ pub fn all_trading_pairs() -> Vec<(String, String)> {
 
 #[cfg(test)]
 mod fee_tier_cache_tests {
-    use super::{cache_fee_tier, cached_fee_tier, cached_fee_tier_pair, fee_cache_key};
+    use super::{
+        cache_fee_tier, cached_fee_tier, cached_fee_tier_pair, fee_cache_key,
+        fee100_best_discarded_count, is_executable_v3_fee_tier, reset_fee100_best_discarded_count,
+        select_executable_v3_best_out, EXECUTABLE_V3_FEE_TIERS, OBSERVED_V3_FEE_TIER_100,
+    };
+    use ethers::types::U256;
 
     #[test]
     fn fee_cache_key_symmetric_and_uppercase() {
@@ -469,5 +570,47 @@ mod fee_tier_cache_tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn executable_tiers_are_500_3000_10000_not_100() {
+        assert_eq!(EXECUTABLE_V3_FEE_TIERS, [500, 3000, 10_000]);
+        assert!(is_executable_v3_fee_tier(500));
+        assert!(is_executable_v3_fee_tier(3000));
+        assert!(is_executable_v3_fee_tier(10_000));
+        assert!(!is_executable_v3_fee_tier(OBSERVED_V3_FEE_TIER_100));
+    }
+
+    #[test]
+    fn select_executable_prefers_best_exec_over_fee100() {
+        reset_fee100_best_discarded_count();
+        let before = fee100_best_discarded_count();
+        let quotes = [
+            (100u32, U256::from(1_000u64)),
+            (500u32, U256::from(900u64)),
+            (3000u32, U256::from(800u64)),
+            (10_000u32, U256::from(700u64)),
+        ];
+        let (fee, out) = select_executable_v3_best_out(&quotes).expect("exec tier");
+        assert_eq!(fee, 500);
+        assert_eq!(out, U256::from(900u64));
+        assert!(fee100_best_discarded_count() > before);
+    }
+
+    #[test]
+    fn select_executable_discards_when_only_fee100_quotes() {
+        reset_fee100_best_discarded_count();
+        let quotes = [(100u32, U256::from(1_000u64))];
+        assert!(select_executable_v3_best_out(&quotes).is_none());
+        assert!(fee100_best_discarded_count() >= 1);
+    }
+
+    #[test]
+    fn cache_fee_tier_rejects_100() {
+        cache_fee_tier("UniswapV3", "AAA_REJ100", "BBB_REJ100", 100);
+        assert_eq!(
+            cached_fee_tier("UniswapV3", "AAA_REJ100", "BBB_REJ100"),
+            None
+        );
     }
 }

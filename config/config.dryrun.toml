@@ -435,6 +435,18 @@ endpoint = "/metrics"
 export_interval = 15
 include_balance_metrics = true
 
+[validation]
+# Paper: observe abaixo do exec min_spread (dryrun exec=0.1%). Envio OFF.
+paper_enabled = false
+dry_run_only = false
+csv_path = "audits/paper_validation.csv"
+summary_window = 50
+# Endereço público autorizado (owner) — eth_call from; NUNCA keypair.
+paper_from = "0x152Aa7ecC490860115C4d1369a19C970f9e9eFFf"
+paper_state_overrides = true
+observe_min_spread = 0.005
+observe_max_per_cycle = 8
+
 [analytics]
 enabled = true
 export_csv = true

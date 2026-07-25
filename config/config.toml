@@ -437,7 +437,13 @@ paper_enabled = false
 dry_run_only = false
 csv_path = "audits/paper_validation.csv"
 summary_window = 50
-# paper_from = ""  # opcional; env PAPER_FROM tem prioridade (nunca keypair)
+# Só vale em paper — NÃO altera min_spread de execução (0.50%).
+# Endereço público (owner/allowed executor) para eth_call; env PAPER_FROM tem prioridade.
+paper_from = "0x152Aa7ecC490860115C4d1369a19C970f9e9eFFf"
+paper_state_overrides = true
+observe_min_spread = 0.005
+observe_max_per_cycle = 8
+# paper_from / PAPER_FROM: nunca keypair
 
 [analytics]
 enabled = true
@@ -645,4 +651,4 @@ SUSHI  = { symbol = "SUSHI", decimals = 18 }
 GRT    = { symbol = "GRT", decimals = 18 }
 SAND   = { symbol = "SAND", decimals = 18 }
 MANA   = { symbol = "MANA", decimals = 18 }
-LDO    = { symbol = "LDO", decimals = 18 }
+LDO    = { symbol = "LDO", decimals = 18 }

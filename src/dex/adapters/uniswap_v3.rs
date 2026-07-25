@@ -20,6 +20,8 @@ use crate::{
         TokenPairPrice,
         addresses, // Importando endereços de Factory/Quoter
         cache_fee_tier,
+        select_executable_v3_best_out,
+        QUOTE_V3_FEE_TIERS,
     },
     AppMiddleware,
 };
@@ -38,7 +40,9 @@ use tracing::{debug, info, warn};
 // 🔧 Constantes e ABIs
 // ============================================================
 const DEX_NAME: &str = "UniswapV3";
-const FEE_TIERS: [u32; 4] = [100, 500, 3000, 10_000]; // 0.01%, 0.05%, 0.3%, 1.0%
+// Cotação: todos os tiers (incl. 100 p/ métrica). Seleção executável: ver
+// `select_executable_v3_best_out` / `EXECUTABLE_V3_FEE_TIERS` em dex/mod.rs.
+const FEE_TIERS: [u32; 4] = QUOTE_V3_FEE_TIERS;
 const PRICE_DEVIATION_LIMIT: f64 = 0.20; // 20% desvio máximo
 
 // Assumindo WETH (ETH principal em Polygon) para comparação com USD
@@ -410,26 +414,28 @@ impl DexContract for UniswapV3Dex {
             return Ok(None);
         };
 
-        // Encontra a melhor FEE tier que retorna um resultado (best_fee)
-        let mut best_fee: u32 = 0;
-        let mut temp_best_out = U256::zero();
-        
-        // Use 1 unidade como teste rápido para encontrar a melhor FEE (o valor em si não é usado como preço final)
-        let amount_in_test = U256::exp10(dec_a as usize); 
+        // Cota todos os tiers (incl. 100 p/ métrica); seleciona só executáveis.
+        let amount_in_test = U256::exp10(dec_a as usize);
+        let mut quotes: Vec<(u32, U256)> = Vec::with_capacity(FEE_TIERS.len());
 
         for &fee in &FEE_TIERS {
-            if let Ok(out) = self.get_quote_with_fallback(*token_a, *token_b, fee, amount_in_test).await {
-                 if out > temp_best_out {
-                    temp_best_out = out;
-                    best_fee = fee;
-                 }
+            if let Ok(out) = self
+                .get_quote_with_fallback(*token_a, *token_b, fee, amount_in_test)
+                .await
+            {
+                if !out.is_zero() {
+                    quotes.push((fee, out));
+                }
             }
         }
 
-        if best_fee == 0 {
-             debug!("- [{}] Nenhuma FEE Tier retornou resultado válido para o par, pulando.", DEX_NAME);
-             return Ok(None);
-        }
+        let Some((best_fee, _)) = select_executable_v3_best_out(&quotes) else {
+            debug!(
+                "- [{}] Nenhum FEE Tier EXECUTÁVEL cotou para o par — descartado",
+                DEX_NAME
+            );
+            return Ok(None);
+        };
 
         // 2. NOVO: Valida o preço usando múltiplos amounts e a melhor fee encontrada
         let validated_price = self.validate_price_with_multiple_amounts(
@@ -442,7 +448,7 @@ impl DexContract for UniswapV3Dex {
 
         // 📊 LOG DE COTAÇÃO (fim do cálculo)
         if let Some(price) = validated_price {
-            // Cacheia fee tier com a mesma chave canônica do multicall (símbolos).
+            // Cacheia fee tier EXECUTÁVEL (nunca 100) com chave canônica.
             if let (Some(info_a), Some(info_b)) = (
                 self.token_cache.get_by_address(token_a).await,
                 self.token_cache.get_by_address(token_b).await,
@@ -519,41 +525,41 @@ impl DexContract for UniswapV3Dex {
 
             for (i, chunk) in raw.chunks_exact(FEE_TIERS.len()).enumerate() {
                 let info = &batch[i];
-                let mut best_out = U256::zero();
-                let mut best_fee: u32 = 0;
+                let mut quotes: Vec<(u32, U256)> = Vec::with_capacity(FEE_TIERS.len());
 
                 for (j, r) in chunk.iter().enumerate() {
                     if let Ok(Token::Uint(v)) = r {
-                        if *v > best_out {
-                            best_out = *v;
-                            best_fee = FEE_TIERS[j];
+                        if !v.is_zero() {
+                            quotes.push((FEE_TIERS[j], *v));
                         }
                     }
                 }
 
-                if !best_out.is_zero() {
-                    let price = calculate_price_from_decimals(
-                        info.amount_in,
-                        best_out,
-                        info.decimals_a,
-                        info.decimals_b,
-                    )?;
-                    if self.debug_mode {
-                        tracing::info!(
-                            "[{}] {}→{} fee={} in={} out={} price={:.8} (multicall)",
-                            DEX_NAME, info.token_a, info.token_b, best_fee, info.amount_in, best_out, price
-                        );
-                    }
-                    if let Some(p) = normalize_price(price) {
-                        cache_fee_tier(DEX_NAME, &info.token_a, &info.token_b, best_fee);
+                let Some((best_fee, best_out)) = select_executable_v3_best_out(&quotes) else {
+                    continue;
+                };
 
-                        results.push(TokenPairPrice::new(
-                            info.token_a.clone(),
-                            info.token_b.clone(),
-                            p,
-                            DEX_NAME.into(),
-                        ).with_fee_tier(best_fee));
-                    }
+                let price = calculate_price_from_decimals(
+                    info.amount_in,
+                    best_out,
+                    info.decimals_a,
+                    info.decimals_b,
+                )?;
+                if self.debug_mode {
+                    tracing::info!(
+                        "[{}] {}→{} fee={} in={} out={} price={:.8} (multicall)",
+                        DEX_NAME, info.token_a, info.token_b, best_fee, info.amount_in, best_out, price
+                    );
+                }
+                if let Some(p) = normalize_price(price) {
+                    cache_fee_tier(DEX_NAME, &info.token_a, &info.token_b, best_fee);
+
+                    results.push(TokenPairPrice::new(
+                        info.token_a.clone(),
+                        info.token_b.clone(),
+                        p,
+                        DEX_NAME.into(),
+                    ).with_fee_tier(best_fee));
                 }
             }
         }
