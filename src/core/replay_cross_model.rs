@@ -3,7 +3,7 @@
 //! Curve **não** tem `DexType` no `FlashloanExecutor` — ciclos com perna Curve
 //! são quote-only (sem eth_call). Não altera o finder.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{bail, Result};
 use serde::Serialize;
 
 /// Modelo de curva por venue.

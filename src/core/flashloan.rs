@@ -8,6 +8,7 @@ use crate::{
     contracts::{FlashloanCaller, FlashloanExecutor, SwapStep as AbiSwapStep, ERC20},
     core::{
         arbitrage::ArbitrageEngine,
+        economics,
         gas::GasEstimator,
         paper_validation::{self, PaperValidationHub},
         types::{ArbitrageOpportunity, BundleResult},
@@ -192,7 +193,14 @@ impl ArbitrageClient {
         gas_cost_usd: f64,
         flashloan_fee_usd: f64,
     ) -> Result<(), FlashloanError> {
-        let net_profit_usd = gross_profit_usd - gas_cost_usd - flashloan_fee_usd;
+        let net_profit_usd = economics::net_profit_usd(
+            gross_profit_usd,
+            &economics::TradeCosts {
+                gas_usd: gas_cost_usd,
+                flashloan_fee_usd,
+                adverse_move_usd: 0.0,
+            },
+        );
 
         if net_profit_usd <= 0.0 {
             return Err(FlashloanError::InsufficientProfit(format!(
@@ -389,9 +397,12 @@ impl ArbitrageClient {
     cfg.arbitrage.min_profit_absolute.parse::<f64>().unwrap_or(0.0001),
     cfg.risk.clone(),
     cfg.flashloan.slippage_bps.unwrap_or(50) as u64,
-    cfg.flashloan.flashloan_decimals.unwrap_or(18) as u32,
+    // 6 decimais (USDC/USDT) — MESMO default dos outros dois call sites.
+    // Divergia (18 aqui, 6 nos demais): com o campo ausente no TOML a fee do
+    // flashloan saía dividida por 1e18 em vez de 1e6, virando ~zero.
+    cfg.flashloan.flashloan_decimals.unwrap_or(6) as u32,
     // Mesma fonte do engine (`recalculate_profitability`); default 5 bps Aave V3.
-    cfg.flashloan.fee_pct.unwrap_or(0.0005),
+    cfg.flashloan.fee_pct.unwrap_or(economics::AAVE_V3_PREMIUM_PCT),
 )
         };
 
@@ -492,7 +503,7 @@ impl ArbitrageClient {
             let cfg = self.config.lock().await;
             (
                 cfg.flashloan.slippage_bps.unwrap_or(50) as u64,
-                cfg.flashloan.fee_pct.unwrap_or(0.0005),
+                cfg.flashloan.fee_pct.unwrap_or(economics::AAVE_V3_PREMIUM_PCT),
                 cfg.flashloan.flashloan_decimals.unwrap_or(6) as u32,
             )
         };

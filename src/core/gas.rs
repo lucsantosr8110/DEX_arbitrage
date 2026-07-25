@@ -107,9 +107,9 @@ where
         // ============================================================
         if gas.use_polygon_oracle {
             if let Ok(Some((max_fee_gwei, prio_gwei))) = self.fetch_polygon_oracle_ttl(ttl).await {
-                let base_fee = gwei((max_fee_gwei - prio_gwei).max(0.0) as u64);
-                let max_fee = gwei(max_fee_gwei as u64);
-                let priority_fee = gwei(prio_gwei as u64);
+                let base_fee = gwei_f64((max_fee_gwei - prio_gwei).max(0.0));
+                let max_fee = gwei_f64(max_fee_gwei);
+                let priority_fee = gwei_f64(prio_gwei);
 
                 self.set_cached_gas(&cache_key, max_fee, priority_fee, base_fee).await;
                 info!(
@@ -207,7 +207,7 @@ where
         }
 
         priority = priority.clamp(min_priority, max_priority);
-        Ok(gwei(priority as u64))
+        Ok(gwei_f64(priority))
     }
 
     async fn calculate_dynamic_max_fee(
@@ -225,7 +225,7 @@ where
             max_fee_gwei = cfg.gas.max_gwei as f64;
         }
 
-        Ok(gwei(max_fee_gwei as u64))
+        Ok(gwei_f64(max_fee_gwei))
     }
 
     // ============================================================
@@ -249,24 +249,36 @@ where
         let priority_gwei = u256_to_f64(priority_fee, 9);
         let eff = base_fee_gwei * 1.05 + priority_gwei;
 
-        let gas_units = if gas_cfg.default_gas_limit == 0 {
+        // `default_gas_limit`/`max_gas_limit` são TETOS da tx, não consumo esperado.
+        // Para decidir lucro o que importa é o gás realmente queimado; usar o teto
+        // infla o custo. `gas.estimated_gas_units` traz o consumo esperado da rota
+        // (flashloan Aave + 3 swaps ≈ 400k); só cai no teto se não configurado.
+        let gas_units = if gas_cfg.estimated_gas_units > 0 {
+            gas_cfg.estimated_gas_units as f64
+        } else if gas_cfg.default_gas_limit == 0 {
             gas_cfg.max_gas_limit as f64
         } else {
             gas_cfg.default_gas_limit as f64
         };
 
-        // Preço do POL via CachedPriceFeed (Coingecko, cache 2min, fallback heurístico).
-        // Antes era estático (gas_cfg.eth_price_usd = 0.102083), sempre errado.
-        // Ver ESTADO_ATUAL.md seção 8 e Fase 2 item 12.
+        // Preço do POL (token de gás da Polygon) via Coingecko com cache de 2 min.
+        //
+        // `PRICE_FEED` já tem fallback heurístico próprio e devolve Err só em caso
+        // patológico; nesse caso usamos o mesmo fallback, NÃO `gas_cfg.eth_price_usd`
+        // — esse campo é um estático de config (0.102083) que ninguém atualiza e
+        // era um terceiro preço divergente na cadeia.
         let matic_price = crate::infra::price_feed::PRICE_FEED
             .get_price("WMATIC")
             .await
-            .unwrap_or(gas_cfg.eth_price_usd);
+            .unwrap_or_else(|_| crate::infra::price_feed::CachedPriceFeed::fallback_price("WMATIC"));
         let cost = gas_units * (eff * 1e-9) * matic_price;
 
+        // Fonte única de gás para finder / executor / risk manager.
+        crate::core::economics::publish_live_gas_usd(cost);
+
         info!(
-            "⛽ [GasEstimator] base={:.2} | prio={:.2} | eff={:.2} | custo=${:.6}",
-            base_fee_gwei, priority_gwei, eff, cost
+            "⛽ [GasEstimator] base={:.2} | prio={:.2} | eff={:.2} | units={} | custo=${:.6}",
+            base_fee_gwei, priority_gwei, eff, gas_units, cost
         );
 
         Ok(cost)
@@ -324,6 +336,21 @@ fn gwei(n: u64) -> U256 {
     U256::from(n) * U256::exp10(9)
 }
 
+/// Gwei fracionário → wei, sem truncar a parte decimal.
+///
+/// `gwei(x as u64)` descartava a fração: um oracle devolvendo 30.7 gwei virava
+/// 30, e uma priority de 0.6 gwei virava **0** (tx que nunca entra em bloco).
+fn gwei_f64(n: f64) -> U256 {
+    if !n.is_finite() || n <= 0.0 {
+        return U256::zero();
+    }
+    let wei = (n * 1e9).round();
+    if wei >= u128::MAX as f64 {
+        return U256::MAX;
+    }
+    U256::from(wei as u128)
+}
+
 pub fn u256_to_f64(value: U256, decimals: u32) -> f64 {
     let divisor = U256::exp10(decimals as usize);
     let integer = value / divisor;
@@ -359,5 +386,38 @@ impl<M> Clone for GasEstimator<M> {
             oracle_cache: self.oracle_cache.clone(),
             http: self.http.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gwei_f64_keeps_fraction() {
+        // `gwei(x as u64)` truncava: 30.7 -> 30 gwei.
+        assert_eq!(gwei_f64(30.7), U256::from(30_700_000_000u64));
+        assert_eq!(gwei_f64(1.0), gwei(1));
+        // Sub-gwei não pode virar zero — priority 0 nunca entra em bloco.
+        assert_eq!(gwei_f64(0.6), U256::from(600_000_000u64));
+        assert!(!gwei_f64(0.6).is_zero());
+    }
+
+    #[test]
+    fn gwei_f64_rejects_nonfinite_and_negative() {
+        assert!(gwei_f64(f64::NAN).is_zero());
+        assert!(gwei_f64(-5.0).is_zero());
+        assert!(gwei_f64(0.0).is_zero());
+    }
+
+    #[test]
+    fn cost_uses_estimated_units_not_limit() {
+        // Precificar com o TETO da tx infla o custo. Config traz consumo esperado.
+        let cfg = crate::config::GasConfig::default();
+        assert!(cfg.estimated_gas_units > 0);
+        assert!(
+            cfg.estimated_gas_units < cfg.max_gas_limit,
+            "consumo esperado deve ser menor que o teto"
+        );
     }
 }

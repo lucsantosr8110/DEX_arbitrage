@@ -1,5 +1,6 @@
 use crate::{
     config::Config,
+    core::economics,
     core::types::{ArbitrageOpportunity, ArbitrageStep, SerializableSteps},
     dex::get_token_decimals,
     utils::{f64_to_u256, u256_to_f64},
@@ -852,32 +853,45 @@ impl ArbitrageEngine {
             ));
         }
 
-        // CORREÇÃO: Calcular profit BRUTO (sem custos ainda)
-        let gross_profit_usd = trade_amount_usd * (total_rate - 1.0);
+        // Lucro BRUTO. `total_rate` é fee-inclusive E impact-inclusive (quotes
+        // cotados no notional de trade) — ver core::economics.
+        let gross_profit_usd = economics::gross_profit_usd(trade_amount_usd, total_rate);
 
-        // CORREÇÃO: Calcular TODOS os custos
+        // Custos reais, um de cada. NÃO deduzir fee/price impact de novo.
         let gas_cost_usd = self.estimate_gas_cost(app_config).await;
 
-        // Fee do flashloan (ler do config, se habilitado)
         let flashloan_fee_usd = if app_config.flashloan.enabled {
-            let fee_pct = app_config.flashloan.fee_pct.unwrap_or(0.0009); // fallback pequeno, prefer config
-            trade_amount_usd * fee_pct
+            let fee_pct = app_config
+                .flashloan
+                .fee_pct
+                .unwrap_or(economics::AAVE_V3_PREMIUM_PCT);
+            economics::flashloan_fee_usd(trade_amount_usd, fee_pct)
         } else {
             0.0
         };
 
-        // Slippage esperado: usar configuração (bps -> pct)
-        let default_price_impact_bps = app_config.execution.default_price_impact_bps;
-        let expected_slippage_usd =
-            trade_amount_usd * (default_price_impact_bps as f64 / 10000.0);
+        let costs = economics::TradeCosts {
+            gas_usd: gas_cost_usd,
+            flashloan_fee_usd,
+            // Buffer opt-in de drift quote→exec (default 0). Antes aqui entrava
+            // `default_price_impact_bps` (25-50 bps), que era dedução DUPLA do
+            // price impact já embutido no quote — sozinho respondia por ~81% do
+            // custo total e exigia ~31 bps de gross para aprovar uma rota.
+            adverse_move_usd: economics::adverse_move_usd(
+                trade_amount_usd,
+                app_config.execution.adverse_move_bps,
+            ),
+        };
 
-        // LUCRO LÍQUIDO REAL
-        let net_profit_usd =
-            gross_profit_usd - gas_cost_usd - flashloan_fee_usd - expected_slippage_usd;
+        let net_profit_usd = economics::net_profit_usd(gross_profit_usd, &costs);
 
         debug!(
-            "PROFIT gross=${:.6} - gas=${:.6} - flashloan=${:.6} - slippage=${:.6} = net=${:.6}",
-            gross_profit_usd, gas_cost_usd, flashloan_fee_usd, expected_slippage_usd, net_profit_usd
+            "PROFIT gross=${:.6} - gas=${:.6} - flashloan=${:.6} - adverse=${:.6} = net=${:.6}",
+            gross_profit_usd,
+            costs.gas_usd,
+            costs.flashloan_fee_usd,
+            costs.adverse_move_usd,
+            net_profit_usd
         );
 
         // Validação final (paper observe: permite net<min para eth_call medir delta;
@@ -893,9 +907,15 @@ impl ArbitrageEngine {
             ));
         }
 
-        // Calcular slippage protection CORRETAMENTE usando BPS vindos do Config
-        self.calculate_slippage_protection(&mut opp.steps.0, amount_in, app_config)
-            .await?;
+        // Slippage protection: teto do config, apertado pelo edge realmente disponível.
+        self.calculate_slippage_protection(
+            &mut opp.steps.0,
+            amount_in,
+            app_config,
+            net_profit_usd,
+            trade_amount_usd,
+        )
+        .await?;
 
         // Atualizar oportunidade
         opp.amount_in = amount_in;
@@ -924,13 +944,37 @@ impl ArbitrageEngine {
         steps: &mut [ArbitrageStep],
         initial_amount: U256,
         app_config: &Config,
+        net_profit_usd: f64,
+        trade_amount_usd: f64,
     ) -> Result<()> {
         let mut current_amount = initial_amount;
 
         // Ler parâmetros do Config
-        let base_slippage_bps = app_config.execution.max_slippage_bps; // ex.: 20 = 0.20%
-        let hop_increase_bps = app_config.execution.hop_slippage_increase_bps; // ex.: 20 = +0.20% por hop (em bps)
-        let safety_margin_bps = app_config.execution.safety_margin_bps; // ex.: 9800 = 98%
+        let configured_slippage_bps = app_config.execution.max_slippage_bps; // teto
+        let hop_increase_bps = app_config.execution.hop_slippage_increase_bps; // bps por hop extra
+        let safety_margin_bps = app_config.execution.safety_margin_bps; // 10000 = sem 2º haircut
+
+        // Teto de slippage que ainda deixa a rota lucrativa. Sem isto, uma rota
+        // com edge de 20 bps carregava amount_out_min 250 bps abaixo do esperado
+        // — folga suficiente para um sandwich extrair 10x o edge e a tx ainda
+        // completar (com prejuízo) em vez de reverter.
+        let base_slippage_bps = economics::max_slippage_bps_for_edge(
+            net_profit_usd,
+            trade_amount_usd,
+            steps.len(),
+            configured_slippage_bps,
+        );
+
+        if base_slippage_bps < configured_slippage_bps {
+            debug!(
+                "🛡️ slippage apertado por orçamento de edge: {} → {} bps/hop (net=${:.6} em ${:.2}, {} hops)",
+                configured_slippage_bps,
+                base_slippage_bps,
+                net_profit_usd,
+                trade_amount_usd,
+                steps.len()
+            );
+        }
 
         for (idx, step) in steps.iter_mut().enumerate() {
             let input_decimals = self.get_token_decimals_smart(&step.token_in, app_config).await?;
@@ -1933,10 +1977,16 @@ impl ArbitrageEngine {
         .await
     }
 
+    /// Custo de gás do gate do finder.
+    ///
+    /// Prefere a medição viva publicada pelo `GasEstimator` (oracle/RPC + preço
+    /// do POL). `execution.estimate_base_gas_usd` só vale como fallback até a
+    /// primeira medição — antes, este era um segundo modelo permanente, que
+    /// divergia do executor e do risk manager.
     async fn estimate_gas_cost(&self, app_config: &Config) -> f64 {
-        let base_gas_cost = app_config.execution.estimate_base_gas_usd;
         let complexity_factor = 1.0 + (app_config.arbitrage.max_path_length as f64 * 0.05);
-        base_gas_cost * complexity_factor
+        let static_fallback = app_config.execution.estimate_base_gas_usd * complexity_factor;
+        economics::gas_usd_or_fallback(static_fallback)
     }
 
     fn estimate_usdt_rate(&self, token: &str, steps: &[ArbitrageStep], is_input: bool) -> f64 {
@@ -2403,6 +2453,42 @@ mod tests {
         //       = 945_250
         let expected = U256::from(945_250u64);
         assert_eq!(result_dangerous, expected, "Resultado do clamp deveria ser 945_250");
+    }
+
+    /// Com `safety_margin_bps = 10000` (config nova) o haircut é só o slippage —
+    /// sem o segundo corte multiplicativo de 2% que existia com 9800.
+    #[test]
+    fn safety_margin_10000_applies_single_haircut() {
+        let amount = U256::from(1_000_000u64);
+        // 6 bps de slippage, sem 2º haircut => 999_400 (0.06% abaixo).
+        let tight = ArbitrageEngine::apply_slippage_safe(amount, 6, 10_000);
+        assert_eq!(tight, U256::from(999_400u64));
+
+        // Com o antigo 9800, o MESMO slippage de 6 bps derrubava para ~97.94%:
+        // folga de ~2% para um sandwich, em cima de um edge de 20 bps.
+        let loose = ArbitrageEngine::apply_slippage_safe(amount, 6, 9_800);
+        assert_eq!(loose, U256::from(979_412u64));
+        assert!(
+            tight > loose,
+            "single haircut deve ser mais apertado que o duplo"
+        );
+    }
+
+    /// Orçamento de slippage nunca ultrapassa o edge disponível.
+    #[test]
+    fn slippage_budget_binds_amount_out_min_to_edge() {
+        // Edge 20 bps em $100, 3 hops => ~6 bps/hop (teto config 50 não manda).
+        let bps = economics::max_slippage_bps_for_edge(0.20, 100.0, 3, 50);
+        assert!(bps <= 7, "bps/hop={bps}");
+
+        let amount = U256::from(1_000_000u64);
+        let min = ArbitrageEngine::apply_slippage_safe(amount, bps, 10_000);
+        // Perda máxima tolerada por perna <= o próprio edge da rota.
+        let haircut_bps = (amount - min).as_u64() as f64 / amount.as_u64() as f64 * 10_000.0;
+        assert!(
+            haircut_bps <= 20.0,
+            "haircut {haircut_bps} bps não pode passar do edge de 20 bps"
+        );
     }
 
     /// safety_margin_bps >= 5000 deve ser usado como-is (sem clamp).

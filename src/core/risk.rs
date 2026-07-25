@@ -5,6 +5,7 @@
 // ✅ Totalmente parametrizado por config.toml
 // ============================================================
 
+use crate::core::economics;
 use crate::core::types::{
     ArbitrageOpportunity, FlashloanOpportunity, RiskAssessment, RiskConfig, RiskFactor,
 };
@@ -60,42 +61,42 @@ impl RiskManager {
     // ============================================================
     // 🔧 Utilitários de cálculo — Gas / Slippage / Profit
     // ============================================================
+    /// Último recurso de gás, só se nunca houve medição viva **e** a oportunidade
+    /// não trouxe custo próprio.
+    ///
+    /// A fórmula `(min+max)/2 * multiplier` não olha gas price, gas units nem o
+    /// preço do POL — com a config atual satura em `gas_max` e devolve um valor
+    /// constante (~$0.10), ~20x a medição real. Mantida apenas como piso de
+    /// segurança; `effective_gas_usd` prefere qualquer fonte medida.
     fn calculate_realistic_gas_usd(&self, adaptive: bool) -> f64 {
-        let gas_min = if adaptive { 
-            self.config.gas_min_usd_adaptive 
-        } else { 
-            self.config.gas_min_usd 
+        let gas_min = if adaptive {
+            self.config.gas_min_usd_adaptive
+        } else {
+            self.config.gas_min_usd
         };
-        let gas_max = if adaptive { 
-            self.config.gas_max_usd_adaptive 
-        } else { 
-            self.config.gas_max_usd 
+        let gas_max = if adaptive {
+            self.config.gas_max_usd_adaptive
+        } else {
+            self.config.gas_max_usd
         };
         let base_gas = (gas_min + gas_max) / 2.0;
-        let multiplier = if adaptive { 
-            self.config.gas_multiplier_adaptive 
-        } else { 
-            self.config.gas_multiplier 
+        let multiplier = if adaptive {
+            self.config.gas_multiplier_adaptive
+        } else {
+            self.config.gas_multiplier
         };
         (base_gas * multiplier).max(gas_min).min(gas_max)
     }
 
-    fn calculate_realistic_slippage(&self, spread_percent: f64, adaptive: bool) -> f64 {
-        let (coef, min_abs, max_abs) = if adaptive {
-            (
-                self.config.slippage_coef_adaptive,
-                self.config.slippage_min_abs_adaptive,
-                self.config.slippage_max_abs_adaptive,
-            )
-        } else {
-            (
-                self.config.slippage_coef_aggressive,
-                self.config.slippage_min_abs_aggressive,
-                self.config.slippage_max_abs_aggressive,
-            )
-        };
-        let slip = spread_percent * coef;
-        slip.max(min_abs).min(max_abs)
+    /// Gás efetivo: medição viva > custo já anexado à oportunidade > fallback config.
+    fn effective_gas_usd(&self, opportunity: &ArbitrageOpportunity, adaptive: bool) -> f64 {
+        if let Some(live) = economics::live_gas_usd() {
+            return live;
+        }
+        if opportunity.gas_cost_usd.is_finite() && opportunity.gas_cost_usd > 0.0 {
+            return opportunity.gas_cost_usd;
+        }
+        self.calculate_realistic_gas_usd(adaptive)
     }
 
     fn min_profit_threshold(&self, _adaptive: bool) -> f64 {
@@ -151,18 +152,27 @@ impl RiskManager {
         let mut risk_factors = Vec::new();
         let mut risk_score = 0.0;
 
-        let gas_real = self.calculate_realistic_gas_usd(false);
+        let gas_real = self.effective_gas_usd(opportunity, false);
         metrics::set_last_gas_usd(gas_real);
 
-        let gross = opportunity.estimated_profit_usd.max(0.0);
-        let slip = self.calculate_realistic_slippage(opportunity.spread_percent, false);
+        // `net_profit_usd` já vem de `core::economics` (gross − gás − prêmio Aave
+        // − adverse move opt-in). Aqui só se aplica a margem de risco própria do
+        // manager. Antes este bloco redescontava gás e um "slippage" calculado
+        // como `spread_percent * coef` — percent × escalar tratado como USD, sem
+        // notional na conta: dimensionalmente incoerente e terceira dedução do
+        // mesmo price impact já embutido no quote.
         let premium = self.config.premium_usd_aggressive.max(0.0);
-        let adjusted_net_profit = gross - gas_real - premium - slip;
+        let adjusted_net_profit = opportunity.net_profit_usd - premium;
         let min_profit_usd = self.min_profit_threshold(false);
 
         debug!(
-            "🧮 [Agg] gross=${:.6} gas=${:.6} prem=${:.6} slip=${:.6} net=${:.6} | min=${:.6} | conf={:.3}",
-            gross, gas_real, premium, slip, adjusted_net_profit, min_profit_usd, opportunity.confidence
+            "🧮 [Agg] net_model=${:.6} gas=${:.6} prem=${:.6} adj_net=${:.6} | min=${:.6} | conf={:.3}",
+            opportunity.net_profit_usd,
+            gas_real,
+            premium,
+            adjusted_net_profit,
+            min_profit_usd,
+            opportunity.confidence
         );
 
         // ✅ VALIDAÇÃO DE LUCRO NEGATIVO - COMPATÍVEL
@@ -252,18 +262,17 @@ impl RiskManager {
         let mut risk_factors = Vec::new();
         let mut risk_score = 0.0;
 
-        let gas_real = self.calculate_realistic_gas_usd(true);
+        let gas_real = self.effective_gas_usd(opportunity, true);
         metrics::set_last_gas_usd(gas_real);
 
-        let gross = opportunity.estimated_profit_usd.max(0.0);
-        let slip = self.calculate_realistic_slippage(opportunity.spread_percent, true);
+        // Mesma convenção do modo agressivo: net vem de core::economics.
         let premium = self.config.premium_usd_adaptive.max(0.0);
-        let adjusted_net_profit = gross - gas_real - premium - slip;
+        let adjusted_net_profit = opportunity.net_profit_usd - premium;
         let min_profit_usd = self.min_profit_threshold(true);
 
         debug!(
-            "🧮 [Adapt] gross=${:.6} gas=${:.6} prem=${:.6} slip=${:.6} net=${:.6} | min=${:.6}",
-            gross, gas_real, premium, slip, adjusted_net_profit, min_profit_usd
+            "🧮 [Adapt] net_model=${:.6} gas=${:.6} prem=${:.6} adj_net=${:.6} | min=${:.6}",
+            opportunity.net_profit_usd, gas_real, premium, adjusted_net_profit, min_profit_usd
         );
 
         // ✅ VALIDAÇÕES ADAPTATIVAS MAIS TOLERANTES
@@ -478,6 +487,54 @@ mod tests {
         let assessment = manager.assess_opportunity(&op);
         assert!(assessment.risk_score >= 0.0);
         assert!(assessment.risk_score <= 100.0);
+    }
+
+    /// O risk manager consome o net de `core::economics`; não redescreve o modelo.
+    #[test]
+    fn risk_uses_engine_net_not_own_cost_model() {
+        let mut manager = RiskManager::with_defaults();
+        let mut op = create_test_opportunity();
+
+        // Gross alto mas net do modelo negativo => reprovar, mesmo com gross bom.
+        op.estimated_profit_usd = 5.0;
+        op.net_profit_usd = -0.01;
+        let rejected = manager.assess_opportunity(&op);
+        assert!(
+            !rejected.approved,
+            "net negativo do modelo único deve reprovar"
+        );
+
+        // Perfil micro-arb (config.toml usa min_profit_usd = 0.0; o default de
+        // código é 0.10 e sozinho barraria qualquer edge pequeno).
+        manager.config.min_profit_usd = 0.0;
+
+        // Micro-lucro real => aprovar. Antes o gás fixo de $0.10 do risk manager
+        // mais o "slippage" incoerente matavam qualquer edge abaixo de ~16 bps.
+        op.net_profit_usd = 0.02;
+        let approved = manager.assess_opportunity(&op);
+        assert!(
+            approved.approved,
+            "micro-lucro de $0.02 deve passar (score={})",
+            approved.risk_score
+        );
+
+        // E o gross alto não salva um net negativo nem nesse perfil.
+        op.net_profit_usd = -0.001;
+        assert!(!manager.assess_opportunity(&op).approved);
+    }
+
+    /// Gás vivo tem prioridade sobre o fallback saturado da config.
+    #[test]
+    fn effective_gas_prefers_live_measurement() {
+        let manager = RiskManager::with_defaults();
+        let mut op = create_test_opportunity();
+        op.gas_cost_usd = 0.0;
+
+        economics::publish_live_gas_usd(0.0051);
+        let g = manager.effective_gas_usd(&op, false);
+        assert!((g - 0.0051).abs() < 1e-9, "esperava gás vivo, veio {g}");
+        // Fallback da config satura em gas_max ($0.10) — muito acima do real.
+        assert!(manager.calculate_realistic_gas_usd(false) > g * 5.0);
     }
 
     #[test]

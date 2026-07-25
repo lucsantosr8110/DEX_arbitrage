@@ -15,6 +15,7 @@
 use crate::{
     config::Config,
     contracts::ERC20,
+    core::economics,
     core::types::ArbitrageOpportunity,
     AppMiddleware,
 };
@@ -521,6 +522,12 @@ pub struct PaperSample {
     pub fee_tiers: String,
     pub trade_usd: f64,
     pub net_previsto_usd: f64,
+    /// Delta que o `eth_call` DEVE devolver: gross − prêmio do flashloan.
+    ///
+    /// Base correta do `erro_rel_pct`. `net_previsto_usd` embute gás (que o
+    /// `eth_call` não cobra) e o adverse move opcional, então comparar contra ele
+    /// media o próprio modelo de custo, não o erro de previsão do quote.
+    pub delta_previsto_usd: f64,
     pub gross_previsto_usd: f64,
     pub gas_usd: f64,
     pub flashloan_fee_usd: f64,
@@ -772,16 +779,23 @@ pub fn build_sample(
         .collect::<Vec<_>>()
         .join("|");
 
+    // Base do erro: o que o eth_call deve devolver (gross − prêmio), não o net
+    // de execução (que desconta gás — não cobrado em eth_call).
+    let delta_previsto_usd =
+        economics::expected_sim_delta_usd(opp.estimated_profit_usd, flashloan_fee_usd);
+
     let (erro_abs, erro_rel, false_profitable) = match profit_realizado_usd {
         Some(real) => {
-            let abs = (opp.net_profit_usd - real).abs();
-            let rel = if opp.net_profit_usd.abs() > 1e-12 {
-                Some((abs / opp.net_profit_usd.abs()) * 100.0)
+            let abs = (delta_previsto_usd - real).abs();
+            let rel = if delta_previsto_usd.abs() > 1e-12 {
+                Some((abs / delta_previsto_usd.abs()) * 100.0)
             } else if real.abs() > 1e-12 {
                 Some(100.0)
             } else {
                 Some(0.0)
             };
+            // "Falso lucrativo" continua julgado pelo net de EXECUÇÃO: prevíamos
+            // lucro real e a simulação não entregou.
             let fp = opp.net_profit_usd > 0.0 && real <= 0.0;
             (Some(abs), rel, fp)
         }
@@ -795,6 +809,7 @@ pub fn build_sample(
         fee_tiers: fee_tiers.join(";"),
         trade_usd: opp.estimated_volume_usd,
         net_previsto_usd: opp.net_profit_usd,
+        delta_previsto_usd,
         gross_previsto_usd: opp.estimated_profit_usd,
         gas_usd: opp.gas_cost_usd,
         flashloan_fee_usd,
@@ -911,18 +926,19 @@ fn append_csv_row(path: &PathBuf, s: &PaperSample, write_header: bool) -> std::i
     if write_header && !exists {
         writeln!(
             f,
-            "timestamp,pair,route,fee_tiers,trade_usd,net_previsto_usd,gross_previsto_usd,gas_usd,flashloan_fee_usd,profit_realizado_usd,erro_abs_usd,erro_rel_pct,block_number,sim_ok,revert_reason,false_profitable,would_execute"
+            "timestamp,pair,route,fee_tiers,trade_usd,net_previsto_usd,delta_previsto_usd,gross_previsto_usd,gas_usd,flashloan_fee_usd,profit_realizado_usd,erro_abs_usd,erro_rel_pct,block_number,sim_ok,revert_reason,false_profitable,would_execute"
         )?;
     }
     writeln!(
         f,
-        "{},{},{},{},{:.8},{:.8},{:.8},{:.8},{:.8},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{:.8},{:.8},{:.8},{:.8},{:.8},{:.8},{},{},{},{},{},{},{},{}",
         s.timestamp,
         s.pair,
         escape_csv(&s.route),
         s.fee_tiers,
         s.trade_usd,
         s.net_previsto_usd,
+        s.delta_previsto_usd,
         s.gross_previsto_usd,
         s.gas_usd,
         s.flashloan_fee_usd,
@@ -1211,6 +1227,7 @@ mod tests {
                 fee_tiers: "500".into(),
                 trade_usd: 100.0,
                 net_previsto_usd: 1.0,
+                delta_previsto_usd: 1.0,
                 gross_previsto_usd: 2.0,
                 gas_usd: 0.1,
                 flashloan_fee_usd: 0.05,
@@ -1230,6 +1247,7 @@ mod tests {
                 fee_tiers: "-".into(),
                 trade_usd: 100.0,
                 net_previsto_usd: 0.5,
+                delta_previsto_usd: 0.5,
                 gross_previsto_usd: 1.0,
                 gas_usd: 0.1,
                 flashloan_fee_usd: 0.05,
@@ -1354,6 +1372,7 @@ mod tests {
             fee_tiers: "500".into(),
             trade_usd: 100.0,
             net_previsto_usd: 1.0,
+            delta_previsto_usd: 1.0,
             gross_previsto_usd: 2.0,
             gas_usd: 0.1,
             flashloan_fee_usd: 0.05,

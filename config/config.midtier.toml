@@ -135,9 +135,18 @@ slippage_tolerance_pct = 0.40
 
 # --- Custos Realistas ---
 default_dex_fee_bps = 30
+# NAO entra no net profit: quotes ja sao fee+impact-inclusive (ver core::economics).
+# Mantido so para overrides de simulacao legada.
 default_price_impact_bps = 25
+# Buffer opt-in de drift quote->execucao, em bps do notional. 0 = desligado.
+# NAO e price impact. Ligar so se quiser pagar por risco de latencia.
+adverse_move_bps = 0
 hop_slippage_increase_bps = 5
-safety_margin_bps = 9800  # 98% — CRÍTICO: valor < 5000 permite slippage catastrófico
+# 10000 = sem 2o haircut. max_slippage_bps e o unico knob de folga, e ele ja
+# e apertado em runtime pelo edge disponivel (economics::max_slippage_bps_for_edge).
+# 9800 aplicava -2% multiplicativo POR PERNA, sozinho maior que qualquer edge
+# de micro-arbitragem: virava orcamento de sandwich, nao protecao.
+safety_margin_bps = 10000
 estimate_base_gas_usd = 0.03
 
 [execution.simulation]
@@ -307,6 +316,9 @@ max_gwei = 500
 priority_gwei = 60.0
 default_gas_price_gwei = 50.0
 default_gas_limit = 300000
+# Consumo ESPERADO da rota (flashloan Aave + 3 swaps), usado para precificar custo.
+# Teto da tx continua em default_gas_limit/max_gas_limit.
+estimated_gas_units = 400000
 max_gas_limit = 700000
 fallback_strategy = "conservative"
 prediction_window = 2

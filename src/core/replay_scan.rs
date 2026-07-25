@@ -4,7 +4,7 @@
 //! Não altera o finder — só alimenta price_map@block.
 
 use crate::{
-    config::{token_cache::TokenCache, Config, ReplayConfig, ReplayWindow},
+    config::{token_cache::TokenCache, Config, ReplayConfig},
     core::{
         arbitrage::ArbitrageEngine,
         flashloan::ArbitrageClient,
@@ -1515,7 +1515,7 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{Config, ReplayWindow};
     use crate::core::types::ArbitrageStep;
 
     #[test]

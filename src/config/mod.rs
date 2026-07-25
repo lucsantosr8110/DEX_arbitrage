@@ -1068,6 +1068,9 @@ pub struct GasConfig {
     #[serde(default)] pub auto_bargain: bool,
     #[serde(default)] pub max_fee_multiplier: Option<f64>,
     #[serde(default = "default_min_priority_gwei")]  pub min_priority_gwei: f64,
+    /// Consumo de gás ESPERADO da rota (não o teto). 0 = cai em `default_gas_limit`.
+    /// Usar o teto para precificar custo infla o hurdle de lucro.
+    #[serde(default)] pub estimated_gas_units: u64,
 }
 impl Default for GasConfig {
     fn default() -> Self {
@@ -1094,6 +1097,8 @@ impl Default for GasConfig {
             auto_bargain: false,
             max_fee_multiplier: Some(1.5),
             min_priority_gwei: default_min_priority_gwei(),
+            // flashloan Aave + 3 swaps ≈ 400k gás queimado
+            estimated_gas_units: 400_000,
         }
     }
 }
@@ -1210,6 +1215,12 @@ pub struct ExecutionConfig {
     #[serde(default)] pub hop_slippage_increase_bps: u32,
     #[serde(default)] pub safety_margin_bps: u32,
     #[serde(default)] pub estimate_base_gas_usd: f64,
+
+    /// Buffer de drift quote→execução, em bps do notional. **Default 0.**
+    ///
+    /// NÃO é price impact: quotes já são impact-inclusive (ver `core::economics`).
+    /// Só ligue isto se quiser pagar explicitamente por risco de latência.
+    #[serde(default)] pub adverse_move_bps: u32,
 }
 
 impl Default for ExecutionConfig {
@@ -1238,8 +1249,12 @@ impl Default for ExecutionConfig {
             rate_limiting: ExecutionRateLimitingConfig::default(),
 
             // sensible defaults (configurable via TOML)
+            // NOTA: default_dex_fee_bps e default_price_impact_bps NÃO entram no
+            // cálculo de net profit — quotes já são fee+impact-inclusive.
+            // Ver core::economics. Mantidos só para overrides de simulação legada.
             default_dex_fee_bps: 30,            // 0.30%
             default_price_impact_bps: 50,       // 0.50%
+            adverse_move_bps: 0,                // opt-in; ver core::economics
             dex_fee_bps_map: HashMap::new(),
             dex_price_impact_bps_map: HashMap::new(),
             hop_slippage_increase_bps: 5,       // 5 bps = 0.05% por hop adicional
@@ -1860,6 +1875,34 @@ impl Config {
         }
         if self.flashloan.max_amount_wmatic.is_none() {
             self.flashloan.max_amount_wmatic = Some(10.0);
+        }
+
+        // Notional de COTAÇÃO vs notional de LUCRO.
+        //
+        // Os quotes são cotados em `arbitrage.default_trade_amount` (ver
+        // dex::quote_amount_for_usd), mas o lucro escala por `flashloan.capital_usd`
+        // quando o flashloan está ligado. Se divergirem, o gross é extrapolado com
+        // um rate medido em outro tamanho — price impact do tamanho real fica de
+        // fora e o lucro sai superestimado. Nada no código força a igualdade, então
+        // avisar alto.
+        if self.flashloan.enabled {
+            let quote_notional = self
+                .arbitrage
+                .default_trade_amount
+                .parse::<f64>()
+                .unwrap_or(0.0);
+            let profit_notional = self.flashloan.capital_usd;
+            if quote_notional > 0.0
+                && profit_notional > 0.0
+                && (quote_notional - profit_notional).abs() / quote_notional > 0.01
+            {
+                warn!(
+                    "⚠️ Notional divergente: quotes cotados a ${:.2} (arbitrage.default_trade_amount) \
+                     mas lucro escalado a ${:.2} (flashloan.capital_usd). O rate medido não vale \
+                     nesse tamanho — gross fica superestimado. Iguale os dois.",
+                    quote_notional, profit_notional
+                );
+            }
         }
 
         if self.min_profit_usd_threshold == 0.0 {
