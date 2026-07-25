@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use ethers::types::Address;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap, fs, path::PathBuf, sync::Arc,
+    collections::{BTreeSet, HashMap}, fs, path::PathBuf, sync::Arc,
     time::{Instant, Duration, SystemTime}
 };
 use tokio::sync::{Mutex, RwLock};
@@ -885,6 +885,10 @@ pub struct DexEntry {
     #[serde(default)] pub priority: Option<u32>,
     #[serde(default)] pub max_slippage: Option<f64>,
     #[serde(default)] pub fee_tier: Option<u32>,
+    /// Gate B2 de TVL específico deste venue (USD). `None` = usa o global
+    /// `arbitrage.min_liquidity`. Estava no TOML mas não existia aqui: os valores
+    /// por DEX eram descartados em silêncio e só o global valia.
+    #[serde(default)] pub liquidity_threshold_usd: Option<f64>,
     #[serde(default)] pub extra: HashMap<String, toml::Value>,
 }
 
@@ -1803,6 +1807,24 @@ impl Default for RadarConfig {
         }
     }
 }
+/// Loga as chaves do TOML que o parser ignorou. Não falha o boot — só torna
+/// impossível "configurar" algo e não perceber que não teve efeito.
+fn report_ignored_keys(raw_toml: &str, cfg: &Config, path: &std::path::Path) {
+    let ignored = Config::ignored_toml_keys(raw_toml, cfg);
+    if ignored.is_empty() {
+        return;
+    }
+    warn!(
+        "⚠️ {:?}: {} chave(s) do TOML NÃO são lidas pelo parser — não têm efeito nenhum. \
+         Ou o campo não existe na struct, ou está na seção errada.",
+        path,
+        ignored.len()
+    );
+    for k in &ignored {
+        warn!("   ⚠️ config ignorada: {k}");
+    }
+}
+
 // ===============================
 // Root Config
 // ===============================
@@ -1979,6 +2001,60 @@ impl Config {
         self.cooldown_manager.clone()
     }
 
+    /// Chaves presentes no TOML que o parser NÃO leu.
+    ///
+    /// Método: TOML bruto → `Config` (parser real) → TOML. O que entra e não
+    /// volta não tem campo correspondente em nenhuma struct, logo não configura
+    /// nada. Usa o próprio serde como fonte de verdade em vez de uma lista
+    /// manual que envelhece.
+    pub fn ignored_toml_keys(raw_toml: &str, parsed: &Config) -> Vec<String> {
+        fn flatten(v: &toml::Value, prefix: &str, out: &mut BTreeSet<String>) {
+            match v {
+                toml::Value::Table(t) => {
+                    for (k, val) in t {
+                        let path = if prefix.is_empty() {
+                            k.clone()
+                        } else {
+                            format!("{prefix}.{k}")
+                        };
+                        match val {
+                            toml::Value::Table(_) => flatten(val, &path, out),
+                            toml::Value::Array(arr) => match arr.first() {
+                                // array de tabelas ([[dex]]): audita o 1º item
+                                Some(toml::Value::Table(_)) => {
+                                    flatten(&arr[0], &format!("{path}[]"), out)
+                                }
+                                _ => {
+                                    out.insert(path);
+                                }
+                            },
+                            _ => {
+                                out.insert(path);
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    out.insert(prefix.to_string());
+                }
+            }
+        }
+
+        let Ok(input) = toml::from_str::<toml::Value>(raw_toml) else {
+            return Vec::new();
+        };
+        let Ok(roundtrip) = toml::Value::try_from(parsed) else {
+            return Vec::new();
+        };
+
+        let mut in_keys = BTreeSet::new();
+        let mut out_keys = BTreeSet::new();
+        flatten(&input, "", &mut in_keys);
+        flatten(&roundtrip, "", &mut out_keys);
+
+        in_keys.difference(&out_keys).cloned().collect()
+    }
+
     pub fn from_file(path: PathBuf) -> Result<Arc<Mutex<Config>>> {
         let raw = fs::read_to_string(&path).with_context(|| format!("failed to read: {:?}", path))?;
         let cleaned = remove_bom(&raw);
@@ -1990,6 +2066,12 @@ impl Config {
         };
         let mut cfg: Config = toml::from_str(&expanded)
             .with_context(|| format!("failed to parse TOML: {:?}", path))?;
+
+        // Nenhuma chave pode ser ignorada em silêncio: sem `deny_unknown_fields`
+        // (que quebraria configs existentes), uma chave com typo ou de uma seção
+        // nunca implementada simplesmente não faz nada — e o operador acha que
+        // configurou. Ver `report_ignored_keys`.
+        report_ignored_keys(&expanded, &cfg, &path);
 
         for (symbol, addr_str) in &cfg.pairs.tokens {
             if let Ok(addr) = addr_str.parse::<Address>() {
@@ -2187,5 +2269,71 @@ impl Default for Config {
             min_profit_usd_threshold: 0.10,
             cooldown_manager: None,
         }
+    }
+}
+#[cfg(test)]
+mod config_parser_tests {
+    use super::*;
+
+    /// Sem `deny_unknown_fields`, chave com typo ou seção nunca implementada é
+    /// aceita e descartada em silêncio. `ignored_toml_keys` usa o próprio serde
+    /// (round-trip) para expor isso no boot.
+    /// TOML completo e válido, a partir do default do próprio código.
+    fn base_toml() -> String {
+        toml::to_string(&Config::default()).expect("serialize default")
+    }
+
+    #[test]
+    fn ignored_keys_detects_unknown_section() {
+        let raw = format!(
+            "{}\n[secao_que_ninguem_le]\nmax_hops = 3\nfoo = \"bar\"\n",
+            base_toml()
+        );
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        let ignored = Config::ignored_toml_keys(&raw, &cfg);
+
+        assert!(
+            ignored.iter().any(|k| k == "secao_que_ninguem_le.max_hops"),
+            "seção não implementada deve ser reportada, veio {ignored:?}"
+        );
+        assert!(ignored.iter().any(|k| k == "secao_que_ninguem_le.foo"));
+    }
+
+    #[test]
+    fn ignored_keys_is_empty_for_fully_supported_toml() {
+        // O default do código, por construção, só tem chaves que o parser lê.
+        let raw = base_toml();
+        let cfg: Config = toml::from_str(&raw).expect("parse");
+        let ignored = Config::ignored_toml_keys(&raw, &cfg);
+        assert!(ignored.is_empty(), "não deveria ignorar nada, veio {ignored:?}");
+    }
+
+    /// `[[dex]].liquidity_threshold_usd` era descartado pelo parser — o valor no
+    /// TOML não chegava a lugar nenhum e todo venue caía no threshold global.
+    #[test]
+    fn per_dex_liquidity_threshold_survives_toml_roundtrip() {
+        let mut cfg = Config::default();
+        cfg.dex = vec![DexEntry {
+            name: "UniswapV3".into(),
+            router_address: "0x0000000000000000000000000000000000000001".into(),
+            enabled: true,
+            liquidity_threshold_usd: Some(10_000.0),
+            ..Default::default()
+        }];
+
+        let raw = toml::to_string(&cfg).expect("serialize");
+        assert!(
+            raw.contains("liquidity_threshold_usd"),
+            "campo deve existir na struct para ser serializado"
+        );
+
+        let back: Config = toml::from_str(&raw).expect("parse");
+        assert_eq!(back.dex[0].liquidity_threshold_usd, Some(10_000.0));
+        assert!(
+            !Config::ignored_toml_keys(&raw, &back)
+                .iter()
+                .any(|k| k.contains("liquidity_threshold_usd")),
+            "não pode mais ser ignorada"
+        );
     }
 }

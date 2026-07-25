@@ -300,7 +300,9 @@ async fn collect_dex_prices(
         .await?;
 
     // Gate de liquidez (TVL proxy) — multicall balanceOf no mesmo ciclo do batch.
-    let min_liq = crate::dex::liquidity::min_pool_liquidity_usd(dm.config_ref());
+    // Threshold do venue (`[[dex]].liquidity_threshold_usd`) com fallback global.
+    let min_liq =
+        crate::dex::liquidity::min_pool_liquidity_usd_for_dex(dm.config_ref(), &adapter);
     let n_before = result.len();
     let result = dm
         .filter_prices_by_liquidity(&adapter, result, min_liq)

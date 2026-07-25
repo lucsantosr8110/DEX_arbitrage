@@ -44,13 +44,27 @@ static POOL_ADDR_CACHE: Lazy<RwLock<HashMap<String, Address>>> =
 static DECIMALS_CACHE: Lazy<RwLock<HashMap<Address, u8>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
-/// Fonte única: `arbitrage.min_liquidity` do config (USD).
+/// Threshold global: `arbitrage.min_liquidity` do config (USD).
 pub fn min_pool_liquidity_usd(cfg: &Config) -> f64 {
     cfg.arbitrage
         .min_liquidity
         .parse::<f64>()
         .unwrap_or(5_000.0)
         .max(0.0)
+}
+
+/// Threshold do venue: `[[dex]].liquidity_threshold_usd`, caindo no global.
+///
+/// Pools V3 concentrados e pools de stable toleram TVL diferente de um pool V2
+/// genérico, daí o override por venue. A chave já existia no TOML mas não era
+/// lida — todo venue usava o global.
+pub fn min_pool_liquidity_usd_for_dex(cfg: &Config, dex_name: &str) -> f64 {
+    cfg.dex
+        .iter()
+        .find(|d| d.name.eq_ignore_ascii_case(dex_name))
+        .and_then(|d| d.liquidity_threshold_usd)
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or_else(|| min_pool_liquidity_usd(cfg))
 }
 
 pub fn low_liquidity_discarded_count() -> u64 {
@@ -380,8 +394,40 @@ mod tests {
         let mut cfg = Config::default();
         cfg.arbitrage.min_liquidity = "12345.5".into();
         assert!((min_pool_liquidity_usd(&cfg) - 12345.5).abs() < 1e-9);
+        // per-dex ausente => cai no global
+        assert!((min_pool_liquidity_usd_for_dex(&cfg, "QuickSwap") - 12345.5).abs() < 1e-9);
         cfg.arbitrage.min_liquidity = "not_a_number".into();
         assert!((min_pool_liquidity_usd(&cfg) - 5000.0).abs() < 1e-9);
+    }
+
+    /// `[[dex]].liquidity_threshold_usd` era descartado pelo parser — todo venue
+    /// usava o global. Agora manda no venue e cai no global só se ausente.
+    #[test]
+    fn per_dex_threshold_overrides_global() {
+        use crate::config::DexEntry;
+        let mut cfg = Config::default();
+        cfg.arbitrage.min_liquidity = "50000".into();
+        cfg.dex = vec![
+            DexEntry {
+                name: "UniswapV3".into(),
+                router_address: String::new(),
+                liquidity_threshold_usd: Some(10_000.0),
+                ..Default::default()
+            },
+            DexEntry {
+                name: "SushiSwap".into(),
+                router_address: String::new(),
+                liquidity_threshold_usd: None,
+                ..Default::default()
+            },
+        ];
+        assert_eq!(min_pool_liquidity_usd_for_dex(&cfg, "UniswapV3"), 10_000.0);
+        // case-insensitive
+        assert_eq!(min_pool_liquidity_usd_for_dex(&cfg, "uniswapv3"), 10_000.0);
+        // sem override => global
+        assert_eq!(min_pool_liquidity_usd_for_dex(&cfg, "SushiSwap"), 50_000.0);
+        // venue desconhecido => global
+        assert_eq!(min_pool_liquidity_usd_for_dex(&cfg, "Curve"), 50_000.0);
     }
 
     #[test]
