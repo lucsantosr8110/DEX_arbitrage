@@ -534,7 +534,7 @@ pub fn is_realistic_price(price: f64, token_pair: &str) -> bool {
     }
 
     // WMATIC ↔ qualquer stable
-    if (pair_lower.contains("wmatic") || pair_lower.contains("matic")) {
+    if pair_lower.contains("wmatic") || pair_lower.contains("matic") {
         if pair_lower.contains("usdt") || pair_lower.contains("usdc") || pair_lower.contains("dai") {
             return price >= 0.05 && price <= 10.0;
         }

@@ -790,7 +790,7 @@ pub async fn start_high_hit_rate_radar(
     ws: Arc<Provider<Ws>>,
     dm: Arc<DexManager>,
     cfg: Arc<Mutex<Config>>,
-    price_cache: Arc<PriceCache>,
+    _price_cache: Arc<PriceCache>,
     cb: Arc<DexCircuitBreaker>,
     price_tx: mpsc::Sender<HashMap<String, HashMap<String, f64>>>,
     mut shutdown_rx: broadcast::Receiver<()>

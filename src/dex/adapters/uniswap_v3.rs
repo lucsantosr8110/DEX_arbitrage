@@ -32,7 +32,7 @@ use ethers::{
     types::{Address, U256},
 };
 use std::{str::FromStr, sync::Arc};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 // ============================================================
 // 🔧 Constantes e ABIs

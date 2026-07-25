@@ -19,7 +19,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::{Mutex, RwLock};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::config::Config;
 

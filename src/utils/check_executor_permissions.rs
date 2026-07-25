@@ -7,7 +7,7 @@ use crate::AppMiddleware;
 use anyhow::{anyhow, Context, Result};
 use ethers::prelude::*;
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 // Endereço do contrato Executor
 const EXECUTOR_ADDRESS: &str = "0xc9bF35C5fF835aF08d1cc48dF114Af0e0D6b6B33"; // Coloque o endereço do seu executor aqui (se necessário)

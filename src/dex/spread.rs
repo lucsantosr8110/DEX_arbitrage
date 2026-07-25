@@ -1,5 +1,4 @@
 // src/dex/spread.rs
-use ethers::types::U256;
 
 pub struct SpreadCalculator;
 

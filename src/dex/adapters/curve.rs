@@ -20,12 +20,12 @@ use crate::{
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use ethers::{
-    abi::{Abi, Token},
+    abi::Abi,
     contract::Contract,
     types::{Address, U256},
 };
 use std::{str::FromStr, sync::Arc};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 const DEX_NAME: &str = "Curve";
 
