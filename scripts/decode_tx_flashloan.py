@@ -6,9 +6,14 @@
 # ===============================================================
 
 from web3 import Web3
+import os
 import sys
 
-RPC_URL = "https://polygon-mainnet.g.alchemy.com/v2/r8SpWPMM1DNvjU87Th6DPenaowGNyzQs"
+# Segredo vem do ambiente. Nunca versione a chave aqui.
+RPC_URL = os.environ.get(
+    "ALCHEMY_RPC_URL",
+    os.environ.get("RPC_POLYGON_URL", "https://polygon-bor-rpc.publicnode.com"),
+)
 w3 = Web3(Web3.HTTPProvider(RPC_URL))
 if not w3.is_connected():
     print("❌ Falha ao conectar ao RPC.")

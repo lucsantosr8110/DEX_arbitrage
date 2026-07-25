@@ -18,7 +18,7 @@ use std::{
     sync::RwLock,
     time::{Duration, Instant},
 };
-use tracing::{debug, warn};
+use tracing::debug;
 
 // ============================================================
 // 📊 Estrutura principal
@@ -38,6 +38,14 @@ pub struct CachedPriceFeed {
 
 static CACHE: Lazy<RwLock<HashMap<String, CachedEntry>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
+
+/// Instância global do feed.
+///
+/// O `CACHE` acima já é estático, então múltiplas instâncias compartilhariam os
+/// preços de qualquer forma — mas cada `CachedPriceFeed::new()` constrói um
+/// `reqwest::Client` novo, com seu próprio pool de conexões. Uma instância só
+/// evita esse desperdício nos adapters, que precisam do feed a cada ciclo.
+pub static PRICE_FEED: Lazy<CachedPriceFeed> = Lazy::new(CachedPriceFeed::new);
 
 // ============================================================
 // 🔹 Implementação
@@ -84,8 +92,24 @@ impl CachedPriceFeed {
                 Ok(price)
             }
             Err(e) => {
-                warn!(target: "price_feed", symbol, error = %e, "⚠️ Falha ao consultar preço — fallback heurístico");
-                Ok(Self::fallback_price(symbol))
+                // Cache NEGATIVO: sem isto, cada cotação re-bate na Coingecko, que
+                // rate-limita a API gratuita e gera milhares de WARN por minuto.
+                // O fallback heurístico é suficiente para DIMENSIONAR o notional
+                // (o preço que vale para lucro é sempre o que o DEX devolve), então
+                // cacheamos o fallback pelo mesmo TTL e seguimos em silêncio.
+                let price = Self::fallback_price(symbol);
+                {
+                    let mut cache = CACHE.write().unwrap();
+                    cache.insert(
+                        symbol.to_lowercase(),
+                        CachedEntry {
+                            price_usd: price,
+                            timestamp: Instant::now(),
+                        },
+                    );
+                }
+                debug!(target: "price_feed", symbol, error = %e, fallback = price, "preço via fallback heurístico (cacheado)");
+                Ok(price)
             }
         }
     }

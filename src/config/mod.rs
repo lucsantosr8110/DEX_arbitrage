@@ -34,6 +34,15 @@ pub struct PairsConfig {
     pub metadata: HashMap<String, TokenMetadata>,
     pub monitor: Vec<String>,
 
+    /// Allowlist de tokens cujos pools foram verificados com liquidez executável.
+    /// Um par de `monitor` só é cotado se ambas as pontas estiverem aqui.
+    /// Vazio = usa o default seguro do radar (stables + bluechips). Preencher para
+    /// experimentos com pares menos concorridos (ex.: LINK, CRV, UNI), depois de
+    /// confirmar o pool on-chain. O gate de reciprocidade a notional continua
+    /// filtrando o que não aguentar o tamanho de trade.
+    #[serde(default)]
+    pub liquidity_allowlist: Vec<String>,
+
     // 🔥 Compatível com seu TOML
     #[serde(default)]
     pub auto_discovery: bool,
@@ -49,6 +58,7 @@ impl Default for PairsConfig {
             tokens: HashMap::new(),
             metadata: HashMap::new(),
             monitor: Vec::new(),
+            liquidity_allowlist: Vec::new(),
             auto_discovery: false,
             refresh_interval: 30,
         }

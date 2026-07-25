@@ -12,6 +12,7 @@ use crate::{
         calculate_price_from_decimals,
         get_token_decimals::get_token_decimals,
         normalize_price,
+        quote_amount_for_usd,
         rate_limiter::ALCHEMY_RATE_LIMITER,
         DexContract, TokenPairPrice,
     },
@@ -105,7 +106,10 @@ impl UniswapV2Dex {
                 continue;
             };
             
-            let amount_in = U256::exp10(decimals_a as usize);
+            // Cotacao dimensionada pelo notional configurado, nao por "1 unidade
+            // do token de entrada" (ver dex::quote_amount_for_usd).
+            let amount_in =
+                quote_amount_for_usd(token_a, decimals_a, self.quote_notional_usd()).await?;
             call_data_list.push(CallInfo {
                 token_a: token_a.clone(),
                 token_b: token_b.clone(),
@@ -257,49 +261,25 @@ impl DexContract for UniswapV2Dex {
             failed_pairs.insert(pair_id);
         }
 
-        // 🚀 CORREÇÃO E0599: Chamada direta ao método do trait usando `self`
-        let Some(wmatic_addr) = self.get_wmatic_address() else {
-             warn!("⚠️ [{}] Não foi possível obter o endereço WMATIC, pulando fallback.", DEX_NAME);
-             return Ok(prices); 
-        };
-        
-        let mut multicall_wmatic = Multicall::new(self.client.clone(), None).await?;
-        let mut wmatic_call_map = Vec::new(); 
-
-        for info in call_data_list.into_iter() {
-            let pair_id = (info.token_a.clone(), info.token_b.clone());
-            if failed_pairs.contains(&pair_id) && info.addr_a != wmatic_addr && info.addr_b != wmatic_addr {
-                let path = vec![info.addr_a, wmatic_addr, info.addr_b];
-                let call = contract.method::<_, Vec<U256>>("getAmountsOut", (info.amount_in, path))?;
-                multicall_wmatic.add_call(call, true);
-                wmatic_call_map.push(info); 
-            }
+        // NOTA: existia aqui um segundo passe que, para todo par sem pool direto,
+        // recotava pelo caminho A -> WMATIC -> B e gravava o resultado como se fosse
+        // o preço spot de A-B. Esse número embute 2x fee e 2x price impact, e o
+        // engine então o comparava contra o preço DIRETO de outro DEX — spread
+        // fabricado, exatamente como o inverso sintético que havia no radar.
+        //
+        // Sem pool direto, o par simplesmente não entra no mapa. Compor rotas
+        // multi-hop é responsabilidade do ArbitrageEngine (build_price_graph em
+        // core/arbitrage.rs), que tem contexto para precificar cada hop. O adapter
+        // não tem, e por isso não deve tentar.
+        if !failed_pairs.is_empty() {
+            debug!(
+                "🔍 [{}] {} par(es) sem pool direto, fora do mapa (amostra: {:?})",
+                DEX_NAME,
+                failed_pairs.len(),
+                failed_pairs.iter().take(5).collect::<Vec<_>>()
+            );
         }
 
-        if wmatic_call_map.is_empty() {
-            return Ok(prices); 
-        }
-
-        debug!("⚡ [{}] Multicall Pass 2 (WMATIC) - {} chamadas", DEX_NAME, wmatic_call_map.len());
-        ALCHEMY_RATE_LIMITER.acquire().await?; 
-        let results_wmatic: Vec<Result<Token, _>> = multicall_wmatic.call_raw().await?;
-
-        for (i, result) in results_wmatic.into_iter().enumerate() {
-             let info = &wmatic_call_map[i];
-             if let Ok(Token::Array(tokens)) = result {
-                 if let Some(Token::Uint(amount_out)) = tokens.last() {
-                     if !amount_out.is_zero() {
-                        let price = calculate_price_from_decimals(
-                            info.amount_in, *amount_out, info.decimals_a, info.decimals_b
-                        )?;
-                        if let Some(p) = normalize_price(price) {
-                            info!("🔁 [{}] Fallback via WMATIC: {}/{}", DEX_NAME, info.token_a, info.token_b);
-                            prices.push(TokenPairPrice::new(info.token_a.clone(), info.token_b.clone(), p, self.name()));
-                        }
-                     }
-                 }
-             }
-        }
         Ok(prices)
     }
 

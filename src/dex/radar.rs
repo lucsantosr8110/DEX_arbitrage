@@ -456,7 +456,7 @@ pub struct CycleEconomics {
 /// **VALIDAÇÃO CROSS-DEX**: Só emite EDGE quando o cycle_rate real (com fees
 /// dos dois DEXes) é > 1.0 — ou seja, quando existe potencial bruto de arbitragem.
 /// Spreads single-direction (ex: USDT-WMATIC 2.42% sem reverso viável) são filtrados.
-fn extract_edges(pr: &HashMap<String, HashMap<String, f64>>) -> (usize, Vec<EdgeInfo>, CycleEconomics) {
+pub fn extract_edges(pr: &HashMap<String, HashMap<String, f64>>) -> (usize, Vec<EdgeInfo>, CycleEconomics) {
     let mut map_pairs: HashMap<String, Vec<(String, f64)>> = HashMap::new();
 
     for (dex, dex_map) in pr {

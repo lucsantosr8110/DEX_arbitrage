@@ -8,7 +8,13 @@ use ethers::{
     types::H160,
 };
 use futures::future;
-use std::{collections::HashMap, path::PathBuf, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    str::FromStr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tracing::{debug, error, info, warn, Level};
 use tracing_subscriber::{
@@ -22,7 +28,7 @@ use flashloan_bot::{
     core::bot::Bot,
     dex::{
         circuit_breaker::DexCircuitBreaker, manager::DexManager, price_cache::PriceCache,
-        radar::start_high_hit_rate_radar,
+        radar::{extract_edges, start_high_hit_rate_radar},
     },
     execution::{bundle_sender::MevConfig, gwei, ExecutionEngine},
     infra::{
@@ -59,6 +65,51 @@ fn log_config_snapshot(config: &Config) {
     info!("═══════════════════════════════════════════════════════════════════");
 }
 
+/// Atualiza o estado compartilhado da TUI com os preços e a economia do ciclo atual.
+fn update_tui_state(
+    tui_state: &Arc<std::sync::RwLock<tui::TuiState>>,
+    prices: &HashMap<String, HashMap<String, f64>>,
+    cycle_count: u64,
+    uptime: Duration,
+) {
+    let (_, _, economics) = extract_edges(prices);
+
+    let mut rows: HashMap<String, tui::PriceRow> = HashMap::new();
+    for (dex, dex_map) in prices {
+        for (pair, price) in dex_map {
+            let row = rows.entry(pair.clone()).or_insert_with(|| tui::PriceRow {
+                pair: pair.clone(),
+                quickswap: None,
+                sushiswap: None,
+                curve: None,
+                uniswap_v3: None,
+            });
+            match dex.as_str() {
+                "QuickSwap" => row.quickswap = Some(*price),
+                "SushiSwap" => row.sushiswap = Some(*price),
+                "Curve" => row.curve = Some(*price),
+                "UniswapV3" => row.uniswap_v3 = Some(*price),
+                _ => {}
+            }
+        }
+    }
+    let mut last_prices: Vec<tui::PriceRow> = rows.into_values().collect();
+    last_prices.sort_by(|a, b| a.pair.cmp(&b.pair));
+    last_prices.truncate(20);
+
+    if let Ok(mut state) = tui_state.write() {
+        state.running = true;
+        state.uptime = uptime;
+        state.cycle_count = cycle_count;
+        state.dex_count = prices.len();
+        state.pairs_count = last_prices.len();
+        state.gross_positive = economics.gross_positive as u32;
+        state.venue_fee_adjusted = economics.venue_fee_adjusted_positive as u32;
+        state.negative_cycles = economics.negative_cycles_found as u32;
+        state.last_prices = last_prices;
+    }
+}
+
 // ============================================================
 // MAIN
 // ============================================================
@@ -74,34 +125,44 @@ async fn main() -> Result<()> {
 
     let env_filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
 
+    // TUI ocupa terminal inteiro (alternate screen). Logs direto no stdout
+    // colidem com o buffer da TUI e aparecem como texto solto fora das boxes.
+    // Por isso logs vão sempre pra arquivo enquanto TUI roda.
+    std::fs::create_dir_all("logs").context("❌ Falha ao criar diretório logs/")?;
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("logs/bot.log")
+        .context("❌ Falha ao abrir logs/bot.log")?;
+
     if use_json_logs {
         tracing_subscriber::fmt()
             .json()
             .with_current_span(false)
             .with_target(false)
+            .with_writer(std::sync::Mutex::new(log_file))
             .init();
-        info!("🧾 Logging JSON habilitado (UTC).");
     } else {
         let filter = tracing_subscriber::EnvFilter::builder()
             .with_default_directive(LevelFilter::INFO.into())
             .parse(env_filter)
             .context("❌ Falha ao parsear RUST_LOG")?;
 
-        let stdout = std::io::stdout.with_max_level(Level::INFO);
+        let writer = std::sync::Mutex::new(log_file).with_max_level(Level::INFO);
 
         let fmt_layer = fmt::layer()
             .compact()
-            .with_ansi(true)
+            .with_ansi(false)
             .with_target(false)
-            .with_writer(stdout);
+            .with_writer(writer);
 
         tracing_subscriber::registry()
             .with(filter)
             .with(fmt_layer)
             .init();
-
-        info!("🧾 Logging padrão habilitado (UTC, com cores).");
     }
+
+    info!("🧾 Logging habilitado em logs/bot.log (TUI usa terminal).");
 
     info!("🚀 Iniciando Flashloan DEX Arbitrage Bot v4.8.4-HYBRID-SAFE...");
 
@@ -303,6 +364,9 @@ async fn main() -> Result<()> {
     let price_rx = Arc::new(Mutex::new(price_rx));
     let (shutdown_tx, _) = broadcast::channel::<()>(4);
 
+    let tui_state = Arc::new(std::sync::RwLock::new(tui::TuiState::default()));
+    tui::spawn_tui(tui_state.clone());
+
     let radar_task = {
         let client_ws = client_ws.clone();
         let dex_manager = dex_manager.clone();
@@ -342,6 +406,8 @@ async fn main() -> Result<()> {
         let price_rx = price_rx.clone();
         let mut sd_rx = shutdown_tx.subscribe();
         let telegram = telegram.clone();
+        let tui_state = tui_state.clone();
+        let start_time = Instant::now();
 
         tokio::spawn(async move {
             info!("🤖 Bot executor iniciado.");
@@ -362,6 +428,9 @@ async fn main() -> Result<()> {
                             if cycle_count % 10 == 0 {
                                 debug!("📊 Ciclo #{} — {} DEXs", cycle_count, prices.len());
                             }
+
+                            update_tui_state(&tui_state, &prices, cycle_count, start_time.elapsed());
+
                             let mut bot_guard = bot.lock().await;
                             if let Err(e) = bot_guard.process_prices(prices).await {
                                 error!("❌ Erro ao processar preços: {:?}", e);
@@ -394,23 +463,6 @@ async fn main() -> Result<()> {
             }
         })
     };
-
-    // ============================================================
-    // 1️⃣2️⃣ TUI (Terminal User Interface)
-    // ============================================================
-    let tui_state = Arc::new(tokio::sync::RwLock::new(tui::TuiState::default()));
-    let tui_state_clone = tui_state.clone();
-
-    // Spawn TUI em thread separada
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let app = tui::TuiApp::new(tui_state_clone);
-            if let Err(e) = app.run().await {
-                eprintln!("TUI error: {:?}", e);
-            }
-        });
-    });
 
     info!("🎯 TUI iniciado. Pressione 'q' no terminal da TUI para sair.");
 

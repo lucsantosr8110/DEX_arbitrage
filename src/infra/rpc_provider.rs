@@ -25,6 +25,15 @@ use crate::{config::NetworkConfig, infra::metrics, AppMiddleware};
 
 pub struct RpcProvider;
 
+/// Um endpoint é inutilizável se estiver vazio ou se ainda for um placeholder
+/// `${VAR}` — o expansor de `Config::from_file` mantém o literal quando a variável
+/// não existe no `.env`. Pular aqui evita uma tentativa de conexão garantidamente
+/// perdida (~300 ms) a cada boot de quem não usa provedor privado.
+pub fn is_usable_endpoint(url: &str) -> bool {
+    let u = url.trim();
+    !u.is_empty() && !u.starts_with("${")
+}
+
 impl RpcProvider {
     // ============================================================
     // 🌐 HTTP simples
@@ -34,11 +43,12 @@ impl RpcProvider {
             warn!("⚠️ .env não encontrado: {:?}", e);
         }
 
-        let rpc_url = if !cfg.rpc_url.trim().is_empty() {
+        let rpc_url = if is_usable_endpoint(&cfg.rpc_url) {
             cfg.rpc_url.clone()
         } else if let Some(list) = &cfg.rpc_endpoints {
-            list.first()
-                .ok_or_else(|| anyhow!("❌ Nenhum endpoint RPC definido no config.toml"))?
+            list.iter()
+                .find(|u| is_usable_endpoint(u))
+                .ok_or_else(|| anyhow!("❌ Nenhum endpoint RPC utilizável no config.toml"))?
                 .to_string()
         } else {
             return Err(anyhow!("❌ Nenhum RPC configurado no bloco [network]"));
@@ -59,7 +69,7 @@ impl RpcProvider {
         let mut backoff = Duration::from_millis(500);
 
         for (i, url) in endpoints.iter().enumerate() {
-            if url.trim().is_empty() {
+            if !is_usable_endpoint(url) {
                 continue;
             }
 
@@ -195,7 +205,7 @@ impl RpcProvider {
         endpoints: &[String],
     ) -> Result<Arc<Provider<Ws>>> {
         for (i, url) in endpoints.iter().enumerate() {
-            if url.trim().is_empty() {
+            if !is_usable_endpoint(url) {
                 continue;
             }
 
