@@ -16,8 +16,8 @@ use crate::{
     core::types::{ArbitrageOpportunity, FlashloanOpportunity},
     dex::{
         adapters::{
-            quickswap::QuickSwapDex, sushiswap::SushiSwapDex, uniswap_v2::UniswapV2Dex,
-            uniswap_v3::UniswapV3Dex,
+            balancer::BalancerDex, curve::CurveDex, quickswap::QuickSwapDex,
+            sushiswap::SushiSwapDex, uniswap_v2::UniswapV2Dex, uniswap_v3::UniswapV3Dex,
         },
         price_cache::PriceCache,
         // ❌ `ArbitrageOpportunity` de `dex` (mod.rs) não é o usado para Flashloans.
@@ -28,14 +28,7 @@ use crate::{
     AppMiddleware,
 };
 use anyhow::{anyhow, Context, Result};
-use ethers::{
-    prelude::*,
-    types::{
-        transaction::eip2718::TypedTransaction, // ✅ IMPORT CORRETO
-        Address, Bytes, U256,
-    },
-};
-use futures::future::join_all;
+use ethers::types::{Address, U256};
 use std::{
     collections::HashMap,
     str::FromStr,
@@ -49,8 +42,6 @@ use tracing::{debug, info, instrument, warn};
 const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(60);
 /// Número máximo de erros antes de ativar o Circuit Breaker
 const CIRCUIT_BREAKER_THRESHOLD: u32 = 5;
-/// Timeout para chamadas multicall individuais
-const MULTICALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Timeout para operação multicall completa
 const MULTICALL_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -108,6 +99,12 @@ impl DexManager {
                 )),
                 "QuickSwap" => Some(Arc::new(
                     QuickSwapDex::new(client.clone(), router_addr, config.clone()).await,
+                )),
+                "Curve" => Some(Arc::new(
+                    CurveDex::new(client.clone(), router_addr, config.clone()).await,
+                )),
+                "Balancer" => Some(Arc::new(
+                    BalancerDex::new(client.clone(), config.clone()).await,
                 )),
                 other => {
                     warn!("⚠️ DEX não reconhecida no TOML: {}", other);
@@ -316,52 +313,10 @@ impl DexManager {
         .context("Erro ao converter símbolo para endereço")
     }
 
-    // ============================================================
-    // 🧩 Multicall — ethers 2.0 compatível (via TypedTransaction)
-    // ============================================================
-    #[instrument(skip(self))]
-    pub async fn multicall(&self, calls: Vec<(Address, Bytes)>) -> Result<Vec<Bytes>> {
-        let futs = calls.into_iter().map(|(to, data)| {
-            let tx_request = ethers::types::TransactionRequest::new()
-                .to(to)
-                .data(data.clone())
-                .from(self.client.default_sender().unwrap_or_default());
-            
-            let client = self.client.clone();
-            
-            async move {
-                let typed_tx: TypedTransaction = tx_request.into();
-                // ✅ Timeout individual para evitar bloqueios
-                tokio::time::timeout(MULTICALL_TIMEOUT, client.call(&typed_tx, None)).await
-            }
-        });
-
-        let results = join_all(futs).await;
-        let mut out = Vec::with_capacity(results.len());
-        let mut errors = 0;
-        
-        for res in results {
-            match res {
-                Ok(Ok(bytes)) => out.push(bytes),
-                Ok(Err(e)) => {
-                    warn!("⚠️ Multicall subcall falhou: {:?}", e);
-                    out.push(Bytes::new());
-                    errors += 1;
-                }
-                Err(_) => {
-                    warn!("⏰ Multicall subcall timeout");
-                    out.push(Bytes::new());
-                    errors += 1;
-                }
-            }
-        }
-        
-        if errors > 0 {
-            warn!("❌ Multicall: {}/{} chamadas falharam", errors, out.len());
-        }
-        
-        Ok(out)
-    }
+    // NOTA: havia aqui um `multicall()` que disparava N `eth_call` paralelos via
+    // `join_all`. Nunca foi chamado por ninguém — a agregação real acontece nos
+    // adapters, que usam `ethers::contract::Multicall` (Multicall3). Removido para
+    // não voltar a parecer que existe um segundo caminho de coleta de preços.
 
     // ============================================================
     // 🔧 Circuit Breaker + Health
@@ -457,7 +412,7 @@ impl DexManager {
             .find(|a| a.name() == adapter_name)
             .ok_or_else(|| anyhow!("Adapter não encontrado: {}", adapter_name))?;
         
-        info!("📊 Coletando preços para {} pares via {}", pairs.len(), adapter_name);
+        debug!("📊 Coletando preços para {} pares via {}", pairs.len(), adapter_name);
         
         // Converter pares para formato (String, String)
         let converted_pairs: Vec<(String, String)> = pairs
@@ -487,7 +442,7 @@ impl DexManager {
         match multicall_result {
             Ok(Ok(mut adapter_prices)) => {
                 prices.append(&mut adapter_prices);
-                info!("✅ {}: {} preços coletados", adapter_name, prices.len());
+                debug!("✅ {}: {} preços coletados", adapter_name, prices.len());
                 // ✅ Reset error count em caso de sucesso
                 self.mark_healthy(adapter_name).await;
             }
