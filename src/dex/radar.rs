@@ -368,6 +368,8 @@ const AUDIT_SPREAD_HIGH: f64 = 50.0;
 fn dex_fee(dex_name: &str, pair: &str) -> f64 {
     match dex_name {
         "QuickSwap" | "SushiSwap" => 0.003,  // V2: sempre 0.3%
+        "Curve" => 0.0004,                    // Curve stables: 0.04%
+        "Balancer" => 0.0025,                 // Balancer V2: 0.25% default
         "UniswapV3" => {
             // Tenta usar o fee tier real do cache
             if let Some(fee_bps) = super::cached_fee_tier(dex_name, pair) {
@@ -438,12 +440,24 @@ pub struct EdgeInfo {
     pub sell_price: f64,
 }
 
+/// Estatísticas econômicas do ciclo (resumo para o log).
+pub struct CycleEconomics {
+    /// Pares avaliados (com ≥2 DEXes e reverso disponível).
+    pub evaluated: usize,
+    /// Pares onde buy×sell bruto (sem fees) > 1.0.
+    pub gross_positive: usize,
+    /// Pares onde cycle_rate com fees > 1.0.
+    pub venue_fee_adjusted_positive: usize,
+    /// Pares com cycle_rate < 1.0 (sem oportunidade).
+    pub negative_cycles_found: usize,
+}
+
 /// Conta sinais de spread E extrai os edges (> 0.01%) para logging/audit.
 ///
 /// **VALIDAÇÃO CROSS-DEX**: Só emite EDGE quando o cycle_rate real (com fees
 /// dos dois DEXes) é > 1.0 — ou seja, quando existe potencial bruto de arbitragem.
 /// Spreads single-direction (ex: USDT-WMATIC 2.42% sem reverso viável) são filtrados.
-fn extract_edges(pr: &HashMap<String, HashMap<String, f64>>) -> (usize, Vec<EdgeInfo>) {
+fn extract_edges(pr: &HashMap<String, HashMap<String, f64>>) -> (usize, Vec<EdgeInfo>, CycleEconomics) {
     let mut map_pairs: HashMap<String, Vec<(String, f64)>> = HashMap::new();
 
     for (dex, dex_map) in pr {
@@ -457,6 +471,10 @@ fn extract_edges(pr: &HashMap<String, HashMap<String, f64>>) -> (usize, Vec<Edge
 
     let mut count = 0;
     let mut edges = Vec::new();
+    let mut evaluated = 0usize;
+    let mut gross_positive = 0usize;
+    let mut fee_adjusted_positive = 0usize;
+    let mut negative_cycles = 0usize;
 
     for (pair, dex_prices) in &map_pairs {
         if dex_prices.len() < 2 {
@@ -475,6 +493,7 @@ fn extract_edges(pr: &HashMap<String, HashMap<String, f64>>) -> (usize, Vec<Edge
         let mut best_sell_dex = String::new();
         let mut best_buy_price: f64 = 0.0;
         let mut best_sell_price: f64 = 0.0;
+        let mut best_gross_rate: f64 = 0.0;
 
         if let Some(rev_prices) = reverse_dex_prices {
             let rev_pair_str = reverse_pair.as_deref().unwrap_or("");
@@ -486,10 +505,13 @@ fn extract_edges(pr: &HashMap<String, HashMap<String, f64>>) -> (usize, Vec<Edge
                     }
                     let fee_buy = dex_fee(buy_dex, pair);
                     let fee_sell = dex_fee(sell_dex, rev_pair_str);
+                    // gross_rate = buy_price × sell_price (sem fees)
+                    let gross_rate = buy_price * sell_price;
                     // cycle_rate = buy_price × (1-fee) × sell_price × (1-fee)
                     let cycle_rate = buy_price * (1.0 - fee_buy) * sell_price * (1.0 - fee_sell);
                     if cycle_rate > best_cycle_rate {
                         best_cycle_rate = cycle_rate;
+                        best_gross_rate = gross_rate;
                         best_buy_dex = buy_dex.clone();
                         best_sell_dex = sell_dex.clone();
                         best_buy_price = *buy_price;
@@ -497,6 +519,23 @@ fn extract_edges(pr: &HashMap<String, HashMap<String, f64>>) -> (usize, Vec<Edge
                     }
                 }
             }
+        }
+
+        if best_cycle_rate == 0.0 {
+            // Sem reverso disponível — não há como avaliar ciclo
+            continue;
+        }
+
+        evaluated += 1;
+
+        // Contabilizar economia do ciclo
+        if best_gross_rate > 1.0 {
+            gross_positive += 1;
+        }
+        if best_cycle_rate > 1.0 {
+            fee_adjusted_positive += 1;
+        } else {
+            negative_cycles += 1;
         }
 
         // Só emitir EDGE se cycle_rate > 1.0 (potencial bruto positivo)
@@ -542,7 +581,15 @@ fn extract_edges(pr: &HashMap<String, HashMap<String, f64>>) -> (usize, Vec<Edge
             .partial_cmp(&a.spread_pct)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    (count, edges)
+
+    let economics = CycleEconomics {
+        evaluated,
+        gross_positive,
+        venue_fee_adjusted_positive: fee_adjusted_positive,
+        negative_cycles_found: negative_cycles,
+    };
+
+    (count, edges, economics)
 }
 
 // ============================================================
@@ -688,11 +735,43 @@ async fn execute_radar_cycle(
     }
 
     let total: usize = out.values().map(|m| m.len()).sum();
-    let (_signals, edges) = extract_edges(&out);
+    let (_signals, edges, economics) = extract_edges(&out);
 
     log_price_audit(&out, cycle);
     log_edge_summary(&edges, cycle);
     log_edge_audit(&edges, cycle);
+
+    // Log de resultado econômico do ciclo
+    info!(
+        "💰 Resultado econômico | evaluated={} gross_positive={} venue_fee_adjusted_positive={} negative_cycles_found={}",
+        economics.evaluated, economics.gross_positive, economics.venue_fee_adjusted_positive, economics.negative_cycles_found
+    );
+
+    // Log de preços cross-DEX para diagnóstico
+    if !out.is_empty() {
+        let mut pair_prices: HashMap<String, Vec<(&String, &f64)>> = HashMap::new();
+        for (dex, dex_map) in &out {
+            for (pair, price) in dex_map {
+                pair_prices.entry(pair.clone()).or_default().push((dex, price));
+            }
+        }
+        // Mostra apenas pares com cotação de ≥2 DEXes (candidatos a arbitragem)
+        let mut cross_dex: Vec<_> = pair_prices.iter()
+            .filter(|(_, prices)| prices.len() >= 2)
+            .collect();
+        cross_dex.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+
+        for (pair, prices) in cross_dex.iter().take(8) {
+            let mut parts: Vec<String> = prices.iter()
+                .map(|(dex, price)| format!("{}={:.8}", dex, price))
+                .collect();
+            parts.sort();
+            info!("  📈 {} | {}", pair, parts.join(" | "));
+        }
+        if cross_dex.len() > 8 {
+            info!("  ... e mais {} pares cross-DEX", cross_dex.len() - 8);
+        }
+    }
 
     *previous = out.clone();
 
