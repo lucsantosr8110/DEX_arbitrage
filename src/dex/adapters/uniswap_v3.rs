@@ -38,7 +38,7 @@ use tracing::{debug, error, info, warn};
 // 🔧 Constantes e ABIs
 // ============================================================
 const DEX_NAME: &str = "UniswapV3";
-const FEE_TIERS: [u32; 3] = [500, 3000, 10_000]; // 0.05%, 0.3%, 1.0%
+const FEE_TIERS: [u32; 4] = [100, 500, 3000, 10_000]; // 0.01%, 0.05%, 0.3%, 1.0%
 const PRICE_DEVIATION_LIMIT: f64 = 0.20; // 20% desvio máximo
 
 // Assumindo WETH (ETH principal em Polygon) para comparação com USD
@@ -492,58 +492,68 @@ impl DexContract for UniswapV3Dex {
             .prepare_call_data(&pairs.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect::<Vec<_>>())
             .await?;
 
-        let mut multicall = Multicall::new(self.client.clone(), None).await?;
-        for info in &call_data {
-            for &fee in &FEE_TIERS {
-                let call = quoter.method::<_, U256>(
-                    "quoteExactInputSingle",
-                    (info.addr_a, info.addr_b, fee, info.amount_in, U256::zero()),
-                )?;
-                multicall.add_call(call, true);
+        // Chunk em batches de 10 pares para caber no gas limit da Alchemy
+        const MULTICALL_BATCH_SIZE: usize = 10;
+
+        for batch in call_data.chunks(MULTICALL_BATCH_SIZE) {
+            let mut multicall = Multicall::new(self.client.clone(), None).await?;
+            for info in batch {
+                for &fee in &FEE_TIERS {
+                    let call = quoter.method::<_, U256>(
+                        "quoteExactInputSingle",
+                        (info.addr_a, info.addr_b, fee, info.amount_in, U256::zero()),
+                    )?;
+                    multicall.add_call(call, true);
+                }
             }
-        }
 
-        ALCHEMY_RATE_LIMITER.acquire().await?;
-        let raw: Vec<Result<Token, _>> = multicall.call_raw().await?;
-        
-        for (i, chunk) in raw.chunks_exact(FEE_TIERS.len()).enumerate() {
-            let info = &call_data[i];
-            let mut best_out = U256::zero();
-            let mut best_fee: u32 = 0;
+            ALCHEMY_RATE_LIMITER.acquire().await?;
+            let raw: Vec<Result<Token, _>> = match multicall.call_raw().await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("[{}] Multicall batch falhou ({} pares): {:?}", DEX_NAME, batch.len(), e);
+                    continue;
+                }
+            };
 
-            for (j, r) in chunk.iter().enumerate() {
-                if let Ok(Token::Uint(v)) = r {
-                    if *v > best_out {
-                        best_out = *v;
-                        best_fee = FEE_TIERS[j];
+            for (i, chunk) in raw.chunks_exact(FEE_TIERS.len()).enumerate() {
+                let info = &batch[i];
+                let mut best_out = U256::zero();
+                let mut best_fee: u32 = 0;
+
+                for (j, r) in chunk.iter().enumerate() {
+                    if let Ok(Token::Uint(v)) = r {
+                        if *v > best_out {
+                            best_out = *v;
+                            best_fee = FEE_TIERS[j];
+                        }
                     }
                 }
-            }
 
-            if !best_out.is_zero() {
-                let price = calculate_price_from_decimals(
-                    info.amount_in,
-                    best_out,
-                    info.decimals_a,
-                    info.decimals_b,
-                )?;
-                if self.debug_mode {
-                    tracing::info!(
-                        "[{}] {}→{} fee={} in={} out={} price={:.8} (multicall)",
-                        DEX_NAME, info.token_a, info.token_b, best_fee, info.amount_in, best_out, price
-                    );
-                }
-                if let Some(p) = normalize_price(price) {
-                    // Cacheia o fee tier real para uso no engine
-                    let pair = format!("{}-{}", info.token_a, info.token_b);
-                    cache_fee_tier(DEX_NAME, &pair, best_fee);
+                if !best_out.is_zero() {
+                    let price = calculate_price_from_decimals(
+                        info.amount_in,
+                        best_out,
+                        info.decimals_a,
+                        info.decimals_b,
+                    )?;
+                    if self.debug_mode {
+                        tracing::info!(
+                            "[{}] {}→{} fee={} in={} out={} price={:.8} (multicall)",
+                            DEX_NAME, info.token_a, info.token_b, best_fee, info.amount_in, best_out, price
+                        );
+                    }
+                    if let Some(p) = normalize_price(price) {
+                        let pair = format!("{}-{}", info.token_a, info.token_b);
+                        cache_fee_tier(DEX_NAME, &pair, best_fee);
 
-                    results.push(TokenPairPrice::new(
-                        info.token_a.clone(),
-                        info.token_b.clone(),
-                        p,
-                        DEX_NAME.into(),
-                    ).with_fee_tier(best_fee));
+                        results.push(TokenPairPrice::new(
+                            info.token_a.clone(),
+                            info.token_b.clone(),
+                            p,
+                            DEX_NAME.into(),
+                        ).with_fee_tier(best_fee));
+                    }
                 }
             }
         }

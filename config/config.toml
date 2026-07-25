@@ -131,7 +131,7 @@ default_dex_fee_bps = 30
 default_price_impact_bps = 25
 hop_slippage_increase_bps = 5
 safety_margin_bps = 10
-estimate_base_gas_usd = 0.03
+estimate_base_gas_usd = 0.008
 
 [execution.simulation]
 enabled = true
@@ -569,6 +569,11 @@ fee_tier = 500
 # ======================================================================
 [pairs]
 enabled = true
+liquidity_allowlist = [
+    "USDC", "USDT", "DAI", "WMATIC", "WETH",
+    "WBTC", "LINK", "AAVE", "CRV", "GHST",
+    "UNI", "SUSHI", "GRT", "SAND", "MANA", "LDO"
+]
 monitor = [
     # --- Base Stables & Majors ---
     "USDC-WMATIC",

@@ -27,7 +27,7 @@ executor_address = "0xC5B79075178866C2B29225AA0c1418464d503a08"
 wrapper_address = "0x8E3E24D1ce0d489141FA7c5C3Ed89fCc246034a8"
 provider_address = "0x794a61358D6845594F94dc1DB02A252b5b4814aD"
 capital_usd = 100.0
-min_profit_usd = 0.00
+min_profit_usd = 0.0
 slippage_tolerance_pct = 0.50
 slippage_bps = 15
 simulate_before_execute = true
@@ -44,10 +44,10 @@ flashloan_decimals = 6
 enabled = true
 executor_address = "0xC5B79075178866C2B29225AA0c1418464d503a08"
 advanced_filters_enabled = true
-min_profit_threshold_usd = 0.00
+min_profit_threshold_usd = 0.0
 min_profit_percent = "0.0"
-min_profit_absolute = "0.05"    # Mínimo real
-min_spread_percent = "0.50"
+min_profit_absolute = "0.0"
+min_spread_percent = "0.1"
 min_liquidity = "50000"         # CRÍTICO: Filtra pools vazias
 min_volume_24h = "5000.0"
 max_slippage = "1.5"
@@ -133,7 +133,7 @@ default_dex_fee_bps = 30
 default_price_impact_bps = 25
 hop_slippage_increase_bps = 5
 safety_margin_bps = 10
-estimate_base_gas_usd = 0.03
+estimate_base_gas_usd = 0.008
 
 [execution.simulation]
 enabled = true
@@ -224,9 +224,9 @@ rpc_endpoints = [
     "https://1rpc.io/matic",
 ]
 ws_endpoints = [
-    "${ALCHEMY_WS_URL}",
+    "wss://polygon-mainnet.g.alchemy.com/v2/r8SpWPMM1DNvjU87Th6DPenaowGNyzQs",
+    "wss://polygon-mainnet.infura.io/ws/v3/5d875274a90a490e9f873e0f97c46c10",
     "wss://polygon-bor-rpc.publicnode.com",
-    "wss://polygon.drpc.org",
 ]
 timeout_ms = 5000
 max_reorg_depth = 64
@@ -341,7 +341,7 @@ balance_monitoring = true
 low_balance_alert_usd = "3.0"
 
 [optimization]
-quick_filter_enabled = true
+quick_filter_enabled = false
 pre_filter_opportunities = true
 adaptive_radar_mode = false
 spread_decay_window = 0
@@ -350,7 +350,7 @@ ultra_fast_mode = true
 auto_tune_execution = true
 auto_retry_failed_swaps = true
 retry_limit = 3
-min_spread_percent = 0.0020
+min_spread_percent = 0.1
 min_profit_after_gas = 0.0000
 max_gas_ratio = 15.0
 min_profit_per_tx = 0.0000
@@ -360,9 +360,9 @@ cooldown_after_fail_seconds = 1
 parallel_processing = true
 
 [risk]
-min_profit_usd = 0.00
-normal_min_profit_percent = 0.0001
-adaptive_min_profit_percent = 0.00005
+min_profit_usd = 0.0
+normal_min_profit_percent = 0.0
+adaptive_min_profit_percent = 0.0
 normal_gas_ratio = 10.0
 adaptive_gas_ratio = 15.0
 min_confidence = 0.70
@@ -557,6 +557,15 @@ liquidity_threshold_usd = 5000.0
 fee_tier = 300
 
 [[dex]]
+name = "Curve"
+router_address = "0x445FE580eF8d70FF569aB36e80c647af338db351"
+enabled = true
+priority = 4
+max_slippage = 0.5
+liquidity_threshold_usd = 5000.0
+fee_tier = 4
+
+[[dex]]
 name = "UniswapV3"
 router_address = "0xE592427A0AEce92De3Edee1F18E0157C05861564"
 factory_address = "0x1F98431c8aD98523631AE4a59f267346ea31F984"
@@ -565,12 +574,25 @@ priority = 3
 max_slippage = 1.0
 liquidity_threshold_usd = 10000.0
 fee_tier = 500
+extra = { }
+
+[[dex]]
+name = "Balancer"
+router_address = "0xBA12222222228d8Ba445958a75a0704d566BF2C8"
+enabled = false  # Desabilitado - precisa ajuste no ABI
+priority = 5
+fee_tier = 25
 
 # ======================================================================
 # PAIRS
 # ======================================================================
 [pairs]
 enabled = true
+liquidity_allowlist = [
+    "USDC", "USDT", "DAI", "WMATIC", "WETH",
+    "WBTC", "LINK", "AAVE", "CRV", "GHST",
+    "UNI", "SUSHI", "GRT", "SAND", "MANA", "LDO"
+]
 monitor = [
     # --- Base Stables & Majors ---
     "USDC-WMATIC",
