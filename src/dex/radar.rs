@@ -49,7 +49,9 @@ const BLUECHIPS: &[&str] = &["WMATIC", "WETH"];
 
 /// Tokens cujos pools na Polygon foram confirmados com liquidez real.
 /// WBTC re-incluído após correção do endereço (B2 gate corta dust).
-const KNOWN_LIQUID: &[&str] = &["USDC", "USDT", "DAI", "WMATIC", "WETH", "WBTC"];
+const KNOWN_LIQUID: &[&str] = &[
+    "USDC", "USDT", "DAI", "WMATIC", "WETH", "WBTC", "LINK", "UNI", "LDO",
+];
 
 // ============================================================
 // NORMALIZAÇÃO
@@ -64,6 +66,9 @@ fn normalize_token(t: &str) -> &str {
         "USDT" => "USDT",
         "DAI" => "DAI",
         "WBTC" | "BTC" => "WBTC",
+        "LINK" => "LINK",
+        "UNI" => "UNI",
+        "LDO" => "LDO",
         _ => t,
     }
 }
@@ -863,6 +868,8 @@ mod tests {
         let mut cfg = Config::default();
         cfg.pairs.liquidity_allowlist = vec![
             "USDC".into(),
+            "USDT".into(),
+            "DAI".into(),
             "WETH".into(),
             "WMATIC".into(),
             "WBTC".into(),
@@ -870,13 +877,14 @@ mod tests {
         cfg.pairs.monitor = vec![
             "USDC-WETH".into(),
             "USDC-WMATIC".into(),
+            "USDT-WETH".into(),
             "WBTC-USDC".into(),
             "WMATIC-WETH".into(),
         ];
         let pares = generate_full_pair_list(&cfg);
-        // 4 lógicos × 2 direções = 8
-        assert_eq!(pares.len(), 8, "pares={:?}", pares);
-        assert!(pares.iter().all(|p| !p.contains("USDT") && !p.contains("DAI")));
+        // 5 lógicos × 2 direções = 10; sem injeção USDT-DAI da matriz M3
+        assert_eq!(pares.len(), 10, "pares={:?}", pares);
+        assert!(!pares.iter().any(|p| p == "USDT-DAI" || p == "DAI-USDT"));
         assert!(pares.contains(&"USDC-WETH".into()));
         assert!(pares.contains(&"WETH-USDC".into()));
         assert!(pares.contains(&"WBTC-USDC".into()));

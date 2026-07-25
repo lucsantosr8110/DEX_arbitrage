@@ -37,6 +37,39 @@ const MAX_REALISTIC_PROFIT_RATIO: f64 = 0.50;
 /// Evita colisões quando múltiplas oportunidades são criadas no mesmo milissegundo.
 static OPP_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Ciclos triangulares descartados porque alguma perna não está no price_map
+/// do venue (já filtrado pelo B2 liquidity gate no radar).
+static TRIANGULAR_LEG_LOW_LIQUIDITY_DISCARDED: AtomicU64 = AtomicU64::new(0);
+
+pub fn triangular_leg_low_liquidity_discarded_count() -> u64 {
+    TRIANGULAR_LEG_LOW_LIQUIDITY_DISCARDED.load(Ordering::Relaxed)
+}
+
+pub fn reset_triangular_leg_low_liquidity_discarded_count() {
+    TRIANGULAR_LEG_LOW_LIQUIDITY_DISCARDED.store(0, Ordering::Relaxed)
+}
+
+fn note_triangular_leg_low_liquidity_discarded(n: u64) {
+    if n > 0 {
+        TRIANGULAR_LEG_LOW_LIQUIDITY_DISCARDED.fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+/// Resultado da montagem de um ciclo 3-hop intra-DEX.
+enum IntraCycleResult {
+    Ok {
+        path: Vec<String>,
+        steps: Vec<ArbitrageStep>,
+        spread: f64,
+        final_rate: f64,
+    },
+    MissingLeg,
+    BelowSpread { final_rate: f64 },
+    Unrealistic,
+    /// Hop V3 sem fee executável / venue não mapeável — descarta (não default).
+    NotExecutable,
+}
+
 /// Gera um ID único combinando timestamp + contador atômico.
 #[inline]
 fn next_opp_id(prefix: &str) -> String {
@@ -431,10 +464,20 @@ impl ArbitrageEngine {
         let mut all_opportunities = Vec::new();
 
         let direct_usdt = self.find_direct_with_usdt(price_map, app_config).await;
-        let tri_usdt = self.find_triangular_with_usdt(price_map, app_config).await;
+        let tri = if app_config.arbitrage.triangular.enabled {
+            if app_config.arbitrage.triangular.intra_dex_only {
+                self.find_intra_dex_triangular_midcaps(price_map, app_config)
+                    .await
+            } else {
+                self.find_cross_dex_triangular_midcaps(price_map, app_config)
+                    .await
+            }
+        } else {
+            Vec::new()
+        };
 
         all_opportunities.extend(direct_usdt);
-        all_opportunities.extend(tri_usdt);
+        all_opportunities.extend(tri);
 
         let direct_generic = self.find_direct_async(price_map, app_config).await;
         all_opportunities.extend(direct_generic);
@@ -607,8 +650,8 @@ impl ArbitrageEngine {
             opp.estimated_profit_usd
         );
 
-        if Self::is_usdt_centric(path) && steps.len() <= MAX_HOPS_FOR_EXECUTION {
-            debug!("✅ Já é USDT-centric, apenas recalculando...");
+        if Self::is_stable_flashloan_centric(path) && steps.len() <= MAX_HOPS_FOR_EXECUTION {
+            debug!("✅ Já é stable-centric (USDT/USDC), apenas recalculando...");
             let steps_sanitized = Self::sanitize_steps_for_execution(steps);
             let mut refreshed_opp = opp.clone();
             refreshed_opp.steps = SerializableSteps(steps_sanitized);
@@ -639,16 +682,11 @@ impl ArbitrageEngine {
         app_config: &Config,
     ) -> Option<ArbitrageOpportunity> {
         match (original_path.len(), original_steps.len()) {
-            (3, 2) if !Self::is_usdt_centric(original_path) => {
+            (3, 2) if !Self::is_stable_flashloan_centric(original_path) => {
                 self.convert_direct_arbitrage(original_path, original_steps, app_config)
                     .await
             }
-            (4..=5, 3..=4)
-                if original_path
-                    .first()
-                    .map(|s| s.as_str())
-                    == Some(TARGET_BASE_TOKEN) =>
-            {
+            (4..=5, 3..=4) if Self::is_stable_flashloan_start(original_path) => {
                 self.build_usdt_opportunity(
                     original_path.to_vec(),
                     original_steps.to_vec(),
@@ -713,8 +751,8 @@ impl ArbitrageEngine {
             return None;
         }
 
-        if !Self::is_usdt_centric(&path) {
-            debug!("🚫 Não é USDT-centric: {:?}", path);
+        if !Self::is_stable_flashloan_centric(&path) {
+            debug!("🚫 Não é stable-centric (USDT/USDC): {:?}", path);
             return None;
         }
 
@@ -765,13 +803,25 @@ impl ArbitrageEngine {
         opp: &mut ArbitrageOpportunity,
         app_config: &Config,
     ) -> Result<()> {
-        let usdt_decimals = self
-            .get_token_decimals_smart(TARGET_BASE_TOKEN, app_config)
+        // Flashloan sizing: só stables ~$1 (USDT/USDC). Path deve começar neles.
+        let start_sym = opp
+            .path
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or(TARGET_BASE_TOKEN);
+        if !Self::is_usd_stable_symbol(start_sym) {
+            return Err(anyhow!(
+                "recalculate exige start USDT/USDC, got {}",
+                start_sym
+            ));
+        }
+        let start_decimals = self
+            .get_token_decimals_smart(start_sym, app_config)
             .await
-            .context("Falha ao obter decimals do USDT")?;
+            .with_context(|| format!("Falha ao obter decimals de {}", start_sym))?;
 
         let trade_amount_usd = self.calculate_safe_trade_amount(app_config);
-        let amount_in = Self::usd_to_token_amount(trade_amount_usd, 1.0, usdt_decimals);
+        let amount_in = Self::usd_to_token_amount(trade_amount_usd, 1.0, start_decimals);
 
         // CORREÇÃO: Calcular taxa total com validação rigorosa
         let total_rate = match Self::calculate_total_rate_corrected(&opp.steps.0) {
@@ -830,10 +880,12 @@ impl ArbitrageEngine {
             gross_profit_usd, gas_cost_usd, flashloan_fee_usd, expected_slippage_usd, net_profit_usd
         );
 
-        // Validação final
+        // Validação final (paper observe: permite net<min para eth_call medir delta;
+        // execução real continua gated por would_execute + sends_forbidden).
         let min_profit = app_config.arbitrage.min_profit_threshold_usd.unwrap_or(0.0015);
+        let paper_observe = crate::core::paper_validation::observation_active(app_config);
 
-        if net_profit_usd < min_profit {
+        if net_profit_usd < min_profit && !paper_observe {
             return Err(anyhow!(
                 "Lucro líquido insuficiente: ${:.6} < ${:.6}",
                 net_profit_usd,
@@ -1114,6 +1166,482 @@ impl ArbitrageEngine {
         opportunities
     }
 
+    /// Triangular **cross-DEX**: `stable → midcap → anchor → stable`, melhor edge
+    /// por hop across venues (`build_price_graph`). Venue+fee_tier congelados
+    /// em cada `ArbitrageStep` na detecção (sem re-otimizar no eth_call).
+    async fn find_cross_dex_triangular_midcaps(
+        &self,
+        prices: &HashMap<String, HashMap<String, f64>>,
+        app_config: &Config,
+    ) -> Vec<ArbitrageOpportunity> {
+        let tri_cfg = &app_config.arbitrage.triangular;
+        let mut opportunities = Vec::new();
+
+        let min_spread = app_config
+            .arbitrage
+            .min_spread_percent
+            .parse::<f64>()
+            .unwrap_or(0.008);
+
+        let stables: Vec<String> = tri_cfg
+            .anchors
+            .iter()
+            .filter(|a| Self::is_usd_stable_symbol(a))
+            .cloned()
+            .collect();
+        let stables = if stables.is_empty() {
+            vec!["USDC".to_string()]
+        } else {
+            stables
+        };
+
+        let hop_anchors: Vec<String> = tri_cfg
+            .anchors
+            .iter()
+            .filter(|a| !Self::is_usd_stable_symbol(a))
+            .cloned()
+            .collect();
+
+        let graph = Self::build_price_graph(prices);
+
+        let mut evaluated = 0u64;
+        let mut gross_positive = 0u64;
+        let mut best_rate = 0.0_f64;
+        let mut best_label = String::new();
+        let mut cross_venue_ok = 0u64;
+
+        for start in &stables {
+            for mid in &tri_cfg.midcaps {
+                for hop in &hop_anchors {
+                    if hop.eq_ignore_ascii_case(start) || hop.eq_ignore_ascii_case(mid) {
+                        continue;
+                    }
+                    evaluated += 1;
+                    match Self::try_cross_dex_cycle(start, mid, hop, &graph, min_spread) {
+                        IntraCycleResult::MissingLeg => {
+                            note_triangular_leg_low_liquidity_discarded(1);
+                        }
+                        IntraCycleResult::Unrealistic | IntraCycleResult::NotExecutable => {}
+                        IntraCycleResult::BelowSpread { final_rate } => {
+                            if final_rate > best_rate {
+                                best_rate = final_rate;
+                                best_label =
+                                    format!("cross:{}→{}→{}→{}", start, mid, hop, start);
+                            }
+                        }
+                        IntraCycleResult::Ok {
+                            path,
+                            steps,
+                            spread,
+                            final_rate,
+                        } => {
+                            let venues: Vec<&str> =
+                                steps.iter().map(|s| s.dex_name.as_str()).collect();
+                            let mixed = venues.windows(2).any(|w| !w[0].eq_ignore_ascii_case(w[1]));
+                            if mixed {
+                                cross_venue_ok += 1;
+                            }
+                            let route_label = format!(
+                                "{}→{}→{}→{} [{}]",
+                                start,
+                                mid,
+                                hop,
+                                start,
+                                venues.join("+")
+                            );
+                            if final_rate > best_rate {
+                                best_rate = final_rate;
+                                best_label = route_label.clone();
+                            }
+                            if spread > 0.0 {
+                                gross_positive += 1;
+                            }
+                            let trade_amount_usd = self.calculate_safe_trade_amount(app_config);
+                            let steps_sanitized = Self::sanitize_steps_for_execution(&steps);
+                            opportunities.push(ArbitrageOpportunity {
+                                id: next_opp_id("cross_tri"),
+                                pair: format!("{}->{}->{}->{}", start, mid, hop, start),
+                                buy_dex: venues.first().unwrap_or(&"?").to_string(),
+                                sell_dex: venues.last().unwrap_or(&"?").to_string(),
+                                buy_price: steps
+                                    .first()
+                                    .map(|s| s.expected_rate)
+                                    .unwrap_or(0.0),
+                                sell_price: steps
+                                    .last()
+                                    .map(|s| s.expected_rate)
+                                    .unwrap_or(0.0),
+                                spread_percent: spread,
+                                amount_in: U256::zero(),
+                                amount_out: U256::zero(),
+                                estimated_profit_usd: trade_amount_usd * (final_rate - 1.0),
+                                gas_cost_usd: 0.0,
+                                net_profit_usd: 0.0,
+                                steps: SerializableSteps(steps_sanitized),
+                                path,
+                                timestamp: Utc::now().timestamp() as u64,
+                                confidence: Self::calculate_confidence(spread, 3),
+                                estimated_volume_usd: trade_amount_usd,
+                                profit_percent: 0.0,
+                                execution_risk: 0.0,
+                                force_flashloan: false,
+                                token_price_usd: Some(1.0),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        info!(
+            target: "arbitrage",
+            evaluated,
+            gross_positive,
+            found = opportunities.len(),
+            cross_venue_cycles = cross_venue_ok,
+            low_liq_legs = triangular_leg_low_liquidity_discarded_count(),
+            best_cycle_rate = best_rate,
+            best_cycle = %best_label,
+            "🔺 triangular CROSS-DEX midcaps"
+        );
+
+        opportunities
+    }
+
+    /// Pure: monta ciclo cross-DEX `start→mid→hop→start` no graph global
+    /// (melhor venue por hop). Descarta se hop V3 sem fee executável.
+    fn try_cross_dex_cycle(
+        start: &str,
+        mid: &str,
+        hop: &str,
+        graph: &HashMap<String, HashMap<String, (f64, String)>>,
+        min_spread_pct: f64,
+    ) -> IntraCycleResult {
+        let Some(leg1) = graph.get(start).and_then(|m| m.get(mid)) else {
+            return IntraCycleResult::MissingLeg;
+        };
+        let Some(leg2) = graph.get(mid).and_then(|m| m.get(hop)) else {
+            return IntraCycleResult::MissingLeg;
+        };
+        let Some(leg3) = graph.get(hop).and_then(|m| m.get(start)) else {
+            return IntraCycleResult::MissingLeg;
+        };
+
+        if !Self::is_realistic_price(leg1.0, start, mid)
+            || !Self::is_realistic_price(leg2.0, mid, hop)
+            || !Self::is_realistic_price(leg3.0, hop, start)
+        {
+            return IntraCycleResult::Unrealistic;
+        }
+
+        let final_rate = leg1.0 * leg2.0 * leg3.0;
+        if !final_rate.is_finite() || final_rate <= 0.0 {
+            return IntraCycleResult::Unrealistic;
+        }
+        let spread = (final_rate - 1.0) * 100.0;
+        if spread > MAX_REALISTIC_SPREAD {
+            return IntraCycleResult::Unrealistic;
+        }
+
+        let steps = vec![
+            Self::create_step(&leg1.1, start, mid, leg1.0),
+            Self::create_step(&leg2.1, mid, hop, leg2.0),
+            Self::create_step(&leg3.1, hop, start, leg3.0),
+        ];
+
+        if steps.iter().any(|s| !Self::hop_is_executable(s)) {
+            return IntraCycleResult::NotExecutable;
+        }
+
+        if spread < min_spread_pct {
+            return IntraCycleResult::BelowSpread { final_rate };
+        }
+
+        let path = vec![
+            start.to_string(),
+            mid.to_string(),
+            hop.to_string(),
+            start.to_string(),
+        ];
+        IntraCycleResult::Ok {
+            path,
+            steps,
+            spread,
+            final_rate,
+        }
+    }
+
+    /// Hop executável: V3 exige fee ∈ {500,3000,10000} no step; V2/Curve ok.
+    fn hop_is_executable(step: &ArbitrageStep) -> bool {
+        let n = step
+            .dex_name
+            .to_lowercase()
+            .replace(' ', "")
+            .replace('_', "");
+        if n.contains("uniswapv3") || n == "uniswapv3" {
+            match step.v3_fee_tier {
+                Some(f) => crate::dex::is_executable_v3_fee_tier(f),
+                None => false,
+            }
+        } else {
+            // QuickSwap / SushiSwap / Curve — venue real, sem fee tier V3.
+            !matches!(
+                step.dex_name.as_str(),
+                "TriHop" | "BellmanFord" | "Unknown" | "MultiHop" | "Router" | "Pathfinder" | ""
+            )
+        }
+    }
+
+    /// Triangular **intra-DEX**: `stable → midcap → anchor → stable` no mesmo venue.
+    ///
+    /// Cada perna deve existir no price_map do venue (pós B2). Perna ausente →
+    /// `triangular_leg_low_liquidity_discarded` + ciclo descartado.
+    /// Venue e fee_tier por hop vêm do cache do quote (`create_step` / A4).
+    async fn find_intra_dex_triangular_midcaps(
+        &self,
+        prices: &HashMap<String, HashMap<String, f64>>,
+        app_config: &Config,
+    ) -> Vec<ArbitrageOpportunity> {
+        let tri_cfg = &app_config.arbitrage.triangular;
+        let mut opportunities = Vec::new();
+
+        let min_spread = app_config
+            .arbitrage
+            .min_spread_percent
+            .parse::<f64>()
+            .unwrap_or(0.008);
+
+        let stables: Vec<String> = tri_cfg
+            .anchors
+            .iter()
+            .filter(|a| Self::is_usd_stable_symbol(a))
+            .cloned()
+            .collect();
+        let stables = if stables.is_empty() {
+            vec!["USDC".to_string()]
+        } else {
+            stables
+        };
+
+        let hop_anchors: Vec<String> = tri_cfg
+            .anchors
+            .iter()
+            .filter(|a| !Self::is_usd_stable_symbol(a))
+            .cloned()
+            .collect();
+
+        let mut evaluated = 0u64;
+        let mut gross_positive = 0u64;
+        let mut best_rate = 0.0_f64;
+        let mut best_label = String::new();
+
+        for venue in &tri_cfg.venues {
+            let Some(dex_prices) = Self::resolve_venue_prices(prices, venue) else {
+                debug!(
+                    target: "arbitrage",
+                    venue = %venue,
+                    "triangular: venue ausente no price_map"
+                );
+                continue;
+            };
+            let graph = Self::build_price_graph_for_dex(venue, dex_prices);
+
+            for start in &stables {
+                for mid in &tri_cfg.midcaps {
+                    for hop in &hop_anchors {
+                        if hop.eq_ignore_ascii_case(start) || hop.eq_ignore_ascii_case(mid) {
+                            continue;
+                        }
+                        evaluated += 1;
+                        match Self::try_intra_dex_cycle(
+                            venue,
+                            start,
+                            mid,
+                            hop,
+                            &graph,
+                            min_spread,
+                        ) {
+                            IntraCycleResult::MissingLeg => {
+                                note_triangular_leg_low_liquidity_discarded(1);
+                            }
+                            IntraCycleResult::Unrealistic | IntraCycleResult::NotExecutable => {}
+                            IntraCycleResult::BelowSpread { final_rate } => {
+                                if final_rate > best_rate {
+                                    best_rate = final_rate;
+                                    best_label = format!("{}:{}→{}→{}→{}", venue, start, mid, hop, start);
+                                }
+                            }
+                            IntraCycleResult::Ok {
+                                path,
+                                steps,
+                                spread,
+                                final_rate,
+                            } => {
+                                if final_rate > best_rate {
+                                    best_rate = final_rate;
+                                    best_label = format!("{}:{}→{}→{}→{}", venue, start, mid, hop, start);
+                                }
+                                if spread > 0.0 {
+                                    gross_positive += 1;
+                                }
+                                let trade_amount_usd =
+                                    self.calculate_safe_trade_amount(app_config);
+                                let steps_sanitized =
+                                    Self::sanitize_steps_for_execution(&steps);
+                                opportunities.push(ArbitrageOpportunity {
+                                    id: next_opp_id("intra_tri"),
+                                    pair: format!("{}->{}->{}->{}", start, mid, hop, start),
+                                    buy_dex: venue.clone(),
+                                    sell_dex: venue.clone(),
+                                    buy_price: steps
+                                        .first()
+                                        .map(|s| s.expected_rate)
+                                        .unwrap_or(0.0),
+                                    sell_price: steps
+                                        .last()
+                                        .map(|s| s.expected_rate)
+                                        .unwrap_or(0.0),
+                                    spread_percent: spread,
+                                    amount_in: U256::zero(),
+                                    amount_out: U256::zero(),
+                                    estimated_profit_usd: trade_amount_usd * (final_rate - 1.0),
+                                    gas_cost_usd: 0.0,
+                                    net_profit_usd: 0.0,
+                                    steps: SerializableSteps(steps_sanitized),
+                                    path,
+                                    timestamp: Utc::now().timestamp() as u64,
+                                    confidence: Self::calculate_confidence(spread, 3),
+                                    estimated_volume_usd: trade_amount_usd,
+                                    profit_percent: 0.0,
+                                    execution_risk: 0.0,
+                                    force_flashloan: false,
+                                    token_price_usd: Some(1.0),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        info!(
+            target: "arbitrage",
+            evaluated,
+            gross_positive,
+            found = opportunities.len(),
+            low_liq_legs = triangular_leg_low_liquidity_discarded_count(),
+            best_cycle_rate = best_rate,
+            best_cycle = %best_label,
+            "🔺 triangular intra-DEX midcaps"
+        );
+
+        opportunities
+    }
+
+    fn resolve_venue_prices<'a>(
+        prices: &'a HashMap<String, HashMap<String, f64>>,
+        venue: &str,
+    ) -> Option<&'a HashMap<String, f64>> {
+        prices.get(venue).or_else(|| {
+            prices
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(venue))
+                .map(|(_, v)| v)
+        })
+    }
+
+    /// Graph de um único venue — não mistura DEX (P2-8 / M4).
+    fn build_price_graph_for_dex(
+        dex_name: &str,
+        dex_prices: &HashMap<String, f64>,
+    ) -> HashMap<String, HashMap<String, (f64, String)>> {
+        let mut graph: HashMap<String, HashMap<String, (f64, String)>> = HashMap::new();
+        for (pair, &rate) in dex_prices {
+            if !rate.is_finite() || rate <= 0.0 {
+                continue;
+            }
+            let parts: Vec<&str> = pair.split('-').collect();
+            if parts.len() != 2 {
+                continue;
+            }
+            let token_a = parts[0].to_string();
+            let token_b = parts[1].to_string();
+            let entry = graph.entry(token_a).or_insert_with(HashMap::new);
+            let current = entry.get(&token_b).map(|(r, _)| *r).unwrap_or(0.0);
+            if rate > current {
+                entry.insert(token_b, (rate, dex_name.to_string()));
+            }
+        }
+        graph
+    }
+
+    /// Pure / testável: monta ciclo `start→mid→hop→start` no graph do venue.
+    fn try_intra_dex_cycle(
+        venue: &str,
+        start: &str,
+        mid: &str,
+        hop: &str,
+        graph: &HashMap<String, HashMap<String, (f64, String)>>,
+        min_spread_pct: f64,
+    ) -> IntraCycleResult {
+        let Some(leg1) = graph.get(start).and_then(|m| m.get(mid)) else {
+            return IntraCycleResult::MissingLeg;
+        };
+        let Some(leg2) = graph.get(mid).and_then(|m| m.get(hop)) else {
+            return IntraCycleResult::MissingLeg;
+        };
+        let Some(leg3) = graph.get(hop).and_then(|m| m.get(start)) else {
+            return IntraCycleResult::MissingLeg;
+        };
+
+        if !leg1.1.eq_ignore_ascii_case(venue)
+            || !leg2.1.eq_ignore_ascii_case(venue)
+            || !leg3.1.eq_ignore_ascii_case(venue)
+        {
+            return IntraCycleResult::MissingLeg;
+        }
+
+        if !Self::is_realistic_price(leg1.0, start, mid)
+            || !Self::is_realistic_price(leg2.0, mid, hop)
+            || !Self::is_realistic_price(leg3.0, hop, start)
+        {
+            return IntraCycleResult::Unrealistic;
+        }
+
+        let final_rate = leg1.0 * leg2.0 * leg3.0;
+        if !final_rate.is_finite() || final_rate <= 0.0 {
+            return IntraCycleResult::Unrealistic;
+        }
+        let spread = (final_rate - 1.0) * 100.0;
+        if spread > MAX_REALISTIC_SPREAD {
+            return IntraCycleResult::Unrealistic;
+        }
+        if spread < min_spread_pct {
+            return IntraCycleResult::BelowSpread { final_rate };
+        }
+
+        let steps = vec![
+            Self::create_step(&leg1.1, start, mid, leg1.0),
+            Self::create_step(&leg2.1, mid, hop, leg2.0),
+            Self::create_step(&leg3.1, hop, start, leg3.0),
+        ];
+        if steps.iter().any(|s| !Self::hop_is_executable(s)) {
+            return IntraCycleResult::NotExecutable;
+        }
+        let path = vec![
+            start.to_string(),
+            mid.to_string(),
+            hop.to_string(),
+            start.to_string(),
+        ];
+        IntraCycleResult::Ok {
+            path,
+            steps,
+            spread,
+            final_rate,
+        }
+    }
+
     /// Build graph: armazena a MELHOR taxa observada para cada direção.
     ///
     /// ✅ CORREÇÃO CRÍTICA:
@@ -1239,7 +1767,32 @@ impl ArbitrageEngine {
     // ⚙️ Utilitários
     // ------------------------------------------------------------
     #[inline]
+    fn is_usd_stable_symbol(sym: &str) -> bool {
+        matches!(sym.to_ascii_uppercase().as_str(), "USDT" | "USDC")
+    }
+
+    /// Ciclo fechado em USDT ou USDC (flashloan $1-stable).
+    #[inline]
+    fn is_stable_flashloan_centric(path: &[String]) -> bool {
+        let Some(first) = path.first() else {
+            return false;
+        };
+        let Some(last) = path.last() else {
+            return false;
+        };
+        first.eq_ignore_ascii_case(last) && Self::is_usd_stable_symbol(first)
+    }
+
+    #[inline]
+    fn is_stable_flashloan_start(path: &[String]) -> bool {
+        path.first()
+            .map(|s| Self::is_usd_stable_symbol(s))
+            .unwrap_or(false)
+    }
+
+    #[inline]
     fn is_usdt_centric(path: &[String]) -> bool {
+        // Compat: USDT-only; preferir is_stable_flashloan_centric.
         path.first().map(|s| s.as_str()) == Some(TARGET_BASE_TOKEN)
             && path.last().map(|s| s.as_str()) == Some(TARGET_BASE_TOKEN)
     }
@@ -2001,4 +2554,186 @@ mod tests {
         );
     }
 
+    /// M4: perna ausente no price_map (B2) → MissingLeg + contador.
+    #[test]
+    fn triangular_discards_cycle_when_leg_missing_liquidity() {
+        reset_triangular_leg_low_liquidity_discarded_count();
+        let before = triangular_leg_low_liquidity_discarded_count();
+
+        let mut uni = HashMap::new();
+        // Só USDC↔LINK; falta LINK→WETH e WETH→USDC
+        uni.insert("USDC-LINK".into(), 0.05);
+        uni.insert("LINK-USDC".into(), 18.0);
+        let graph = ArbitrageEngine::build_price_graph_for_dex("UniswapV3", &uni);
+
+        let r = ArbitrageEngine::try_intra_dex_cycle(
+            "UniswapV3",
+            "USDC",
+            "LINK",
+            "WETH",
+            &graph,
+            0.01,
+        );
+        assert!(matches!(r, IntraCycleResult::MissingLeg));
+
+        // Simula o finder: MissingLeg → note
+        note_triangular_leg_low_liquidity_discarded(1);
+        assert_eq!(
+            triangular_leg_low_liquidity_discarded_count(),
+            before + 1
+        );
+        reset_triangular_leg_low_liquidity_discarded_count();
+    }
+
+    /// M4: ciclo completo com rates realistas e spread acima do mínimo.
+    #[test]
+    fn triangular_intra_dex_cycle_ok_when_legs_present() {
+        use crate::dex::cache_fee_tier;
+        cache_fee_tier("UniswapV3", "USDC", "LINK", 3000);
+        cache_fee_tier("UniswapV3", "LINK", "WETH", 3000);
+        cache_fee_tier("UniswapV3", "WETH", "USDC", 500);
+
+        let mut uni = HashMap::new();
+        // Produto ligeiramente > 1 (após fees embutidas nos rates)
+        uni.insert("USDC-LINK".into(), 0.06); // LINK per USDC
+        uni.insert("LINK-WETH".into(), 0.004); // WETH per LINK
+        uni.insert("WETH-USDC".into(), 4200.0); // USDC per WETH
+        // 0.06 * 0.004 * 4200 = 1.008 → +0.8%
+        let graph = ArbitrageEngine::build_price_graph_for_dex("UniswapV3", &uni);
+
+        let r = ArbitrageEngine::try_intra_dex_cycle(
+            "UniswapV3",
+            "USDC",
+            "LINK",
+            "WETH",
+            &graph,
+            0.1, // min 0.1%
+        );
+        match r {
+            IntraCycleResult::Ok {
+                path,
+                steps,
+                spread,
+                final_rate,
+            } => {
+                assert_eq!(path, vec!["USDC", "LINK", "WETH", "USDC"]);
+                assert_eq!(steps.len(), 3);
+                assert!(steps.iter().all(|s| s.dex_name == "UniswapV3"));
+                assert!(steps.iter().all(|s| {
+                    s.v3_fee_tier
+                        .map(crate::dex::is_executable_v3_fee_tier)
+                        .unwrap_or(false)
+                }));
+                assert!((final_rate - 1.008).abs() < 1e-9);
+                assert!((spread - 0.8).abs() < 1e-6);
+            }
+            _ => panic!("expected Ok, got variant"),
+        }
+    }
+
+    /// Cross-DEX: pernas em venues distintos preservam venue+fee até ArbitrageStep.
+    #[test]
+    fn triangular_cross_dex_preserves_venue_and_fee_per_hop() {
+        use crate::dex::cache_fee_tier;
+        cache_fee_tier("UniswapV3", "LINK", "WETH", 500);
+
+        let mut prices: HashMap<String, HashMap<String, f64>> = HashMap::new();
+        let mut qs = HashMap::new();
+        qs.insert("USDC-LINK".into(), 0.06);
+        prices.insert("QuickSwap".into(), qs);
+        let mut uni = HashMap::new();
+        uni.insert("LINK-WETH".into(), 0.004);
+        prices.insert("UniswapV3".into(), uni);
+        let mut sushi = HashMap::new();
+        sushi.insert("WETH-USDC".into(), 4200.0);
+        prices.insert("SushiSwap".into(), sushi);
+
+        let graph = ArbitrageEngine::build_price_graph(&prices);
+        let r = ArbitrageEngine::try_cross_dex_cycle("USDC", "LINK", "WETH", &graph, 0.1);
+        match r {
+            IntraCycleResult::Ok { steps, .. } => {
+                assert_eq!(steps.len(), 3);
+                assert_eq!(steps[0].dex_name, "QuickSwap");
+                assert_eq!(steps[0].v3_fee_tier, None);
+                assert_eq!(steps[1].dex_name, "UniswapV3");
+                assert_eq!(steps[1].v3_fee_tier, Some(500));
+                assert_eq!(steps[2].dex_name, "SushiSwap");
+                assert_eq!(steps[2].v3_fee_tier, None);
+                // Sanitizer não troca venues reais
+                let sanitized = ArbitrageEngine::sanitize_steps_for_execution(&steps);
+                assert_eq!(sanitized[0].dex_name, "QuickSwap");
+                assert_eq!(sanitized[1].dex_name, "UniswapV3");
+                assert_eq!(sanitized[1].v3_fee_tier, Some(500));
+                assert_eq!(sanitized[2].dex_name, "SushiSwap");
+            }
+            _ => panic!("expected Ok cross-DEX, got non-Ok"),
+        }
+    }
+
+    /// Cross-DEX: hop ausente no price_map (B2) → MissingLeg + counter.
+    #[test]
+    fn triangular_cross_dex_discards_when_leg_low_liquidity() {
+        reset_triangular_leg_low_liquidity_discarded_count();
+        let mut prices: HashMap<String, HashMap<String, f64>> = HashMap::new();
+        let mut qs = HashMap::new();
+        qs.insert("USDC-LINK".into(), 0.06);
+        prices.insert("QuickSwap".into(), qs);
+        // falta LINK→WETH e WETH→USDC
+        let graph = ArbitrageEngine::build_price_graph(&prices);
+        let r = ArbitrageEngine::try_cross_dex_cycle("USDC", "LINK", "WETH", &graph, 0.01);
+        assert!(matches!(r, IntraCycleResult::MissingLeg));
+        note_triangular_leg_low_liquidity_discarded(1);
+        assert_eq!(triangular_leg_low_liquidity_discarded_count(), 1);
+        reset_triangular_leg_low_liquidity_discarded_count();
+    }
+
+    /// eth_call / extraData usa fee congelado no step — não re-otimiza via cache.
+    #[test]
+    fn eth_call_uses_detection_fee_not_cache_reopt() {
+        use crate::core::flashloan::ArbitrageClient;
+        use crate::dex::cache_fee_tier;
+
+        cache_fee_tier("UniswapV3", "USDC", "LINK_REOPT", 500);
+        let step = ArbitrageEngine::create_step("UniswapV3", "USDC", "LINK_REOPT", 1.0);
+        assert_eq!(step.v3_fee_tier, Some(500));
+
+        // Cache muda depois da detecção — simulação deve manter 500
+        cache_fee_tier("UniswapV3", "USDC", "LINK_REOPT", 3000);
+        let extra = ArbitrageClient::build_extra_data_for_step(&step).unwrap();
+        let decoded = ArbitrageClient::decode_v3_fee_extra_data(&extra).unwrap();
+        assert_eq!(decoded, 500, "não re-otimizar fee no eth_call");
+    }
+
+    /// M4: create_step grava fee tiers executáveis {500,3000,10000} no step.
+    #[test]
+    fn triangular_v3_steps_use_executable_fee_tiers() {
+        use crate::dex::{cache_fee_tier, EXECUTABLE_V3_FEE_TIERS};
+        use crate::core::flashloan::ArbitrageClient;
+
+        for &fee in &EXECUTABLE_V3_FEE_TIERS {
+            let tag = format!("TRI_FEE_{}", fee);
+            cache_fee_tier("UniswapV3", "USDC", &tag, fee);
+            let step = ArbitrageEngine::create_step("UniswapV3", "USDC", &tag, 1.0);
+            assert_eq!(step.v3_fee_tier, Some(fee));
+            let extra = ArbitrageClient::encode_v3_fee_extra_data(fee);
+            let decoded = ArbitrageClient::decode_v3_fee_extra_data(&extra).unwrap();
+            assert_eq!(decoded, fee);
+            assert!(
+                EXECUTABLE_V3_FEE_TIERS.contains(&decoded),
+                "fee {decoded} fora de EXECUTABLE_V3_FEE_TIERS"
+            );
+        }
+    }
+
+    #[test]
+    fn stable_flashloan_centric_accepts_usdc() {
+        let path = vec![
+            "USDC".into(),
+            "LINK".into(),
+            "WETH".into(),
+            "USDC".into(),
+        ];
+        assert!(ArbitrageEngine::is_stable_flashloan_centric(&path));
+        assert!(!ArbitrageEngine::is_usdt_centric(&path));
+    }
 }

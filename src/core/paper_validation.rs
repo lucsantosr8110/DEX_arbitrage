@@ -541,6 +541,8 @@ pub struct PaperAggregate {
     pub n_reverts: u64,
     pub n_falsos_lucrativos: u64,
     pub n_would_execute: u64,
+    pub n_reached_eth_call: u64,
+    pub n_sim_ok: u64,
     pub erro_rel_pct_mean: Option<f64>,
     pub erro_rel_pct_p50: Option<f64>,
     pub erro_rel_pct_p95: Option<f64>,
@@ -552,6 +554,8 @@ impl PaperAggregate {
         let n_reverts = samples.iter().filter(|s| !s.sim_ok).count() as u64;
         let n_falsos = samples.iter().filter(|s| s.false_profitable).count() as u64;
         let n_would = samples.iter().filter(|s| s.would_execute).count() as u64;
+        let n_eth = samples.iter().filter(|s| reached_eth_call(s)).count() as u64;
+        let n_ok = samples.iter().filter(|s| s.sim_ok).count() as u64;
 
         let mut errs: Vec<f64> = samples.iter().filter_map(|s| s.erro_rel_pct).collect();
         errs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -567,6 +571,8 @@ impl PaperAggregate {
             n_reverts,
             n_falsos_lucrativos: n_falsos,
             n_would_execute: n_would,
+            n_reached_eth_call: n_eth,
+            n_sim_ok: n_ok,
             erro_rel_pct_mean: mean,
             erro_rel_pct_p50: percentile(&errs, 50.0),
             erro_rel_pct_p95: percentile(&errs, 95.0),
@@ -575,9 +581,11 @@ impl PaperAggregate {
 
     pub fn log_summary(&self) {
         let fee100_discarded = crate::dex::fee100_best_discarded_count();
+        let n_eth = self.n_reached_eth_call;
+        let n_ok = self.n_sim_ok;
         info!(
             target: "paper_validation",
-            "📊 PAPER SUMMARY | n={} would_execute={} reverts={} falsos_lucrativos={} erro_rel% mean={:?} p50={:?} p95={:?} | fee100_best_discarded={} low_liquidity_discarded={}",
+            "📊 PAPER SUMMARY | n={} would_execute={} reverts={} falsos_lucrativos={} erro_rel% mean={:?} p50={:?} p95={:?} | fee100_best_discarded={} low_liquidity_discarded={} triangular_leg_low_liquidity_discarded={} | n_reached_eth_call={} sim_ok={}",
             self.n_amostras,
             self.n_would_execute,
             self.n_reverts,
@@ -587,6 +595,9 @@ impl PaperAggregate {
             self.erro_rel_pct_p95,
             fee100_discarded,
             crate::dex::liquidity::low_liquidity_discarded_count(),
+            crate::core::arbitrage::triangular_leg_low_liquidity_discarded_count(),
+            n_eth,
+            n_ok,
         );
     }
 
@@ -661,6 +672,54 @@ impl PaperAggregate {
             );
         }
     }
+
+    /// SUMMARY por ciclo triangular (3 hops V3): rota, fees, net↔delta.
+    pub fn log_summary_by_cycle(samples: &[PaperSample]) {
+        let tris: Vec<&PaperSample> = samples.iter().filter(|s| is_triangular_sample(s)).collect();
+        if tris.is_empty() {
+            info!(
+                target: "paper_validation",
+                "📊 PAPER SUMMARY BY CYCLE | n_triangular=0 (nenhum ciclo 3-hop amostrado)"
+            );
+            return;
+        }
+        for s in &tris {
+            info!(
+                target: "paper_validation",
+                "📊 PAPER SUMMARY BY CYCLE | route={} fee_tiers={} trade_usd={:.4} gross_rate_proxy={:.6} net_previsto_usd={:.6} profit_realizado_usd={:?} erro_abs={:?} erro_rel_pct={:?} revert_reason={:?} would_execute={} sim_ok={}",
+                s.route,
+                s.fee_tiers,
+                s.trade_usd,
+                if s.trade_usd > 1e-12 {
+                    1.0 + (s.gross_previsto_usd / s.trade_usd)
+                } else {
+                    0.0
+                },
+                s.net_previsto_usd,
+                s.profit_realizado_usd,
+                s.erro_abs_usd,
+                s.erro_rel_pct,
+                s.revert_reason,
+                s.would_execute,
+                s.sim_ok,
+            );
+        }
+        if let Some(first_ok) = tris.iter().find(|s| s.sim_ok && s.erro_rel_pct.is_some()) {
+            info!(
+                target: "paper_validation",
+                "📊 PAPER SUMMARY BY CYCLE | first_sim_ok erro_rel_pct={:?} route={}",
+                first_ok.erro_rel_pct,
+                first_ok.route,
+            );
+        }
+    }
+}
+
+/// Amostra triangular: 3 steps (2 separadores `|` na route) ou pair com 3 setas.
+fn is_triangular_sample(s: &PaperSample) -> bool {
+    s.route.matches('|').count() >= 2
+        || s.pair.matches("->").count() >= 3
+        || s.fee_tiers.matches(';').count() >= 2
 }
 
 /// eth_call chegou a rodar (não abort pré-encode fee100 / DEX ausente).
@@ -796,6 +855,7 @@ impl PaperValidationHub {
                         let agg = PaperAggregate::from_samples(&guard);
                         agg.log_summary();
                         PaperAggregate::log_summary_by_pair(&guard);
+                        PaperAggregate::log_summary_by_cycle(&guard);
                     }
                     n
                 };
@@ -807,6 +867,7 @@ impl PaperValidationHub {
             if !guard.is_empty() {
                 PaperAggregate::from_samples(&guard).log_summary();
                 PaperAggregate::log_summary_by_pair(&guard);
+                PaperAggregate::log_summary_by_cycle(&guard);
             }
         });
 

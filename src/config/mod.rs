@@ -815,6 +815,32 @@ pub struct ArbitrageTriangularConfig {
     pub enabled: bool,
     pub max_hops: u32,
     pub min_triangle_profit: String,
+    /// Só ciclos com as 3 pernas no mesmo venue. Default **false** = cross-DEX
+    /// (melhor edge por hop across venues) — desenho original do bot.
+    #[serde(default = "default_false")]
+    pub intra_dex_only: bool,
+    /// Venues para triangular intra-DEX.
+    #[serde(default = "default_tri_venues")]
+    pub venues: Vec<String>,
+    /// Âncoras do ciclo (flashloanáveis / profundos). Preferir USDC como start.
+    #[serde(default = "default_tri_anchors")]
+    pub anchors: Vec<String>,
+    /// Mid-caps como perna do meio (shortlist liquidity-gated).
+    #[serde(default = "default_tri_midcaps")]
+    pub midcaps: Vec<String>,
+}
+
+fn default_false() -> bool {
+    false
+}
+fn default_tri_venues() -> Vec<String> {
+    vec!["UniswapV3".into()]
+}
+fn default_tri_anchors() -> Vec<String> {
+    vec!["USDC".into(), "WETH".into(), "WMATIC".into()]
+}
+fn default_tri_midcaps() -> Vec<String> {
+    vec!["LINK".into(), "LDO".into(), "UNI".into()]
 }
 
 impl Default for ArbitrageTriangularConfig {
@@ -823,6 +849,10 @@ impl Default for ArbitrageTriangularConfig {
             enabled: true,
             max_hops: 3,
             min_triangle_profit: "0.10".to_string(),
+            intra_dex_only: false,
+            venues: default_tri_venues(),
+            anchors: default_tri_anchors(),
+            midcaps: default_tri_midcaps(),
         }
     }
 }

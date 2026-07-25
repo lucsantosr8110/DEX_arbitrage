@@ -145,6 +145,7 @@ impl ArbitrageClient {
             );
             crate::dex::reset_fee100_best_discarded_count();
             crate::dex::liquidity::reset_low_liquidity_discarded_count();
+            crate::core::arbitrage::reset_triangular_leg_low_liquidity_discarded_count();
             *slot = Some(PaperValidationHub::spawn(
                 std::path::PathBuf::from(path),
                 window,
@@ -259,25 +260,20 @@ impl ArbitrageClient {
         n.contains("uniswapv3") || n == "uniswapv3"
     }
 
-    /// Resolve fee V3 da MESMA fonte do quote (`v3_fee_tier` no step ou
-    /// `cached_fee_tier` / `fee_cache_key`). Sem silent default 3000.
+    /// Resolve fee V3 **congelado na detecção** (`step.v3_fee_tier`).
+    /// Não re-consulta cache para não re-otimizar fee entre detecção e eth_call.
     fn resolve_v3_fee_for_step(step: &crate::core::types::ArbitrageStep) -> Result<u32> {
-        let fee = step
-            .v3_fee_tier
-            .or_else(|| {
-                crate::dex::cached_fee_tier("UniswapV3", &step.token_in, &step.token_out)
-            })
-            .ok_or_else(|| {
-                anyhow!(
-                    "V3 fee_tier ausente no cache para {}→{} — abort (não forçar 3000)",
-                    step.token_in, step.token_out
-                )
-            })?;
+        let fee = step.v3_fee_tier.ok_or_else(|| {
+            anyhow!(
+                "V3 fee_tier ausente no step {}→{} — abort (não forçar 3000 / não re-query)",
+                step.token_in, step.token_out
+            )
+        })?;
         Self::executable_v3_fee_tier(fee)
     }
 
     /// Monta `extraData`: V3 = abi.encode(uint24); V2/Curve = vazio.
-    fn build_extra_data_for_step(step: &crate::core::types::ArbitrageStep) -> Result<Bytes> {
+    pub(crate) fn build_extra_data_for_step(step: &crate::core::types::ArbitrageStep) -> Result<Bytes> {
         if Self::is_uniswap_v3_step(&step.dex_name) {
             let fee = Self::resolve_v3_fee_for_step(step)?;
             Ok(Self::encode_v3_fee_extra_data(fee))

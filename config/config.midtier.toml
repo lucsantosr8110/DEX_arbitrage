@@ -69,9 +69,13 @@ min_trade_amount_usd = "10.0"
 # ======================================================================
 [arbitrage.triangular]
 enabled = true
-max_hops = 2
+max_hops = 3
 min_triangle_profit = "0.0005"
 enforce_token_rotation = true
+intra_dex_only = false
+venues = ["UniswapV3", "QuickSwap", "SushiSwap"]
+anchors = ["USDC", "WETH", "WMATIC"]
+midcaps = ["LINK", "LDO", "UNI"]
 
 [arbitrage.cross_dex]
 enabled = true
@@ -582,8 +586,7 @@ fee_tier = 500
 [pairs]
 enabled = true
 monitor = [
-    # --- Stable + Bluechip (curated matrix cobre estes automaticamente,
-    #     mas explicito e melhor que implicito) ---
+    # --- Stable + Bluechip ---
     "USDC-WMATIC",
     "USDC-WETH",
     "USDT-WMATIC",
@@ -591,19 +594,23 @@ monitor = [
     "DAI-WMATIC",
     "DAI-WETH",
     "WMATIC-WETH",
-
-    # --- Pares adicionais com liquidez verificada ---
     "WBTC-USDC",
     "WBTC-WMATIC",
-
-    # NOTA: WBTC-WETH removido (sem pool V2, audit 5.4). Pares volateis
-    # (LINK, AAVE, CRV, etc.) removidos: ruido sem arbitragem real.
+    # Mid-caps triangulares UniswapV3 (sem GHST/CRV/SAND/SUSHI)
+    "LINK-WETH",
+    "LINK-USDC",
+    "LINK-WMATIC",
+    "UNI-WETH",
+    "UNI-USDC",
+    "LDO-WETH",
+    "LDO-USDC",
+    "LDO-WMATIC",
 ]
 
 
 liquidity_allowlist = [
-    "USDC", "USDT", "DAI", "WMATIC", "WETH",
-    "LINK", "CRV", "UNI", "GHST", "SAND", "SUSHI", "LDO",
+    "USDC", "USDT", "DAI", "WMATIC", "WETH", "WBTC",
+    "LINK", "UNI", "LDO",
 ]
 
 auto_discovery = false

@@ -8,7 +8,7 @@
 version = "v5.5.9-COMPLETE"
 env_source = ".env"
 expand_env = true
-intermediate_tokens = ["WMATIC", "USDC", "WETH", "DAI", "USDT"]
+intermediate_tokens = ["WMATIC", "USDC", "WETH", "DAI", "USDT", "WBTC"]
 max_parallel_requests = 50      # 50 para estabilidade de conexão
 health_check_interval = 1
 shutdown_timeout = 180
@@ -66,9 +66,13 @@ min_trade_amount_usd = "10.0"
 # ======================================================================
 [arbitrage.triangular]
 enabled = true
-max_hops = 2
+max_hops = 3
 min_triangle_profit = "0.0005"
 enforce_token_rotation = true
+intra_dex_only = false
+venues = ["UniswapV3", "QuickSwap", "SushiSwap"]
+anchors = ["USDC", "WETH", "WMATIC"]
+midcaps = ["LINK", "LDO", "UNI"]
 
 [arbitrage.cross_dex]
 enabled = true
@@ -594,15 +598,29 @@ fee_tier = 500
 [pairs]
 enabled = true
 liquidity_allowlist = [
-    "USDC", "WMATIC", "WETH", "WBTC"
+    "USDC", "USDT", "DAI", "WMATIC", "WETH", "WBTC",
+    "LINK", "UNI", "LDO",
 ]
 monitor = [
-    # Universo paper-first CURADO (voláteis) — calibração sim_ok / erro_rel.
-    # Addresses validados on-chain 2026-07-25 (USDC.e / WETH / WMATIC / WBTC).
-    "USDC-WETH",
+    # Stable + bluechip + WBTC
     "USDC-WMATIC",
-    "WBTC-USDC",
+    "USDC-WETH",
+    "USDT-WMATIC",
+    "USDT-WETH",
+    "DAI-WMATIC",
+    "DAI-WETH",
     "WMATIC-WETH",
+    "WBTC-USDC",
+    "WBTC-WMATIC",
+    # Mid-caps triangulares (UniswapV3); GHST/CRV/SAND/SUSHI fora
+    "LINK-WETH",
+    "LINK-USDC",
+    "LINK-WMATIC",
+    "UNI-WETH",
+    "UNI-USDC",
+    "LDO-WETH",
+    "LDO-USDC",
+    "LDO-WMATIC",
 ]
 
 auto_discovery = false

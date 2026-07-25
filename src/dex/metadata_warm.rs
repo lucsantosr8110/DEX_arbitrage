@@ -23,6 +23,19 @@ pub fn expected_decimals(symbol: &str) -> Option<u8> {
         "WBTC" | "BTC" => Some(8),
         "USDC" | "USDT" | "USDC.E" => Some(6),
         "WETH" | "ETH" | "WMATIC" | "MATIC" | "WPOL" | "DAI" => Some(18),
+        // Mid-caps triangulares (ERC-20 tradeáveis Polygon)
+        "LINK" | "LDO" | "UNI" => Some(18),
+        _ => None,
+    }
+}
+
+/// Endereços ERC-20 tradeáveis conhecidos (NÃO PegSwap/CCIP wrappers).
+pub fn expected_tradable_address(symbol: &str) -> Option<&'static str> {
+    match symbol.to_ascii_uppercase().as_str() {
+        // Chainlink LINK on Polygon PoS (ERC-20); PegSwap ≠ este.
+        "LINK" => Some("0x53E0bca35eC356BD5ddDFebbD1Fc0fD03FaBad39"),
+        "LDO" => Some("0xC3C7d422809852031b44ab29EEC9F1EfF2A58756"),
+        "UNI" => Some("0xb33EaAd8d922B1083446DC23f610c2567fB5180f"),
         _ => None,
     }
 }
@@ -84,6 +97,18 @@ pub async fn warm_monitor_metadata(
 
     for sym in &symbols {
         let addr = address_from_config(cfg, sym)?;
+        if let Some(exp_addr) = expected_tradable_address(sym) {
+            let exp = Address::from_str(exp_addr)
+                .with_context(|| format!("endereço esperado inválido para {}", sym))?;
+            if addr != exp {
+                bail!(
+                    "endereço {}={:?} diverge do ERC-20 tradeável esperado {:?} (possível PegSwap/wrapper)",
+                    sym,
+                    addr,
+                    exp
+                );
+            }
+        }
         let cfg_dec = decimals_from_config(cfg, sym)?;
         if let Some(exp) = expected_decimals(sym) {
             if cfg_dec != exp {
@@ -115,6 +140,7 @@ pub async fn warm_monitor_metadata(
             symbol = %sym,
             ?addr,
             decimals = cfg_dec,
+            tradable_erc20 = expected_tradable_address(sym).is_some(),
             "token metadata warmed"
         );
     }
@@ -218,6 +244,35 @@ mod tests {
         assert_eq!(expected_decimals("USDC"), Some(6));
         assert_eq!(expected_decimals("WETH"), Some(18));
         assert_eq!(expected_decimals("WMATIC"), Some(18));
+        assert_eq!(expected_decimals("LINK"), Some(18));
+        assert_eq!(expected_decimals("LDO"), Some(18));
+        assert_eq!(expected_decimals("UNI"), Some(18));
+    }
+
+    #[test]
+    fn link_tradable_address_not_pegswap() {
+        let link = expected_tradable_address("LINK").unwrap();
+        assert_eq!(
+            link.to_ascii_lowercase(),
+            "0x53e0bca35ec356bd5dddfebbd1fc0fd03fabad39"
+        );
+        // PegSwap / bridge wrappers usam outros contratos — não este.
+    }
+
+    #[test]
+    fn warm_aborts_without_link_decimals_metadata() {
+        let mut cfg = Config::default();
+        cfg.pairs.monitor = vec!["LINK-WETH".into()];
+        cfg.pairs.tokens.insert(
+            "LINK".into(),
+            "0x53E0bca35eC356BD5ddDFebbD1Fc0fD03FaBad39".into(),
+        );
+        cfg.pairs.tokens.insert(
+            "WETH".into(),
+            "0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619".into(),
+        );
+        // Sem metadata.decimals → abort (não assume 18)
+        assert!(decimals_from_config(&cfg, "LINK").is_err());
     }
 
     #[test]
