@@ -9,11 +9,20 @@ use crate::{
         arbitrage::ArbitrageEngine,
         flashloan::ArbitrageClient,
         paper_validation,
+        replay_cross_model::{
+            self, find_best_stable_cycle, should_eth_call_for_route, validate_stable_decimals,
+            QuoteIndex, STABLE_SYMBOLS,
+        },
         types::{ArbitrageOpportunity, ArbitrageStep},
     },
     dex::{
-        cache_fee_tier, calculate_price_from_decimals, quote_amount_for_usd,
-        rate_limiter::ALCHEMY_RATE_LIMITER, select_executable_v3_best_out, EXECUTABLE_V3_FEE_TIERS,
+        cache_fee_tier, calculate_price_from_decimals,
+        liquidity::{
+            min_pool_liquidity_usd, note_low_liquidity_discarded_pub, passes_liquidity_gate,
+            pool_tvl_usd_from_balances,
+        },
+        quote_amount_for_usd, rate_limiter::ALCHEMY_RATE_LIMITER, select_executable_v3_best_out,
+        EXECUTABLE_V3_FEE_TIERS,
     },
     AppMiddleware,
 };
@@ -46,9 +55,20 @@ const POLYGON_BLOCK_SECS: f64 = 2.0;
 const V3_QUOTER: &str = "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6";
 const QUICKSWAP_ROUTER: &str = "0xa5E0829CaCEd8fFDD4De3c43696c57F7D7A678ff";
 const SUSHISWAP_ROUTER: &str = "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506";
+/// Curve Aave plain pool (amDAI/amUSDC/amUSDT) — Polygon.
+const CURVE_AAVE_POOL: &str = "0x445FE580eF8d70FF569aB36e80c647af338db351";
 
 const MULTICALL_BATCH_PAIRS: usize = 12;
 const THROUGHPUT_LOG_EVERY: u64 = 50;
+
+const CURVE_GET_DY_ABI: &str = r#"[
+  {"name":"get_dy","outputs":[{"type":"uint256","name":""}],
+   "inputs":[{"type":"int128","name":"i"},{"type":"int128","name":"j"},{"type":"uint256","name":"dx"}],
+   "stateMutability":"view","type":"function"},
+  {"name":"balances","outputs":[{"type":"uint256","name":""}],
+   "inputs":[{"type":"uint256","name":"i"}],
+   "stateMutability":"view","type":"function"}
+]"#;
 
 // ---------------------------------------------------------------------------
 // Gate / helpers
@@ -69,12 +89,7 @@ pub fn should_run(cfg: &Config) -> bool {
 pub fn theoretical_fee_floor(steps: &[ArbitrageStep]) -> f64 {
     let mut p = 1.0_f64;
     for s in steps {
-        let fee = if s.dex_name.to_ascii_lowercase().contains("uniswapv3") {
-            s.v3_fee_tier.unwrap_or(3000) as f64 / 1_000_000.0
-        } else {
-            0.003
-        };
-        p *= 1.0 - fee;
+        p *= 1.0 - replay_cross_model::venue_fee_fraction(&s.dex_name, s.v3_fee_tier);
     }
     p
 }
@@ -167,12 +182,21 @@ pub struct ReplayBlockSample {
     pub block: u64,
     pub quote_block: u64,
     pub eth_call_block: Option<u64>,
+    /// Best same-model (CPMM-only midcap finder) cycle_rate.
+    pub same_model_rate: f64,
+    /// Best cross-model (Curve×CPMM stables) cycle_rate.
+    pub cross_model_rate: f64,
+    pub cross_model: bool,
+    pub quote_only: bool,
     pub best_cycle_rate: f64,
     pub fee_floor: f64,
     pub edge_exists: bool,
+    pub edge_same_model: bool,
+    pub edge_cross_model: bool,
     pub pair: String,
     pub route: String,
     pub fee_tiers: String,
+    pub models: String,
     pub net_previsto_usd: Option<f64>,
     pub profit_realizado_usd: Option<f64>,
     pub erro_rel_pct: Option<f64>,
@@ -182,17 +206,113 @@ pub struct ReplayBlockSample {
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
+pub struct ModelGroupSummary {
+    pub n_with_rate: u64,
+    pub best_cycle_rate_min: Option<f64>,
+    pub best_cycle_rate_p50: Option<f64>,
+    pub best_cycle_rate_p95: Option<f64>,
+    pub best_cycle_rate_max: Option<f64>,
+    pub histogram: CycleRateHistogram,
+    pub n_blocos_com_edge: u64,
+    pub n_blocos_lucrativos_pos_custos: u64,
+    pub n_reached_eth_call: u64,
+    pub n_sim_ok: u64,
+    pub n_reverts: u64,
+    pub n_quote_only_edges: u64,
+    pub erro_rel_pct_p50: Option<f64>,
+    pub erro_rel_pct_p95: Option<f64>,
+    pub top10: Vec<(u64, f64, String)>,
+}
+
+impl ModelGroupSummary {
+    fn from_rates_and_meta(
+        rates: &[f64],
+        n_edge: u64,
+        n_prof: u64,
+        n_eth: u64,
+        n_ok: u64,
+        n_reverts: u64,
+        n_quote_only_edges: u64,
+        errs: &[f64],
+        top10: Vec<(u64, f64, String)>,
+    ) -> Self {
+        let mut sorted = rates.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mut errs_s = errs.to_vec();
+        errs_s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        Self {
+            n_with_rate: sorted.len() as u64,
+            best_cycle_rate_min: sorted.first().copied(),
+            best_cycle_rate_p50: percentile(&sorted, 50.0),
+            best_cycle_rate_p95: percentile(&sorted, 95.0),
+            best_cycle_rate_max: sorted.last().copied(),
+            histogram: CycleRateHistogram::from_rates(&sorted),
+            n_blocos_com_edge: n_edge,
+            n_blocos_lucrativos_pos_custos: n_prof,
+            n_reached_eth_call: n_eth,
+            n_sim_ok: n_ok,
+            n_reverts,
+            n_quote_only_edges,
+            erro_rel_pct_p50: percentile(&errs_s, 50.0),
+            erro_rel_pct_p95: percentile(&errs_s, 95.0),
+            top10,
+        }
+    }
+
+    fn log(&self, prefix: &str, group: &str) {
+        info!(
+            target: "replay_scan",
+            "📊 {} {} | n_rate={} rate min={:?} p50={:?} p95={:?} max={:?} | hist[<0.99={},0.99-0.995={},0.995-1.0={},>=1.0={}] | n_edge={} n_lucrativos={} | eth_call={} sim_ok={} reverts={} quote_only_edges={} | erro_rel% p50={:?} p95={:?}",
+            prefix,
+            group,
+            self.n_with_rate,
+            self.best_cycle_rate_min,
+            self.best_cycle_rate_p50,
+            self.best_cycle_rate_p95,
+            self.best_cycle_rate_max,
+            self.histogram.lt_0_99,
+            self.histogram.b_0_99_0_995,
+            self.histogram.b_0_995_1_0,
+            self.histogram.gte_1_0,
+            self.n_blocos_com_edge,
+            self.n_blocos_lucrativos_pos_custos,
+            self.n_reached_eth_call,
+            self.n_sim_ok,
+            self.n_reverts,
+            self.n_quote_only_edges,
+            self.erro_rel_pct_p50,
+            self.erro_rel_pct_p95,
+        );
+        for (i, (b, r, p)) in self.top10.iter().enumerate() {
+            info!(
+                target: "replay_scan",
+                "📊 {} {} TOP{} block={} rate={:.8} {}",
+                prefix,
+                group,
+                i + 1,
+                b,
+                r,
+                p
+            );
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ReplayScanSummary {
     pub label: String,
     pub profile: String,
     pub n_blocos_amostrados: u64,
-    /// `to - from + 1` do range configurado.
     pub n_blocos_range: u64,
-    /// True se step=1 e n_amostrados == n_range (cobertura contígua real).
     pub contiguous_full: bool,
     pub block_from: u64,
     pub block_to: u64,
     pub step: u64,
+    pub curve_executable: bool,
+    pub curve_mode: String,
+    pub same_model: ModelGroupSummary,
+    pub cross_model: ModelGroupSummary,
+    /// Legacy combined fields (best overall rate for backward logs).
     pub best_cycle_rate_min: Option<f64>,
     pub best_cycle_rate_p50: Option<f64>,
     pub best_cycle_rate_p95: Option<f64>,
@@ -222,32 +342,113 @@ impl ReplayScanSummary {
         profile: &str,
         elapsed: Option<Duration>,
     ) -> Self {
-        let mut rates: Vec<f64> = samples
+        let same_rates: Vec<f64> = samples
             .iter()
-            .map(|s| s.best_cycle_rate)
+            .map(|s| s.same_model_rate)
             .filter(|r| r.is_finite() && *r > 0.0)
             .collect();
+        let cross_rates: Vec<f64> = samples
+            .iter()
+            .map(|s| s.cross_model_rate)
+            .filter(|r| r.is_finite() && *r > 0.0)
+            .collect();
+
+        let mut same_top: Vec<(u64, f64, String)> = samples
+            .iter()
+            .filter(|s| s.same_model_rate > 0.0)
+            .map(|s| {
+                (
+                    s.block,
+                    s.same_model_rate,
+                    format!("{} | {}", s.pair, s.route),
+                )
+            })
+            .collect();
+        same_top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        same_top.truncate(10);
+
+        let mut cross_top: Vec<(u64, f64, String)> = samples
+            .iter()
+            .filter(|s| s.cross_model && s.cross_model_rate > 0.0)
+            .map(|s| {
+                (
+                    s.block,
+                    s.cross_model_rate,
+                    format!("{} | {} | models={}", s.pair, s.route, s.models),
+                )
+            })
+            .collect();
+        cross_top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        cross_top.truncate(10);
+
+        let same_errs: Vec<f64> = samples
+            .iter()
+            .filter(|s| !s.cross_model && s.sim_ok == Some(true))
+            .filter_map(|s| s.erro_rel_pct)
+            .collect();
+        // cross-model is quote-only → no erro_rel from eth_call
+        let cross_errs: Vec<f64> = Vec::new();
+
+        let same = ModelGroupSummary::from_rates_and_meta(
+            &same_rates,
+            samples.iter().filter(|s| s.edge_same_model).count() as u64,
+            samples
+                .iter()
+                .filter(|s| {
+                    !s.quote_only
+                        && s.sim_ok == Some(true)
+                        && s.profit_realizado_usd.map(|p| p > 0.0).unwrap_or(false)
+                })
+                .count() as u64,
+            samples
+                .iter()
+                .filter(|s| s.eth_call_block.is_some() && !s.quote_only)
+                .count() as u64,
+            samples
+                .iter()
+                .filter(|s| s.sim_ok == Some(true) && !s.quote_only)
+                .count() as u64,
+            samples
+                .iter()
+                .filter(|s| s.sim_ok == Some(false) && !s.quote_only)
+                .count() as u64,
+            0,
+            &same_errs,
+            same_top.clone(),
+        );
+
+        let cross = ModelGroupSummary::from_rates_and_meta(
+            &cross_rates,
+            samples.iter().filter(|s| s.edge_cross_model).count() as u64,
+            0, // quote-only → no lucro pos eth_call
+            0,
+            0,
+            0,
+            samples
+                .iter()
+                .filter(|s| s.edge_cross_model && s.quote_only)
+                .count() as u64,
+            &cross_errs,
+            cross_top.clone(),
+        );
+
+        let same_err_p50 = same.erro_rel_pct_p50;
+        let same_err_p95 = same.erro_rel_pct_p95;
+
+        let mut rates = same_rates.clone();
+        rates.extend(cross_rates.iter().copied());
         rates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-        let n_edge = samples.iter().filter(|s| s.edge_exists).count() as u64;
-        let n_prof = samples
-            .iter()
-            .filter(|s| {
-                s.sim_ok == Some(true) && s.profit_realizado_usd.map(|p| p > 0.0).unwrap_or(false)
-            })
-            .count() as u64;
-        let n_eth = samples.iter().filter(|s| s.eth_call_block.is_some()).count() as u64;
-        let n_ok = samples.iter().filter(|s| s.sim_ok == Some(true)).count() as u64;
         let n_arch = samples.iter().filter(|s| s.archive_error.is_some()).count() as u64;
-
         let mut reason_counts: HashMap<String, u64> = HashMap::new();
         let mut n_reverts = 0u64;
         for s in samples {
-            if s.sim_ok == Some(false) || (s.eth_call_block.is_some() && s.sim_ok != Some(true)) {
+            if s.sim_ok == Some(false) {
                 n_reverts += 1;
                 if let Some(r) = &s.revert_reason {
-                    let key = r.chars().take(120).collect::<String>();
-                    *reason_counts.entry(key).or_default() += 1;
+                    *reason_counts
+                        .entry(r.chars().take(120).collect())
+                        .or_default() += 1;
                 }
             }
         }
@@ -255,24 +456,9 @@ impl ReplayScanSummary {
         revert_reasons.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         revert_reasons.truncate(10);
 
-        let mut errs: Vec<f64> = samples
-            .iter()
-            .filter(|s| s.sim_ok == Some(true))
-            .filter_map(|s| s.erro_rel_pct)
-            .collect();
-        errs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-        let mut top: Vec<(u64, f64, String)> = samples
-            .iter()
-            .map(|s| (s.block, s.best_cycle_rate, s.pair.clone()))
-            .collect();
-        top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        top.truncate(10);
-
         let n_range = expected_contiguous_count(from, to);
         let n_samp = samples.len() as u64;
         let contiguous_full = step <= 1 && n_samp == n_range;
-
         let elapsed_secs = elapsed.map(|d| d.as_secs_f64());
         let throughput = elapsed_secs.and_then(|s| {
             if s > 0.0 {
@@ -281,6 +467,11 @@ impl ReplayScanSummary {
                 None
             }
         });
+
+        let mut top = same_top;
+        top.extend(cross_top);
+        top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        top.truncate(10);
 
         Self {
             label: label.to_string(),
@@ -291,148 +482,45 @@ impl ReplayScanSummary {
             block_from: from.min(to),
             block_to: from.max(to),
             step,
+            curve_executable: replay_cross_model::curve_executor_supported(),
+            curve_mode: if replay_cross_model::curve_executor_supported() {
+                "executable".into()
+            } else {
+                "QUOTE_ONLY".into()
+            },
+            same_model: same,
+            cross_model: cross,
             best_cycle_rate_min: rates.first().copied(),
             best_cycle_rate_p50: percentile(&rates, 50.0),
             best_cycle_rate_p95: percentile(&rates, 95.0),
             best_cycle_rate_max: rates.last().copied(),
             histogram: CycleRateHistogram::from_rates(&rates),
-            n_blocos_com_edge: n_edge,
-            n_blocos_lucrativos_pos_custos: n_prof,
-            n_reached_eth_call: n_eth,
-            n_sim_ok: n_ok,
+            n_blocos_com_edge: samples.iter().filter(|s| s.edge_exists).count() as u64,
+            n_blocos_lucrativos_pos_custos: samples
+                .iter()
+                .filter(|s| {
+                    s.sim_ok == Some(true)
+                        && s.profit_realizado_usd.map(|p| p > 0.0).unwrap_or(false)
+                })
+                .count() as u64,
+            n_reached_eth_call: samples.iter().filter(|s| s.eth_call_block.is_some()).count()
+                as u64,
+            n_sim_ok: samples.iter().filter(|s| s.sim_ok == Some(true)).count() as u64,
             n_reverts,
             revert_reasons,
             n_archive_abort: n_arch,
-            erro_rel_pct_p50: percentile(&errs, 50.0),
-            erro_rel_pct_p95: percentile(&errs, 95.0),
+            erro_rel_pct_p50: same_err_p50,
+            erro_rel_pct_p95: same_err_p95,
             top10: top,
             throughput_blocks_per_sec: throughput,
             elapsed_secs,
         }
     }
 
-    pub fn merge_aggregate(parts: &[ReplayScanSummary], step: u64) -> Self {
-        let mut all_rates: Vec<f64> = Vec::new();
-        let mut hist = CycleRateHistogram::default();
-        let mut n_samp = 0u64;
-        let mut n_range = 0u64;
-        let mut n_edge = 0u64;
-        let mut n_prof = 0u64;
-        let mut n_eth = 0u64;
-        let mut n_ok = 0u64;
-        let mut n_reverts = 0u64;
-        let mut n_arch = 0u64;
-        let mut reason_counts: HashMap<String, u64> = HashMap::new();
-        let mut errs: Vec<f64> = Vec::new();
-        let mut top: Vec<(u64, f64, String)> = Vec::new();
-        let mut elapsed = 0.0_f64;
-        let mut from_min = u64::MAX;
-        let mut to_max = 0u64;
-        let mut contiguous_all = !parts.is_empty();
-
-        for p in parts {
-            n_samp += p.n_blocos_amostrados;
-            n_range += p.n_blocos_range;
-            n_edge += p.n_blocos_com_edge;
-            n_prof += p.n_blocos_lucrativos_pos_custos;
-            n_eth += p.n_reached_eth_call;
-            n_ok += p.n_sim_ok;
-            n_reverts += p.n_reverts;
-            n_arch += p.n_archive_abort;
-            hist.merge(&p.histogram);
-            contiguous_all &= p.contiguous_full;
-            from_min = from_min.min(p.block_from);
-            to_max = to_max.max(p.block_to);
-            if let Some(s) = p.elapsed_secs {
-                elapsed += s;
-            }
-            top.extend(p.top10.iter().cloned());
-            for (r, n) in &p.revert_reasons {
-                *reason_counts.entry(r.clone()).or_default() += n;
-            }
-            if let Some(v) = p.best_cycle_rate_min {
-                all_rates.push(v);
-            }
-            if let Some(v) = p.best_cycle_rate_max {
-                all_rates.push(v);
-            }
-            if let Some(v) = p.best_cycle_rate_p50 {
-                all_rates.push(v);
-            }
-            if let Some(v) = p.erro_rel_pct_p50 {
-                errs.push(v);
-            }
-            if let Some(v) = p.erro_rel_pct_p95 {
-                errs.push(v);
-            }
-        }
-
-        // Recompute min/max/p50/p95 from window extrema is weak; prefer re-scan
-        // rates via top10 + extrema already collected. For aggregate we keep
-        // extrema from parts:
-        let mut mins: Vec<f64> = parts.iter().filter_map(|p| p.best_cycle_rate_min).collect();
-        let mut maxs: Vec<f64> = parts.iter().filter_map(|p| p.best_cycle_rate_max).collect();
-        mins.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        maxs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-        // Weighted-ish p50/p95: use per-window p50/p95 list
-        let mut p50s: Vec<f64> = parts.iter().filter_map(|p| p.best_cycle_rate_p50).collect();
-        let mut p95s: Vec<f64> = parts.iter().filter_map(|p| p.best_cycle_rate_p95).collect();
-        p50s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        p95s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-        let mut err_p50s: Vec<f64> = parts.iter().filter_map(|p| p.erro_rel_pct_p50).collect();
-        let mut err_p95s: Vec<f64> = parts.iter().filter_map(|p| p.erro_rel_pct_p95).collect();
-        err_p50s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        err_p95s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-        top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        top.truncate(10);
-
-        let mut revert_reasons: Vec<(String, u64)> = reason_counts.into_iter().collect();
-        revert_reasons.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        revert_reasons.truncate(10);
-
-        let _ = all_rates;
-        let _ = errs;
-
-        Self {
-            label: "AGGREGATE".into(),
-            profile: "multi_window".into(),
-            n_blocos_amostrados: n_samp,
-            n_blocos_range: n_range,
-            contiguous_full: contiguous_all,
-            block_from: if from_min == u64::MAX { 0 } else { from_min },
-            block_to: to_max,
-            step,
-            best_cycle_rate_min: mins.first().copied(),
-            best_cycle_rate_p50: percentile(&p50s, 50.0),
-            best_cycle_rate_p95: percentile(&p95s, 50.0),
-            best_cycle_rate_max: maxs.last().copied(),
-            histogram: hist,
-            n_blocos_com_edge: n_edge,
-            n_blocos_lucrativos_pos_custos: n_prof,
-            n_reached_eth_call: n_eth,
-            n_sim_ok: n_ok,
-            n_reverts,
-            revert_reasons,
-            n_archive_abort: n_arch,
-            erro_rel_pct_p50: percentile(&err_p50s, 50.0),
-            erro_rel_pct_p95: percentile(&err_p95s, 50.0),
-            top10: top,
-            throughput_blocks_per_sec: if elapsed > 0.0 {
-                Some(n_samp as f64 / elapsed)
-            } else {
-                None
-            },
-            elapsed_secs: if elapsed > 0.0 { Some(elapsed) } else { None },
-        }
-    }
-
     pub fn log(&self, prefix: &str) {
         info!(
             target: "replay_scan",
-            "📊 {} SUMMARY | label={} profile={} sampled={} range_size={} contiguous_full={} range=[{}..{}] step={} | rate min={:?} p50={:?} p95={:?} max={:?} | hist[<0.99={},0.99-0.995={},0.995-1.0={},>=1.0={}] | n_edge={} n_lucrativos={} | eth_call={} sim_ok={} reverts={} archive={} | erro_rel% p50={:?} p95={:?} | thrpt={:?} blk/s elapsed={:?}",
+            "📊 {} SUMMARY | label={} profile={} sampled={} range_size={} contiguous_full={} range=[{}..{}] step={} | curve={} ({}) | thrpt={:?} blk/s elapsed={:?}",
             prefix,
             self.label,
             self.profile,
@@ -442,25 +530,13 @@ impl ReplayScanSummary {
             self.block_from,
             self.block_to,
             self.step,
-            self.best_cycle_rate_min,
-            self.best_cycle_rate_p50,
-            self.best_cycle_rate_p95,
-            self.best_cycle_rate_max,
-            self.histogram.lt_0_99,
-            self.histogram.b_0_99_0_995,
-            self.histogram.b_0_995_1_0,
-            self.histogram.gte_1_0,
-            self.n_blocos_com_edge,
-            self.n_blocos_lucrativos_pos_custos,
-            self.n_reached_eth_call,
-            self.n_sim_ok,
-            self.n_reverts,
-            self.n_archive_abort,
-            self.erro_rel_pct_p50,
-            self.erro_rel_pct_p95,
+            self.curve_mode,
+            replay_cross_model::curve_execution_diagnostic(),
             self.throughput_blocks_per_sec,
             self.elapsed_secs,
         );
+        self.same_model.log(prefix, "SAME_MODEL");
+        self.cross_model.log(prefix, "CROSS_MODEL");
         for (reason, n) in &self.revert_reasons {
             info!(
                 target: "replay_scan",
@@ -468,17 +544,6 @@ impl ReplayScanSummary {
                 prefix,
                 n,
                 reason
-            );
-        }
-        for (i, (b, r, p)) in self.top10.iter().enumerate() {
-            info!(
-                target: "replay_scan",
-                "📊 {} TOP{} block={} rate={:.8} pair={}",
-                prefix,
-                i + 1,
-                b,
-                r,
-                p
             );
         }
     }
@@ -616,8 +681,11 @@ struct HistQuoter {
     token_cache: Arc<TokenCache>,
     quoter_abi: Abi,
     router_abi: Abi,
+    curve_abi: Abi,
     notional_usd: f64,
     min_interval: Duration,
+    /// B2 gate real (balances() @ latest block) — false ⇒ Curve leg skip, sem revert silencioso.
+    curve_liquid: bool,
 }
 
 impl HistQuoter {
@@ -626,6 +694,8 @@ impl HistQuoter {
             .context("parse uniswap_v3_quoter abi")?;
         let router_abi = parse_abi_flexible(include_str!("../../abi/uniswap_v2_router.json"))
             .context("parse uniswap_v2_router abi")?;
+        let curve_abi: Abi =
+            serde_json::from_str(CURVE_GET_DY_ABI).context("parse curve get_dy abi")?;
         let token_cache = TokenCache::global(cfg.clone()).await;
         let min_interval = Duration::from_millis(cfg.validation.replay.min_interval_ms);
         Ok(Self {
@@ -633,9 +703,48 @@ impl HistQuoter {
             token_cache,
             quoter_abi,
             router_abi,
+            curve_abi,
             notional_usd: 100.0,
             min_interval,
+            curve_liquid: false,
         })
+    }
+
+    /// B2 gate real: soma `balances(i)` do pool Curve Aave @ `block_num`, compara
+    /// contra `min_pool_liquidity_usd(cfg)`. Stables ≈ $1 (mesmo fallback de
+    /// `dex::liquidity::token_price_usd`). Chamado 1x no boot do scan, não por bloco.
+    async fn probe_curve_liquidity(&self, cfg: &Config, block_num: u64) -> Result<(f64, bool)> {
+        let block = BlockId::Number(BlockNumber::Number(block_num.into()));
+        let pool = Contract::new(
+            Address::from_str(CURVE_AAVE_POOL)?,
+            self.curve_abi.clone(),
+            self.client.clone(),
+        );
+        // Índices do pool: DAI=0 (18 dec), USDC=1 (6 dec), USDT=2 (6 dec).
+        let mut bal = [U256::zero(); 3];
+        for (i, b) in bal.iter_mut().enumerate() {
+            self.pace().await;
+            *b = pool
+                .method::<_, U256>("balances", U256::from(i as u64))?
+                .block(block)
+                .call()
+                .await
+                .map_err(|e| anyhow!("curve balances({i}) failed: {e}"))?;
+        }
+        let tvl = pool_tvl_usd_from_balances(bal[0], 18, 1.0, bal[1], 6, 1.0)
+            + pool_tvl_usd_from_balances(bal[2], 6, 1.0, U256::zero(), 0, 0.0);
+        let min_usd = min_pool_liquidity_usd(cfg);
+        let ok = passes_liquidity_gate(tvl, min_usd);
+        Ok((tvl, ok))
+    }
+
+    /// Abort se USDC/USDT/DAI decimals ≠ canônico.
+    async fn assert_stable_decimals(&self) -> Result<()> {
+        for sym in STABLE_SYMBOLS {
+            let (_, dec) = self.resolve(sym).await?;
+            validate_stable_decimals(sym, dec)?;
+        }
+        Ok(())
     }
 
     async fn pace(&self) {
@@ -796,6 +905,64 @@ impl HistQuoter {
         }
         Ok(results)
     }
+
+    /// Curve Aave pool get_dy@block — sequencial. Índices: DAI=0, USDC=1, USDT=2.
+    async fn quote_curve_stables(
+        &self,
+        block_num: u64,
+    ) -> Result<HashMap<(String, String), f64>> {
+        if !self.curve_liquid {
+            // B2 gate falhou no probe inicial — sem quote-only silencioso: cross_model
+            // simplesmente não aparece nesta janela (sem eth_call, sem fake edge).
+            return Ok(HashMap::new());
+        }
+        let block = BlockId::Number(BlockNumber::Number(block_num.into()));
+        let pool = Contract::new(
+            Address::from_str(CURVE_AAVE_POOL)?,
+            self.curve_abi.clone(),
+            self.client.clone(),
+        );
+        let idx = |s: &str| -> Option<i128> {
+            match s {
+                "DAI" => Some(0),
+                "USDC" => Some(1),
+                "USDT" => Some(2),
+                _ => None,
+            }
+        };
+        let mut out = HashMap::new();
+        for &a in STABLE_SYMBOLS {
+            for &b in STABLE_SYMBOLS {
+                if a == b {
+                    continue;
+                }
+                let (Some(i), Some(j)) = (idx(a), idx(b)) else {
+                    continue;
+                };
+                let (_, dec_a) = self.resolve(a).await?;
+                let (_, dec_b) = self.resolve(b).await?;
+                let amount_in = quote_amount_for_usd(a, dec_a, self.notional_usd).await?;
+                self.pace().await;
+                let call = pool.method::<_, U256>("get_dy", (i, j, amount_in))?;
+                match call.block(block).call().await {
+                    Ok(dy) if !dy.is_zero() => {
+                        let price = calculate_price_from_decimals(amount_in, dy, dec_a, dec_b)?;
+                        if price > 0.0 {
+                            out.insert((a.to_string(), b.to_string()), price);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        let s = e.to_string();
+                        if paper_validation::is_archive_state_error(&s) {
+                            return Err(anyhow!("archive state unavailable (curve get_dy): {s}"));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 fn triangular_pairs(cfg: &Config) -> Vec<(String, String)> {
@@ -818,21 +985,34 @@ fn triangular_pairs(cfg: &Config) -> Vec<(String, String)> {
             }
         }
     }
+    for &a in STABLE_SYMBOLS {
+        for &b in STABLE_SYMBOLS {
+            if a != b {
+                set.insert((a.to_string(), b.to_string()));
+            }
+        }
+    }
     set.into_iter().collect()
 }
 
-async fn build_price_map_at_block(
+/// CPMM price_map (finder) + QuoteIndex (inclui Curve) para cross-model.
+async fn build_quotes_at_block(
     quoter: &HistQuoter,
     metas: &[PairMeta],
     block_num: u64,
-) -> Result<HashMap<String, HashMap<String, f64>>> {
+) -> Result<(HashMap<String, HashMap<String, f64>>, QuoteIndex)> {
     let mut out: HashMap<String, HashMap<String, f64>> = HashMap::new();
+    let mut index = QuoteIndex::new();
 
     let v3 = quoter.quote_v3_multicall(metas, block_num).await?;
-    for ((a, b), (price, _)) in v3 {
+    for ((a, b), (price, fee)) in &v3 {
         out.entry("UniswapV3".into())
             .or_default()
-            .insert(format!("{a}-{b}"), price);
+            .insert(format!("{a}-{b}"), *price);
+        index.insert(
+            ("UniswapV3".into(), a.clone(), b.clone()),
+            (*price, Some(*fee)),
+        );
     }
 
     let qs = Address::from_str(QUICKSWAP_ROUTER)?;
@@ -845,9 +1025,18 @@ async fn build_price_map_at_block(
             out.entry(dex.into())
                 .or_default()
                 .insert(format!("{a}-{b}"), price);
+            index.insert((dex.into(), a, b), (price, None));
         }
     }
-    Ok(out)
+
+    let curve = quoter.quote_curve_stables(block_num).await?;
+    for ((a, b), price) in curve {
+        out.entry("Curve".into())
+            .or_default()
+            .insert(format!("{a}-{b}"), price);
+        index.insert(("Curve".into(), a, b), (price, None));
+    }
+    Ok((out, index))
 }
 
 fn best_tri_from_opps(opps: &[ArbitrageOpportunity]) -> Option<(f64, &ArbitrageOpportunity)> {
@@ -890,12 +1079,12 @@ fn append_csv(path: &Path, sample: &ReplayBlockSample, header: bool) -> Result<(
     if header {
         writeln!(
             f,
-            "window,block,quote_block,eth_call_block,best_cycle_rate,fee_floor,edge_exists,pair,route,fee_tiers,net_previsto_usd,profit_realizado_usd,erro_rel_pct,sim_ok,revert_reason,archive_error"
+            "window,block,quote_block,eth_call_block,same_model_rate,cross_model_rate,cross_model,quote_only,best_cycle_rate,fee_floor,edge_exists,edge_same,edge_cross,pair,route,fee_tiers,models,net_previsto_usd,profit_realizado_usd,erro_rel_pct,sim_ok,revert_reason,archive_error"
         )?;
     }
     writeln!(
         f,
-        "{},{},{},{},{:.10},{:.10},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{:.10},{:.10},{},{},{:.10},{:.10},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         sample.window_label.replace(',', ";"),
         sample.block,
         sample.quote_block,
@@ -903,12 +1092,19 @@ fn append_csv(path: &Path, sample: &ReplayBlockSample, header: bool) -> Result<(
             .eth_call_block
             .map(|b| b.to_string())
             .unwrap_or_default(),
+        sample.same_model_rate,
+        sample.cross_model_rate,
+        sample.cross_model,
+        sample.quote_only,
         sample.best_cycle_rate,
         sample.fee_floor,
         sample.edge_exists,
+        sample.edge_same_model,
+        sample.edge_cross_model,
         sample.pair,
         sample.route.replace(',', ";"),
         sample.fee_tiers,
+        sample.models.replace(',', ";"),
         sample
             .net_previsto_usd
             .map(|v| format!("{v:.6}"))
@@ -994,12 +1190,19 @@ async fn scan_window(
             block,
             quote_block: block,
             eth_call_block: None,
+            same_model_rate: 0.0,
+            cross_model_rate: 0.0,
+            cross_model: false,
+            quote_only: false,
             best_cycle_rate: 0.0,
             fee_floor: 0.0,
             edge_exists: false,
+            edge_same_model: false,
+            edge_cross_model: false,
             pair: String::new(),
             route: String::new(),
             fee_tiers: String::new(),
+            models: String::new(),
             net_previsto_usd: None,
             profit_realizado_usd: None,
             erro_rel_pct: None,
@@ -1008,22 +1211,66 @@ async fn scan_window(
             archive_error: None,
         };
 
-        match build_price_map_at_block(quoter, metas, block).await {
-            Ok(prices) => {
+        match build_quotes_at_block(quoter, metas, block).await {
+            Ok((prices, quote_idx)) => {
+                // SAME_MODEL: finder midcap CPMM (baseline)
                 let opps = engine
                     .find_arbitrage_opportunities(&prices, discovery)
                     .await;
+                let mut same_opp: Option<&ArbitrageOpportunity> = None;
                 if let Some((rate, opp)) = best_tri_from_opps(&opps) {
+                    sample.same_model_rate = rate;
+                    sample.edge_same_model = edge_exists(rate);
+                    same_opp = Some(opp);
+                }
+
+                // CROSS_MODEL: Curve × CPMM stables
+                if let Some(cross) = find_best_stable_cycle(&quote_idx, true) {
+                    sample.cross_model = true;
+                    sample.cross_model_rate = cross.cycle_rate;
+                    sample.edge_cross_model = edge_exists(cross.cycle_rate);
+                    sample.quote_only = !replay_cross_model::route_all_legs_executable(
+                        cross.venues().into_iter(),
+                    );
+                    // Prefer cross route in CSV when present (inspection)
+                    sample.pair = cross.pair_label();
+                    sample.route = cross.route_label();
+                    sample.fee_tiers = cross.fee_tiers_label();
+                    sample.models = cross
+                        .legs
+                        .iter()
+                        .map(|l| l.model().as_str().to_string())
+                        .collect::<Vec<_>>()
+                        .join("+");
+                    sample.fee_floor = cross.fee_floor;
+                    sample.best_cycle_rate = cross.cycle_rate;
+                } else if let Some(opp) = same_opp {
                     let (route, fees) = route_and_fees(opp);
-                    sample.best_cycle_rate = rate;
-                    sample.fee_floor = theoretical_fee_floor(&opp.steps.0);
-                    sample.edge_exists = edge_exists(rate);
                     sample.pair = opp.pair.clone();
                     sample.route = route;
                     sample.fee_tiers = fees;
-                    sample.net_previsto_usd = Some(opp.net_profit_usd);
+                    sample.models = opp
+                        .steps
+                        .0
+                        .iter()
+                        .map(|s| replay_cross_model::venue_curve_model(&s.dex_name).as_str())
+                        .collect::<Vec<_>>()
+                        .join("+");
+                    sample.fee_floor = theoretical_fee_floor(&opp.steps.0);
+                    sample.best_cycle_rate = sample.same_model_rate;
+                }
 
-                    if should_eth_call(sample.edge_exists, *eth_calls, max_eth) {
+                sample.edge_exists = sample.edge_same_model || sample.edge_cross_model;
+
+                // eth_call: only same-model executable edges (Curve = quote-only)
+                if let Some(opp) = same_opp {
+                    let executable = paper_validation::route_executor_supported(opp);
+                    if should_eth_call_for_route(
+                        sample.edge_same_model,
+                        *eth_calls,
+                        max_eth,
+                        executable,
+                    ) {
                         assert_same_block_tag(sample.quote_block, block)?;
                         let slip = cfg.flashloan.slippage_bps.unwrap_or(15) as u64;
                         let fl_fee = if cfg.flashloan.enabled {
@@ -1045,6 +1292,7 @@ async fn scan_window(
                                 sample.erro_rel_pct = ps.erro_rel_pct;
                                 sample.revert_reason = ps.revert_reason;
                                 sample.net_previsto_usd = Some(ps.net_previsto_usd);
+                                sample.quote_only = false;
                             }
                             Err(e) => {
                                 let s = e.to_string();
@@ -1056,7 +1304,17 @@ async fn scan_window(
                                 }
                             }
                         }
+                    } else if sample.edge_cross_model && sample.quote_only {
+                        sample.revert_reason = Some(
+                            "cross_model QUOTE_ONLY: Curve not in FlashloanExecutor DexType"
+                                .into(),
+                        );
                     }
+                } else if sample.edge_cross_model {
+                    sample.quote_only = true;
+                    sample.revert_reason = Some(
+                        "cross_model QUOTE_ONLY: Curve not in FlashloanExecutor DexType".into(),
+                    );
                 }
             }
             Err(e) => {
@@ -1132,7 +1390,13 @@ pub async fn run(
         n_windows = windows.len(),
         step,
         max_eth,
-        "📼 REPLAY SCAN start (paper-only, archive required, multicall@block)"
+        curve_mode = if replay_cross_model::curve_executor_supported() {
+            "executable"
+        } else {
+            "QUOTE_ONLY"
+        },
+        diag = replay_cross_model::curve_execution_diagnostic(),
+        "📼 REPLAY SCAN start (paper-only, archive, multicall+curve get_dy)"
     );
     for (lo, hi, label, profile) in &windows {
         info!(
@@ -1146,7 +1410,31 @@ pub async fn run(
         );
     }
 
-    let quoter = HistQuoter::new(client.clone(), cfg.clone()).await?;
+    let mut quoter = HistQuoter::new(client.clone(), cfg.clone()).await?;
+    quoter.assert_stable_decimals().await?;
+
+    let (curve_tvl_usd, curve_passes_b2) = quoter.probe_curve_liquidity(&cfg, latest).await?;
+    quoter.curve_liquid = curve_passes_b2;
+    if curve_passes_b2 {
+        info!(
+            target: "replay_scan",
+            pool = CURVE_AAVE_POOL,
+            tvl_usd = curve_tvl_usd,
+            min_usd = min_pool_liquidity_usd(&cfg),
+            "Curve Aave pool (amDAI/amUSDC/amUSDT) @ block {} — B2 PASS",
+            latest
+        );
+    } else {
+        note_low_liquidity_discarded_pub(1);
+        warn!(
+            target: "replay_scan",
+            pool = CURVE_AAVE_POOL,
+            tvl_usd = curve_tvl_usd,
+            min_usd = min_pool_liquidity_usd(&cfg),
+            "Curve Aave pool @ block {} — B2 FAIL, cross_model desabilitado nesta run",
+            latest
+        );
+    }
     let pairs = triangular_pairs(&cfg);
     let metas = quoter.prepare_pairs(&pairs).await?;
     let csv_path = Path::new(&replay.csv_path);
@@ -1362,12 +1650,19 @@ mod tests {
                 block: 1,
                 quote_block: 1,
                 eth_call_block: Some(1),
+                same_model_rate: 1.001,
+                cross_model_rate: 0.0,
+                cross_model: false,
+                quote_only: false,
                 best_cycle_rate: 1.001,
                 fee_floor: 0.99,
                 edge_exists: true,
+                edge_same_model: true,
+                edge_cross_model: false,
                 pair: "A".into(),
                 route: String::new(),
                 fee_tiers: String::new(),
+                models: "Cpmm+Cpmm+Cpmm".into(),
                 net_previsto_usd: Some(1.0),
                 profit_realizado_usd: Some(0.5),
                 erro_rel_pct: Some(10.0),
@@ -1380,17 +1675,24 @@ mod tests {
                 block: 2,
                 quote_block: 2,
                 eth_call_block: None,
-                best_cycle_rate: 0.996,
+                same_model_rate: 0.996,
+                cross_model_rate: 1.002,
+                cross_model: true,
+                quote_only: true,
+                best_cycle_rate: 1.002,
                 fee_floor: 0.99,
-                edge_exists: false,
+                edge_exists: true,
+                edge_same_model: false,
+                edge_cross_model: true,
                 pair: "B".into(),
-                route: String::new(),
-                fee_tiers: String::new(),
+                route: "Curve[StableSwap]:USDC→USDT|UniswapV3[Cpmm]:USDT→DAI|QuickSwap[Cpmm]:DAI→USDC".into(),
+                fee_tiers: "4bps;100;-".into(),
+                models: "StableSwap+Cpmm+Cpmm".into(),
                 net_previsto_usd: None,
                 profit_realizado_usd: None,
                 erro_rel_pct: None,
                 sim_ok: None,
-                revert_reason: None,
+                revert_reason: Some("cross_model QUOTE_ONLY".into()),
                 archive_error: None,
             },
         ];
@@ -1399,12 +1701,19 @@ mod tests {
             block: 10,
             quote_block: 10,
             eth_call_block: None,
-            best_cycle_rate: 0.994,
+            same_model_rate: 0.994,
+            cross_model_rate: 0.995,
+            cross_model: true,
+            quote_only: true,
+            best_cycle_rate: 0.995,
             fee_floor: 0.99,
             edge_exists: false,
+            edge_same_model: false,
+            edge_cross_model: false,
             pair: "C".into(),
             route: String::new(),
             fee_tiers: String::new(),
+            models: String::new(),
             net_previsto_usd: None,
             profit_realizado_usd: None,
             erro_rel_pct: None,
@@ -1416,33 +1725,36 @@ mod tests {
         let w2 = ReplayScanSummary::from_samples(&s2, 10, 10, 1, "w2", "control", None);
         assert!(w1.contiguous_full);
         assert!(w2.contiguous_full);
-        assert_eq!(w1.n_blocos_com_edge, 1);
-        assert_eq!(w1.n_sim_ok, 1);
-        assert_eq!(w1.histogram.gte_1_0, 1);
+        assert_eq!(w1.same_model.n_blocos_com_edge, 1);
+        assert_eq!(w1.cross_model.n_blocos_com_edge, 1);
+        assert_eq!(w1.cross_model.n_quote_only_edges, 1);
+        assert_eq!(w1.same_model.n_sim_ok, 1);
+        assert_eq!(w1.cross_model.histogram.gte_1_0, 1);
 
         let mut all = s1;
         all.extend(s2);
         let agg = ReplayScanSummary::from_samples(&all, 1, 10, 1, "AGGREGATE", "multi_window", None);
         assert_eq!(agg.n_blocos_amostrados, 3);
-        assert_eq!(agg.n_blocos_com_edge, 1);
-        assert_eq!(agg.n_sim_ok, 1);
-        assert_eq!(agg.n_blocos_lucrativos_pos_custos, 1);
-        assert_eq!(agg.histogram.gte_1_0, 1);
-        assert_eq!(agg.histogram.b_0_995_1_0, 1);
-        assert_eq!(agg.histogram.b_0_99_0_995, 1);
-
-        let merged = ReplayScanSummary::merge_aggregate(&[w1, w2], 1);
-        assert_eq!(merged.n_blocos_amostrados, 3);
-        assert_eq!(merged.n_blocos_com_edge, 1);
-        assert_eq!(merged.n_blocos_range, 3); // 2+1
+        assert_eq!(agg.same_model.n_blocos_com_edge, 1);
+        assert_eq!(agg.cross_model.n_blocos_com_edge, 1);
+        assert_eq!(agg.curve_mode, "QUOTE_ONLY");
     }
 
     #[test]
-    fn histogram_bins() {
-        let h = CycleRateHistogram::from_rates(&[0.98, 0.992, 0.997, 1.0, 1.002]);
-        assert_eq!(h.lt_0_99, 1);
-        assert_eq!(h.b_0_99_0_995, 1);
-        assert_eq!(h.b_0_995_1_0, 1);
-        assert_eq!(h.gte_1_0, 2);
+    fn committed_windows_step1_contiguous() {
+        // Same ranges as config.toml — must sample every block.
+        let windows = [
+            (90772627u64, 90773526u64),
+            (90776227, 90777126),
+            (90815827, 90816726),
+        ];
+        for (from, to) in windows {
+            let blocks = sample_block_list(from, to, 1);
+            assert_eq!(
+                blocks.len() as u64,
+                expected_contiguous_count(from, to),
+                "undersample [{from}..{to}]"
+            );
+        }
     }
 }
