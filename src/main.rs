@@ -188,14 +188,12 @@ async fn main() -> Result<()> {
     };
     info!("🧩 Usando arquivo de configuração: {}", config_path.display());
 
-    let config = Arc::new(Mutex::new(
-        Config::from_file(config_path.clone()).with_context(|| {
-            format!(
-                "❌ Falha ao ler o arquivo de configuração: {}",
-                config_path.display()
-            )
-        })?,
-    ));
+    let config = Config::from_file(config_path.clone()).with_context(|| {
+        format!(
+            "❌ Falha ao ler o arquivo de configuração: {}",
+            config_path.display()
+        )
+    })?;
     let cfg_unlocked = {
         let lock = config.lock().await;
         Arc::new(lock.clone())

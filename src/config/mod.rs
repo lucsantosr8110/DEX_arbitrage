@@ -1762,7 +1762,7 @@ impl Config {
         self.cooldown_manager.clone()
     }
 
-    pub fn from_file(path: PathBuf) -> Result<Self> {
+    pub fn from_file(path: PathBuf) -> Result<Arc<Mutex<Config>>> {
         let raw = fs::read_to_string(&path).with_context(|| format!("failed to read: {:?}", path))?;
         let cleaned = remove_bom(&raw);
         let expanded = {
@@ -1784,13 +1784,18 @@ impl Config {
 
         cfg.apply_fallbacks();
 
-        let cfg_arc = Arc::new(Mutex::new(cfg.clone()));
+        // Retornar o MESMO Arc que o reload listener usa — antes era criado
+        // um Arc local para o listener e retornado cfg por valor, que main.rs
+        // embrulhava em OUTRO Arc. O listener atualizava o Arc órfão que
+        // ninguém lia. Ver ESTADO_ATUAL.md seção 6.1.
+        let cfg_arc = Arc::new(Mutex::new(cfg));
+        let reload_arc = cfg_arc.clone();
         let path_clone = path.clone();
         tokio::spawn(async move {
-            Config::start_reload_listener(cfg_arc, path_clone).await;
+            Config::start_reload_listener(reload_arc, path_clone).await;
         });
 
-        Ok(cfg)
+        Ok(cfg_arc)
     }
 
     pub async fn start_reload_listener(cfg: Arc<Mutex<Config>>, path: PathBuf) {
