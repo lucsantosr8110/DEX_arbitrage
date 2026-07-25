@@ -47,16 +47,9 @@ use tracing::{debug, error, info, instrument, warn};
 const STABLES: &[&str] = &["USDC", "USDT", "DAI"];
 const BLUECHIPS: &[&str] = &["WMATIC", "WETH"];
 
-/// Tokens cujos pools na Polygon foram confirmados com liquidez real durante a
-/// auditoria. Um par de `pairs.monitor` só é monitorado se ambas as pontas
-/// estiverem aqui — o resto (`LINK`, `UNI`, `GHST`, `SUSHI`, `SAND`, `GRT`,
-/// `AAVE`, `CRV`, `MANA`, `LDO`, `WBTC`, …) tinha pools de poeira ou nem par
-/// direto, e só gerava cotação lixo + `eth_call` desperdiçada por ciclo.
-///
-/// O gate de liquidez por pool (`arbitrage.min_liquidity` → `dex::liquidity`)
-/// corta dust via `balanceOf(pool)` multicall no radar. Este allowlist só evita
-/// nem começar a cotar o que já se sabe morto. Ampliar exige reverificar on-chain.
-const KNOWN_LIQUID: &[&str] = &["USDC", "USDT", "DAI", "WMATIC", "WETH"];
+/// Tokens cujos pools na Polygon foram confirmados com liquidez real.
+/// WBTC re-incluído após correção do endereço (B2 gate corta dust).
+const KNOWN_LIQUID: &[&str] = &["USDC", "USDT", "DAI", "WMATIC", "WETH", "WBTC"];
 
 // ============================================================
 // NORMALIZAÇÃO
@@ -70,6 +63,7 @@ fn normalize_token(t: &str) -> &str {
         "USDC" => "USDC",
         "USDT" => "USDT",
         "DAI" => "DAI",
+        "WBTC" | "BTC" => "WBTC",
         _ => t,
     }
 }
@@ -143,23 +137,11 @@ fn curated_matrix_pairs() -> Vec<String> {
 
 /// Emite pares **direcionais**: para cada par lógico A-B, tanto `"A-B"` quanto `"B-A"`.
 ///
-/// Antes só a forma canônica (stable-first) era cotada e o radar sintetizava a direção
-/// oposta como 1/preço. Cotar as duas pontas de verdade é o que permite o gate de
-/// reciprocidade em `prune_non_reciprocal` e mata o lucro fantasma cross-DEX.
-///
-/// Dobra as chamadas por par lógico — compensado pela poda de `pairs.monitor` e pelo
-/// fato de os adapters agregarem tudo via Multicall3 numa chamada só.
+/// Se `pairs.monitor` estiver preenchido, essa lista é a **única** fonte (universo
+/// curado paper-first). A matriz M3 só entra quando `monitor` está vazio.
 fn generate_full_pair_list(cfg: &Config) -> Vec<String> {
     let mut canonical = std::collections::HashSet::new();
 
-    // Matriz M3
-    for p in curated_matrix_pairs() {
-        canonical.insert(p);
-    }
-
-    // Allowlist efetivo: o da config, se preenchido; senão o default seguro
-    // (stables + bluechips). Permite experimentos com pares menos concorridos sem
-    // recompilar — ver pairs.liquidity_allowlist.
     let allow: Vec<String> = if cfg.pairs.liquidity_allowlist.is_empty() {
         KNOWN_LIQUID.iter().map(|s| s.to_string()).collect()
     } else {
@@ -171,18 +153,24 @@ fn generate_full_pair_list(cfg: &Config) -> Vec<String> {
     };
     let allowed = |t: &str| allow.iter().any(|a| a == t);
 
-    // Config do usuário — só pares cujas duas pontas estão no allowlist.
-    for p in &cfg.pairs.monitor {
-        if let Some((a, b)) = p.split_once('-') {
-            let na = normalize_token(a);
-            let nb = normalize_token(b);
-            if allowed(na) && allowed(nb) {
-                canonical.insert(canonical_pair_name(a, b));
-            } else {
-                debug!(
-                    "⏭️ par {}-{} ignorado: token fora do allowlist de liquidez",
-                    a, b
-                );
+    if cfg.pairs.monitor.is_empty() {
+        // Fallback: matriz ultra-líquida M3
+        for p in curated_matrix_pairs() {
+            canonical.insert(p);
+        }
+    } else {
+        for p in &cfg.pairs.monitor {
+            if let Some((a, b)) = p.split_once('-') {
+                let na = normalize_token(a);
+                let nb = normalize_token(b);
+                if allowed(na) && allowed(nb) {
+                    canonical.insert(canonical_pair_name(a, b));
+                } else {
+                    debug!(
+                        "⏭️ par {}-{} ignorado: token fora do allowlist de liquidez",
+                        a, b
+                    );
+                }
             }
         }
     }
@@ -868,6 +856,30 @@ mod tests {
         let mut map = m(&[("USDC-WETH", 0.00053)]);
         prune_non_reciprocal("UniswapV3", &mut map);
         assert!(map.contains_key("USDC-WETH"));
+    }
+
+    #[test]
+    fn pares_monitor_curado_nao_injeta_matriz_m3() {
+        let mut cfg = Config::default();
+        cfg.pairs.liquidity_allowlist = vec![
+            "USDC".into(),
+            "WETH".into(),
+            "WMATIC".into(),
+            "WBTC".into(),
+        ];
+        cfg.pairs.monitor = vec![
+            "USDC-WETH".into(),
+            "USDC-WMATIC".into(),
+            "WBTC-USDC".into(),
+            "WMATIC-WETH".into(),
+        ];
+        let pares = generate_full_pair_list(&cfg);
+        // 4 lógicos × 2 direções = 8
+        assert_eq!(pares.len(), 8, "pares={:?}", pares);
+        assert!(pares.iter().all(|p| !p.contains("USDT") && !p.contains("DAI")));
+        assert!(pares.contains(&"USDC-WETH".into()));
+        assert!(pares.contains(&"WETH-USDC".into()));
+        assert!(pares.contains(&"WBTC-USDC".into()));
     }
 
     #[test]

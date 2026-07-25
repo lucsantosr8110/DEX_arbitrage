@@ -589,6 +589,91 @@ impl PaperAggregate {
             crate::dex::liquidity::low_liquidity_discarded_count(),
         );
     }
+
+    /// SUMMARY por par (calibração volátil): amostras, eth_call, sim_ok, reverts.
+    pub fn log_summary_by_pair(samples: &[PaperSample]) {
+        use std::collections::BTreeMap;
+        let mut by: BTreeMap<String, Vec<&PaperSample>> = BTreeMap::new();
+        for s in samples {
+            by.entry(s.pair.clone()).or_default().push(s);
+        }
+        for (pair, xs) in by {
+            let n = xs.len();
+            let n_eth = xs.iter().filter(|s| reached_eth_call(s)).count();
+            let n_ok = xs.iter().filter(|s| s.sim_ok).count();
+            let n_rev = xs.iter().filter(|s| !s.sim_ok).count();
+            let mut reasons: BTreeMap<String, usize> = BTreeMap::new();
+            for s in &xs {
+                if !s.sim_ok {
+                    let r = s
+                        .revert_reason
+                        .as_deref()
+                        .unwrap_or("unknown")
+                        .chars()
+                        .take(80)
+                        .collect::<String>();
+                    *reasons.entry(r).or_default() += 1;
+                }
+            }
+            let reason_s = reasons
+                .iter()
+                .map(|(k, v)| format!("{}×{}", v, k))
+                .collect::<Vec<_>>()
+                .join(" | ");
+
+            // Only REAL erro_rel from sim_ok samples
+            let mut errs: Vec<f64> = xs
+                .iter()
+                .filter(|s| s.sim_ok)
+                .filter_map(|s| s.erro_rel_pct)
+                .collect();
+            errs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let p50 = percentile(&errs, 50.0);
+            let p95 = percentile(&errs, 95.0);
+
+            let ok_detail: Vec<String> = xs
+                .iter()
+                .filter(|s| s.sim_ok)
+                .map(|s| {
+                    format!(
+                        "net={:.4} real={:?} abs={:?} rel={:?}",
+                        s.net_previsto_usd,
+                        s.profit_realizado_usd,
+                        s.erro_abs_usd,
+                        s.erro_rel_pct
+                    )
+                })
+                .take(5)
+                .collect();
+
+            info!(
+                target: "paper_validation",
+                "📊 PAPER SUMMARY BY PAIR | pair={} n={} n_reached_eth_call={} sim_ok={} reverts={} | erro_rel% p50={:?} p95={:?} | reasons=[{}] | sim_ok_detail={:?}",
+                pair,
+                n,
+                n_eth,
+                n_ok,
+                n_rev,
+                p50,
+                p95,
+                reason_s,
+                ok_detail,
+            );
+        }
+    }
+}
+
+/// eth_call chegou a rodar (não abort pré-encode fee100 / DEX ausente).
+pub fn reached_eth_call(s: &PaperSample) -> bool {
+    if s.sim_ok {
+        return true;
+    }
+    let rr = s.revert_reason.as_deref().unwrap_or("");
+    !(rr.contains("fee_tier=100")
+        || rr.contains("ausente")
+        || rr.contains("DEX não")
+        || rr.contains("não suportada")
+        || rr.contains("nao suportada"))
 }
 
 fn percentile(sorted: &[f64], p: f64) -> Option<f64> {
@@ -710,6 +795,7 @@ impl PaperValidationHub {
                     if summary_window > 0 && n as u64 % summary_window == 0 {
                         let agg = PaperAggregate::from_samples(&guard);
                         agg.log_summary();
+                        PaperAggregate::log_summary_by_pair(&guard);
                     }
                     n
                 };
@@ -720,6 +806,7 @@ impl PaperValidationHub {
             let guard = agg2.lock().unwrap();
             if !guard.is_empty() {
                 PaperAggregate::from_samples(&guard).log_summary();
+                PaperAggregate::log_summary_by_pair(&guard);
             }
         });
 
@@ -1181,5 +1268,34 @@ mod tests {
         };
         assert_eq!(mode, "paper_send_blocked");
         std::env::remove_var(ENV_PAPER_VALIDATION);
+    }
+
+    #[test]
+    fn reached_eth_call_filters_pre_encode_aborts() {
+        let mut s = PaperSample {
+            timestamp: String::new(),
+            pair: "USDC-WETH".into(),
+            route: String::new(),
+            fee_tiers: "500".into(),
+            trade_usd: 100.0,
+            net_previsto_usd: 1.0,
+            gross_previsto_usd: 2.0,
+            gas_usd: 0.1,
+            flashloan_fee_usd: 0.05,
+            profit_realizado_usd: None,
+            erro_abs_usd: None,
+            erro_rel_pct: None,
+            block_number: 1,
+            sim_ok: false,
+            revert_reason: Some("fee_tier=100 unsupported".into()),
+            false_profitable: false,
+            would_execute: false,
+        };
+        assert!(!reached_eth_call(&s));
+        s.revert_reason = Some(r#"Error("Not profitable")"#.into());
+        assert!(reached_eth_call(&s));
+        s.sim_ok = true;
+        s.revert_reason = None;
+        assert!(reached_eth_call(&s));
     }
 }

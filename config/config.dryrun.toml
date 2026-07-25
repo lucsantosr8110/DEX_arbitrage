@@ -10,7 +10,7 @@
 version = "v5.5.9-COMPLETE"
 env_source = ".env"
 expand_env = true
-intermediate_tokens = ["WMATIC", "USDC", "WETH", "DAI", "USDT"]
+intermediate_tokens = ["WMATIC", "USDC", "WETH", "WBTC"]
 max_parallel_requests = 50      # 50 para estabilidade de conexão
 health_check_interval = 1
 shutdown_timeout = 180
@@ -440,11 +440,11 @@ include_balance_metrics = true
 paper_enabled = false
 dry_run_only = false
 csv_path = "audits/paper_validation.csv"
-summary_window = 50
+summary_window = 25
 # Endereço público autorizado (owner) — eth_call from; NUNCA keypair.
 paper_from = "0x152Aa7ecC490860115C4d1369a19C970f9e9eFFf"
 paper_state_overrides = true
-observe_min_spread = 0.005
+observe_min_spread = 0.03
 observe_max_per_cycle = 8
 
 [analytics]
@@ -604,27 +604,15 @@ fee_tier = 25
 [pairs]
 enabled = true
 liquidity_allowlist = [
-    "USDC", "USDT", "DAI", "WMATIC", "WETH",
-    "WBTC", "LINK", "AAVE", "CRV", "GHST",
-    "UNI", "SUSHI", "GRT", "SAND", "MANA", "LDO"
+    "USDC", "WMATIC", "WETH", "WBTC"
 ]
 monitor = [
-    # --- Stable + Bluechip (curated matrix cobre estes automaticamente,
-    #     mas explicito e melhor que implicito) ---
-    "USDC-WMATIC",
+    # Universo paper-first CURADO (voláteis) — calibração sim_ok / erro_rel.
+    # Addresses validados on-chain 2026-07-25 (USDC.e / WETH / WMATIC / WBTC).
     "USDC-WETH",
-    "USDT-WMATIC",
-    "USDT-WETH",
-    "DAI-WMATIC",
-    "DAI-WETH",
-    "WMATIC-WETH",
-
-    # --- Pares adicionais com liquidez verificada ---
+    "USDC-WMATIC",
     "WBTC-USDC",
-    "WBTC-WMATIC",
-
-    # NOTA: WBTC-WETH removido (sem pool V2, audit 5.4). Pares volateis
-    # (LINK, AAVE, CRV, etc.) removidos: ruido sem arbitragem real.
+    "WMATIC-WETH",
 ]
 
 auto_discovery = false
@@ -639,7 +627,7 @@ USDC   = "0x2791Bca1f2de4661ED88A30C99a7a9449Aa84174"
 USDT   = "0xc2132D05D31c914a87C6611C10748AEb04B58e8F"
 WETH   = "0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619"
 DAI    = "0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063"
-WBTC   = "0x1BFD67037B42Cf7962514636336322b350036159"
+WBTC   = "0x1BFD67037B42Cf73acF2047067bd4F2C47D9BfD6"
 LINK   = "0x53E0bca35eC356BD5ddDFebbD1Fc0fD03FaBad39"
 AAVE   = "0xD6DF932A45C0f2553776ED742056204D536D3d8e"
 CRV    = "0x172370d5Cd63279eFa6d502DAB29171933a610AF"

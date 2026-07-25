@@ -70,11 +70,29 @@ impl TokenCache {
         for (symbol, addr_str) in tokens_map {
             match Address::from_str(addr_str) {
                 Ok(address) => {
-                    // Busca decimals do metadata ou usa fallback
-                    let decimals = metadata_map
+                    let decimals = match metadata_map
                         .get(symbol)
                         .and_then(|meta| meta.decimals)
-                        .unwrap_or(18);
+                    {
+                        Some(d) => d,
+                        None => {
+                            if let Some(d) =
+                                crate::dex::metadata_warm::expected_decimals(symbol)
+                            {
+                                warn!(
+                                    "⚠️ TokenCache: decimals ausente no metadata para {} — usando expected {}",
+                                    symbol, d
+                                );
+                                d
+                            } else {
+                                warn!(
+                                    "⚠️ TokenCache: decimals ausente para {} — NÃO carregado (sem fallback 18)",
+                                    symbol
+                                );
+                                continue;
+                            }
+                        }
+                    };
 
                     let token_info = TokenInfo {
                         address,

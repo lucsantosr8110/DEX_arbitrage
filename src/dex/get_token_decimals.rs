@@ -80,14 +80,25 @@ pub async fn get_token_decimals(client: Arc<AppMiddleware>, token_address: Addre
             Ok(decimals)
         }
         Ok(Err(e)) => {
-            warn!("⚠️ [DECIMALS FALLBACK] Erro em decimals() para token {:?}: {} → usando fallback 18 (PODE GERAR PREÇOS ERRADOS para tokens com decimais diferentes!)", token_address, e);
-            cache_token_decimals(token_address, 18);
-            Ok(18)
+            warn!(
+                "⚠️ [DECIMALS] Erro em decimals() para {:?}: {} — SEM fallback 18",
+                token_address, e
+            );
+            Err(anyhow::anyhow!(
+                "decimals() falhou para {:?}: {} (sem fallback 18)",
+                token_address,
+                e
+            ))
         }
         Err(_) => {
-            warn!("⏰ [DECIMALS FALLBACK] Timeout em decimals() para token {:?} → usando fallback 18 (PODE GERAR PREÇOS ERRADOS para tokens com decimais diferentes!)", token_address);
-            cache_token_decimals(token_address, 18);
-            Ok(18)
+            warn!(
+                "⏰ [DECIMALS] Timeout decimals() para {:?} — SEM fallback 18",
+                token_address
+            );
+            Err(anyhow::anyhow!(
+                "decimals() timeout para {:?} (sem fallback 18)",
+                token_address
+            ))
         }
     }
 }

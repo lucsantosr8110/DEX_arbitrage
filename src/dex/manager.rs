@@ -36,7 +36,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::RwLock;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 /// Intervalo entre verificações de saúde
 const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(60);
@@ -146,9 +146,35 @@ impl DexManager {
                 .collect::<Vec<_>>()
         );
 
+        manager.start_metadata_warm().await;
         manager.start_dynamic_warm_up().await;
         manager.start_health_checker().await;
         Ok(manager)
+    }
+
+    /// Warm-boot address+decimals+pool (fora do hot path). Sem fallback 18.
+    pub async fn start_metadata_warm(&self) {
+        let client = self.client.clone();
+        let cfg = self.config.clone();
+        let token_cache = self.token_cache.clone();
+        let adapters = self.active_adapters.read().await.clone();
+        match crate::dex::metadata_warm::warm_monitor_metadata(
+            client,
+            cfg.as_ref(),
+            token_cache.as_ref(),
+            &adapters,
+        )
+        .await
+        {
+            Ok(r) => info!(
+                "✅ Metadata warm-boot: {} tokens, {} pools",
+                r.tokens_warmed, r.pools_warmed
+            ),
+            Err(e) => {
+                // Barulhento: não seguir cego com decimals errados.
+                error!("❌ Metadata warm-boot FALHOU: {:#}", e);
+            }
+        }
     }
 
     /// ============================================================

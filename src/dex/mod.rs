@@ -393,6 +393,7 @@ pub mod circuit_breaker;
 pub mod error;
 pub mod get_token_decimals;
 pub mod liquidity;
+pub mod metadata_warm;
 pub mod manager;
 pub mod price_cache;
 pub mod radar;
@@ -498,7 +499,7 @@ pub mod addresses {
     pub const UNISWAP_V3_FACTORY: &str = "0x1F98431c8ADf9730573766cd80bd442F4B6c4fC8"; // Uniswap V3 Factory (Polygon)
     pub const QUOTER_V2_ADDRESS: &str = "0x61fFE691821291C350f9C4b99d0e0e5B0d64E8b7"; // Fallback Quoter V2 para V3
     
-    // ðŸš€ NOVO: EndereÃ§o WBTC Polygon POS (Bridged) - CORRIGIDO PARA BATER COM config.toml
+    // WBTC Polygon PoS (bridged) — alinhado com [pairs.tokens]
     pub const WBTC_ADDRESS: &str = "0x1BFD67037B42Cf73acF2047067bd4F2C47D9BfD6"; 
     
     pub fn router_address(router: &str) -> Address {
