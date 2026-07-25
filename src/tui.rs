@@ -14,17 +14,14 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Row, Table, TableState},
+    widgets::{Block, Borders, Cell, List, ListItem, Paragraph, Row, Table},
     Frame, Terminal,
 };
 use std::{
     io,
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
-use tokio::sync::RwLock;
-
-use crate::config::Config;
 
 // ============================================================
 // TUI State
@@ -76,15 +73,11 @@ impl Default for TuiState {
 
 pub struct TuiApp {
     state: Arc<RwLock<TuiState>>,
-    start_time: Instant,
 }
 
 impl TuiApp {
     pub fn new(state: Arc<RwLock<TuiState>>) -> Self {
-        Self {
-            state,
-            start_time: Instant::now(),
-        }
+        Self { state }
     }
 
     pub async fn run(&self) -> io::Result<()> {
@@ -133,10 +126,10 @@ impl TuiApp {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3),   // Header
-                Constraint::Length(6),   // Status
-                Constraint::Min(8),     // Prices
-                Constraint::Length(4),   // Footer
+                Constraint::Length(5),   // Header (border + 3 lines de conteúdo)
+                Constraint::Length(6),   // Status (border + 4 lines de conteúdo)
+                Constraint::Min(10),     // Prices (table) - mais espaço para tabela
+                Constraint::Length(4),   // Footer (border + 2 lines de conteúdo)
             ])
             .split(f.area());
 
@@ -149,15 +142,15 @@ impl TuiApp {
     fn draw_header(&self, f: &mut Frame, area: Rect) {
         let header = Paragraph::new(vec![
             Line::from(vec![
-                Span::styled("  DEX ARBITRAGE BOT", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                Span::raw("  |  "),
-                Span::styled("Dashboard v1.0", Style::default().fg(Color::Gray)),
+                Span::styled("  DEX ARBITRAGE BOT v1.0", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
             ]),
             Line::from(vec![
-                Span::styled("  Polygon Mainnet", Style::default().fg(Color::Yellow)),
-                Span::raw("  |  "),
-                Span::styled("Flashloan Mode", Style::default().fg(Color::Green)),
-                Span::raw("  |  Press "),
+                Span::styled("  Polygon", Style::default().fg(Color::Yellow)),
+                Span::raw(" | "),
+                Span::styled("Flashloan", Style::default().fg(Color::Green)),
+            ]),
+            Line::from(vec![
+                Span::raw("  Press "),
                 Span::styled("q", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
                 Span::raw(" to quit"),
             ]),
@@ -179,19 +172,23 @@ impl TuiApp {
             ListItem::new(Line::from(vec![
                 Span::styled("  Status: ", Style::default().fg(Color::Gray)),
                 Span::styled("RUNNING", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-                Span::raw(format!("  |  Uptime: {}", uptime_str)),
+                Span::raw(" | "),
+                Span::raw(format!("Uptime: {}", uptime_str)),
             ])),
             ListItem::new(Line::from(vec![
                 Span::styled("  DEXes: ", Style::default().fg(Color::Gray)),
                 Span::styled(format!("{}", state.dex_count), Style::default().fg(Color::Cyan)),
-                Span::raw(format!("  |  Pares: {}  |  Ciclos: {}", state.pairs_count, state.cycle_count)),
+                Span::raw(" | "),
+                Span::raw(format!("Pares: {}", state.pairs_count)),
+                Span::raw(" | "),
+                Span::raw(format!("Ciclos: {}", state.cycle_count)),
             ])),
             ListItem::new(Line::from(vec![
-                Span::styled("  Econômico: ", Style::default().fg(Color::Gray)),
+                Span::styled("  Econ: ", Style::default().fg(Color::Gray)),
                 Span::styled(format!("gross={}", state.gross_positive), Style::default().fg(if state.gross_positive > 0 { Color::Green } else { Color::Red })),
-                Span::raw("  |  "),
-                Span::styled(format!("fee_adj={}", state.venue_fee_adjusted), Style::default().fg(if state.venue_fee_adjusted > 0 { Color::Green } else { Color::Yellow })),
-                Span::raw("  |  "),
+                Span::raw(" | "),
+                Span::styled(format!("adj={}", state.venue_fee_adjusted), Style::default().fg(if state.venue_fee_adjusted > 0 { Color::Green } else { Color::Yellow })),
+                Span::raw(" | "),
                 Span::styled(format!("neg={}", state.negative_cycles), Style::default().fg(Color::Gray)),
             ])),
         ];
@@ -215,19 +212,34 @@ impl TuiApp {
 
         let mut rows: Vec<Row> = Vec::new();
         for p in &state.last_prices {
-            let spread = if let (Some(q), Some(s)) = (p.quickswap, p.sushiswap) {
-                ((s - q).abs() / q * 100.0)
+            let venue_prices: Vec<f64> = [p.quickswap, p.sushiswap, p.curve, p.uniswap_v3]
+                .into_iter()
+                .flatten()
+                .filter(|v| *v > 0.0)
+                .collect();
+
+            let spread = if venue_prices.len() >= 2 {
+                let min = venue_prices.iter().cloned().fold(f64::INFINITY, f64::min);
+                let max = venue_prices.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                (max - min) / min * 100.0
             } else {
                 0.0
             };
 
+            // Truncar pair se for muito longo (char-safe, evita panic em UTF-8 multi-byte)
+            let pair_display = if p.pair.chars().count() > 12 {
+                format!("{}...", p.pair.chars().take(12).collect::<String>())
+            } else {
+                p.pair.clone()
+            };
+
             rows.push(Row::new(vec![
-                Cell::from(p.pair.clone()),
+                Cell::from(pair_display),
                 Cell::from(format_opt(p.quickswap)),
                 Cell::from(format_opt(p.sushiswap)),
                 Cell::from(format_opt(p.curve)),
                 Cell::from(format_opt(p.uniswap_v3)),
-                Cell::from(format!("{:.4}%", spread)).style(
+                Cell::from(format!("{:.2}%", spread)).style(  // Reduzir para 2 casas decimais
                     if spread > 0.5 { Style::default().fg(Color::Red) }
                     else if spread > 0.1 { Style::default().fg(Color::Yellow) }
                     else { Style::default().fg(Color::Gray) }
@@ -236,12 +248,12 @@ impl TuiApp {
         }
 
         let widths = [
-            Constraint::Length(12),
-            Constraint::Length(14),
-            Constraint::Length(14),
-            Constraint::Length(14),
-            Constraint::Length(14),
-            Constraint::Length(10),
+            Constraint::Length(16),     // Pair - mais espaço para nomes de pares
+            Constraint::Length(16),     // QuickSwap
+            Constraint::Length(16),     // SushiSwap
+            Constraint::Length(16),     // Curve
+            Constraint::Length(16),     // UniswapV3
+            Constraint::Length(12),     // Spread% - mais espaço para porcentagens
         ];
 
         let table = Table::new(rows, widths)
@@ -252,22 +264,24 @@ impl TuiApp {
     }
 
     fn draw_footer(&self, f: &mut Frame, area: Rect) {
-        let footer = Paragraph::new(Line::from(vec![
-            Span::styled("  Alchemy RPC", Style::default().fg(Color::Cyan)),
-            Span::raw("  |  "),
-            Span::styled("Aave V3 Flashloan", Style::default().fg(Color::Green)),
-            Span::raw("  |  "),
-            Span::styled("0.04% Curve", Style::default().fg(Color::Yellow)),
-            Span::raw("  |  "),
-            Span::styled("0.01%-1% UniswapV3", Style::default().fg(Color::Blue)),
-        ]))
+        let footer = Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled("  Alchemy RPC", Style::default().fg(Color::Cyan)),
+                Span::raw(" | "),
+                Span::styled("Aave V3", Style::default().fg(Color::Green)),
+            ]),
+            Line::from(vec![
+                Span::styled("  Curve 0.04%", Style::default().fg(Color::Yellow)),
+                Span::raw(" | "),
+                Span::styled("UniV3 0.01-1%", Style::default().fg(Color::Blue)),
+            ]),
+        ])
         .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Gray)));
         f.render_widget(footer, area);
     }
 
     fn blocking_read(&self) -> TuiState {
-        // Simplified - in real impl would use async
-        TuiState::default()
+        self.state.read().expect("tui state lock poisoned").clone()
     }
 }
 
@@ -278,8 +292,6 @@ fn format_opt(v: Option<f64>) -> String {
         None => "-".to_string(),
     }
 }
-
-use ratatui::widgets::Cell;
 
 // ============================================================
 // TUI Spawner
