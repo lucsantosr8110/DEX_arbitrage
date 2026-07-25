@@ -7,6 +7,7 @@ pub mod bot;
 pub mod flashloan;
 pub mod gas;
 pub mod paper_validation;
+pub mod replay_scan;
 pub mod risk;
 pub mod smart_retry;
 pub mod types;

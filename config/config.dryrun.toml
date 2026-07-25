@@ -453,6 +453,18 @@ paper_state_overrides = true
 observe_min_spread = 0.0
 observe_max_per_cycle = 8
 
+# Replay histórico (paper-only): varre horário ativo US; requer archive RPC.
+# Ativar com REPLAY_SCAN=1 ou enabled=true (+ PAPER_VALIDATION=1).
+[validation.replay]
+enabled = false
+# 0 = auto última sessão Sex–Qui 14:30–17:30 UTC
+block_from = 0
+block_to = 0
+step = 180
+max_eth_calls = 40
+csv_path = "audits/replay_scan.csv"
+auto_us_session = true
+
 [analytics]
 enabled = true
 export_csv = true

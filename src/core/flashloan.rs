@@ -548,7 +548,29 @@ impl ArbitrageClient {
         would_execute: bool,
     ) -> Result<BundleResult> {
         let hub = self.ensure_paper_hub().await;
+        let block = paper_validation::current_block_number(&self.middleware)
+            .await
+            .unwrap_or(0);
+        let sample = self
+            .paper_validate_at_block(opp, block, slippage_bps, flashloan_fee_usd, would_execute)
+            .await?;
+        paper_validation::log_sample(&sample);
+        if let Some(h) = hub {
+            h.try_submit(sample);
+        }
+        Ok(BundleResult::skipped().with_execution_mode("paper_validated"))
+    }
 
+    /// Paper eth_call no `blockTag` dado (replay histórico). Mesmo from público;
+    /// **nunca** send. Retorna amostra sem side-effects de hub (caller decide).
+    pub async fn paper_validate_at_block(
+        &self,
+        opp: &ArbitrageOpportunity,
+        block: u64,
+        slippage_bps: u64,
+        flashloan_fee_usd: f64,
+        would_execute: bool,
+    ) -> Result<paper_validation::PaperSample> {
         let (asset, amount, steps, decimals, token_price, paper_from, use_overrides) = {
             let cfg = self.config.lock().await;
             let (asset, amount, steps) =
@@ -569,13 +591,10 @@ impl ArbitrageClient {
         info!(
             target: "paper_validation",
             paper_from = ?paper_from,
-            wallet = ?self.get_wallet_address().ok(),
-            "PAPER eth_call from=paper_from (endereço público; sem assinatura)"
+            block,
+            "PAPER eth_call@block from=paper_from (sem assinatura)"
         );
 
-        let block = paper_validation::current_block_number(&self.middleware)
-            .await
-            .unwrap_or(0);
         let block_id = paper_validation::block_id(block);
         let holder = paper_from;
 
@@ -588,7 +607,6 @@ impl ArbitrageClient {
         .await
         .ok();
 
-        // from explícito = caller autorizado (onlyExecutor). Sem keypair.
         let call = self
             .executor
             .execute_flashloan(asset, amount, steps.clone())
@@ -598,11 +616,8 @@ impl ArbitrageClient {
         let (sim_ok, revert_reason) = match timeout(Duration::from_secs(15), call.call()).await {
             Ok(Ok(true)) => (true, None),
             Ok(Ok(false)) => {
-                // try/catch do Solidity engoliu o revert — probe Aave.
                 let params = self.encode_flashloan_callback_params(paper_from, &steps);
                 let state_ovr = if use_overrides {
-                    // Override mínimo documentado: saldo do holder no token base
-                    // (flashloan Aave não exige; mantido para paths futuros / debug).
                     Some(paper_validation::erc20_balance_state_override(
                         asset,
                         holder,
@@ -633,12 +648,18 @@ impl ArbitrageClient {
             }
             Ok(Err(e)) => {
                 let decoded = paper_validation::decode_revert_message(&e.to_string());
+                if paper_validation::is_archive_state_error(&decoded)
+                    || paper_validation::is_archive_state_error(&e.to_string())
+                {
+                    return Err(anyhow!(
+                        "archive state unavailable at block {block}: {decoded}"
+                    ));
+                }
                 (false, Some(format!("executeFlashloan revert: {decoded}")))
             }
             Err(_) => (false, Some("Simulation timeout".into())),
         };
 
-        // Delta: Alchemy asset changes com o MESMO from. Sem send.
         let mut profit_realizado_usd = None;
         if sim_ok {
             if let Some(data) = call.tx.data().cloned() {
@@ -664,10 +685,8 @@ impl ArbitrageClient {
                 }
             }
         }
-        // Reverts: NÃO forçar profit=0 (isso inflava erro_rel=100 sem medição).
-        // false_profitable ainda marca via build_sample quando real=None && !sim_ok.
 
-        let sample = paper_validation::build_sample(
+        Ok(paper_validation::build_sample(
             opp,
             block,
             flashloan_fee_usd,
@@ -675,13 +694,7 @@ impl ArbitrageClient {
             sim_ok,
             revert_reason,
             would_execute,
-        );
-        paper_validation::log_sample(&sample);
-        if let Some(h) = hub {
-            h.try_submit(sample);
-        }
-
-        Ok(BundleResult::skipped().with_execution_mode("paper_validated"))
+        ))
     }
 
     /// `abi.encode(initiator, steps)` — idêntico ao FlashloanExecutor.executeFlashloan.

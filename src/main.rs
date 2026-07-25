@@ -339,6 +339,33 @@ async fn main() -> Result<()> {
     let bot = Arc::new(Mutex::new(bot));
 
     // ============================================================
+    // 8️⃣.5 Replay scan (paper-only): varre blocos históricos e sai
+    // ============================================================
+    if flashloan_bot::core::replay_scan::should_run(&cfg_unlocked) {
+        info!("📼 REPLAY_SCAN ativo — paper-only, sem radar/envio");
+        let summary = {
+            let guard = bot.lock().await;
+            flashloan_bot::core::replay_scan::run(
+                client_http.clone(),
+                cfg_unlocked.clone(),
+                guard.get_arbitrage_engine(),
+                &guard.arbitrage_client,
+            )
+            .await
+            .context("❌ replay_scan falhou")?
+        };
+        info!(
+            target: "replay_scan",
+            "📼 REPLAY_SCAN done | n={} edge={} sim_ok={} lucrativos={}",
+            summary.n_blocos_amostrados,
+            summary.n_blocos_com_edge,
+            summary.n_sim_ok,
+            summary.n_blocos_lucrativos_pos_custos
+        );
+        return Ok(());
+    }
+
+    // ============================================================
     // 9️⃣ Canais e Radar
     // ============================================================
     let (price_tx, price_rx) = mpsc::channel::<HashMap<String, HashMap<String, f64>>>(256);

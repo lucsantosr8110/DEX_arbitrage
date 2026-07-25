@@ -1038,6 +1038,20 @@ pub fn block_id(n: u64) -> BlockId {
     BlockId::Number(BlockNumber::Number(n.into()))
 }
 
+/// Erros típicos de RPC sem archive / estado histórico ausente.
+pub fn is_archive_state_error(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("missing trie node")
+        || e.contains("historical state")
+        || e.contains("state is not available")
+        || e.contains("unknown block")
+        || e.contains("header not found")
+        || e.contains("cannot query unfinalized data")
+        || e.contains("pruned history")
+        || e.contains("ancient") && e.contains("not available")
+        || e.contains("archive") && (e.contains("required") || e.contains("unavailable"))
+}
+
 /// Log estruturado de uma amostra paper.
 pub fn log_sample(s: &PaperSample) {
     info!(

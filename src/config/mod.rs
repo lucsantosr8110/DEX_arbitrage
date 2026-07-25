@@ -111,6 +111,60 @@ pub struct ValidationConfig {
     /// Máximo de eth_calls paper por ciclo de preços (evita spam RPC).
     #[serde(default = "default_observe_max_per_cycle")]
     pub observe_max_per_cycle: u64,
+    /// Replay histórico (paper-only): varrer blocos e medir edges triangulares.
+    #[serde(default)]
+    pub replay: ReplayConfig,
+}
+
+/// Scan de blocos históricos para calibrar triangular (eth_call@blockTag).
+/// Só ativo com observation_active (paper). Requer archive node.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ReplayConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Inclusive. `None`/`0` + auto_us_session → resolve horário ativo.
+    #[serde(default)]
+    pub block_from: Option<u64>,
+    #[serde(default)]
+    pub block_to: Option<u64>,
+    /// Amostrar 1 a cada `step` blocos (ex.: 120 ≈ 4 min em Polygon).
+    #[serde(default = "default_replay_step")]
+    pub step: u64,
+    /// Cap de eth_calls nos blocos com edge (RPC cost).
+    #[serde(default = "default_replay_max_eth_calls")]
+    pub max_eth_calls: u64,
+    #[serde(default = "default_replay_csv")]
+    pub csv_path: String,
+    /// Se from/to vazios: última sessão US cash (sex–qui 14:30–17:30 UTC).
+    #[serde(default = "default_true_replay_auto")]
+    pub auto_us_session: bool,
+}
+
+fn default_replay_step() -> u64 {
+    120
+}
+fn default_replay_max_eth_calls() -> u64 {
+    40
+}
+fn default_replay_csv() -> String {
+    "audits/replay_scan.csv".into()
+}
+fn default_true_replay_auto() -> bool {
+    true
+}
+
+impl Default for ReplayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            block_from: None,
+            block_to: None,
+            step: default_replay_step(),
+            max_eth_calls: default_replay_max_eth_calls(),
+            csv_path: default_replay_csv(),
+            auto_us_session: true,
+        }
+    }
 }
 
 fn default_paper_csv() -> String {
@@ -137,6 +191,7 @@ impl Default for ValidationConfig {
             paper_state_overrides: default_paper_state_overrides(),
             observe_min_spread: None,
             observe_max_per_cycle: default_observe_max_per_cycle(),
+            replay: ReplayConfig::default(),
         }
     }
 }

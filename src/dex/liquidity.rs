@@ -67,6 +67,11 @@ fn note_low_liquidity_discarded(n: u64) {
     }
 }
 
+/// Replay scan: incrementa o mesmo counter do B2 live.
+pub fn note_low_liquidity_discarded_pub(n: u64) {
+    note_low_liquidity_discarded(n);
+}
+
 fn pool_cache_key(dex: &str, token_a: &str, token_b: &str, fee_tier: u32) -> String {
     let a = token_a.to_ascii_uppercase();
     let b = token_b.to_ascii_uppercase();
