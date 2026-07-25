@@ -129,7 +129,7 @@ impl DexContract for BalancerDex {
         ]);
 
         let result: Vec<I256> = vault
-            .method("queryBatchSwap", (0u8, vec![swap], Address::zero()))?
+            .method("queryBatchSwap", (0u8, vec![swap], self.vault))?
             .call()
             .await
             .map_err(|e| anyhow!("Balancer queryBatchSwap failed: {}", e))?;
@@ -172,7 +172,7 @@ impl DexContract for BalancerDex {
             ]);
 
             let result: Vec<I256> = match vault
-                .method("queryBatchSwap", (0u8, vec![swap], Address::zero()))?
+                .method("queryBatchSwap", (0u8, vec![swap], self.vault))?
                 .call()
                 .await
             {
