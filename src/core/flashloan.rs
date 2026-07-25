@@ -658,11 +658,12 @@ impl ArbitrageClient {
     ///
     /// Este metodo inspeciona o bool: false = falha de iniciacao do flashloan.
     ///
-    /// Limitacao: o callback executeOperation ainda engole falhas da arbitragem
-    /// interna e retorna true. Ou seja, true aqui significa "flashloan iniciou",
-    /// nao "arbitragem lucrou". Para validar a executabilidade completa seria
-    /// necessario mudar o contrato para reverter ou simular _executeArbitrage
-    /// diretamente. Ver ESTADO_ATUAL.md secao 4.3.
+    /// Após a correção do contrato (remoção do try/catch em executeOperation),
+    /// falhas da arbitragem interna agora propagam como revert — o braço
+    /// Ok(Err(e)) abaixo captura isso. Ou seja:
+    ///   Ok(Ok(true))  = flashloan iniciou E arbitragem lucrou
+    ///   Ok(Ok(false)) = flashloan não iniciou (falha na Aave)
+    ///   Ok(Err(e))    = arbitragem falhou (swap revert, slippage, não lucrativo)
     async fn simulate_bool_transaction(
         &self,
         call: &ContractCall<AppMiddleware, bool>,

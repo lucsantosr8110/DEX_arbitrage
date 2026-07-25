@@ -337,25 +337,27 @@ contract FlashloanExecutor is ReentrancyGuard, IFlashLoanSimpleReceiver {
         totalPremiumPaid += premium;
         uint256 totalOwed = amount + premium;
 
-        try this._executeArbitrage(asset, amount, steps) returns (uint256 finalAmount) {
-            require(finalAmount >= totalOwed, "Not profitable");
-            _approveTo(AAVE_POOL, asset, totalOwed);
+        // 🔧 CORREÇÃO (ESTADO_ATUAL.md §4.3): Removido try/catch que engolia falhas
+        // da arbitragem interna. Antes, executeOperation sempre retornava true para
+        // Aave — mesmo quando a arbitragem falhava — fazendo o bot perder o premium
+        // do flashloan em cada tentativa falha. Agora, se _executeArbitrage reverter
+        // (swap falhou, slippage alto, rota inviável) ou se finalAmount < totalOwed
+        // (não lucrativo), a transação inteira reverte. Aave devolve os fundos sem
+        // cobrar premium. O bot perde só gás, não gás + premium.
+        //
+        // A simulação Rust (simulate_bool_transaction / simulate_transaction via
+        // eth_call) agora detecta reverts corretamente — falso positivo eliminado.
+        uint256 finalAmount = this._executeArbitrage(asset, amount, steps);
+        require(finalAmount >= totalOwed, "Not profitable");
 
-            uint256 profit = finalAmount - totalOwed;
-            if (profit > 0) {
-                totalProfit += profit;
-                IERC20(asset).safeTransfer(executorAddr, profit);
-            }
-            emit FlashLoanSuccess(asset, amount, premium, profit, executorAddr);
-        } catch Error(string memory reason) {
-            _approveTo(AAVE_POOL, asset, totalOwed);
-            emit FlashLoanFailure(asset, amount, reason, executorAddr);
-            failedFlashloans++;
-        } catch {
-            _approveTo(AAVE_POOL, asset, totalOwed);
-            emit FlashLoanFailure(asset, amount, "Low level error", executorAddr);
-            failedFlashloans++;
+        _approveTo(AAVE_POOL, asset, totalOwed);
+
+        uint256 profit = finalAmount - totalOwed;
+        if (profit > 0) {
+            totalProfit += profit;
+            IERC20(asset).safeTransfer(executorAddr, profit);
         }
+        emit FlashLoanSuccess(asset, amount, premium, profit, executorAddr);
 
         emit MetricsUpdated(totalFlashloans, totalProfit, totalPremiumPaid, failedFlashloans);
         return true;
@@ -619,4 +621,4 @@ contract FlashloanExecutor is ReentrancyGuard, IFlashLoanSimpleReceiver {
     }
 
     receive() external payable {}
-}
+}
