@@ -255,7 +255,13 @@ where
             gas_cfg.default_gas_limit as f64
         };
 
-        let matic_price = gas_cfg.eth_price_usd;
+        // Preço do POL via CachedPriceFeed (Coingecko, cache 2min, fallback heurístico).
+        // Antes era estático (gas_cfg.eth_price_usd = 0.102083), sempre errado.
+        // Ver ESTADO_ATUAL.md seção 8 e Fase 2 item 12.
+        let matic_price = crate::infra::price_feed::PRICE_FEED
+            .get_price("WMATIC")
+            .await
+            .unwrap_or(gas_cfg.eth_price_usd);
         let cost = gas_units * (eff * 1e-9) * matic_price;
 
         info!(
