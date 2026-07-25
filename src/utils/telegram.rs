@@ -56,8 +56,10 @@ impl TelegramNotifier {
             return Err(anyhow!("❌ TELEGRAM_CHAT_ID não encontrado (env: TELEGRAM_CHAT_ID ou config.telegram.chat_id)"));
         }
 
-        if token == "${TELEGRAM_TOKEN}" || chat_id == "${TELEGRAM_CHAT_ID}" {
-            return Err(anyhow!("❌ Variáveis Telegram não substituídas - verifique o arquivo .env"));
+        if token == "${TELEGRAM_TOKEN}" || token == "${TELEGRAM_BOT_TOKEN}"
+            || chat_id == "${TELEGRAM_CHAT_ID}"
+        {
+            return Err(anyhow!("❌ Variáveis Telegram não substituídas - verifique .env (TELEGRAM_TOKEN e TELEGRAM_CHAT_ID)"));
         }
 
         // ⏱️ Configuração de cooldown com fallback seguro

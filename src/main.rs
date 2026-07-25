@@ -34,6 +34,7 @@ use flashloan_bot::{
     infra::{
         metrics,
         rpc_provider::{is_usable_endpoint, RpcProvider},
+        try_serve_metrics_with_fallback,
     },
     tui,
     utils::telegram::TelegramNotifier,
@@ -212,6 +213,20 @@ async fn main() -> Result<()> {
     };
 
     log_config_snapshot(&cfg_unlocked);
+
+    // ============================================================
+    // 3️⃣.5 Servidor Prometheus (métricas)
+    // ============================================================
+    // Antes o servidor de métricas nunca era iniciado — Infrastructure::initialize()
+    // não era chamado do main.rs, e toda a camada de observabilidade era decorativa.
+    // Agora chamamos diretamente: inicia warp em [prometheus].port (fallback 9101).
+    if cfg_unlocked.prometheus.enabled || cfg_unlocked.metrics.enabled {
+        if let Err(e) = try_serve_metrics_with_fallback(&cfg_unlocked).await {
+            warn!("⚠️ Falha ao iniciar servidor Prometheus: {}", e);
+        }
+    } else {
+        info!("📊 Prometheus desativado via config.");
+    }
 
     // ============================================================
     // 4️⃣ RPC Providers (HTTP e WS)

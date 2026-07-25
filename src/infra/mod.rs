@@ -130,7 +130,13 @@ impl Infrastructure {
 pub async fn try_serve_metrics_with_fallback(cfg: &Config) -> Result<()> {
     use crate::infra::metrics::{inc_bot_start_total, set_bot_status};
 
-    let base_port = cfg.metrics.port;
+    // Preferir [prometheus].port (alinhado com prometheus.yml) quando ativo;
+    // cair para [metrics].port como fallback.
+    let base_port = if cfg.prometheus.enabled && cfg.prometheus.port > 0 {
+        cfg.prometheus.port
+    } else {
+        cfg.metrics.port
+    };
     let mut port = base_port;
 
     // registra métricas base

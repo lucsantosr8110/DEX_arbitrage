@@ -32,7 +32,7 @@ simulate_before_execute = true
 bundle_relay_url = "https://relay.flashbots.net"
 private_mode = false
 max_premium_bps = 18
-fee_pct = 0.0009
+fee_pct = 0.0005  # 5 bps - FLASHLOAN_PREMIUM_TOTAL da Aave V3 (verificado on-chain 2026-07-24)
 flashloan_decimals = 6
 
 # ======================================================================
@@ -55,7 +55,7 @@ max_gas_cost_ratio = "60.0"
 simulate_prices = true
 execution_mode = "flashloan"
 safety_margin = "1.0"
-cooldown_seconds = 1
+cooldown_seconds = 10  # runtime forca minimo 10s
 max_path_length = 3
 profit_decay_factor = 0.20
 adaptive_trade_amount = true
@@ -112,7 +112,7 @@ dry_run = false
 use_flashloan = true
 max_slippage_bps = 50
 max_retries = 3
-retry_delay_ms = 500
+retry_delay_ms = 2000  # runtime forca minimo 2000ms
 confirmation_blocks = 1
 nonce_monitoring = true
 tx_timeout_seconds = 20
@@ -463,7 +463,7 @@ balance_tracking = true
 
 [telegram]
 enabled = true
-bot_token = "${TELEGRAM_BOT_TOKEN}"
+bot_token = "${TELEGRAM_TOKEN}"
 chat_id = "1236942420"
 notify_on_profit = true
 notify_on_fail = true

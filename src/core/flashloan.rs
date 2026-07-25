@@ -258,9 +258,9 @@ impl ArbitrageClient {
         opp: &mut ArbitrageOpportunity
     ) -> Result<BundleResult> {
 
-        // CORREÇÃO: Anti-MEV atualiza bloco sem bloquear execução
-        self.update_execution_block().await;
-
+        // NOTE: update_execution_block() era chamado AQUI (antes da execução),
+        // o que faria debounce_same_block() sempre retornar true se fosse
+        // implementado. Movido para após TX confirmada em send_and_confirm_transaction.
         let (strategy, min_profit, risk_cfg, slippage_bps, flashloan_decimals) = {
             let cfg = self.config.lock().await;
 
@@ -337,10 +337,29 @@ impl ArbitrageClient {
         }
     }
 
-    // CORREÇÃO: Debounce removido ou sempre retorna false
+    /// Anti-MEV: checa se já executamos neste bloco.
+    ///
+    /// O contrato Solidity tem `modifier antiMEV { require(block.number !=
+    /// lastExecutionBlock) }` em executeFlashloan e executeDirect. Sem esta
+    /// verificação no lado Rust, a segunda execução no mesmo bloco reverte
+    /// on-chain, queimando gás. Retorna true se o bloco atual == último bloco
+    /// de execução (deve skipar).
     async fn debounce_same_block(&self) -> Result<bool> {
-        // CORREÇÃO: Nunca bloquear por mesmo bloco - oportunidades lucrativas devem ser executadas
-        Ok(false)
+        let last = {
+            let guard = self.last_exec_block.lock().await;
+            *guard
+        };
+        let Some(last_block) = last else {
+            // Primeira execução ou após restart — sem histórico, permite.
+            return Ok(false);
+        };
+        let current = self.middleware.get_block_number().await?.as_u64();
+        if current == last_block {
+            debug!("🛡️ Anti-MEV: bloco {} já teve execução, skipando", current);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     // ========================================================================
@@ -711,7 +730,12 @@ impl ArbitrageClient {
                         Ok(Ok(Some(receipt))) => {
                             if receipt.status == Some(1.into()) {
                                 info!("✅ TX Confirmada: {:?}", receipt.transaction_hash);
-                                
+
+                                // Anti-MEV: registrar bloco da execução bem-sucedida
+                                // para que debounce_same_block bloqueie tentativas
+                                // subsequentes no mesmo bloco (contrato exige).
+                                self.update_execution_block().await;
+
                                 let real_profit = self.extract_real_profit_from_receipt(&receipt)
                                     .unwrap_or(opp.estimated_profit_usd);
                                 
