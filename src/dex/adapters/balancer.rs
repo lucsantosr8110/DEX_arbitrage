@@ -21,48 +21,17 @@ use crate::{
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use ethers::{
-    abi::{Abi, ParamType, Token},
+    abi::{Abi, Token},
     contract::Contract,
     types::{Address, U256, I256},
 };
 use std::{str::FromStr, sync::Arc};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 const DEX_NAME: &str = "Balancer";
 
 // Balancer V2 Vault on Polygon
 const BALANCER_VAULT: &str = "0xBA12222222228d8Ba445958a75a0704d566BF2C8";
-
-// ABI mínima para queryBatchSwap
-const VAULT_ABI: &str = r#"[
-    {
-        "name": "queryBatchSwap",
-        "inputs": [
-            {
-                "type": "uint8",
-                "name": "kind"
-            },
-            {
-                "type": "tuple[]",
-                "name": "swaps",
-                "components": [
-                    {"type": "address", "name": "assetIn"},
-                    {"type": "address", "name": "assetOut"},
-                    {"type": "uint256", "name": "amount"}
-                ]
-            },
-            {
-                "type": "address",
-                "name": "funds"
-            }
-        ],
-        "outputs": [
-            {"type": "int256[]", "name": "assetDeltas"}
-        ],
-        "stateMutability": "view",
-        "type": "function"
-    }
-]"#;
 
 // Known stablecoins on Polygon
 const TOKENS: &[(&str, &str, u8)] = &[
@@ -108,12 +77,25 @@ impl BalancerDex {
         }
     }
 
+    fn load_abi() -> Result<Abi> {
+        let abi_str = include_str!("../../../abi/BalancerVault.json");
+        serde_json::from_str(abi_str).map_err(|e| anyhow!("Balancer ABI parse error: {}", e))
+    }
+
     fn get_token_info(&self, symbol: &str) -> Option<(&str, Address, u8)> {
         self.token_addrs.iter().find(|(sym, _, _)| sym == symbol).map(|(s, a, d)| (s.as_str(), *a, *d))
     }
 
     fn get_token_info_by_addr(&self, addr: &Address) -> Option<(&str, Address, u8)> {
         self.token_addrs.iter().find(|(_, a, _)| a == addr).map(|(s, a, d)| (s.as_str(), *a, *d))
+    }
+
+    fn quote_notional_usd(&self) -> f64 {
+        self.config
+            .arbitrage
+            .default_trade_amount
+            .parse::<f64>()
+            .unwrap_or(100.0)
     }
 }
 
@@ -131,57 +113,41 @@ impl DexContract for BalancerDex {
             return Ok(None);
         };
 
-        let decimals_a = dec_a;
-        let decimals_b = dec_b;
-
-        let amount_in = quote_amount_for_usd(sym_a, decimals_a, self.quote_notional_usd())
+        let amount_in = quote_amount_for_usd(sym_a, dec_a, self.quote_notional_usd())
             .await
-            .unwrap_or(U256::from(10u64.pow(decimals_a as u32)));
+            .unwrap_or(U256::from(10u64.pow(dec_a as u32)));
 
         ALCHEMY_RATE_LIMITER.acquire().await?;
 
-        let abi: Abi = serde_json::from_str(VAULT_ABI)?;
+        let abi = Self::load_abi()?;
         let vault = Contract::new(self.vault, abi, self.client.clone());
 
-        // Build swap struct: (assetIn, assetOut, amount)
         let swap = Token::Tuple(vec![
             Token::Address(addr_a),
             Token::Address(addr_b),
             Token::Uint(amount_in),
         ]);
 
-        // queryBatchSwap(SWAP_EXACT_IN, [swap], address(0))
         let result: Vec<I256> = vault
-            .method(
-                "queryBatchSwap",
-                (
-                    0u8, // SWAP_EXACT_IN
-                    vec![swap],
-                    Address::zero(), // funds
-                ),
-            )?
+            .method("queryBatchSwap", (0u8, vec![swap], Address::zero()))?
             .call()
             .await
             .map_err(|e| anyhow!("Balancer queryBatchSwap failed: {}", e))?;
 
-        if result.is_empty() || result[0].is_negative() {
+        if result.is_empty() || result[0].is_negative() || result[0].is_zero() {
             return Ok(None);
         }
 
         let amount_out = result[0].into_raw();
-        if amount_out.is_zero() {
-            return Ok(None);
-        }
-
-        let price = calculate_price_from_decimals(amount_in, amount_out, decimals_a, decimals_b)?;
+        let price = calculate_price_from_decimals(amount_in, amount_out, dec_a, dec_b)?;
         Ok(normalize_price(price))
     }
 
     async fn get_prices_multicall(&self, pairs: &[(String, String)]) -> Result<Vec<TokenPairPrice>> {
         let mut results = Vec::new();
-        let abi: Abi = serde_json::from_str(VAULT_ABI)?;
+        let abi = Self::load_abi()?;
 
-        debug!("[{}] Querying {} pairs", DEX_NAME, pairs.len());
+        info!("[{}] Querying {} pairs", DEX_NAME, pairs.len());
 
         for (token_a, token_b) in pairs {
             let info_a = self.get_token_info(token_a);
@@ -206,21 +172,18 @@ impl DexContract for BalancerDex {
             ]);
 
             let result: Vec<I256> = match vault
-                .method(
-                    "queryBatchSwap",
-                    (0u8, vec![swap], Address::zero()),
-                )?
+                .method("queryBatchSwap", (0u8, vec![swap], Address::zero()))?
                 .call()
                 .await
             {
                 Ok(r) => r,
                 Err(e) => {
-                    debug!("[{}] queryBatchSwap({}→{}) failed: {}", DEX_NAME, token_a, token_b, e);
+                    info!("[{}] queryBatchSwap({}→{}) failed: {}", DEX_NAME, token_a, token_b, e);
                     continue;
                 }
             };
 
-            debug!("[{}] queryBatchSwap({}→{}) result: {:?}", DEX_NAME, token_a, token_b, result);
+            info!("[{}] queryBatchSwap({}→{}) result: {:?}", DEX_NAME, token_a, token_b, result);
 
             if result.is_empty() || result[0].is_negative() || result[0].is_zero() {
                 continue;
@@ -246,7 +209,6 @@ impl DexContract for BalancerDex {
     }
 
     async fn get_pair_or_pool_address(&self, token_a: Address, token_b: Address) -> Result<Option<Address>> {
-        // Balancer V2 uses a single Vault for all pools
         let info_a = self.get_token_info_by_addr(&token_a);
         let info_b = self.get_token_info_by_addr(&token_b);
 

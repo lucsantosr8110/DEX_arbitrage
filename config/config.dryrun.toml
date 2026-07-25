@@ -579,7 +579,7 @@ extra = { }
 [[dex]]
 name = "Balancer"
 router_address = "0xBA12222222228d8Ba445958a75a0704d566BF2C8"
-enabled = false  # Desabilitado - precisa ajuste no ABI
+enabled = false  # queryBatchSwap reverte - pools com liquidez insuficiente
 priority = 5
 fee_tier = 25
 

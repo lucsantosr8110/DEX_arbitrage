@@ -1,0 +1,48 @@
+[
+  {
+    "inputs": [
+      {
+        "internalType": "uint8",
+        "name": "kind",
+        "type": "uint8"
+      },
+      {
+        "components": [
+          {
+            "internalType": "address",
+            "name": "assetIn",
+            "type": "address"
+          },
+          {
+            "internalType": "address",
+            "name": "assetOut",
+            "type": "address"
+          },
+          {
+            "internalType": "uint256",
+            "name": "amount",
+            "type": "uint256"
+          }
+        ],
+        "internalType": "struct IVault.Swap[]",
+        "name": "swaps",
+        "type": "tuple[]"
+      },
+      {
+        "internalType": "address",
+        "name": "funds",
+        "type": "address"
+      }
+    ],
+    "name": "queryBatchSwap",
+    "outputs": [
+      {
+        "internalType": "int256[]",
+        "name": "assetDeltas",
+        "type": "int256[]"
+      }
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  }
+]
