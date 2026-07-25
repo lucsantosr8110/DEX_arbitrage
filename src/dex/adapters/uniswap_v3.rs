@@ -442,16 +442,17 @@ impl DexContract for UniswapV3Dex {
 
         // 📊 LOG DE COTAÇÃO (fim do cálculo)
         if let Some(price) = validated_price {
-            // Cacheia o fee tier real para uso no engine
-            let pair = format!("{}-{}",
-                hex::encode(token_a.as_bytes()),
-                hex::encode(token_b.as_bytes())
-            );
-            cache_fee_tier(DEX_NAME, &pair, best_fee);
+            // Cacheia fee tier com a mesma chave canônica do multicall (símbolos).
+            if let (Some(info_a), Some(info_b)) = (
+                self.token_cache.get_by_address(token_a).await,
+                self.token_cache.get_by_address(token_b).await,
+            ) {
+                cache_fee_tier(DEX_NAME, &info_a.symbol, &info_b.symbol, best_fee);
+            }
 
             if self.debug_mode {
                 tracing::info!(
-                    "[{}] {}→{} fee={} price={:.8} (validated, cached fee_tier={}bps)",
+                    "[{}] {}→{} fee={} price={:.8} (validated, cached fee_tier={})",
                     DEX_NAME, token_a, token_b, best_fee, price, best_fee
                 );
             }
@@ -544,8 +545,7 @@ impl DexContract for UniswapV3Dex {
                         );
                     }
                     if let Some(p) = normalize_price(price) {
-                        let pair = format!("{}-{}", info.token_a, info.token_b);
-                        cache_fee_tier(DEX_NAME, &pair, best_fee);
+                        cache_fee_tier(DEX_NAME, &info.token_a, &info.token_b, best_fee);
 
                         results.push(TokenPairPrice::new(
                             info.token_a.clone(),

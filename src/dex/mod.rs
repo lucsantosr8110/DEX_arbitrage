@@ -26,26 +26,54 @@ use tracing::{debug, warn};
 // ================================================================
 // CACHE GLOBAL DE FEE TIERS (para V3 pools)
 // ================================================================
-// Armazena o fee tier real de cada par V3, permitindo que o engine
-// use a fee correta em vez do hardcoded 0.3%.
-// Chave: "DEX_NAME:TOKEN_A-TOKEN_B" → fee_tier_bps (ex: 500, 3000, 10000)
+// Armazena o fee tier real de cada par V3 (unidade nativa uint24 Uniswap:
+// hundredths of a bip — 500=0.05%, 3000=0.3%, 10000=1%).
+// Chave completa: "DEX_NAME:{fee_cache_key}" → fee_tier (ex: 500, 3000, 10000)
 static FEE_TIER_CACHE: Lazy<RwLock<std::collections::HashMap<String, u32>>> =
     Lazy::new(|| RwLock::new(std::collections::HashMap::new()));
 
-/// Registra o fee tier de um par V3 no cache global.
-pub fn cache_fee_tier(dex_name: &str, pair: &str, fee_tier_bps: u32) {
-    let key = format!("{}:{}", dex_name, pair);
-    if let Ok(mut cache) = FEE_TIER_CACHE.write() {
-        cache.insert(key, fee_tier_bps);
-        debug!("💾 [FEE TIER CACHE SET] {}:{} => {} bps", dex_name, pair, fee_tier_bps);
+/// Chave canônica do par para `FEE_TIER_CACHE`.
+///
+/// Convenção: símbolos em ASCII uppercase, ordenados lexicograficamente,
+/// unidos por `-`. Assim `key(A,B) == key(B,A)` (fee do pool V3 é o mesmo
+/// nas duas direções). Ex.: `fee_cache_key("WETH", "USDC") == "USDC-WETH"`.
+///
+/// Todos os writers (`get_price`, multicall) e readers (`cached_fee_tier*`)
+/// DEVEM usar esta função — nunca hex de endereço nem `"A-B"` direcional cru.
+pub fn fee_cache_key(token_a: &str, token_b: &str) -> String {
+    let a = token_a.to_ascii_uppercase();
+    let b = token_b.to_ascii_uppercase();
+    if a <= b {
+        format!("{}-{}", a, b)
+    } else {
+        format!("{}-{}", b, a)
     }
 }
 
-/// Retorna o fee tier de um par V3 do cache global.
-/// Retorna None se o par não estiver no cache (usar fee padrão).
-pub fn cached_fee_tier(dex_name: &str, pair: &str) -> Option<u32> {
+/// Registra o fee tier V3 (`uint24` nativo) no cache global.
+pub fn cache_fee_tier(dex_name: &str, token_a: &str, token_b: &str, fee_tier: u32) {
+    let pair = fee_cache_key(token_a, token_b);
+    let key = format!("{}:{}", dex_name, pair);
+    if let Ok(mut cache) = FEE_TIER_CACHE.write() {
+        cache.insert(key, fee_tier);
+        debug!(
+            "[FEE TIER CACHE SET] {}:{} => fee_tier={}",
+            dex_name, pair, fee_tier
+        );
+    }
+}
+
+/// Retorna o fee tier V3 do cache (`uint24`), ou `None` se miss.
+pub fn cached_fee_tier(dex_name: &str, token_a: &str, token_b: &str) -> Option<u32> {
+    let pair = fee_cache_key(token_a, token_b);
     let key = format!("{}:{}", dex_name, pair);
     FEE_TIER_CACHE.read().ok()?.get(&key).cloned()
+}
+
+/// Lookup a partir de par direcional `"A-B"` (radar/engine). Normaliza via `fee_cache_key`.
+pub fn cached_fee_tier_pair(dex_name: &str, pair: &str) -> Option<u32> {
+    let (a, b) = pair.split_once('-')?;
+    cached_fee_tier(dex_name, a, b)
 }
 
 // ================================================================
@@ -304,8 +332,7 @@ pub struct TokenPairPrice {
     pub price: f64,
     pub dex_name: String,
     pub timestamp: u64,
-    /// Fee tier do pool (em bps). Para V2 = 3000 (0.3%), para V3 = 500/3000/10000.
-    /// Usado para calcular fees reais no cycle_rate.
+    /// Fee tier do pool (unidade nativa V3 uint24: 500/3000/10000). V2 default 3000.
     pub fee_tier_bps: u32,
 }
 impl TokenPairPrice {
@@ -397,4 +424,50 @@ pub fn all_trading_pairs() -> Vec<(String, String)> {
         pairs.push((b.to_string(), a.to_string()));
     }
     pairs
+}
+
+#[cfg(test)]
+mod fee_tier_cache_tests {
+    use super::{cache_fee_tier, cached_fee_tier, cached_fee_tier_pair, fee_cache_key};
+
+    #[test]
+    fn fee_cache_key_symmetric_and_uppercase() {
+        assert_eq!(fee_cache_key("WETH", "USDC"), "USDC-WETH");
+        assert_eq!(fee_cache_key("USDC", "WETH"), fee_cache_key("WETH", "USDC"));
+        assert_eq!(fee_cache_key("weth", "usdc"), "USDC-WETH");
+    }
+
+    #[test]
+    fn fee_tier_cache_write_read_no_miss() {
+        // Write com ordem A,B; read com B,A e via par direcional — sem miss → sem default 0.3%.
+        cache_fee_tier("UniswapV3", "WETH", "USDC_CACHE_TEST", 500);
+        assert_eq!(
+            cached_fee_tier("UniswapV3", "USDC_CACHE_TEST", "WETH"),
+            Some(500)
+        );
+        assert_eq!(
+            cached_fee_tier_pair("UniswapV3", "WETH-USDC_CACHE_TEST"),
+            Some(500)
+        );
+        assert_eq!(
+            cached_fee_tier_pair("UniswapV3", "USDC_CACHE_TEST-WETH"),
+            Some(500)
+        );
+    }
+
+    #[test]
+    fn v3_fee_tier_to_fraction_scale() {
+        // Documenta a escala correta (espelha ArbitrageEngine::dex_fee).
+        let cases = [(500u32, 0.0005), (3000, 0.003), (10_000, 0.01)];
+        for (tier, expected) in cases {
+            let frac = tier as f64 / 1_000_000.0;
+            assert!(
+                (frac - expected).abs() < 1e-15,
+                "tier {} => {}, expected {}",
+                tier,
+                frac,
+                expected
+            );
+        }
+    }
 }

@@ -1447,7 +1447,7 @@ impl ArbitrageEngine {
 
     /// Retorna a fee de swap para um DEX (em fração).
     /// V2 pools (QuickSwap, SushiSwap) = 0.3%.
-    /// V3 pools (UniswapV3) = fee real do pool (0.05%, 0.3%, ou 1.0%).
+    /// V3 pools (UniswapV3) = fee tier real do pool / 1_000_000 (unidade uint24).
     /// Se o fee tier não estiver no cache, usa 0.3% como default.
     #[inline]
     fn dex_fee(dex_name: &str, pair: &str) -> f64 {
@@ -1455,9 +1455,9 @@ impl ArbitrageEngine {
             "QuickSwap" | "SushiSwap" => 0.003,  // V2: sempre 0.3%
             "Curve" => 0.0004,                    // Curve stables: 0.04%
             "UniswapV3" => {
-                // Tenta usar o fee tier real do cache
-                if let Some(fee_bps) = crate::dex::cached_fee_tier(dex_name, pair) {
-                    fee_bps as f64 / 10_000.0  // Converte bps para fração
+                // Fee V3 = hundredths of a bip → fração = fee_tier / 1e6
+                if let Some(fee_tier) = crate::dex::cached_fee_tier_pair(dex_name, pair) {
+                    fee_tier as f64 / 1_000_000.0
                 } else {
                     0.003  // Default: 0.3% (fee tier mais comum)
                 }
@@ -1617,18 +1617,20 @@ mod tests {
     }
 
     /// Valida que UniswapV3 usa fee tier do cache quando disponível.
+    /// Uniswap V3 fee = hundredths of a bip → fração = fee_tier / 1_000_000.
     #[test]
     fn dex_fee_uses_cached_tier_for_v3() {
         use crate::dex::cache_fee_tier;
-        let pair = "USDT-WMATIC_TEST";
+        let pair = "USDT-WMATIC_FEE_SCALE_TEST";
 
-        // Com cache de 500 bps (0.05%)
-        cache_fee_tier("UniswapV3", pair, 500);
-        assert_eq!(ArbitrageEngine::dex_fee("UniswapV3", pair), 0.05);
+        cache_fee_tier("UniswapV3", "USDT", "WMATIC_FEE_SCALE_TEST", 500);
+        assert_eq!(ArbitrageEngine::dex_fee("UniswapV3", pair), 0.0005);
 
-        // Com cache de 10000 bps (1.0%)
-        cache_fee_tier("UniswapV3", pair, 10000);
-        assert_eq!(ArbitrageEngine::dex_fee("UniswapV3", pair), 1.0);
+        cache_fee_tier("UniswapV3", "USDT", "WMATIC_FEE_SCALE_TEST", 3000);
+        assert_eq!(ArbitrageEngine::dex_fee("UniswapV3", pair), 0.003);
+
+        cache_fee_tier("UniswapV3", "USDT", "WMATIC_FEE_SCALE_TEST", 10000);
+        assert_eq!(ArbitrageEngine::dex_fee("UniswapV3", pair), 0.01);
     }
 
     // ============================================================

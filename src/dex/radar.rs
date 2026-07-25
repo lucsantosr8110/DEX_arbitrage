@@ -363,24 +363,6 @@ const MAX_SPREAD_PCT: f64 = 50.0;
 const AUDIT_SPREAD_LOW: f64 = 10.0;
 const AUDIT_SPREAD_HIGH: f64 = 50.0;
 
-/// Fee de swap por DEX (em fração). V2 = 0.3%, V3 = fee real do pool.
-/// Usa o cache de fee tiers para V3 pools (0.05%, 0.3%, ou 1.0%).
-fn dex_fee(dex_name: &str, pair: &str) -> f64 {
-    match dex_name {
-        "QuickSwap" | "SushiSwap" => 0.003,  // V2: sempre 0.3%
-        "Curve" => 0.0004,                    // Curve stables: 0.04%
-        "UniswapV3" => {
-            // Tenta usar o fee tier real do cache
-            if let Some(fee_bps) = super::cached_fee_tier(dex_name, pair) {
-                fee_bps as f64 / 10_000.0  // Converte bps para fração
-            } else {
-                0.003  // Default: 0.3% (fee tier mais comum)
-            }
-        }
-        _ => 0.003,
-    }
-}
-
 /// Derruba os dois lados de todo par cujo produto recíproco esteja fora da janela.
 ///
 /// Derruba ambos de propósito: quando o produto está errado não dá para saber qual
@@ -443,9 +425,10 @@ pub struct EdgeInfo {
 pub struct CycleEconomics {
     /// Pares avaliados (com ≥2 DEXes e reverso disponível).
     pub evaluated: usize,
-    /// Pares onde buy×sell bruto (sem fees) > 1.0.
+    /// Pares onde `cycle_rate = buy×sell` (quotes fee-inclusive) > 1.0.
     pub gross_positive: usize,
-    /// Pares onde cycle_rate com fees > 1.0.
+    /// Mesmo critério que `gross_positive` (legado TUI). Quotes já embutem fee AMM;
+    /// não há segunda dedução de fee venue no radar.
     pub venue_fee_adjusted_positive: usize,
     /// Pares com cycle_rate < 1.0 (sem oportunidade).
     pub negative_cycles_found: usize,
@@ -453,8 +436,8 @@ pub struct CycleEconomics {
 
 /// Conta sinais de spread E extrai os edges (> 0.01%) para logging/audit.
 ///
-/// **VALIDAÇÃO CROSS-DEX**: Só emite EDGE quando o cycle_rate real (com fees
-/// dos dois DEXes) é > 1.0 — ou seja, quando existe potencial bruto de arbitragem.
+/// **VALIDAÇÃO CROSS-DEX**: Só emite EDGE quando `cycle_rate = buy_price × sell_price`
+/// (quotes já fee-inclusive via getAmountsOut / Quoter) é > 1.0.
 /// Spreads single-direction (ex: USDT-WMATIC 2.42% sem reverso viável) são filtrados.
 pub fn extract_edges(pr: &HashMap<String, HashMap<String, f64>>) -> (usize, Vec<EdgeInfo>, CycleEconomics) {
     let mut map_pairs: HashMap<String, Vec<(String, f64)>> = HashMap::new();
@@ -492,25 +475,19 @@ pub fn extract_edges(pr: &HashMap<String, HashMap<String, f64>>) -> (usize, Vec<
         let mut best_sell_dex = String::new();
         let mut best_buy_price: f64 = 0.0;
         let mut best_sell_price: f64 = 0.0;
-        let mut best_gross_rate: f64 = 0.0;
 
         if let Some(rev_prices) = reverse_dex_prices {
-            let rev_pair_str = reverse_pair.as_deref().unwrap_or("");
             // Para cada combinação (buy_dex, sell_dex) onde buy ≠ sell
             for (buy_dex, buy_price) in dex_prices {
                 for (sell_dex, sell_price) in rev_prices {
                     if buy_dex == sell_dex {
                         continue;
                     }
-                    let fee_buy = dex_fee(buy_dex, pair);
-                    let fee_sell = dex_fee(sell_dex, rev_pair_str);
-                    // gross_rate = buy_price × sell_price (sem fees)
-                    let gross_rate = buy_price * sell_price;
-                    // cycle_rate = buy_price × (1-fee) × sell_price × (1-fee)
-                    let cycle_rate = buy_price * (1.0 - fee_buy) * sell_price * (1.0 - fee_sell);
+                    // Quotes (getAmountsOut / Quoter) já incluem fee AMM + impact.
+                    // NÃO aplicar (1-fee) de novo — isso era dedução dupla.
+                    let cycle_rate = buy_price * sell_price;
                     if cycle_rate > best_cycle_rate {
                         best_cycle_rate = cycle_rate;
-                        best_gross_rate = gross_rate;
                         best_buy_dex = buy_dex.clone();
                         best_sell_dex = sell_dex.clone();
                         best_buy_price = *buy_price;
@@ -527,11 +504,9 @@ pub fn extract_edges(pr: &HashMap<String, HashMap<String, f64>>) -> (usize, Vec<
 
         evaluated += 1;
 
-        // Contabilizar economia do ciclo
-        if best_gross_rate > 1.0 {
-            gross_positive += 1;
-        }
+        // Contabilizar economia do ciclo (gross == fee-inclusive product)
         if best_cycle_rate > 1.0 {
+            gross_positive += 1;
             fee_adjusted_positive += 1;
         } else {
             negative_cycles += 1;
@@ -893,5 +868,53 @@ mod tests {
             let rev = format!("{}-{}", b, a);
             assert!(pares.contains(&rev), "falta reverso de {}", p);
         }
+    }
+
+    /// Quotes fee-inclusive: cycle_rate == buy_price × sell_price (sem (1-fee)).
+    #[test]
+    fn extract_edges_cycle_rate_equals_product_v2x_v2() {
+        let mut pr: HashMap<String, HashMap<String, f64>> = HashMap::new();
+        // buy Sushi A-B=1.01, sell Quick B-A=1.0 → cycle=1.01 → spread 1%
+        // Se ainda deduzisse (0.997)^2, spread cairia ~0.4%.
+        pr.insert(
+            "QuickSwap".into(),
+            m(&[("AAA-BBB", 1.0), ("BBB-AAA", 1.0)]),
+        );
+        pr.insert(
+            "SushiSwap".into(),
+            m(&[("AAA-BBB", 1.01), ("BBB-AAA", 1.0)]),
+        );
+
+        let (_n, edges, econ) = extract_edges(&pr);
+        assert!(!edges.is_empty(), "deve emitir edge");
+        let best = &edges[0];
+        assert!(
+            (best.spread_pct - 1.0).abs() < 1e-9,
+            "spread esperado 1.0%, got {}",
+            best.spread_pct
+        );
+        assert_eq!(econ.gross_positive, econ.venue_fee_adjusted_positive);
+    }
+
+    /// Mesmo produto fee-inclusive cross-DEX V3×V3 (sem escala de fee no cycle).
+    #[test]
+    fn extract_edges_cycle_rate_equals_product_v3x_v3() {
+        let mut pr: HashMap<String, HashMap<String, f64>> = HashMap::new();
+        pr.insert(
+            "UniswapV3".into(),
+            m(&[("CCC-DDD", 1.005), ("DDD-CCC", 1.0)]),
+        );
+        // Segundo "venue" sintético: usamos Sushi só como perna sell (preços fee-inclusive).
+        // Para V3×V3 puro precisaríamos 2 mapas UniswapV3 — o radar exige buy_dex != sell_dex
+        // por nome, então o segundo mapa simula outro venue com quotes já inclusive.
+        pr.insert(
+            "QuickSwap".into(),
+            m(&[("CCC-DDD", 1.0), ("DDD-CCC", 1.0)]),
+        );
+
+        let (_n, edges, _) = extract_edges(&pr);
+        assert!(!edges.is_empty());
+        // Melhor: 1.005 * 1.0 = 1.005 → 0.5%
+        assert!((edges[0].spread_pct - 0.5).abs() < 1e-9);
     }
 }
