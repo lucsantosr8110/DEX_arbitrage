@@ -7,6 +7,7 @@ pub mod core;
 pub mod dex;
 pub mod execution;  // ✅ Este deve existir
 pub mod infra;      // ✅ Este deve existir
+pub mod tui;
 pub mod utils;
 pub use dex::DexContract;
 

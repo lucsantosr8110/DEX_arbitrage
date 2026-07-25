@@ -29,6 +29,7 @@ use flashloan_bot::{
         metrics,
         rpc_provider::{is_usable_endpoint, RpcProvider},
     },
+    tui,
     utils::telegram::TelegramNotifier,
 };
 
@@ -395,9 +396,28 @@ async fn main() -> Result<()> {
     };
 
     // ============================================================
-    // 1️⃣2️⃣ Execução Concorrente e Debug
+    // 1️⃣2️⃣ TUI (Terminal User Interface)
     // ============================================================
-    
+    let tui_state = Arc::new(tokio::sync::RwLock::new(tui::TuiState::default()));
+    let tui_state_clone = tui_state.clone();
+
+    // Spawn TUI em thread separada
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let app = tui::TuiApp::new(tui_state_clone);
+            if let Err(e) = app.run().await {
+                eprintln!("TUI error: {:?}", e);
+            }
+        });
+    });
+
+    info!("🎯 TUI iniciado. Pressione 'q' no terminal da TUI para sair.");
+
+    // ============================================================
+    // 1️⃣3️⃣ Execução Concorrente e Debug
+    // ============================================================
+
     // Configura a lista de tasks principais
     let tasks = vec![radar_task, bot_task, shutdown_task];
 
