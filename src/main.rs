@@ -5,13 +5,11 @@
 use anyhow::{Context, Result};
 use ethers::{
     providers::{Middleware, Provider, Ws},
-    types::H160,
 };
 use futures::future;
 use std::{
     collections::HashMap,
     path::PathBuf,
-    str::FromStr,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -30,7 +28,7 @@ use flashloan_bot::{
         circuit_breaker::DexCircuitBreaker, manager::DexManager, price_cache::PriceCache,
         radar::{extract_edges, start_high_hit_rate_radar},
     },
-    execution::{bundle_sender::MevConfig, gwei, ExecutionEngine},
+    // execution:: imports removidos: ExecutionEngine/MevConfig/gwei eram codigo morto
     infra::{
         metrics,
         rpc_provider::{is_usable_endpoint, RpcProvider},
@@ -301,43 +299,13 @@ async fn main() -> Result<()> {
     info!("🧩 DexManager inicializado com sucesso.");
 
     // ============================================================
-    // 6️⃣ Inicialização do ExecutionEngine (v4.8.4-HYBRID-SAFE)
+    // 6️⃣ ExecutionEngine removido (codigo morto)
     // ============================================================
-    let mev_cfg = MevConfig {
-        enabled: cfg_unlocked.mev.enabled,
-        relay_url: cfg_unlocked.mev.relay_url.clone(),
-        signer_address: cfg_unlocked.mev.signer_address.clone(),
-        min_tip_matic: cfg_unlocked.mev.min_tip_matic.clone(),
-        target_block_offset: cfg_unlocked.mev.target_block_offset,
-        timeout_seconds: cfg_unlocked.mev.timeout_seconds,
-    };
-
-    let executor_address = cfg_unlocked
-        .flashloan
-        .executor_address
-        .as_ref()
-        .and_then(|addr| H160::from_str(addr).ok())
-        .ok_or_else(|| anyhow::anyhow!("Executor address inválido ou ausente"))?;
-
-    let _execution_engine = match ExecutionEngine::new(
-        client_http.clone(),
-        Arc::new(client_http.signer().clone()),
-        mev_cfg,
-        1,              // cooldown_seconds
-        executor_address,
-        Some(gwei(25)), // piso do priority fee (PIP-35)
-    )
-    .await
-    {
-        Ok(engine) => {
-            info!("✅ ExecutionEngine (v4.8.4-HYBRID-SAFE) inicializado com sucesso.");
-            Some(engine)
-        }
-        Err(e) => {
-            warn!("⚠️ Falha ao inicializar ExecutionEngine: {:?}", e);
-            None
-        }
-    };
+    // ExecutionEngine/MevConfig/BundleSender eram construidos aqui e
+    // descartados (_execution_engine). O bot executa via ArbitrageClient
+    // diretamente (execute_direct/execute_flashloan/execute_wrapper).
+    // Ver ESTADO_ATUAL.md secao 6.
+    
 
     // ============================================================
     // 7️⃣ Circuit Breaker
