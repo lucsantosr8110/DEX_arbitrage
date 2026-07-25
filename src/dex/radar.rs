@@ -369,7 +369,6 @@ fn dex_fee(dex_name: &str, pair: &str) -> f64 {
     match dex_name {
         "QuickSwap" | "SushiSwap" => 0.003,  // V2: sempre 0.3%
         "Curve" => 0.0004,                    // Curve stables: 0.04%
-        "Balancer" => 0.0025,                 // Balancer V2: 0.25% default
         "UniswapV3" => {
             // Tenta usar o fee tier real do cache
             if let Some(fee_bps) = super::cached_fee_tier(dex_name, pair) {

@@ -16,8 +16,8 @@ use crate::{
     core::types::{ArbitrageOpportunity, FlashloanOpportunity},
     dex::{
         adapters::{
-            balancer::BalancerDex, curve::CurveDex, quickswap::QuickSwapDex,
-            sushiswap::SushiSwapDex, uniswap_v2::UniswapV2Dex, uniswap_v3::UniswapV3Dex,
+            curve::CurveDex, quickswap::QuickSwapDex, sushiswap::SushiSwapDex,
+            uniswap_v2::UniswapV2Dex, uniswap_v3::UniswapV3Dex,
         },
         price_cache::PriceCache,
         // ❌ `ArbitrageOpportunity` de `dex` (mod.rs) não é o usado para Flashloans.
@@ -102,9 +102,6 @@ impl DexManager {
                 )),
                 "Curve" => Some(Arc::new(
                     CurveDex::new(client.clone(), router_addr, config.clone()).await,
-                )),
-                "Balancer" => Some(Arc::new(
-                    BalancerDex::new(client.clone(), config.clone()).await,
                 )),
                 other => {
                     warn!("⚠️ DEX não reconhecida no TOML: {}", other);
