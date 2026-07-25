@@ -573,30 +573,22 @@ fee_tier = 500
 [pairs]
 enabled = true
 monitor = [
-    # LINK — unico com pool profundo nas 3 DEXs (melhor cross-DEX)
-    "LINK-WETH",
-    "LINK-WMATIC",
-    # CRV
-    "CRV-WETH",
-    "CRV-WMATIC",
-    # UNI
-    "UNI-WETH",
-    "UNI-WMATIC",
-    # GHST
-    "GHST-WETH",
-    "GHST-WMATIC",
-    "GHST-USDC",
-    # SAND — SAND-WMATIC muito profundo
-    "SAND-WMATIC",
-    # SUSHI
-    "SUSHI-WETH",
-    "SUSHI-WMATIC",
-    # GRT
-    "GRT-WETH",
-    "GRT-WMATIC",
-    # LDO
-    "LDO-WETH",
-    "LDO-WMATIC",
+    # --- Stable + Bluechip (curated matrix cobre estes automaticamente,
+    #     mas explicito e melhor que implicito) ---
+    "USDC-WMATIC",
+    "USDC-WETH",
+    "USDT-WMATIC",
+    "USDT-WETH",
+    "DAI-WMATIC",
+    "DAI-WETH",
+    "WMATIC-WETH",
+
+    # --- Pares adicionais com liquidez verificada ---
+    "WBTC-USDC",
+    "WBTC-WMATIC",
+
+    # NOTA: WBTC-WETH removido (sem pool V2, audit 5.4). Pares volateis
+    # (LINK, AAVE, CRV, etc.) removidos: ruido sem arbitragem real.
 ]
 
 

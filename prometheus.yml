@@ -1,21 +1,26 @@
+# ============================================================
+# Prometheus Configuration — DEX Arbitrage Bot
+# ============================================================
+# Unico arquivo de config Prometheus (antes havia 3 divergentes).
+# Intervalo de 5s para HFT; alvo e o servico flashloan-bot na rede Docker.
+# ============================================================
+
 global:
-  scrape_interval: 15s
-  evaluation_interval: 15s
-  scrape_timeout: 10s
+  scrape_interval: 5s
+  evaluation_interval: 5s
+  scrape_timeout: 3s
 
 scrape_configs:
   - job_name: "flashloan_bot"
     metrics_path: "/metrics"
     static_configs:
-      - targets: ["host.docker.internal:9100"]
+      # Docker: usar nome do servico; local: usar localhost
+      - targets: ["flashloan-bot:9100"]
         labels:
           service: "flashloan_bot"
-          instance: "local"
-
-  - job_name: "redis"
-    metrics_path: "/metrics"
-    static_configs:
-      - targets: ["host.docker.internal:9121"]
-        labels:
-          service: "redis"
-          instance: "local"
+          instance: "docker"
+    # Remove metricas internas irrelevantes (Go runtime, etc)
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: '^(go_|process_|promhttp_).*'
+        action: drop

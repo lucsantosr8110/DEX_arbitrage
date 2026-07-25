@@ -575,7 +575,8 @@ liquidity_allowlist = [
     "UNI", "SUSHI", "GRT", "SAND", "MANA", "LDO"
 ]
 monitor = [
-    # --- Base Stables & Majors ---
+    # --- Stable + Bluechip (curated matrix cobre estes automaticamente,
+    #     mas explicito e melhor que implicito) ---
     "USDC-WMATIC",
     "USDC-WETH",
     "USDT-WMATIC",
@@ -584,34 +585,12 @@ monitor = [
     "DAI-WETH",
     "WMATIC-WETH",
 
-    # --- Volatilidade ---
-    "WBTC-WETH",
+    # --- Pares adicionais com liquidez verificada ---
     "WBTC-USDC",
     "WBTC-WMATIC",
-    "LINK-WETH",
-    "LINK-WMATIC",
-    "LINK-USDC",
-    "AAVE-WETH",
-    "AAVE-WMATIC",
-    "CRV-WETH",
-    "CRV-WMATIC",
-    "GHST-WMATIC",
-    "GHST-USDC",
 
-    # --- HFT Pairs ---
-    "UNI-WETH",
-    "UNI-USDC",
-    "UNI-WMATIC",
-    "SUSHI-WETH",
-    "SUSHI-WMATIC",
-    "GRT-WETH",
-    "GRT-WMATIC",
-    "SAND-WMATIC",
-    "SAND-USDC",
-    "MANA-WMATIC",
-    "MANA-USDC",
-    "LDO-WETH",
-    "LDO-WMATIC"
+    # NOTA: WBTC-WETH removido (sem pool V2, audit 5.4). Pares volateis
+    # (LINK, AAVE, CRV, etc.) removidos: ruido sem arbitragem real.
 ]
 
 auto_discovery = false

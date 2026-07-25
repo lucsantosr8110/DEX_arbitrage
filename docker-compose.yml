@@ -1,53 +1,66 @@
 # ============================================================
-# 📈 Prometheus Configuration — Flashloan Bot Monitoring
-# Versão: v1.2 — Corrigida para ambiente local (Windows)
-# ------------------------------------------------------------
-# ✅ Intervalos otimizados
-# ✅ Corrigido erro "lookup bot: no such host"
-# ✅ Redis opcional (caso tenha um exporter ativo)
-# ✅ Filtragem de métricas internas irrelevantes
+# Docker Compose — DEX Arbitrage Bot + Prometheus + Grafana
+# ============================================================
+# Uso: docker compose up -d
+# Requer: .env na raiz com PRIVATE_KEY, BOT_RPC_ENDPOINTS, etc.
 # ============================================================
 
-global:
-  scrape_interval: 15s
-  evaluation_interval: 15s
-  scrape_timeout: 10s
+services:
+  # ----------------------------------------------------------
+  # Flashloan Bot
+  # ----------------------------------------------------------
+  flashloan-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: flashloan-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "9100:9100"   # Prometheus metrics
+    volumes:
+      - ./logs:/app/logs
+    networks:
+      - monitoring
 
-# ============================================================
-# 🔍 JOB 1 — Flashloan Bot
-# ============================================================
-scrape_configs:
-  - job_name: "flashloan_bot"
-    metrics_path: "/metrics"
-    static_configs:
-      - targets: ["localhost:9100"]   # ✅ Corrigido (antes era bot:9090)
-        labels:
-          service: "flashloan_bot"
-          instance: "local"
+  # ----------------------------------------------------------
+  # Prometheus
+  # ----------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    networks:
+      - monitoring
+    depends_on:
+      - flashloan-bot
 
-    # 🧹 Remove métricas de runtime irrelevantes (Prometheus, Go, etc)
-    metric_relabel_configs:
-      - source_labels: [__name__]
-        regex: '^(go_|process_|promhttp_).*'
-        action: drop
+  # ----------------------------------------------------------
+  # Grafana
+  # ----------------------------------------------------------
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+    networks:
+      - monitoring
+    depends_on:
+      - prometheus
 
-# ============================================================
-# 🧠 JOB 2 — Redis Exporter (opcional)
-# ============================================================
-  - job_name: "redis"
-    metrics_path: "/metrics"
-    static_configs:
-      - targets: ["localhost:9121"]   # ✅ Corrigido (antes era redis-exporter:9121)
-        labels:
-          service: "redis"
-          instance: "local"
+networks:
+  monitoring:
+    driver: bridge
 
-# ============================================================
-# 📜 RULES — Arquivos de alerta (opcional)
-# ============================================================
-# rule_files:
-#   - /etc/prometheus/alerts.yml
-
-# ============================================================
-# ✅ Fim da configuração
-# ============================================================
+volumes:
+  prometheus-data:
+  grafana-data:

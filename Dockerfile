@@ -22,8 +22,9 @@ RUN mkdir src && echo 'fn main() {}' > src/main.rs && \
     cargo build --release && rm -rf src
 
 # Copia o projeto inteiro e compila em release
+# Override .cargo/config.toml (target-cpu=native) para imagem portavel
 COPY . .
-RUN cargo build --release
+RUN RUSTFLAGS="-C target-cpu=x86-64" cargo build --release
 
 # Instala dependências do Node.js (para Hardhat)
 COPY package.json package-lock.json ./
@@ -42,8 +43,11 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# CORRIGIDO: Copia o config.toml diretamente
-COPY config/config.toml /app/config.toml
+# Config: bot procura config/config.toml (main.rs:125), preservar estrutura de diretorios
+COPY config/ /app/config/
+
+# ABIs necessarias em runtime (utils/abi_loader.rs le de disco)
+COPY abi/ /app/abi/
 
 # CORRIGIDO: Removidas as linhas de entrypoint.sh e config.template.toml
 # COPY config.template.toml /app/config.template.toml
@@ -53,8 +57,8 @@ COPY config/config.toml /app/config.toml
 # Copia binário do bot
 COPY --from=builder /usr/src/app/target/release/flashloan-bot /usr/local/bin/
 
-# Expõe porta de métricas
-EXPOSE 9090
+# Porta de metricas Prometheus ([prometheus].port = 9100)
+EXPOSE 9100
 
 # CORRIGIDO: Executa o binário do bot diretamente
 CMD ["/usr/local/bin/flashloan-bot"]
