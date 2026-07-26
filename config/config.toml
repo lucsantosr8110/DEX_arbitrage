@@ -64,7 +64,7 @@ max_hops = 4
 min_triangle_profit = "0.0005"
 intra_dex_only = false
 venues = ["UniswapV3", "QuickSwap", "SushiSwap"]
-anchors = ["USDC", "WETH", "WMATIC"]
+anchors = ["USDC", "USDT", "WETH", "WMATIC"]
 midcaps = ["LINK", "LDO", "UNI"]
 
 [arbitrage.cross_dex]
