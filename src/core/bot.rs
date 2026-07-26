@@ -189,6 +189,18 @@ impl Bot {
         &mut self,
         mut opportunity: ArbitrageOpportunity,
     ) -> Result<BundleResult> {
+        // C2: rota não-suportada pelo FlashloanExecutor (ex.: Curve) é descartada
+        // antes de qualquer estimativa de gas/RPC — espelha o gate do paper path
+        // (bot.rs:276). Finder ainda emite opps Curve p/ replay cross-model
+        // (paper), mas exec real nunca as processa.
+        if !paper_validation::route_executor_supported(&opportunity) {
+            info!(
+                "🚫 Skip exec: rota não-suportada pelo executor ({}): {}",
+                opportunity.buy_dex, opportunity.pair
+            );
+            return Ok(BundleResult::skipped().with_execution_mode("route_unsupported"));
+        }
+
         if self.telegram.is_enabled() {
             let _ = self.telegram.notify_opportunity(
                 opportunity.spread_percent,
