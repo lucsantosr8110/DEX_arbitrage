@@ -27,6 +27,10 @@ const ERC20_ABI = [
   "function approve(address spender, uint256 amount) returns (bool)",
   "function allowance(address owner, address spender) view returns (uint256)",
 ];
+const WRAPPER_ABI = [
+  "function executor() view returns (address)",
+  "function updateExecutor(address)",
+];
 
 async function main() {
   const EXEC = process.env.EXECUTOR_ADDRESS;
@@ -69,6 +73,19 @@ async function main() {
       console.log("✅ wrapper autorizado:", tx.hash);
     } else {
       console.log("✅ wrapper já autorizado");
+    }
+
+    // O caller mantém seu próprio destino; sem isto ele continuaria iniciando
+    // o flashloan contra o executor anterior mesmo autorizado no novo contrato.
+    const caller = new ethers.Contract(WRAP, WRAPPER_ABI, signer);
+    const callerExecutor = await caller.executor();
+    if (callerExecutor.toLowerCase() !== EXEC.toLowerCase()) {
+      console.log("➡️ wrapper.updateExecutor(", EXEC, ")");
+      const tx = await caller.updateExecutor(EXEC);
+      await tx.wait();
+      console.log("✅ wrapper aponta para executor novo:", tx.hash);
+    } else {
+      console.log("✅ wrapper já aponta para este executor");
     }
   } else {
     console.log("ℹ️ Sem wrapper — pulando linkage (modo flashloan direto)");

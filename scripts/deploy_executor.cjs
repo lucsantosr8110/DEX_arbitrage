@@ -37,8 +37,10 @@ async function main() {
   console.log("👤 Deployer:", c.yellow(deployer.address));
   console.log("==============================================");
 
-  // ✅ Deploy do novo contrato com execução direta habilitada
-  const wrapperAddress = "0x0000000000000000000000000000000000000000"; // pode ser alterado se houver wrapper externo
+  // Preserva o wrapper de produção; o post-deploy também o autoriza e aponta
+  // o FlashloanCaller para este novo executor.
+  const wrapperAddress = process.env.WRAPPER_ADDRESS || "0x0000000000000000000000000000000000000000";
+  if (!ethers.isAddress(wrapperAddress)) throw new Error("❌ WRAPPER_ADDRESS inválido no .env");
   const Executor = await ethers.getContractFactory("FlashloanExecutor");
   const executor = await Executor.deploy(wrapperAddress);
 
