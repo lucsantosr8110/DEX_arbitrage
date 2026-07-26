@@ -26,7 +26,7 @@ use flashloan_bot::{
     core::bot::Bot,
     dex::{
         circuit_breaker::DexCircuitBreaker, manager::DexManager, price_cache::PriceCache,
-        radar::{extract_edges, start_high_hit_rate_radar},
+        radar::{extract_edges, start_high_hit_rate_radar, AdjCostParams},
     },
     // execution:: imports removidos: ExecutionEngine/MevConfig/gwei eram codigo morto
     infra::{
@@ -67,11 +67,12 @@ fn log_config_snapshot(config: &Config) {
 /// Atualiza o estado compartilhado da TUI com os preços e a economia do ciclo atual.
 fn update_tui_state(
     tui_state: &Arc<std::sync::RwLock<tui::TuiState>>,
+    adj_cost: &AdjCostParams,
     prices: &HashMap<String, HashMap<String, f64>>,
     cycle_count: u64,
     uptime: Duration,
 ) {
-    let (_, _, economics, _adj_cycles) = extract_edges(prices);
+    let (_, _, economics, _adj_cycles) = extract_edges(prices, adj_cost);
 
     let mut rows: HashMap<String, tui::PriceRow> = HashMap::new();
     for (dex, dex_map) in prices {
@@ -103,7 +104,7 @@ fn update_tui_state(
         state.dex_count = prices.len();
         state.pairs_count = last_prices.len();
         state.gross_positive = economics.gross_positive as u32;
-        state.venue_fee_adjusted = economics.venue_fee_adjusted_positive as u32;
+        state.net_positive = economics.net_positive as u32;
         state.negative_cycles = economics.negative_cycles_found as u32;
         state.last_prices = last_prices;
     }
@@ -196,6 +197,27 @@ async fn main() -> Result<()> {
         let lock = config.lock().await;
         Arc::new(lock.clone())
     };
+
+    // Custo config-driven p/ projetar net dos ciclos `adj` (log + TUI). Fonte única:
+    // notional do [arbitrage].default_trade_amount, premium Aave V3 verificado
+    // on-chain ([flashloan].fee_pct, 5 bps), gas base ([execution].estimate_base_gas_usd).
+    // PROJEÇÃO — não é decisão de execução (desconto real é downstream em economics/flashloan).
+    let adj_cost = Arc::new(AdjCostParams {
+        notional_usd: cfg_unlocked
+            .arbitrage
+            .default_trade_amount
+            .parse::<f64>()
+            .unwrap_or(100.0),
+        flashloan_fee_pct: cfg_unlocked.flashloan.fee_pct.unwrap_or(0.0005),
+        gas_usd_est: cfg_unlocked.execution.estimate_base_gas_usd,
+    });
+    info!(
+        "🧮 adj cost params | notional=${:.2} flashloan_fee_pct={:.5} gas_est=${:.4} → cost/cycle=${:.4}",
+        adj_cost.notional_usd,
+        adj_cost.flashloan_fee_pct,
+        adj_cost.gas_usd_est,
+        adj_cost.cost_usd(),
+    );
 
     // ============================================================
     // 3️⃣ Telegram Notifier
@@ -385,6 +407,7 @@ async fn main() -> Result<()> {
         let client_ws = client_ws.clone();
         let dex_manager = dex_manager.clone();
         let config = config.clone();
+        let adj_cost = adj_cost.clone();
         let price_tx = price_tx.clone();
         let price_cache = price_cache.clone();
         let circuit_breaker = circuit_breaker.clone();
@@ -397,6 +420,7 @@ async fn main() -> Result<()> {
                 client_ws,
                 dex_manager,
                 config,
+                adj_cost,
                 price_cache,
                 circuit_breaker,
                 price_tx,
@@ -421,6 +445,7 @@ async fn main() -> Result<()> {
         let mut sd_rx = shutdown_tx.subscribe();
         let telegram = telegram.clone();
         let tui_state = tui_state.clone();
+        let adj_cost = adj_cost.clone();
         let start_time = Instant::now();
 
         tokio::spawn(async move {
@@ -443,7 +468,7 @@ async fn main() -> Result<()> {
                                 debug!("📊 Ciclo #{} — {} DEXs", cycle_count, prices.len());
                             }
 
-                            update_tui_state(&tui_state, &prices, cycle_count, start_time.elapsed());
+                            update_tui_state(&tui_state, &adj_cost, &prices, cycle_count, start_time.elapsed());
 
                             let mut bot_guard = bot.lock().await;
                             if let Err(e) = bot_guard.process_prices(prices).await {

@@ -447,6 +447,61 @@ pub struct AdjLeg {
     pub rate: f64,
 }
 
+/// Parâmetros de custo config-driven p/ projetar net de um ciclo `adj`.
+/// `adj` no radar == gross fee-inclusive (quotes já embutem fee AMM); o desconto
+/// de gas + flashloan fee é downstream (economics/flashloan). Estes valores são a
+/// PROJEÇÃO usada só p/ log/TUI — não são decisão de execução.
+///
+/// - `flashloan_fee_pct`: premium Aave V3 verificado on-chain (5 bps = 0.0005).
+/// - `gas_usd_est`: gas base estimado em USD (config.execution.estimate_base_gas_usd).
+#[derive(Clone, Copy, Debug)]
+pub struct AdjCostParams {
+    pub notional_usd: f64,
+    pub flashloan_fee_pct: f64,
+    pub gas_usd_est: f64,
+}
+
+impl AdjCostParams {
+    /// Net projetado (USD) de um ciclo dado seu `gross_profit_pct` (= (cycle_rate-1)*100).
+    /// cost = flashloan_fee + gas; net = gross - cost.
+    pub fn net_usd(&self, gross_profit_pct: f64) -> f64 {
+        let gross = gross_profit_pct / 100.0 * self.notional_usd;
+        let cost = self.notional_usd * self.flashloan_fee_pct + self.gas_usd_est;
+        gross - cost
+    }
+
+    /// Custo total projetado (USD) = flashloan_fee + gas.
+    pub fn cost_usd(&self) -> f64 {
+        self.notional_usd * self.flashloan_fee_pct + self.gas_usd_est
+    }
+}
+
+impl Default for AdjCostParams {
+    fn default() -> Self {
+        // Defaults alinhados ao config (Aave 5 bps, gas base $0.008, notional $100).
+        Self { notional_usd: 100.0, flashloan_fee_pct: 0.0005, gas_usd_est: 0.008 }
+    }
+}
+
+/// Chave canônica de um round-trip, INDEPENDENTE da direção do par (A-B vs B-A).
+/// Espelhos (mesmas pernas invertidas) colidem nesta chave p/ dedup. Composta por:
+///   venues sorted ∪ token-pair sorted
+/// Ex.: USDC-USDT em Curve×UniswapV3 → "Curve|UniswapV3|USDC|USDT" (mesmo valor
+/// p/ USDT-USDC espelhado). venues distintas ou token-pair distinto → chave distinta
+/// (ciclo economicamente distinto, NÃO dedup).
+fn adj_canonical_key(legs: &[AdjLeg]) -> String {
+    let mut venues: Vec<&str> = legs.iter().map(|l| l.venue.as_str()).collect();
+    venues.sort();
+    venues.dedup();
+    let mut tokens: Vec<&str> = legs
+        .iter()
+        .flat_map(|l| [l.token_in.as_str(), l.token_out.as_str()])
+        .collect();
+    tokens.sort();
+    tokens.dedup();
+    format!("{}|{}", venues.join("|"), tokens.join("|"))
+}
+
 /// Ciclo que passou o ajuste de custo (`adj` = `venue_fee_adjusted_positive`,
 /// incrementado quando `cycle_rate > 1.0`). Emitido por `extract_edges` p/ o
 /// caller fazer persistência + log estruturado. **Nota:** neste layer do radar
@@ -461,6 +516,9 @@ pub struct AdjCycleInfo {
     pub cycle_rate: f64,
     /// (cycle_rate - 1) * 100.
     pub gross_profit_pct: f64,
+    /// Net projetado (USD) = gross - (flashloan_fee + gas). PROJEÇÃO config-driven,
+    /// não decisão de execução. Negativo → custo > lucro → oportunidade ilusória.
+    pub net_profit_usd: f64,
     pub executable: bool,
     pub has_curve_leg: bool,
 }
@@ -568,6 +626,9 @@ pub struct CycleEconomics {
     pub venue_fee_adjusted_positive: usize,
     /// Pares com cycle_rate < 1.0 (sem oportunidade).
     pub negative_cycles_found: usize,
+    /// Ciclos `adj` deduped (mirror A-B/B-A = 1) com net projetado > 0
+    /// (gross > flashloan_fee + gas). Reflete realidade pós-custo, não só gross.
+    pub net_positive: usize,
 }
 
 /// Conta sinais de spread E extrai os edges (> 0.01%) para logging/audit.
@@ -575,7 +636,10 @@ pub struct CycleEconomics {
 /// **VALIDAÇÃO CROSS-DEX**: Só emite EDGE quando `cycle_rate = buy_price × sell_price`
 /// (quotes já fee-inclusive via getAmountsOut / Quoter) é > 1.0.
 /// Spreads single-direction (ex: USDT-WMATIC 2.42% sem reverso viável) são filtrados.
-pub fn extract_edges(pr: &HashMap<String, HashMap<String, f64>>) -> (usize, Vec<EdgeInfo>, CycleEconomics, Vec<AdjCycleInfo>) {
+pub fn extract_edges(
+    pr: &HashMap<String, HashMap<String, f64>>,
+    cost: &AdjCostParams,
+) -> (usize, Vec<EdgeInfo>, CycleEconomics, Vec<AdjCycleInfo>) {
     let mut map_pairs: HashMap<String, Vec<(String, f64)>> = HashMap::new();
 
     for (dex, dex_map) in pr {
@@ -591,8 +655,6 @@ pub fn extract_edges(pr: &HashMap<String, HashMap<String, f64>>) -> (usize, Vec<
     let mut edges = Vec::new();
     let mut adj_cycles: Vec<AdjCycleInfo> = Vec::new();
     let mut evaluated = 0usize;
-    let mut gross_positive = 0usize;
-    let mut fee_adjusted_positive = 0usize;
     let mut negative_cycles = 0usize;
 
     for (pair, dex_prices) in &map_pairs {
@@ -643,9 +705,6 @@ pub fn extract_edges(pr: &HashMap<String, HashMap<String, f64>>) -> (usize, Vec<
 
         // Contabilizar economia do ciclo (gross == fee-inclusive product)
         if best_cycle_rate > 1.0 {
-            gross_positive += 1;
-            fee_adjusted_positive += 1;
-
             // INSTRUMENTAÇÃO `adj`: coleta composição + executabilidade p/ log
             // estruturado (persistência fica no caller, que tem estado entre scans).
             let (token_a, token_b) = pair.split_once('-').unwrap_or((pair.as_str(), ""));
@@ -673,12 +732,14 @@ pub fn extract_edges(pr: &HashMap<String, HashMap<String, f64>>) -> (usize, Vec<
                 .map(|l| format!("{}|{}>{}", l.venue, l.token_in, l.token_out))
                 .collect::<Vec<_>>()
                 .join("||");
+            let gross_profit_pct = (best_cycle_rate - 1.0) * 100.0;
             adj_cycles.push(AdjCycleInfo {
                 cycle_key,
                 pair: pair.clone(),
                 legs,
                 cycle_rate: best_cycle_rate,
-                gross_profit_pct: (best_cycle_rate - 1.0) * 100.0,
+                gross_profit_pct,
+                net_profit_usd: cost.net_usd(gross_profit_pct),
                 executable,
                 has_curve_leg,
             });
@@ -730,14 +791,51 @@ pub fn extract_edges(pr: &HashMap<String, HashMap<String, f64>>) -> (usize, Vec<
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
+    // DEDUP mirror pairs: A-B e B-A produzem o mesmo round-trip econômico (pernas
+    // invertidas, mesmo cycle_rate). `extract_edges` itera ambos os sentidos do par
+    // (generate_full_pair_list é direcional), então sem dedup o mesmo ciclo vira 2
+    // adj. Colapsa por `adj_canonical_key` (venues+tokens sorted, direção-agnóstica),
+    // mantendo a entrada de MAIOR net projetado.
+    //
+    // Tiebreak determinístico: espelhos simétricos empatam em net → desempata por
+    // cycle_key ASC (menor string primeiro). Assim o sobrevivente é o mesmo qualquer
+    // que seja a ordem de iteração do HashMap de input (estável entre scans/runs).
+    // O `pair` do sobrevivente é normalizado p/ forma canônica (direção-agnóstica),
+    // já que o round-trip espelhado não tem direção preferida.
+    adj_cycles.sort_by(|a, b| {
+        b.net_profit_usd
+            .partial_cmp(&a.net_profit_usd)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.cycle_key.cmp(&b.cycle_key))
+    });
+    let mut deduped: Vec<AdjCycleInfo> = Vec::with_capacity(adj_cycles.len());
+    let mut seen_canon: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for mut ac in adj_cycles {
+        let canon = adj_canonical_key(&ac.legs);
+        if seen_canon.insert(canon) {
+            // Normaliza o label do par p/ forma canônica (stable-first / sorted),
+            // independente de qual direção (A-B vs B-A) ganhou o desempate.
+            if let Some((a, b)) = ac.pair.split_once('-') {
+                ac.pair = canonical_pair_name(a, b);
+            }
+            deduped.push(ac);
+        }
+    }
+    let net_positive = deduped.iter().filter(|a| a.net_profit_usd > 0.0).count();
+    // gross/adj contam ciclos ÚNICOS pós-dedup (mirror A-B/B-A = 1), consistente com
+    // adj_total e net_positive. evaluated/negative_cycles permanecem por direção
+    // (cobertura do scan, não oportunidades).
+    let gross_dedup = deduped.len();
+
     let economics = CycleEconomics {
         evaluated,
-        gross_positive,
-        venue_fee_adjusted_positive: fee_adjusted_positive,
+        gross_positive: gross_dedup,
+        venue_fee_adjusted_positive: gross_dedup,
         negative_cycles_found: negative_cycles,
+        net_positive,
     };
 
-    (count, edges, economics, adj_cycles)
+    (count, edges, economics, deduped)
 }
 
 // ============================================================
@@ -834,6 +932,7 @@ fn log_edge_audit(edges: &[EdgeInfo], cycle: u64) {
 async fn execute_radar_cycle(
     dm: &Arc<DexManager>,
     cfg: &Arc<Mutex<Config>>,
+    adj_cost: &AdjCostParams,
     price_tx: &mpsc::Sender<HashMap<String, HashMap<String, f64>>>,
     previous: &mut HashMap<String, HashMap<String, f64>>,
     adj_tracker: &mut AdjTracker,
@@ -842,21 +941,12 @@ async fn execute_radar_cycle(
     cycle: u64,
 ) -> Result<(usize, Vec<EdgeInfo>)> {
 
-    let (pairs, qf_enabled, min_spread, notional_usd, flashloan_fee_pct, gas_usd_est) = {
+    let (pairs, qf_enabled, min_spread) = {
         let cfg = cfg.lock().await;
         (
             generate_full_pair_list(&cfg),
             cfg.optimization.quick_filter_enabled,
             cfg.optimization.min_spread_percent,
-            cfg.arbitrage
-                .default_trade_amount
-                .parse::<f64>()
-                .unwrap_or(100.0),
-            // Custo (estimativa config-driven, honesta): premium Aave V3 verificado
-            // on-chain (5 bps) + gas base. O `adj` do radar == gross fee-inclusive;
-            // cost/net aqui é PROJEÇÃO downstream (economics/flashloan), não decisão.
-            cfg.flashloan.fee_pct.unwrap_or(0.0005),
-            cfg.execution.estimate_base_gas_usd,
         )
     };
 
@@ -903,7 +993,7 @@ async fn execute_radar_cycle(
     }
 
     let total: usize = out.values().map(|m| m.len()).sum();
-    let (_signals, edges, economics, adj_cycles) = extract_edges(&out);
+    let (_signals, edges, economics, adj_cycles) = extract_edges(&out, adj_cost);
 
     log_price_audit(&out, cycle);
     log_edge_summary(&edges, cycle);
@@ -921,11 +1011,10 @@ async fn execute_radar_cycle(
     adj_tracker.begin_scan(cycle);
     let mut adj_executable = 0usize;
     let mut adj_vitrine = 0usize;
+    let cost_usd = adj_cost.cost_usd();
     for ac in &adj_cycles {
-        let gross_profit_usd = ac.gross_profit_pct / 100.0 * notional_usd;
-        let flashloan_fee_usd = notional_usd * flashloan_fee_pct;
-        let cost_usd = flashloan_fee_usd + gas_usd_est;
-        let net_profit_usd = gross_profit_usd - cost_usd;
+        // net/cost já computados em extract_edges (fonte única, config-driven).
+        let gross_profit_usd = ac.gross_profit_pct / 100.0 * adj_cost.notional_usd;
         let seen = adj_tracker.observe(&ac.cycle_key, cycle);
         let key = adj_key_hash(&ac.cycle_key);
         let legs_str = ac
@@ -950,7 +1039,7 @@ async fn execute_radar_cycle(
             ac.cycle_rate,
             gross_profit_usd,
             cost_usd,
-            net_profit_usd,
+            ac.net_profit_usd,
             ac.executable,
             ac.has_curve_leg,
             seen,
@@ -958,16 +1047,19 @@ async fn execute_radar_cycle(
     }
     adj_tracker.end_scan(cycle);
 
-    // Resumo por scan: adj_total = ciclos que passaram o ajuste (== gross_positive).
-    // executable = caixa acionável (route_all_legs_executable); vitrine = tem perna Curve.
+    // Resumo por scan: adj_total = ciclos deduped (mirror A-B/B-A = 1, não 2).
+    // executable = caixa acionável (route_all_legs_executable); vitrine = perna Curve.
+    // net_pos = ciclos com net projetado > 0 (gross > flashloan_fee + gas) — realidade
+    // pós-custo, não só gross. Mostra o valor líquido real da "oportunidade".
     if !adj_cycles.is_empty() {
         info!(
             target: "adjcycle",
-            "[ADJ-SUMMARY] scan={} adj_total={} executable={} vitrine={}",
+            "[ADJ-SUMMARY] scan={} adj_total={} executable={} vitrine={} net_pos={}",
             cycle,
             adj_cycles.len(),
             adj_executable,
             adj_vitrine,
+            economics.net_positive,
         );
     }
 
@@ -1021,6 +1113,7 @@ pub async fn start_high_hit_rate_radar(
     ws: Arc<Provider<Ws>>,
     dm: Arc<DexManager>,
     cfg: Arc<Mutex<Config>>,
+    adj_cost: Arc<AdjCostParams>,
     _price_cache: Arc<PriceCache>,
     cb: Arc<DexCircuitBreaker>,
     price_tx: mpsc::Sender<HashMap<String, HashMap<String, f64>>>,
@@ -1047,7 +1140,7 @@ pub async fn start_high_hit_rate_radar(
                 DEX_RATE_LIMITER.cleanup().await;
 
                 match execute_radar_cycle(
-                    &dm, &cfg, &price_tx,
+                    &dm, &cfg, &adj_cost, &price_tx,
                     &mut previous, &mut adj_tracker, cb.clone(),
                     &retry, cycle
                 ).await {
@@ -1188,7 +1281,7 @@ mod tests {
             m(&[("AAA-BBB", 1.0), ("BBB-AAA", 1.0)]),
         );
 
-        let (_n, _edges, econ, adj) = extract_edges(&pr);
+        let (_n, _edges, econ, adj) = extract_edges(&pr, &AdjCostParams::default());
 
         let vitrine = adj.iter().find(|a| a.pair == "USDC-USDT");
         assert!(vitrine.is_some(), "deve haver adj USDC-USDT");
@@ -1254,8 +1347,8 @@ mod tests {
         pr_b.insert("QuickSwap".into(), m(&[("USDC-USDT", 1.0), ("USDT-USDC", 1.0001)]));
         pr_b.insert("Curve".into(), m(&[("USDC-USDT", 1.0001), ("USDT-USDC", 1.0)]));
 
-        let (_, _, _, adj_a) = extract_edges(&pr_a);
-        let (_, _, _, adj_b) = extract_edges(&pr_b);
+        let (_, _, _, adj_a) = extract_edges(&pr_a, &AdjCostParams::default());
+        let (_, _, _, adj_b) = extract_edges(&pr_b, &AdjCostParams::default());
 
         let ka = adj_a.iter().find(|a| a.pair == "USDC-USDT").unwrap();
         let kb = adj_b.iter().find(|a| a.pair == "USDC-USDT").unwrap();
@@ -1273,6 +1366,54 @@ mod tests {
         assert_ne!(adj_key_hash("A|X>Y||B|Y>X"), adj_key_hash("B|Y>X||A|X>Y"));
     }
 
+    /// Dedup mirror pairs: A-B e B-A (pernas invertidas) = MESMO round-trip econômico
+    /// → colapsa em 1 adj, não 2. E net_positive conta só ciclos com net projetado > 0
+    /// (gross > flashloan_fee + gas), refletindo realidade pós-custo.
+    #[test]
+    fn extract_adj_cycles_dedup_mirror_e_conta_net_positive() {
+        let mut pr: HashMap<String, HashMap<String, f64>> = HashMap::new();
+        // Ciclo 1 (vitrine, net-NEGATIVO): Curve×QuickSwap USDC-USDT cycle_rate 1.0002.
+        //   gross = 0.02% × $100 = $0.02; cost = $0.058 → net = -$0.038.
+        pr.insert(
+            "Curve".into(),
+            m(&[("USDC-USDT", 1.0001), ("USDT-USDC", 1.0)]),
+        );
+        // QuickSwap cota os dois ciclos — num insert só (segundo sobrescreveria).
+        pr.insert(
+            "QuickSwap".into(),
+            m(&[
+                ("USDC-USDT", 1.0),
+                ("USDT-USDC", 1.0001),
+                ("AAA-BBB", 1.01),
+                ("BBB-AAA", 1.0),
+            ]),
+        );
+        // Ciclo 2 (caixa, net-POSITIVO): QuickSwap×SushiSwap AAA-BBB cycle_rate 1.01.
+        //   gross = 1% × $100 = $1.00; cost = $0.058 → net = $0.942.
+        pr.insert(
+            "SushiSwap".into(),
+            m(&[("AAA-BBB", 1.0), ("BBB-AAA", 1.0)]),
+        );
+
+        let (_n, _edges, econ, adj) = extract_edges(&pr, &AdjCostParams::default());
+
+        // Sem dedup seriam 4 adj (2 espelhos × 2 ciclos). Dedup colapsa espelhos → 2.
+        assert_eq!(adj.len(), 2, "espelhos A-B/B-A devem colapsar em 1 adj cada");
+
+        // gross/adj contam ÚNICOS pós-dedup (2 ciclos), não 4 direções.
+        assert_eq!(econ.gross_positive, 2, "gross_positive pós-dedup = 2 ciclos únicos");
+        assert_eq!(econ.venue_fee_adjusted_positive, 2, "adj == gross por construção");
+
+        // net_positive: só o ciclo 2 (AAA-BBB) tem net>0. Ciclo 1 é net-negativo.
+        assert_eq!(econ.net_positive, 1, "só 1 ciclo com net projetado > 0");
+
+        // O ciclo net-positivo tem net>0; o net-negativo tem net<0.
+        let caxas = adj.iter().find(|a| a.pair == "AAA-BBB").unwrap();
+        assert!(caxas.net_profit_usd > 0.0, "AAA-BBB net={:.4} deve ser > 0", caxas.net_profit_usd);
+        let vitrine = adj.iter().find(|a| a.pair == "USDC-USDT").unwrap();
+        assert!(vitrine.net_profit_usd < 0.0, "USDC-USDT net={:.4} deve ser < 0", vitrine.net_profit_usd);
+    }
+
     /// Quotes fee-inclusive: cycle_rate == buy_price × sell_price (sem (1-fee)).
     #[test]
     fn extract_edges_cycle_rate_equals_product_v2x_v2() {
@@ -1288,7 +1429,7 @@ mod tests {
             m(&[("AAA-BBB", 1.01), ("BBB-AAA", 1.0)]),
         );
 
-        let (_n, edges, econ, _adj) = extract_edges(&pr);
+        let (_n, edges, econ, _adj) = extract_edges(&pr, &AdjCostParams::default());
         assert!(!edges.is_empty(), "deve emitir edge");
         let best = &edges[0];
         assert!(
@@ -1315,7 +1456,7 @@ mod tests {
             m(&[("CCC-DDD", 1.0), ("DDD-CCC", 1.0)]),
         );
 
-        let (_n, edges, _, _adj) = extract_edges(&pr);
+        let (_n, edges, _, _adj) = extract_edges(&pr, &AdjCostParams::default());
         assert!(!edges.is_empty());
         // Melhor: 1.005 * 1.0 = 1.005 → 0.5%
         assert!((edges[0].spread_pct - 0.5).abs() < 1e-9);
