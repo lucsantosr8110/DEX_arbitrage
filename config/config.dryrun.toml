@@ -202,18 +202,24 @@ chain_id = 137
 # Segredos vêm do .env via expansão ${VAR} (ver Config::from_file).
 # Se ALCHEMY_RPC_URL/ALCHEMY_WS_URL não estiverem definidos, o literal "${...}"
 # permanece e o fallback público abaixo assume. Nunca versione chaves aqui.
-rpc_url = "${ALCHEMY_RPC_URL}"
+rpc_url = "${QUICKNODE_RPC_URL}"
 rpc_endpoints = [
+    "${QUICKNODE_RPC_URL}",
     "${ALCHEMY_RPC_URL}",
     "${INFURA_RPC_URL}",
     "https://polygon-bor-rpc.publicnode.com",
     "https://1rpc.io/matic",
+    "https://polygon-rpc.com",
+    "https://polygon.llamarpc.com",
 ]
 ws_endpoints = [
+    "${QUICKNODE_WS_URL}",
     "${ALCHEMY_WS_URL}",
     "${INFURA_WS_URL}",
     "wss://polygon-bor-rpc.publicnode.com",
     "wss://polygon.drpc.org",
+    "wss://polygon-rpc.com",
+    "wss://polygon.llamarpc.com",
 ]
 timeout_ms = 5000
 max_reorg_depth = 64
