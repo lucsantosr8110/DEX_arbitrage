@@ -9,7 +9,10 @@
 
 use crate::{
     config::Config,
-    core::smart_retry::SmartRetryManager,
+    core::{
+        replay_cross_model::{route_all_legs_executable, venue_curve_model, CurveModel},
+        smart_retry::SmartRetryManager,
+    },
     dex::{
         circuit_breaker::DexCircuitBreaker,
         manager::DexManager,
@@ -435,6 +438,125 @@ pub struct EdgeInfo {
     pub sell_price: f64,
 }
 
+/// Uma perna de um ciclo `adj` (round-trip 2-hop cross-DEX num par).
+pub struct AdjLeg {
+    pub venue: String,
+    pub token_in: String,
+    pub token_out: String,
+    /// Preço fee-inclusive (tokenOut por tokenIn) vindo do quote (getAmountsOut/Quoter/get_dy).
+    pub rate: f64,
+}
+
+/// Ciclo que passou o ajuste de custo (`adj` = `venue_fee_adjusted_positive`,
+/// incrementado quando `cycle_rate > 1.0`). Emitido por `extract_edges` p/ o
+/// caller fazer persistência + log estruturado. **Nota:** neste layer do radar
+/// `adj == gross` — quotes já embutem fee AMM; o desconto de gas/flashloan fee
+/// acontece downstream (economics/flashloan). O flag `executable` distingue
+/// "caixa acionável" de "vitrine" (ex.: perna Curve, sem DexType on-chain).
+pub struct AdjCycleInfo {
+    /// Chave determinística (independente do scan): join de "venue|in>out" por perna.
+    pub cycle_key: String,
+    pub pair: String,
+    pub legs: Vec<AdjLeg>,
+    pub cycle_rate: f64,
+    /// (cycle_rate - 1) * 100.
+    pub gross_profit_pct: f64,
+    pub executable: bool,
+    pub has_curve_leg: bool,
+}
+
+/// Estado de persistência de um ciclo `adj` entre scans.
+#[derive(Clone, Copy, Debug)]
+pub struct AdjSeen {
+    pub first_seen_scan: u64,
+    pub last_seen_scan: u64,
+    /// Quantos scans CONSECUTIVOS o ciclo apareceu como `adj`. Quebra se ausente
+    /// num scan (last_seen != scan-1 na próxima aparição).
+    pub seen_consecutive: usize,
+}
+
+/// Mapa em memória {cycle_key -> AdjSeen}, atualizado a cada scan. Responde
+/// "por quantos ciclos de scan consecutivos o mesmo ciclo apareceu como adj".
+pub struct AdjTracker {
+    map: HashMap<String, AdjSeen>,
+    current_scan: u64,
+}
+
+impl Default for AdjTracker {
+    fn default() -> Self {
+        Self {
+            map: HashMap::new(),
+            current_scan: 0,
+        }
+    }
+}
+
+impl AdjTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Marca início de um scan. Não reseta o mapa — `observe` decide continuidade.
+    pub fn begin_scan(&mut self, scan: u64) {
+        self.current_scan = scan;
+    }
+
+    /// Registra um ciclo `adj` visto neste scan. Retorna `seen_consecutive` atual.
+    pub fn observe(&mut self, cycle_key: &str, scan: u64) -> usize {
+        let prev_scan = scan.wrapping_sub(1);
+        let seen_consecutive = match self.map.get(cycle_key) {
+            Some(s) if s.last_seen_scan == prev_scan => s.seen_consecutive + 1,
+            _ => 1,
+        };
+        let first_seen_scan = self
+            .map
+            .get(cycle_key)
+            .map(|s| s.first_seen_scan)
+            .unwrap_or(scan);
+        self.map.insert(
+            cycle_key.to_string(),
+            AdjSeen {
+                first_seen_scan,
+                last_seen_scan: scan,
+                seen_consecutive,
+            },
+        );
+        seen_consecutive
+    }
+
+    /// Fim do scan: descarta ciclos não vistos há mais de `grace` scans (bounding
+    /// de memória; o streak deles já está quebrado pela lógica de `observe`).
+    pub fn end_scan(&mut self, scan: u64) {
+        const GRACE: u64 = 10;
+        self.map
+            .retain(|_, s| scan.saturating_sub(s.last_seen_scan) <= GRACE);
+    }
+
+    /// Snapshot p/ diagnóstico/teste.
+    pub fn snapshot(&self) -> &HashMap<String, AdjSeen> {
+        &self.map
+    }
+
+    pub fn current_scan(&self) -> u64 {
+        self.current_scan
+    }
+}
+
+/// Hash curto e determinístico (4 hex chars) do `cycle_key` p/ o log `[ADJ] key=`.
+/// FNV-1a 64-bit → low 16 bits. Determinístico: mesmas pernas+venues → mesmo hash.
+/// Não é criptográfico — só identificador compacto/auditável (mesmas pernas em
+/// ordem diferente dão hash diferente, o que é correto: ciclo distinto).
+pub fn adj_key_hash(cycle_key: &str) -> String {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut h: u64 = FNV_OFFSET;
+    for b in cycle_key.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    format!("{:04x}", (h & 0xffff) as u32)
+}
+
 /// Estatísticas econômicas do ciclo (resumo para o log).
 pub struct CycleEconomics {
     /// Pares avaliados (com ≥2 DEXes e reverso disponível).
@@ -453,7 +575,7 @@ pub struct CycleEconomics {
 /// **VALIDAÇÃO CROSS-DEX**: Só emite EDGE quando `cycle_rate = buy_price × sell_price`
 /// (quotes já fee-inclusive via getAmountsOut / Quoter) é > 1.0.
 /// Spreads single-direction (ex: USDT-WMATIC 2.42% sem reverso viável) são filtrados.
-pub fn extract_edges(pr: &HashMap<String, HashMap<String, f64>>) -> (usize, Vec<EdgeInfo>, CycleEconomics) {
+pub fn extract_edges(pr: &HashMap<String, HashMap<String, f64>>) -> (usize, Vec<EdgeInfo>, CycleEconomics, Vec<AdjCycleInfo>) {
     let mut map_pairs: HashMap<String, Vec<(String, f64)>> = HashMap::new();
 
     for (dex, dex_map) in pr {
@@ -467,6 +589,7 @@ pub fn extract_edges(pr: &HashMap<String, HashMap<String, f64>>) -> (usize, Vec<
 
     let mut count = 0;
     let mut edges = Vec::new();
+    let mut adj_cycles: Vec<AdjCycleInfo> = Vec::new();
     let mut evaluated = 0usize;
     let mut gross_positive = 0usize;
     let mut fee_adjusted_positive = 0usize;
@@ -522,6 +645,43 @@ pub fn extract_edges(pr: &HashMap<String, HashMap<String, f64>>) -> (usize, Vec<
         if best_cycle_rate > 1.0 {
             gross_positive += 1;
             fee_adjusted_positive += 1;
+
+            // INSTRUMENTAÇÃO `adj`: coleta composição + executabilidade p/ log
+            // estruturado (persistência fica no caller, que tem estado entre scans).
+            let (token_a, token_b) = pair.split_once('-').unwrap_or((pair.as_str(), ""));
+            let legs = vec![
+                AdjLeg {
+                    venue: best_buy_dex.clone(),
+                    token_in: token_a.to_string(),
+                    token_out: token_b.to_string(),
+                    rate: best_buy_price,
+                },
+                AdjLeg {
+                    venue: best_sell_dex.clone(),
+                    token_in: token_b.to_string(),
+                    token_out: token_a.to_string(),
+                    rate: best_sell_price,
+                },
+            ];
+            let has_curve_leg = legs
+                .iter()
+                .any(|l| venue_curve_model(&l.venue) == CurveModel::StableSwap);
+            let executable =
+                route_all_legs_executable(legs.iter().map(|l| l.venue.as_str()));
+            let cycle_key = legs
+                .iter()
+                .map(|l| format!("{}|{}>{}", l.venue, l.token_in, l.token_out))
+                .collect::<Vec<_>>()
+                .join("||");
+            adj_cycles.push(AdjCycleInfo {
+                cycle_key,
+                pair: pair.clone(),
+                legs,
+                cycle_rate: best_cycle_rate,
+                gross_profit_pct: (best_cycle_rate - 1.0) * 100.0,
+                executable,
+                has_curve_leg,
+            });
         } else {
             negative_cycles += 1;
         }
@@ -577,7 +737,7 @@ pub fn extract_edges(pr: &HashMap<String, HashMap<String, f64>>) -> (usize, Vec<
         negative_cycles_found: negative_cycles,
     };
 
-    (count, edges, economics)
+    (count, edges, economics, adj_cycles)
 }
 
 // ============================================================
@@ -676,17 +836,27 @@ async fn execute_radar_cycle(
     cfg: &Arc<Mutex<Config>>,
     price_tx: &mpsc::Sender<HashMap<String, HashMap<String, f64>>>,
     previous: &mut HashMap<String, HashMap<String, f64>>,
+    adj_tracker: &mut AdjTracker,
     cb: Arc<DexCircuitBreaker>,
     retry: &SmartRetryManager,
     cycle: u64,
 ) -> Result<(usize, Vec<EdgeInfo>)> {
 
-    let (pairs, qf_enabled, min_spread) = {
+    let (pairs, qf_enabled, min_spread, notional_usd, flashloan_fee_pct, gas_usd_est) = {
         let cfg = cfg.lock().await;
         (
             generate_full_pair_list(&cfg),
             cfg.optimization.quick_filter_enabled,
             cfg.optimization.min_spread_percent,
+            cfg.arbitrage
+                .default_trade_amount
+                .parse::<f64>()
+                .unwrap_or(100.0),
+            // Custo (estimativa config-driven, honesta): premium Aave V3 verificado
+            // on-chain (5 bps) + gas base. O `adj` do radar == gross fee-inclusive;
+            // cost/net aqui é PROJEÇÃO downstream (economics/flashloan), não decisão.
+            cfg.flashloan.fee_pct.unwrap_or(0.0005),
+            cfg.execution.estimate_base_gas_usd,
         )
     };
 
@@ -733,11 +903,73 @@ async fn execute_radar_cycle(
     }
 
     let total: usize = out.values().map(|m| m.len()).sum();
-    let (_signals, edges, economics) = extract_edges(&out);
+    let (_signals, edges, economics, adj_cycles) = extract_edges(&out);
 
     log_price_audit(&out, cycle);
     log_edge_summary(&edges, cycle);
     log_edge_audit(&edges, cycle);
+
+    // INSTRUMENTAÇÃO `adj`: log estruturado por ciclo que passou o ajuste de custo.
+    // Persistência: adj_tracker mantém {cycle_key -> AdjSeen} entre scans; `persist`
+    // = seen_consecutive (por quantos scans seguidos o mesmo ciclo apareceu como adj).
+    // Ciclo estável = persist alto; intermitente = persist 1-2.
+    //
+    // Custo/net aqui é PROJEÇÃO config-driven (premium Aave 5 bps + gas base), não
+    // decisão de execução — `adj` no radar == gross fee-inclusive (quotes já embutem
+    // fee AMM). Flag `executable` separa "caixa" (route_all_legs_executable) de
+    // "vitrine" (perna Curve, sem DexType on-chain hoje).
+    adj_tracker.begin_scan(cycle);
+    let mut adj_executable = 0usize;
+    let mut adj_vitrine = 0usize;
+    for ac in &adj_cycles {
+        let gross_profit_usd = ac.gross_profit_pct / 100.0 * notional_usd;
+        let flashloan_fee_usd = notional_usd * flashloan_fee_pct;
+        let cost_usd = flashloan_fee_usd + gas_usd_est;
+        let net_profit_usd = gross_profit_usd - cost_usd;
+        let seen = adj_tracker.observe(&ac.cycle_key, cycle);
+        let key = adj_key_hash(&ac.cycle_key);
+        let legs_str = ac
+            .legs
+            .iter()
+            .map(|l| format!("{}>{}>{}", l.token_in, l.venue, l.token_out))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        if ac.executable {
+            adj_executable += 1;
+        }
+        if ac.has_curve_leg {
+            adj_vitrine += 1;
+        }
+        info!(
+            target: "adjcycle",
+            "[ADJ] scan={} key={} legs={} cycle_rate={:.6} gross=${:.4} cost=${:.4} net=${:.4} \
+             executable={} has_curve_leg={} persist={}",
+            cycle,
+            key,
+            legs_str,
+            ac.cycle_rate,
+            gross_profit_usd,
+            cost_usd,
+            net_profit_usd,
+            ac.executable,
+            ac.has_curve_leg,
+            seen,
+        );
+    }
+    adj_tracker.end_scan(cycle);
+
+    // Resumo por scan: adj_total = ciclos que passaram o ajuste (== gross_positive).
+    // executable = caixa acionável (route_all_legs_executable); vitrine = tem perna Curve.
+    if !adj_cycles.is_empty() {
+        info!(
+            target: "adjcycle",
+            "[ADJ-SUMMARY] scan={} adj_total={} executable={} vitrine={}",
+            cycle,
+            adj_cycles.len(),
+            adj_executable,
+            adj_vitrine,
+        );
+    }
 
     // Log de resultado econômico do ciclo
     info!(
@@ -798,6 +1030,7 @@ pub async fn start_high_hit_rate_radar(
     let mut stream = ws.subscribe_blocks().await?;
     let retry = SmartRetryManager::new(2, Duration::from_millis(35)).with_jitter(0.2);
     let mut previous: HashMap<String, HashMap<String, f64>> = HashMap::new();
+    let mut adj_tracker = AdjTracker::new();
     let mut cycle = 0u64;
 
     loop {
@@ -815,7 +1048,7 @@ pub async fn start_high_hit_rate_radar(
 
                 match execute_radar_cycle(
                     &dm, &cfg, &price_tx,
-                    &mut previous, cb.clone(),
+                    &mut previous, &mut adj_tracker, cb.clone(),
                     &retry, cycle
                 ).await {
                     Ok((total, edges)) =>
@@ -921,6 +1154,125 @@ mod tests {
         }
     }
 
+    /// INSTRUMENTAÇÃO adj: ciclo com perna Curve é VITRINE (não executável).
+    /// has_curve_leg=true, executable=false (route_all_legs_executable false
+    /// por curve_executor_supported() -> false). Ciclo só QuickSwap/SushiSwap
+    /// → executable=true, has_curve_leg=false (caixa).
+    #[test]
+    fn extract_adj_cycles_marca_vitrine_e_caxa() {
+        let mut pr: HashMap<String, HashMap<String, f64>> = HashMap::new();
+        // Ciclo VITRINE: cross Curve×QuickSwap no par USDC-USDT. extract_edges exige
+        // ≥2 DEXes no par forward + 1 DEX distinto no reverse. Ambas DEXes cotam as
+        // duas direções; o cross vencedor é buy=Curve(USDC>USDT) × sell=QuickSwap(USDT>USDC).
+        // cycle_rate = 1.0001 * 1.0001 = 1.0002 > 1.0 → adj, has_curve_leg=true.
+        pr.insert(
+            "Curve".into(),
+            m(&[("USDC-USDT", 1.0001), ("USDT-USDC", 1.0)]),
+        );
+        // QuickSwap cota os dois ciclos: vitrine (USDC-USDT) + caixa (AAA-BBB).
+        // Tudo num insert só — segundo insert sobrescreveria o primeiro.
+        pr.insert(
+            "QuickSwap".into(),
+            m(&[
+                ("USDC-USDT", 1.0),
+                ("USDT-USDC", 1.0001),
+                ("AAA-BBB", 1.01),
+                ("BBB-AAA", 1.0),
+            ]),
+        );
+        // Ciclo CAIXA: cross QuickSwap×SushiSwap no par AAA-BBB.
+        // buy=QuickSwap(AAA>BBB 1.01) × sell=SushiSwap(BBB>AAA 1.0) = 1.01 → adj,
+        // has_curve_leg=false, executable=true.
+        pr.insert(
+            "SushiSwap".into(),
+            m(&[("AAA-BBB", 1.0), ("BBB-AAA", 1.0)]),
+        );
+
+        let (_n, _edges, econ, adj) = extract_edges(&pr);
+
+        let vitrine = adj.iter().find(|a| a.pair == "USDC-USDT");
+        assert!(vitrine.is_some(), "deve haver adj USDC-USDT");
+        let v = vitrine.unwrap();
+        assert!(v.has_curve_leg, "USDC-USDT tem perna Curve");
+        assert!(!v.executable, "Curve não é executável on-chain");
+        assert!(v.cycle_rate > 1.0);
+        // cycle_key determinístico e contém as duas pernas com venues.
+        assert!(v.cycle_key.contains("Curve|USDC>USDT"));
+        assert!(v.cycle_key.contains("QuickSwap|USDT>USDC"));
+
+        let caxa = adj.iter().find(|a| a.pair == "AAA-BBB");
+        assert!(caxa.is_some(), "deve haver adj AAA-BBB");
+        let c = caxa.unwrap();
+        assert!(!c.has_curve_leg);
+        assert!(c.executable, "QuickSwap+SushiSwap é executável");
+        assert!((c.cycle_rate - 1.01).abs() < 1e-9);
+
+        // Contagem: ambos passaram o ajuste (gross == adj neste layer).
+        assert!(econ.venue_fee_adjusted_positive >= 2);
+    }
+
+    /// Persistência: AdjTracker conta consecutivos e quebra após gap.
+    #[test]
+    fn adj_tracker_conta_consecutivos_e_quebra_apos_gap() {
+        let mut t = AdjTracker::new();
+        t.begin_scan(1);
+        assert_eq!(t.observe("k", 1), 1); // primeira aparição
+        t.end_scan(1);
+
+        t.begin_scan(2);
+        assert_eq!(t.observe("k", 2), 2); // consecutivo
+        t.end_scan(2);
+
+        // scan 3: gap — "k" não aparece.
+        t.begin_scan(3);
+        t.end_scan(3);
+
+        t.begin_scan(4);
+        assert_eq!(t.observe("k", 4), 1, "gap em scan 3 deve zerar o streak");
+        t.end_scan(4);
+
+        let snap = t.snapshot();
+        assert_eq!(snap.get("k").unwrap().seen_consecutive, 1);
+        assert_eq!(snap.get("k").unwrap().first_seen_scan, 1); // preserva first_seen
+        assert_eq!(snap.get("k").unwrap().last_seen_scan, 4);
+    }
+
+    /// (b) cycle_key + adj_key_hash são determinísticos: mesmas pernas+venues em
+    /// ordem igual → mesma chave e mesmo hash curto. Orem diferente → hash distinto
+    /// (ciclo distinto). Persistência (`persist`) depende desta estabilidade.
+    #[test]
+    fn adj_cycle_key_e_hash_sao_deterministicos() {
+        // Mesmo ciclo (mesmas pernas+venues, mesma ordem) em dois HashMaps de input
+        // com ordem de iteração distinta → mesmo cycle_key → mesmo hash. Ambas DEXes
+        // cotam as duas direções (extract_edges exige ≥2 DEXes no par forward).
+        let mut pr_a: HashMap<String, HashMap<String, f64>> = HashMap::new();
+        pr_a.insert("Curve".into(), m(&[("USDC-USDT", 1.0001), ("USDT-USDC", 1.0)]));
+        pr_a.insert("QuickSwap".into(), m(&[("USDC-USDT", 1.0), ("USDT-USDC", 1.0001)]));
+
+        let mut pr_b: HashMap<String, HashMap<String, f64>> = HashMap::new();
+        // Inserção em ordem trocada — iteração pode variar, mas o ciclo é o mesmo.
+        pr_b.insert("QuickSwap".into(), m(&[("USDC-USDT", 1.0), ("USDT-USDC", 1.0001)]));
+        pr_b.insert("Curve".into(), m(&[("USDC-USDT", 1.0001), ("USDT-USDC", 1.0)]));
+
+        let (_, _, _, adj_a) = extract_edges(&pr_a);
+        let (_, _, _, adj_b) = extract_edges(&pr_b);
+
+        let ka = adj_a.iter().find(|a| a.pair == "USDC-USDT").unwrap();
+        let kb = adj_b.iter().find(|a| a.pair == "USDC-USDT").unwrap();
+        assert_eq!(ka.cycle_key, kb.cycle_key, "cycle_key deve ser igual p/ mesmo ciclo");
+        assert_eq!(adj_key_hash(&ka.cycle_key), adj_key_hash(&kb.cycle_key));
+
+        // Hash determinístico p/ string fixa (snapshot estável entre runs).
+        assert_eq!(adj_key_hash("Curve|USDC>USDT||QuickSwap|USDT>USDC"),
+                   adj_key_hash("Curve|USDC>USDT||QuickSwap|USDT>USDC"));
+        // 4 hex chars.
+        let h = adj_key_hash("Curve|USDC>USDT||QuickSwap|USDT>USDC");
+        assert_eq!(h.len(), 4);
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+        // Ordem de pernas diferente → cycle_key diferente → hash diferente.
+        assert_ne!(adj_key_hash("A|X>Y||B|Y>X"), adj_key_hash("B|Y>X||A|X>Y"));
+    }
+
     /// Quotes fee-inclusive: cycle_rate == buy_price × sell_price (sem (1-fee)).
     #[test]
     fn extract_edges_cycle_rate_equals_product_v2x_v2() {
@@ -936,7 +1288,7 @@ mod tests {
             m(&[("AAA-BBB", 1.01), ("BBB-AAA", 1.0)]),
         );
 
-        let (_n, edges, econ) = extract_edges(&pr);
+        let (_n, edges, econ, _adj) = extract_edges(&pr);
         assert!(!edges.is_empty(), "deve emitir edge");
         let best = &edges[0];
         assert!(
@@ -963,7 +1315,7 @@ mod tests {
             m(&[("CCC-DDD", 1.0), ("DDD-CCC", 1.0)]),
         );
 
-        let (_n, edges, _) = extract_edges(&pr);
+        let (_n, edges, _, _adj) = extract_edges(&pr);
         assert!(!edges.is_empty());
         // Melhor: 1.005 * 1.0 = 1.005 → 0.5%
         assert!((edges[0].spread_pct - 0.5).abs() < 1e-9);

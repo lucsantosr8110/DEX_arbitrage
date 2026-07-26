@@ -71,7 +71,7 @@ fn update_tui_state(
     cycle_count: u64,
     uptime: Duration,
 ) {
-    let (_, _, economics) = extract_edges(prices);
+    let (_, _, economics, _adj_cycles) = extract_edges(prices);
 
     let mut rows: HashMap<String, tui::PriceRow> = HashMap::new();
     for (dex, dex_map) in prices {
