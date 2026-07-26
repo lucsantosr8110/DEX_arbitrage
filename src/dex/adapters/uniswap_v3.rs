@@ -605,6 +605,40 @@ impl DexContract for UniswapV3Dex {
                     continue;
                 };
 
+                // A3: multicall (hot path) não rodava validate_price_with_
+                // multiple_amounts. Reusar os quotes JÁ fetchados dos tiers
+                // executáveis p/ medir dispersão cross-tier (zero RPC extra).
+                // Pools V3 concentradas/rasas mostram desvio alto entre tiers
+                // — sinal de liquidez ruim. Descarta igual ao path get_price.
+                let mut tier_prices: Vec<f64> = Vec::new();
+                for (fee, out) in quotes.iter() {
+                    if !is_executable_v3_fee_tier(*fee) || out.is_zero() {
+                        continue;
+                    }
+                    if let Ok(p) =
+                        calculate_price_from_decimals(info.amount_in, *out, info.decimals_a, info.decimals_b)
+                    {
+                        if p > 0.0 {
+                            tier_prices.push(p);
+                        }
+                    }
+                }
+                if tier_prices.len() >= 2 {
+                    tier_prices.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    let mid = tier_prices[tier_prices.len() / 2];
+                    let max_dev = tier_prices
+                        .iter()
+                        .map(|p| ((p - mid) / mid).abs())
+                        .fold(0.0_f64, f64::max);
+                    if max_dev > PRICE_DEVIATION_LIMIT {
+                        debug!(
+                            "[{}] multicall {}/{} — dispersão cross-tier {:.2}% > {}% (pool concentrada/rasa), descartado",
+                            DEX_NAME, info.token_a, info.token_b, max_dev * 100.0, PRICE_DEVIATION_LIMIT * 100.0
+                        );
+                        continue;
+                    }
+                }
+
                 let price = calculate_price_from_decimals(
                     info.amount_in,
                     best_out,
@@ -650,11 +684,29 @@ impl DexContract for UniswapV3Dex {
         let router_abi = Self::load_abi_from_wrapper(include_str!("../../../abi/UniswapV3Router.json"))?;
         let router = Contract::new(self.router, router_abi, self.client.clone());
 
-        // A Fee Tier correta deve ser fornecida pela lógica de arbitragem
+        // A2: fee tier hardcoded 3000 revertia em pools fee=500/10000. Resolver
+        // via cache (preenchido pelo get_price/multicall) — fallback 3000 só se
+        // sem cache (e loga, pois é arriscado).
+        let (sym_in, sym_out) = (
+            self.token_cache.get_by_address(&token_in).await.map(|i| i.symbol),
+            self.token_cache.get_by_address(&token_out).await.map(|i| i.symbol),
+        );
+        let fee_tier = match (sym_in.as_deref(), sym_out.as_deref()) {
+            (Some(a), Some(b)) => crate::dex::cached_fee_tier(DEX_NAME, a, b),
+            _ => None,
+        };
+        let fee = fee_tier.unwrap_or_else(|| {
+            warn!(
+                "[{}] swap: fee_tier não cacheado p/ {:?}/{:?} — fallback 3000 (arriscado p/ pool 500/10000)",
+                DEX_NAME, token_in, token_out
+            );
+            3000
+        });
+
         let params = (
             token_in,
             token_out,
-            3000u32, // PLACEHOLDER: Deve ser a Fee Tier da rota de arbitragem
+            fee,
             self.client.address(),
             self.deadline(),
             amount_in,
