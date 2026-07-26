@@ -15,7 +15,7 @@ use once_cell::sync::Lazy;
 use prometheus::{
     register, register_counter, register_gauge, register_histogram, register_int_counter,
     register_int_counter_vec, register_int_gauge, Counter, Gauge, Histogram, IntCounter,
-    IntCounterVec, IntGauge, Opts,
+    HistogramVec, IntCounterVec, IntGauge, Opts,
 };
 use std::{collections::HashMap, net::SocketAddr, sync::Mutex};
 use tracing::{debug, info, warn};
@@ -85,6 +85,33 @@ pub static EXEC_FAIL: Lazy<IntCounterVec> = Lazy::new(|| {
     register(Box::new(vec.clone())).ok();
     vec
 });
+
+pub static DEX_QUOTE_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let vec = IntCounterVec::new(
+        Opts::new("dex_quote_total", "Lotes de quote por DEX e resultado"),
+        &["dex_name", "outcome"],
+    ).unwrap();
+    register(Box::new(vec.clone())).unwrap();
+    vec
+});
+
+pub static DEX_QUOTE_LATENCY_MS: Lazy<HistogramVec> = Lazy::new(|| {
+    let vec = HistogramVec::new(
+        prometheus::HistogramOpts::new("dex_quote_latency_ms", "Latência de lote de quote por DEX")
+            .buckets(vec![5.0, 20.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 3000.0, 10_000.0]),
+        &["dex_name"],
+    ).unwrap();
+    register(Box::new(vec.clone())).unwrap();
+    vec
+});
+
+pub static GAS_CALIBRATION_RATIO: Lazy<Gauge> = Lazy::new(||
+    register_gauge!("gas_calibration_ratio", "gas_used real / estimativa de unidades").unwrap()
+);
+
+pub static GAS_USED_OBSERVED: Lazy<Histogram> = Lazy::new(||
+    register_histogram!("gas_used_observed", "Gas usado confirmado", vec![100_000.0, 250_000.0, 400_000.0, 600_000.0, 900_000.0, 1_500_000.0]).unwrap()
+);
 
 // ============================================================
 // ⚡️ MÉTRICAS FLASHLOAN
@@ -209,6 +236,19 @@ pub fn inc_dex_request(dex_name: &str) {
     DEX_REQUESTS.inc();
     COUNTER_DEX_REQUESTS.with_label_values(&[dex_name]).inc();
     debug!("📊 Requisição DEX registrada: {}", dex_name);
+}
+
+pub fn observe_dex_quote(dex_name: &str, outcome: &str, elapsed_ms: f64) {
+    DEX_QUOTE_TOTAL.with_label_values(&[dex_name, outcome]).inc();
+    DEX_QUOTE_LATENCY_MS.with_label_values(&[dex_name]).observe(elapsed_ms.max(0.0));
+}
+
+pub fn record_gas_calibration(estimated_units: f64, actual_units: f64) {
+    if estimated_units <= 0.0 || actual_units <= 0.0 {
+        return;
+    }
+    GAS_CALIBRATION_RATIO.set(actual_units / estimated_units);
+    GAS_USED_OBSERVED.observe(actual_units);
 }
 
 // ============================================================

@@ -20,8 +20,8 @@ use crate::{
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use ethers::{
-    abi::Abi,
-    contract::Contract,
+    abi::{Abi, Token},
+    contract::{Contract, Multicall},
     types::{Address, U256},
 };
 use std::{str::FromStr, sync::Arc};
@@ -81,12 +81,29 @@ pub struct CurveDex {
     pool_tokens: Vec<(Address, u8, String)>, // (am_address, decimals, original_symbol)
 }
 
+#[derive(Clone)]
+struct CurveQuoteCall {
+    token_a: String,
+    token_b: String,
+    idx_a: usize,
+    idx_b: usize,
+    decimals_a: u8,
+    decimals_b: u8,
+    amount_in: U256,
+}
+
 impl CurveDex {
     pub async fn new(client: Arc<AppMiddleware>, pool_addr: Address, config: Arc<Config>) -> Self {
         let token_cache = TokenCache::global(config.clone()).await;
 
-        // Ordem real do pool (verificado via API): amDAI(idx 0), amUSDC(idx 1), amUSDT(idx 2)
-        let pool_tokens = default_stable_pool_tokens();
+        // I2: a ordem é descoberta no contrato, não presumida. Fallback estático
+        // só preserva operação se o Multicall/RPC falhar no boot.
+        let pool_tokens = discover_pool_tokens(client.clone(), pool_addr)
+            .await
+            .unwrap_or_else(|| {
+                warn!("[{}] coins(i) indisponível; usando ordem Curve conhecida", DEX_NAME);
+                default_stable_pool_tokens()
+            });
 
         info!("✅ {}Dex inicializado | pool={} | 3 stables (0.04% fee)", DEX_NAME, pool_addr);
         Self {
@@ -156,6 +173,9 @@ impl DexContract for CurveDex {
         ) else {
             return Ok(None);
         };
+        if idx_a == idx_b {
+            return Ok(None);
+        }
 
         let abi = Self::load_abi(CURVE_POOL_ABI)?;
         let pool = Contract::new(self.pool_address, abi, self.client.clone());
@@ -191,7 +211,7 @@ impl DexContract for CurveDex {
         let abi = Self::load_abi(CURVE_POOL_ABI)?;
         let pool = Contract::new(self.pool_address, abi, self.client.clone());
 
-        let mut results = Vec::new();
+        let mut calls = Vec::new();
 
         for (token_a, token_b) in pairs {
             // Só processa pares de stables
@@ -208,6 +228,9 @@ impl DexContract for CurveDex {
                 );
                 continue;
             };
+            if idx_a == idx_b {
+                continue;
+            }
 
             let decimals_a = self.pool_tokens[idx_a].1;
             let decimals_b = self.pool_tokens[idx_b].1;
@@ -216,30 +239,31 @@ impl DexContract for CurveDex {
                 .await
                 .unwrap_or(U256::from(10u64.pow(decimals_a as u32)));
 
-            ALCHEMY_RATE_LIMITER.acquire().await?;
+            calls.push(CurveQuoteCall {
+                token_a: token_a.clone(), token_b: token_b.clone(), idx_a, idx_b,
+                decimals_a, decimals_b, amount_in,
+            });
+        }
 
-            let dy: U256 = match pool
-                .method("get_dy", (idx_a as i128, idx_b as i128, amount_in))?
-                .call()
-                .await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    debug!("[{}] get_dy({}→{}) failed: {}", DEX_NAME, token_a, token_b, e);
-                    continue;
-                }
-            };
-
-            if dy.is_zero() {
+        if calls.is_empty() { return Ok(Vec::new()); }
+        let mut multicall = Multicall::new(self.client.clone(), None).await?;
+        for info in &calls {
+            let call = pool.method::<_, U256>("get_dy", (info.idx_a as i128, info.idx_b as i128, info.amount_in))?;
+            // I1: uma falha de par não invalida todo lote Curve.
+            multicall.add_call(call, false);
+        }
+        ALCHEMY_RATE_LIMITER.acquire().await?;
+        let raw: Vec<Result<Token, _>> = multicall.call_raw().await?;
+        let mut results = Vec::new();
+        for (info, result) in calls.iter().zip(raw) {
+            let Ok(Token::Uint(dy)) = result else {
+                debug!("[{}] get_dy({}→{}) falhou no multicall", DEX_NAME, info.token_a, info.token_b);
                 continue;
-            }
-
-            if let Ok(price) = calculate_price_from_decimals(amount_in, dy, decimals_a, decimals_b) {
+            };
+            if dy.is_zero() { continue; }
+            if let Ok(price) = calculate_price_from_decimals(info.amount_in, dy, info.decimals_a, info.decimals_b) {
                 if let Some(normalized) = normalize_price(price) {
-                    results.push(
-                        TokenPairPrice::new(token_a.clone(), token_b.clone(), normalized, DEX_NAME.into())
-                            .with_fee_tier(4), // 0.04% = 4 bps
-                    );
+                    results.push(TokenPairPrice::new(info.token_a.clone(), info.token_b.clone(), normalized, DEX_NAME.into()).with_fee_tier(4));
                 }
             }
         }
@@ -337,6 +361,38 @@ fn default_stable_pool_tokens() -> Vec<(Address, u8, String)> {
     ]
 }
 
+/// Descobre `coins(0..2)` via Multicall e mantém somente os amTokens esperados.
+/// A ordem retornada pelo contrato vira a única fonte de índices para `get_dy`.
+async fn discover_pool_tokens(
+    client: Arc<AppMiddleware>,
+    pool_address: Address,
+) -> Option<Vec<(Address, u8, String)>> {
+    let abi = CurveDex::load_abi(CURVE_POOL_ABI).ok()?;
+    let pool = Contract::new(pool_address, abi, client.clone());
+    let mut multicall = Multicall::new(client, None).await.ok()?;
+    for index in 0u64..3 {
+        multicall.add_call(pool.method::<_, Address>("coins", index).ok()?, false);
+    }
+    let raw: Vec<Result<Token, _>> = multicall.call_raw().await.ok()?;
+    let mut tokens = Vec::with_capacity(3);
+    for result in raw {
+        let Ok(Token::Address(address)) = result else { return None; };
+        let (decimals, symbol) = stable_metadata_for_am_token(address)?;
+        tokens.push((address, decimals, symbol.to_string()));
+    }
+    (tokens.len() == 3).then_some(tokens)
+}
+
+fn stable_metadata_for_am_token(address: Address) -> Option<(u8, &'static str)> {
+    let address = format!("{address:#x}").to_ascii_lowercase();
+    match address.as_str() {
+        a if a == AM_DAI.to_ascii_lowercase() => Some((18, "DAI")),
+        a if a == AM_USDC.to_ascii_lowercase() => Some((6, "USDC")),
+        a if a == AM_USDT.to_ascii_lowercase() => Some((6, "USDT")),
+        _ => None,
+    }
+}
+
 /// Índice de um símbolo no pool (None → não suportado → `–` honesto).
 fn stable_pool_index(pool_tokens: &[(Address, u8, String)], symbol: &str) -> Option<usize> {
     pool_tokens
@@ -378,6 +434,13 @@ mod tests {
         assert_eq!(stable_pool_index(&pt, "USDC"), Some(1));
         assert_eq!(stable_pool_index(&pt, "USDT"), Some(2));
         assert_eq!(stable_pool_index(&pt, "dai"), Some(0)); // case-insensitive
+    }
+
+    #[test]
+    fn discovered_am_tokens_keep_symbol_and_decimals() {
+        let usdc = Address::from_str(AM_USDC).unwrap();
+        assert_eq!(stable_metadata_for_am_token(usdc), Some((6, "USDC")));
+        assert_eq!(stable_metadata_for_am_token(Address::zero()), None);
     }
 
     /// Q2: Curve é stable-only. Pares não-stable (WETH, WMATIC, WBTC, LINK…)

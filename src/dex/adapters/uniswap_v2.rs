@@ -42,8 +42,6 @@ const UNISWAP_V2_ROUTER_ABI: &str = r#"[{
     "outputs": [{"name": "", "type": "uint256[]"}],
     "stateMutability": "view"
 }]"#;
-const DEX_NAME: &str = "UniswapV2";
-
 // CORREÇÃO E0412/E0422: Movido para o escopo do arquivo.
 #[derive(Clone)]
 struct CallInfo {
@@ -57,20 +55,30 @@ struct CallInfo {
 }
 
 #[derive(Clone)]
-pub struct UniswapV2Dex {
+/// Adapter único para todos os routers Uniswap V2-compatible.
+/// QuickSwap, SushiSwap e UniswapV2 só diferem por nome/endereço no TOML.
+pub struct V2Dex {
     client: Arc<AppMiddleware>,
     router: Address,
+    dex_name: String,
     config: Arc<Config>,
     token_cache: Arc<TokenCache>,
 }
 
-impl UniswapV2Dex {
-    pub async fn new(client: Arc<AppMiddleware>, router: Address, config: Arc<Config>) -> Self {
+impl V2Dex {
+    pub async fn new(
+        client: Arc<AppMiddleware>,
+        router: Address,
+        config: Arc<Config>,
+        dex_name: impl Into<String>,
+    ) -> Self {
         let token_cache = TokenCache::global(config.clone()).await;
-        info!("✅ {}Dex inicializado com router {}", DEX_NAME, router);
+        let dex_name = dex_name.into();
+        info!("✅ {}Dex inicializado com router {}", dex_name, router);
         Self {
             client,
             router,
+            dex_name,
             config,
             token_cache,
         }
@@ -94,7 +102,7 @@ impl UniswapV2Dex {
                 self.resolve_token(token_a).await,
                 self.resolve_token(token_b).await,
             ) else {
-                warn!("⚠️ [{}] Falha ao resolver par {}/{} (endereços)", DEX_NAME, token_a, token_b);
+                warn!("⚠️ [{}] Falha ao resolver par {}/{} (endereços)", self.name(), token_a, token_b);
                 continue;
             };
 
@@ -102,7 +110,7 @@ impl UniswapV2Dex {
                 get_token_decimals(self.client.clone(), addr_a).await,
                 get_token_decimals(self.client.clone(), addr_b).await,
             ) else {
-                warn!("⚠️ [{}] Falha ao resolver par {}/{} (decimais)", DEX_NAME, token_a, token_b);
+                warn!("⚠️ [{}] Falha ao resolver par {}/{} (decimais)", self.name(), token_a, token_b);
                 continue;
             };
             
@@ -125,9 +133,9 @@ impl UniswapV2Dex {
 }
 
 #[async_trait]
-impl DexContract for UniswapV2Dex {
+impl DexContract for V2Dex {
     fn name(&self) -> String {
-        DEX_NAME.into()
+        self.dex_name.clone()
     }
 
     async fn get_pair_or_pool_address(
@@ -244,10 +252,11 @@ impl DexContract for UniswapV2Dex {
         for info in &call_data_list {
             let path = vec![info.addr_a, info.addr_b];
             let call = contract.method::<_, Vec<U256>>("getAmountsOut", (info.amount_in, path))?;
-            multicall_direct.add_call(call, true);
+            // Pool ausente/revertido não deve descartar cotações válidas do lote.
+            multicall_direct.add_call(call, false);
         }
 
-        debug!("⚡ [{}] Multicall Pass 1 (Direct) - {} chamadas", DEX_NAME, call_data_list.len());
+        debug!("⚡ [{}] Multicall Pass 1 (Direct) - {} chamadas", self.name(), call_data_list.len());
         ALCHEMY_RATE_LIMITER.acquire().await?; 
         let results_direct: Vec<Result<Token, _>> = multicall_direct.call_raw().await?;
 
@@ -270,10 +279,10 @@ impl DexContract for UniswapV2Dex {
                     }
                 }
                 Ok(other) => {
-                    debug!("- [{}] Path direto {}/{} retornou Token inesperado: {:?}", DEX_NAME, info.token_a, info.token_b, other);
+                    debug!("- [{}] Path direto {}/{} retornou Token inesperado: {:?}", self.name(), info.token_a, info.token_b, other);
                 }
                 Err(e) => {
-                     debug!("- [{}] Path direto falhou para {}/{}: {}", DEX_NAME, info.token_a, info.token_b, e.to_string());
+                     debug!("- [{}] Path direto falhou para {}/{}: {}", self.name(), info.token_a, info.token_b, e.to_string());
                 }
             }
             failed_pairs.insert(pair_id);
@@ -292,7 +301,7 @@ impl DexContract for UniswapV2Dex {
         if !failed_pairs.is_empty() {
             debug!(
                 "🔍 [{}] {} par(es) sem pool direto, fora do mapa (amostra: {:?})",
-                DEX_NAME,
+                self.name(),
                 failed_pairs.len(),
                 failed_pairs.iter().take(5).collect::<Vec<_>>()
             );
@@ -301,10 +310,30 @@ impl DexContract for UniswapV2Dex {
         Ok(prices)
     }
 
-    async fn swap(&self, _token_in: Address, _token_out: Address, amount_in: U256) -> Result<U256> {
-        warn!("💱 [{}] Swap simulado (modo leitura)", DEX_NAME);
+    async fn swap(&self, token_in: Address, token_out: Address, amount_in: U256) -> Result<U256> {
+        // Mantém contrato histórico: UniswapV2 é quote-only; Quick/Sushi podem
+        // enviar quando dry-run está desligado.
+        if self.config.execution.dry_run || self.dex_name == "UniswapV2" {
+            warn!("💱 [{}] Swap simulado (modo leitura)", self.name());
+            return Ok(amount_in);
+        }
+        let abi: Abi = serde_json::from_str(include_str!("../../../abi/uniswap_v2_router.json"))?;
+        let router = Contract::new(self.router, abi, self.client.clone());
+        let deadline = U256::from(chrono::Utc::now().timestamp().saturating_add(600) as u64);
+        let call = router.method::<_, Vec<U256>>(
+            "swapExactTokensForTokens",
+            (amount_in, U256::zero(), vec![token_in, token_out], self.client.address(), deadline),
+        )?;
+        ALCHEMY_RATE_LIMITER.acquire().await?;
+        let pending = call.send().await?;
+        if let Some(receipt) = pending.await? {
+            info!("✅ [{}] Swap confirmado: {:?}", self.name(), receipt.transaction_hash);
+        }
         Ok(amount_in)
     }
     fn client(&self) -> &Arc<AppMiddleware> { &self.client }
     fn config(&self) -> &Arc<Config> { &self.config }
 }
+
+/// Compatibilidade de API para callers que ainda importam o nome antigo.
+pub type UniswapV2Dex = V2Dex;

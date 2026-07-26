@@ -419,8 +419,7 @@ pub mod resilient_dex_system;
 // REEXPORTS
 // ================================================================
 pub use adapters::{
-    quickswap::QuickSwapDex, sushiswap::SushiSwapDex, uniswap_v2::UniswapV2Dex,
-    uniswap_v3::UniswapV3Dex,
+    uniswap_v2::{UniswapV2Dex, V2Dex}, uniswap_v3::UniswapV3Dex,
 };
 pub use error::{DexError, DexResult};
 pub use get_token_decimals::{cache_token_decimals, cached_token_decimals, get_token_decimals};

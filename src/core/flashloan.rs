@@ -1322,9 +1322,18 @@ impl ArbitrageClient {
                                 // subsequentes no mesmo bloco (contrato exige).
                                 self.update_execution_block().await;
 
+                                if let Some(gas_used) = receipt.gas_used {
+                                    self.gas_estimator
+                                        .observe_gas_used(opp.steps.0.len().max(1), gas_used)
+                                        .await;
+                                }
+
                                 let real_profit = self
                                     .extract_real_profit_from_receipt(&receipt, opp, flashloan_decimals)
                                     .unwrap_or(opp.estimated_profit_usd);
+                                metrics::inc_arbitrage_executions();
+                                metrics::inc_exec_ok();
+                                metrics::set_last_profit(real_profit);
                                 
                                 return Ok(BundleResult::new(true, real_profit, opp.gas_cost_usd)
                                     .with_execution_mode(mode)

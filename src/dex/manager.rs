@@ -16,13 +16,13 @@ use crate::{
     core::types::{ArbitrageOpportunity, FlashloanOpportunity},
     dex::{
         adapters::{
-            curve::CurveDex, quickswap::QuickSwapDex, sushiswap::SushiSwapDex,
-            uniswap_v2::UniswapV2Dex, uniswap_v3::UniswapV3Dex,
+            curve::CurveDex, uniswap_v2::V2Dex, uniswap_v3::UniswapV3Dex,
         },
         // ❌ `ArbitrageOpportunity` de `dex` (mod.rs) não é o usado para Flashloans.
         DexContract, TokenPairPrice,
     },
     // ✅ CORREÇÃO: `u256_to_f64` vem de `dex` (via `utils`)
+    infra::metrics,
     utils::utils::u256_to_f64,
     AppMiddleware,
 };
@@ -85,17 +85,11 @@ impl DexManager {
                 .with_context(|| format!("❌ Router inválido para {}", dex_cfg.name))?;
 
             let adapter: Option<Arc<dyn DexContract + Send + Sync>> = match dex_cfg.name.as_str() {
-                "UniswapV2" => Some(Arc::new(
-                    UniswapV2Dex::new(client.clone(), router_addr, config.clone()).await,
+                "UniswapV2" | "SushiSwap" | "QuickSwap" => Some(Arc::new(
+                    V2Dex::new(client.clone(), router_addr, config.clone(), dex_cfg.name.clone()).await,
                 )),
                 "UniswapV3" => Some(Arc::new(
                     UniswapV3Dex::new(client.clone(), router_addr, config.clone()).await,
-                )),
-                "SushiSwap" => Some(Arc::new(
-                    SushiSwapDex::new(client.clone(), router_addr, config.clone()).await,
-                )),
-                "QuickSwap" => Some(Arc::new(
-                    QuickSwapDex::new(client.clone(), router_addr, config.clone()).await,
                 )),
                 "Curve" => Some(Arc::new(
                     CurveDex::new(client.clone(), router_addr, config.clone()).await,
@@ -392,6 +386,9 @@ impl DexManager {
             return Ok(prices);
         }
         
+        // Métrica única no manager cobre Curve/V2/V3 e também os fallbacks.
+        let quote_started = Instant::now();
+        metrics::inc_dex_request(adapter_name);
         // ✅ Timeout para operação completa
         let multicall_result = tokio::time::timeout(
             MULTICALL_TOTAL_TIMEOUT,
@@ -401,11 +398,13 @@ impl DexManager {
         match multicall_result {
             Ok(Ok(mut adapter_prices)) => {
                 prices.append(&mut adapter_prices);
+                metrics::observe_dex_quote(adapter_name, "ok", quote_started.elapsed().as_secs_f64() * 1_000.0);
                 debug!("✅ {}: {} preços coletados", adapter_name, prices.len());
                 // ✅ Reset error count em caso de sucesso
                 self.mark_healthy(adapter_name).await;
             }
             Ok(Err(e)) => {
+                metrics::observe_dex_quote(adapter_name, "error", quote_started.elapsed().as_secs_f64() * 1_000.0);
                 warn!("❌ Erro no multicall do {}: {:?}", adapter_name, e);
                 self.record_error(adapter_name).await;
                 
@@ -413,6 +412,7 @@ impl DexManager {
                 prices = self.get_prices_fallback(adapter, &converted_pairs, adapter_name).await;
             }
             Err(_) => {
+                metrics::observe_dex_quote(adapter_name, "timeout", quote_started.elapsed().as_secs_f64() * 1_000.0);
                 warn!("⏰ Timeout no multicall do {}", adapter_name);
                 self.record_error(adapter_name).await;
                 

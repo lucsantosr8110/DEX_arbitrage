@@ -64,6 +64,8 @@ pub struct GasEstimator<M> {
     gas_cache: Arc<RwLock<HashMap<String, GasCacheEntry>>>,
     base_fee_cache: Arc<RwLock<Option<(U256, Instant)>>>,
     oracle_cache: Arc<RwLock<Option<(PolygonGasOracle, Instant)>>>,
+    /// EWMA de gas real/estimado, aprendido de receipts confirmados.
+    gas_unit_multiplier: Arc<RwLock<f64>>,
     http: Client,
 }
 
@@ -78,6 +80,7 @@ where
             gas_cache: Arc::new(RwLock::new(HashMap::new())),
             base_fee_cache: Arc::new(RwLock::new(None)),
             oracle_cache: Arc::new(RwLock::new(None)),
+            gas_unit_multiplier: Arc::new(RwLock::new(1.0)),
             http: Client::builder().timeout(Duration::from_secs(3)).build().unwrap(),
         }
     }
@@ -274,7 +277,9 @@ where
         let priority_gwei = u256_to_f64(priority_fee, 9);
         let eff = base_fee_gwei * 1.05 + priority_gwei;
 
-        let gas_units = Self::gas_units_for_hops(gas_cfg, &cfg, n_hops);
+        let baseline_units = Self::gas_units_for_hops(gas_cfg, &cfg, n_hops);
+        let multiplier = *self.gas_unit_multiplier.read().await;
+        let gas_units = baseline_units * multiplier;
 
         // Preço do POL (token de gás da Polygon) via Coingecko com cache de 2 min.
         let matic_price = crate::infra::price_feed::PRICE_FEED
@@ -319,6 +324,20 @@ where
         } else {
             gas_cfg.default_gas_limit as f64
         }
+    }
+
+    /// Aprende do receipt sem deixar uma tx atípica distorcer a estimativa.
+    pub async fn observe_gas_used(&self, n_hops: usize, actual_units: U256) {
+        let actual = actual_units.as_u64() as f64;
+        if actual <= 0.0 { return; }
+        let cfg = self.config.lock().await.clone();
+        let estimated = Self::gas_units_for_hops(&cfg.gas, &cfg, n_hops);
+        if estimated <= 0.0 { return; }
+        let mut multiplier = self.gas_unit_multiplier.write().await;
+        // EWMA 20% observação / 80% histórico, limitado para segurança.
+        *multiplier = next_gas_multiplier(*multiplier, actual, estimated);
+        crate::infra::metrics::record_gas_calibration(estimated, actual);
+        info!("⛽ [GasCalibration] hops={} estimated={:.0} actual={:.0} multiplier={:.3}", n_hops, estimated, actual, *multiplier);
     }
 
     // ============================================================
@@ -373,6 +392,14 @@ fn gwei(n: u64) -> U256 {
     U256::from(n) * U256::exp10(9)
 }
 
+fn next_gas_multiplier(previous: f64, actual_units: f64, estimated_units: f64) -> f64 {
+    if !actual_units.is_finite() || !estimated_units.is_finite() || actual_units <= 0.0 || estimated_units <= 0.0 {
+        return previous.clamp(0.8, 1.5);
+    }
+    let ratio = (actual_units / estimated_units).clamp(0.5, 2.0);
+    (previous * 0.8 + ratio * 0.2).clamp(0.8, 1.5)
+}
+
 /// Gwei fracionário → wei, sem truncar a parte decimal.
 ///
 /// `gwei(x as u64)` descartava a fração: um oracle devolvendo 30.7 gwei virava
@@ -421,6 +448,7 @@ impl<M> Clone for GasEstimator<M> {
             gas_cache: self.gas_cache.clone(),
             base_fee_cache: self.base_fee_cache.clone(),
             oracle_cache: self.oracle_cache.clone(),
+            gas_unit_multiplier: self.gas_unit_multiplier.clone(),
             http: self.http.clone(),
         }
     }
@@ -474,5 +502,12 @@ mod tests {
         // 0 hops (degen) não divide por zero — clamp em 1.
         let u0 = GasEstimator::<ethers::providers::Provider<ethers::providers::Http>>::gas_units_for_hops(&gas_cfg, &cfg, 0);
         assert!(u0.is_finite() && u0 > 0.0);
+    }
+
+    #[test]
+    fn calibration_ewma_tracks_receipt_without_outlier_jump() {
+        assert!((next_gas_multiplier(1.0, 120.0, 100.0) - 1.04).abs() < 1e-9);
+        // 10x receipt é clampado, não eleva multiplicador direto para 10x.
+        assert!(next_gas_multiplier(1.0, 1_000.0, 100.0) <= 1.200_001);
     }
 }

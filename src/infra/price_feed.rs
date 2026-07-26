@@ -32,6 +32,8 @@ struct CachedEntry {
     /// True se veio do fallback heurístico (Coingecko falhou). Fallback usa TTL
     /// curto p/ não prender o bot em preço stale após recover. (Audit A14)
     is_fallback: bool,
+    /// TTL individual evita que todos os símbolos/instâncias expirem juntos.
+    ttl: Duration,
 }
 
 #[derive(Clone)]
@@ -110,6 +112,7 @@ impl CachedPriceFeed {
                             price_usd: price,
                             timestamp: Instant::now(),
                             is_fallback: false,
+                            ttl: Self::ttl_with_jitter(self.ttl, &key),
                         },
                     );
                 }
@@ -132,6 +135,7 @@ impl CachedPriceFeed {
                             price_usd: price,
                             timestamp: Instant::now(),
                             is_fallback: true,
+                            ttl: Self::ttl_with_jitter(self.fallback_ttl, &key),
                         },
                     );
                 }
@@ -145,17 +149,26 @@ impl CachedPriceFeed {
     fn read_fresh_cache(&self, key: &str) -> Option<f64> {
         let cache = CACHE.read().unwrap();
         let entry = cache.get(key)?;
-        let ttl = if entry.is_fallback {
-            self.fallback_ttl
-        } else {
-            self.ttl
-        };
-        if entry.timestamp.elapsed() < ttl {
+        if entry.timestamp.elapsed() < entry.ttl {
             debug!(target: "price_feed", key, price_usd = entry.price_usd, fallback = entry.is_fallback, "💾 Cache HIT");
             Some(entry.price_usd)
         } else {
             None
         }
+    }
+
+    /// Jitter de ±12.5%, derivado de chave + relógio de inserção. Evita burst
+    /// de refresh quando muitos caches expiram na mesma janela (I5).
+    fn ttl_with_jitter(base: Duration, key: &str) -> Duration {
+        let base_secs = base.as_secs().max(1);
+        let spread = (base_secs / 8).max(1);
+        let clock = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64)
+            .unwrap_or(0);
+        let hash = key.bytes().fold(clock, |acc, byte| acc.wrapping_mul(31).wrapping_add(byte as u64));
+        let offset = hash % (spread * 2 + 1);
+        Duration::from_secs(base_secs + offset - spread)
     }
 
     /// 🔹 Consulta simples à API pública do Coingecko
@@ -229,6 +242,7 @@ impl CachedPriceFeed {
 #[cfg(test)]
 mod tests {
     use super::CachedPriceFeed;
+    use std::time::Duration;
 
     /// O token de gás da Polygon é POL. `matic-network` é a página legada do
     /// MATIC, congelada em 2025-10-17 (mcap 0, volume ~$0.15) — ainda responde
@@ -259,5 +273,12 @@ mod tests {
         for sym in ["USDC", "USDT", "DAI"] {
             assert_eq!(CachedPriceFeed::fallback_price(sym), 1.0);
         }
+    }
+
+    #[test]
+    fn cache_ttl_jitter_stays_within_expected_band() {
+        let base = Duration::from_secs(120);
+        let ttl = CachedPriceFeed::ttl_with_jitter(base, "usdc");
+        assert!((105..=135).contains(&ttl.as_secs()), "ttl={ttl:?}");
     }
 }
