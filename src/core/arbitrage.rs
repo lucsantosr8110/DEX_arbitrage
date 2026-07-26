@@ -329,9 +329,9 @@ impl ArbitrageEngine {
     }
 
     /// 🔧 CORREÇÃO 5: Cálculo de taxa total COM VALIDAÇÃO POR STEP
-    fn calculate_total_rate_corrected(steps: &[ArbitrageStep]) -> Result<f64, String> {
+    fn calculate_total_rate_corrected(steps: &[ArbitrageStep]) -> Result<f64> {
         if steps.is_empty() {
-            return Err("Steps vazios".to_string());
+            bail!("Steps vazios");
         }
 
         let mut total_rate = 1.0;
@@ -340,18 +340,18 @@ impl ArbitrageEngine {
         for (i, step) in steps.iter().enumerate() {
             // Validar taxa individual
             if !step.expected_rate.is_finite() || step.expected_rate <= 0.0 {
-                return Err(format!(
+                bail!(
                     "Taxa inválida no step {}: {} ({}→{})",
                     i, step.expected_rate, step.token_in, step.token_out
-                ));
+                );
             }
 
             // Validar se a taxa faz sentido para o par
             if !Self::is_realistic_price(step.expected_rate, &step.token_in, &step.token_out) {
-                return Err(format!(
+                bail!(
                     "Preço irreal no step {}: {} {}→{} = {:.8}",
                     i, step.dex_name, step.token_in, step.token_out, step.expected_rate
-                ));
+                );
             }
 
             total_rate *= step.expected_rate;
@@ -363,20 +363,20 @@ impl ArbitrageEngine {
 
             // Validar que não explodiu
             if !total_rate.is_finite() {
-                return Err(format!(
+                bail!(
                     "Taxa acumulada infinita após step {}: {} | Steps: {:?}",
                     i, total_rate, debug_info
-                ));
+                );
             }
         }
 
         // VALIDAÇÃO FINAL: taxa total típica de arb não deve explodir
         // Mantém tolerância, mas bloqueia ilusões de "multiplica e fica gigante"
         if total_rate < 0.90 || total_rate > 1.50 {
-            return Err(format!(
+            bail!(
                 "Taxa total suspeita: {:.8} (esperado 0.90-1.50) | Route: {:?}",
                 total_rate, debug_info
-            ));
+            );
         }
 
         debug!("✅ Taxa total validada: {:.8} | Route: {:?}", total_rate, debug_info);
@@ -496,7 +496,14 @@ impl ArbitrageEngine {
             .arbitrage
             .min_spread_percent
             .parse::<f64>()
-            .unwrap_or(0.008);
+            .unwrap_or_else(|_| {
+                warn!(
+                    target: "arbitrage",
+                    "min_spread_percent='{}' inválido no config, usando fallback 0.008%",
+                    app_config.arbitrage.min_spread_percent
+                );
+                0.008
+            });
 
         let min_profit_usd = app_config.arbitrage.min_profit_threshold_usd.unwrap_or(0.0015);
 
@@ -888,13 +895,11 @@ impl ArbitrageEngine {
         let amount_in = Self::usd_to_token_amount(trade_amount_usd, 1.0, start_decimals);
 
         // CORREÇÃO: Calcular taxa total com validação rigorosa
-        let total_rate = match Self::calculate_total_rate_corrected(&opp.steps.0) {
-            Ok(rate) => rate,
-            Err(e) => {
+        let total_rate = Self::calculate_total_rate_corrected(&opp.steps.0)
+            .map_err(|e| {
                 debug!("❌ Oportunidade rejeitada: {}", e);
-                return Err(anyhow!("Cálculo de taxa falhou: {}", e));
-            }
-        };
+                anyhow!("Cálculo de taxa falhou: {}", e)
+            })?;
 
         // 🔍 DEBUG DELTA ENTRE STEPS
         self.log_route_delta(&opp.steps.0, total_rate, &opp.id);
@@ -1082,7 +1087,10 @@ impl ArbitrageEngine {
             let adjusted_slippage_bps = proposed_slippage_bps
                 .min(max_here)
                 .max(economics::MIN_SLIPPAGE_BPS);
-            // Campo legado passa a carregar orçamento real para executor validar.
+            // Campo `price_impact_bps` é reutilizado para carregar o orçamento de
+            // slippage real (adjusted_slippage_bps) que o executor deve respeitar.
+            // NOTA: o nome é legado — não representa price impact real (que já vem
+            // embutido no quote fee-inclusive), e sim o slippage allowance por hop.
             step.price_impact_bps = Some(adjusted_slippage_bps);
             used_slippage_bps = used_slippage_bps.saturating_add(adjusted_slippage_bps);
 
@@ -1275,37 +1283,6 @@ impl ArbitrageEngine {
             force_flashloan: false,
             token_price_usd: None,
         })
-    }
-
-    async fn find_triangular_with_usdt(
-        &self,
-        prices: &HashMap<String, HashMap<String, f64>>,
-        app_config: &Config,
-    ) -> Vec<ArbitrageOpportunity> {
-        let mut opportunities = Vec::new();
-        let graph = Self::build_price_graph(prices);
-
-        let min_spread = app_config
-            .arbitrage
-            .min_spread_percent
-            .parse::<f64>()
-            .unwrap_or(0.008);
-
-        for token_a in graph.keys().filter(|t| *t != TARGET_BASE_TOKEN) {
-            for token_b in graph
-                .keys()
-                .filter(|t| *t != TARGET_BASE_TOKEN && *t != token_a)
-            {
-                if let Some(opp) =
-                    self.find_usdt_triangular(token_a, token_b, &graph, min_spread, app_config)
-                        .await
-                {
-                    opportunities.push(opp);
-                }
-            }
-        }
-
-        opportunities
     }
 
     /// Triangular **cross-DEX**: `stable → midcap → anchor → stable`, melhor edge
@@ -1824,87 +1801,6 @@ impl ArbitrageEngine {
         graph
     }
 
-    async fn find_usdt_triangular(
-        &self,
-        token_a: &str,
-        token_b: &str,
-        graph: &HashMap<String, HashMap<String, (f64, String)>>,
-        min_spread_pct: f64,
-        app_config: &Config,
-    ) -> Option<ArbitrageOpportunity> {
-        // Espera-se que graph contenha as três arestas: USDT->A, A->B, B->USDT
-        let usdt_to_a = graph.get(TARGET_BASE_TOKEN)?.get(token_a)?;
-        let a_to_b = graph.get(token_a)?.get(token_b)?;
-        let b_to_usdt = graph.get(token_b)?.get(TARGET_BASE_TOKEN)?;
-
-        // Semântica do graph: cada rate = token_out per token_in
-        let rate_usdt_to_a = usdt_to_a.0; // quantos A por 1 USDT
-        let rate_a_to_b = a_to_b.0; // quantos B por 1 A
-        let rate_b_to_usdt = b_to_usdt.0; // quantos USDT por 1 B
-
-        // Guardrails por step
-        if !Self::is_realistic_price(rate_usdt_to_a, TARGET_BASE_TOKEN, token_a)
-            || !Self::is_realistic_price(rate_a_to_b, token_a, token_b)
-            || !Self::is_realistic_price(rate_b_to_usdt, token_b, TARGET_BASE_TOKEN)
-        {
-            return None;
-        }
-
-        let final_rate = rate_usdt_to_a * rate_a_to_b * rate_b_to_usdt;
-        let spread = (final_rate - 1.0) * 100.0;
-
-        if spread > MAX_REALISTIC_SPREAD {
-            debug!("Spread triangular irreal rejeitado: {:.2}%", spread);
-            return None;
-        }
-
-        if spread < min_spread_pct {
-            return None;
-        }
-
-        let steps = vec![
-            Self::create_step(&usdt_to_a.1, TARGET_BASE_TOKEN, token_a, rate_usdt_to_a),
-            Self::create_step(&a_to_b.1, token_a, token_b, rate_a_to_b),
-            Self::create_step(&b_to_usdt.1, token_b, TARGET_BASE_TOKEN, rate_b_to_usdt),
-        ];
-
-        let path: Vec<String> = vec![
-            TARGET_BASE_TOKEN.to_string(),
-            token_a.to_string(),
-            token_b.to_string(),
-            TARGET_BASE_TOKEN.to_string(),
-        ];
-
-        let steps_sanitized = Self::sanitize_steps_for_execution(&steps);
-        let opportunity_id = next_opp_id("usdt_tri");
-
-        let trade_amount_usd = self.calculate_safe_trade_amount(app_config);
-
-        Some(ArbitrageOpportunity {
-            id: opportunity_id,
-            pair: format!("USDT->{}->{}", token_a, token_b),
-            buy_dex: format!("{}/{}", usdt_to_a.1, a_to_b.1),
-            sell_dex: b_to_usdt.1.clone(),
-            buy_price: usdt_to_a.0,
-            sell_price: b_to_usdt.0,
-            spread_percent: spread,
-            amount_in: U256::zero(),
-            amount_out: U256::zero(),
-            estimated_profit_usd: trade_amount_usd * (final_rate - 1.0),
-            gas_cost_usd: 0.0,
-            net_profit_usd: 0.0,
-            steps: SerializableSteps(steps_sanitized),
-            path,
-            timestamp: Utc::now().timestamp() as u64,
-            confidence: Self::calculate_confidence(spread, 3),
-            estimated_volume_usd: trade_amount_usd,
-            profit_percent: 0.0,
-            execution_risk: 0.0,
-            force_flashloan: false,
-            token_price_usd: Some(1.0),
-        })
-    }
-
     // ------------------------------------------------------------
     // ⚙️ Utilitários
     // ------------------------------------------------------------
@@ -2017,8 +1913,10 @@ impl ArbitrageEngine {
 
         if final_amount.is_zero() {
             U256::one()
-        } else if final_amount >= amount {
-            // fallback conservador: 95% do input
+        } else if final_amount > amount {
+            // final_amount > amount só acontece se slippage_bps=0 e safety_margin_bps=10000
+            // (numer = amount * 10000 * 10000, denom = 10000 * 10000 → final = amount).
+            // Se por overflow/edge case final > amount, fallback conservador: 95% do input.
             amount.saturating_mul(U256::from(95u64)) / U256::from(100u64)
         } else {
             final_amount
@@ -2083,12 +1981,6 @@ impl ArbitrageEngine {
         .await
     }
 
-    /// Custo de gás do gate do finder.
-    ///
-    /// Prefere a medição viva publicada pelo `GasEstimator` (oracle/RPC + preço
-    /// do POL). `execution.estimate_base_gas_usd` só vale como fallback até a
-    /// primeira medição — antes, este era um segundo modelo permanente, que
-    /// divergia do executor e do risk manager.
     /// Custo de gás do gate do finder.
     ///
     /// Prefere a medição viva publicada pelo `GasEstimator` (oracle/RPC + preço
