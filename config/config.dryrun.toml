@@ -205,11 +205,13 @@ chain_id = 137
 rpc_url = "${ALCHEMY_RPC_URL}"
 rpc_endpoints = [
     "${ALCHEMY_RPC_URL}",
+    "${INFURA_RPC_URL}",
     "https://polygon-bor-rpc.publicnode.com",
     "https://1rpc.io/matic",
 ]
 ws_endpoints = [
-    "${ALCHEMY_WSS_URL}",
+    "${ALCHEMY_WS_URL}",
+    "${INFURA_WS_URL}",
     "wss://polygon-bor-rpc.publicnode.com",
     "wss://polygon.drpc.org",
 ]
