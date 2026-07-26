@@ -109,6 +109,12 @@ contract FlashloanExecutor is ReentrancyGuard, IFlashLoanSimpleReceiver {
         bool   enabled;
     }
 
+    struct CallbackData {
+        address executor;
+        SwapStep[] steps;
+        uint256 minProfit;
+    }
+
     // =============================================================
     // CONSTANTS - Polygon Mainnet
     // =============================================================
@@ -213,7 +219,12 @@ contract FlashloanExecutor is ReentrancyGuard, IFlashLoanSimpleReceiver {
     // =============================================================
     // MAIN EXECUTION
     // =============================================================
-    function executeFlashloan(address asset, uint256 amount, SwapStep[] calldata steps)
+    function executeFlashloan(
+        address asset,
+        uint256 amount,
+        SwapStep[] calldata steps,
+        uint256 minProfit
+    )
         external
         onlyExecutor
         nonReentrant
@@ -226,7 +237,7 @@ contract FlashloanExecutor is ReentrancyGuard, IFlashLoanSimpleReceiver {
         require(amount >= _minAmount(asset), "Amount too low");
         _validateSteps(steps, asset);
 
-        bytes memory params = abi.encode(msg.sender, steps);
+        bytes memory params = abi.encode(msg.sender, steps, minProfit);
 
         try IAavePool(AAVE_POOL).flashLoanSimple(address(this), asset, amount, params, 0) {
             return true;
@@ -241,7 +252,8 @@ contract FlashloanExecutor is ReentrancyGuard, IFlashLoanSimpleReceiver {
     function executeDirect(
         address asset,
         uint256 amount,
-        SwapStep[] calldata steps
+        SwapStep[] calldata steps,
+        uint256 minProfit
     )
         external
         payable
@@ -292,7 +304,7 @@ contract FlashloanExecutor is ReentrancyGuard, IFlashLoanSimpleReceiver {
             // Calcula o delta gerado (capital + lucro) somente deste ciclo
             uint256 wmaticAfter = IERC20(TOKEN_WMATIC).balanceOf(address(this));
             uint256 delta = wmaticAfter - wmaticBefore; // deve ser >= amount
-            require(delta >= amount, "Cycle did not return capital");
+            require(delta >= amount + minProfit, "Profit below minimum");
 
             profit = delta - amount;
             if (profit > 0) totalProfit += profit;
@@ -307,7 +319,7 @@ contract FlashloanExecutor is ReentrancyGuard, IFlashLoanSimpleReceiver {
         } else {
             // ERC20: devolve capital + lucro
             // AUDIT fix #1: reverter em perda — paridade com o caminho nativo (delta >= amount).
-            require(finalAmount >= amount, "Cycle did not return capital");
+            require(finalAmount >= amount + minProfit, "Profit below minimum");
             if (finalAmount > amount) {
                 profit = finalAmount - amount;
                 totalProfit += profit;
@@ -339,11 +351,11 @@ contract FlashloanExecutor is ReentrancyGuard, IFlashLoanSimpleReceiver {
             initiator == address(this);
         require(isValidInitiator, "Invalid initiator");
 
-        (address executorAddr, SwapStep[] memory steps) = abi.decode(params, (address, SwapStep[]));
+        CallbackData memory data = abi.decode(params, (CallbackData));
 
         // AUDIT fix #2: validar steps vindos via callback (FlashloanCaller passa params cru).
         // Defesa em profundidade — alinha com executeFlashloan/executeDirect.
-        _validateStepsMemory(steps, asset);
+        _validateStepsMemory(data.steps, asset);
 
         totalFlashloans++;
         totalPremiumPaid += premium;
@@ -359,17 +371,17 @@ contract FlashloanExecutor is ReentrancyGuard, IFlashLoanSimpleReceiver {
         //
         // A simulação Rust (simulate_bool_transaction / simulate_transaction via
         // eth_call) agora detecta reverts corretamente — falso positivo eliminado.
-        uint256 finalAmount = this._executeArbitrage(asset, amount, steps);
-        require(finalAmount >= totalOwed, "Not profitable");
+        uint256 finalAmount = this._executeArbitrage(asset, amount, data.steps);
+        require(finalAmount >= totalOwed + data.minProfit, "Profit below minimum");
 
         _approveTo(AAVE_POOL, asset, totalOwed);
 
         uint256 profit = finalAmount - totalOwed;
         if (profit > 0) {
             totalProfit += profit;
-            IERC20(asset).safeTransfer(executorAddr, profit);
+            IERC20(asset).safeTransfer(data.executor, profit);
         }
-        emit FlashLoanSuccess(asset, amount, premium, profit, executorAddr);
+        emit FlashLoanSuccess(asset, amount, premium, profit, data.executor);
 
         emit MetricsUpdated(totalFlashloans, totalProfit, totalPremiumPaid, failedFlashloans);
         return true;
@@ -391,9 +403,10 @@ contract FlashloanExecutor is ReentrancyGuard, IFlashLoanSimpleReceiver {
             SwapStep memory step = steps[i];
             require(currentToken == step.tokenIn, "Token mismatch");
 
-            uint256 minReturn = _calculateMinReturn(step.tokenOut, step.amountOutMin);
-            uint256 received = _executeSingleSwap(step, currentAmount, minReturn);
-            require(received >= minReturn, "Insufficient output");
+            // Rust calcula amountOutMin uma única vez a partir do quote. Aplicar
+            // slippage do contrato aqui criava segundo haircut e abria margem MEV.
+            uint256 received = _executeSingleSwap(step, currentAmount, step.amountOutMin);
+            require(received >= step.amountOutMin, "Insufficient output");
 
             emit SwapExecuted(i, step.dexType, step.tokenIn, step.tokenOut, currentAmount, received);
 
@@ -481,15 +494,6 @@ contract FlashloanExecutor is ReentrancyGuard, IFlashLoanSimpleReceiver {
         } catch {
             return 1_000_000;
         }
-    }
-
-    function _calculateMinReturn(address token, uint256 expected) internal view returns (uint256) {
-        SlippageConfig memory cfg = slippageConfigs[token];
-        if (!cfg.enabled || cfg.baseSlippage == 0) return expected;
-
-        uint16 eff = cfg.baseSlippage > cfg.maxSlippage ? cfg.maxSlippage : cfg.baseSlippage;
-        uint256 slip = expected.mulDiv(eff, 10_000);
-        return expected - slip;
     }
 
     // USDT-safe: zero antes de aprovar quando necessário

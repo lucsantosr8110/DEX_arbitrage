@@ -184,13 +184,19 @@ impl DexContract for CurveDex {
         let decimals_a = self.pool_tokens[idx_a].1;
         let decimals_b = self.pool_tokens[idx_b].1;
 
-        let amount_in = quote_amount_for_usd(
+        let amount_in = match quote_amount_for_usd(
             sym_a.as_deref().unwrap_or("USDC"),
             decimals_a,
             self.quote_notional_usd(),
         )
         .await
-        .unwrap_or(U256::from(10u64.pow(decimals_a as u32)));
+        {
+            Ok(amount) => amount,
+            Err(e) => {
+                debug!("[{}] notional indisponível: {}", DEX_NAME, e);
+                return Ok(None);
+            }
+        };
 
         ALCHEMY_RATE_LIMITER.acquire().await?;
 
@@ -240,9 +246,13 @@ impl DexContract for CurveDex {
             let decimals_a = self.pool_tokens[idx_a].1;
             let decimals_b = self.pool_tokens[idx_b].1;
 
-            let amount_in = quote_amount_for_usd(token_a, decimals_a, self.quote_notional_usd())
-                .await
-                .unwrap_or(U256::from(10u64.pow(decimals_a as u32)));
+            let amount_in = match quote_amount_for_usd(token_a, decimals_a, self.quote_notional_usd()).await {
+                Ok(amount) => amount,
+                Err(e) => {
+                    debug!("[{}] pulando {}-{}: notional indisponível: {}", DEX_NAME, token_a, token_b, e);
+                    continue;
+                }
+            };
 
             calls.push(CurveQuoteCall {
                 token_a: token_a.clone(), token_b: token_b.clone(), idx_a, idx_b,

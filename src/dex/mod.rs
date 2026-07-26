@@ -370,24 +370,18 @@ pub async fn quote_amount_for_usd(symbol: &str, decimals: u8, usd_notional: f64)
 
     if !price_usd.is_finite() || price_usd <= 0.0 || !usd_notional.is_finite() || usd_notional <= 0.0
     {
-        // Sem referência utilizável, cai no comportamento antigo (1 unidade). É um
-        // tamanho ruim, mas conhecido — melhor que uma quantidade arbitrária.
-        warn!(
-            "[quote_size] sem preço de referência para {} (usd={}), usando 1 unidade",
-            symbol, price_usd
-        );
-        return Ok(U256::exp10(decimals as usize));
+        return Err(anyhow!(
+            "[quote_size] sem preço de referência utilizável para {symbol} (usd={price_usd})"
+        ));
     }
 
     let units = usd_notional / price_usd;
     let raw = units * 10f64.powi(decimals as i32);
 
     if !raw.is_finite() || raw < 1.0 || raw >= u128::MAX as f64 {
-        warn!(
-            "[quote_size] notional ${:.2} em {} gerou quantidade fora de faixa ({:.3e}), usando 1 unidade",
-            usd_notional, symbol, raw
-        );
-        return Ok(U256::exp10(decimals as usize));
+        return Err(anyhow!(
+            "[quote_size] notional ${usd_notional:.2} em {symbol} gerou quantidade fora de faixa ({raw:.3e})"
+        ));
     }
 
     Ok(U256::from(raw as u128))

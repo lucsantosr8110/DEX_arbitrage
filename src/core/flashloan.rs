@@ -14,6 +14,7 @@ use crate::{
         types::{ArbitrageOpportunity, BundleResult},
     },
     infra::metrics,
+    utils::f64_to_u256,
     AppMiddleware,
 };
 
@@ -792,14 +793,14 @@ impl ArbitrageClient {
 
         let call = self
             .executor
-            .execute_flashloan(asset, amount, steps.clone())
+            .execute_flashloan(asset, amount, steps.clone(), U256::zero())
             .from(paper_from)
             .block(block_id);
 
         let (sim_ok, revert_reason) = match timeout(Duration::from_secs(15), call.call()).await {
             Ok(Ok(true)) => (true, None),
             Ok(Ok(false)) => {
-                let params = self.encode_flashloan_callback_params(paper_from, &steps);
+                let params = self.encode_flashloan_callback_params(paper_from, &steps, U256::zero());
                 let state_ovr = if use_overrides {
                     Some(paper_validation::erc20_balance_state_override(
                         asset,
@@ -880,17 +881,36 @@ impl ArbitrageClient {
         ))
     }
 
-    /// `abi.encode(initiator, steps)` — idêntico ao FlashloanExecutor.executeFlashloan.
+    /// `abi.encode(initiator, steps, minProfit)` — callback do executor.
     fn encode_flashloan_callback_params(
         &self,
         initiator: Address,
         steps: &[AbiSwapStep],
+        min_profit: U256,
     ) -> Bytes {
         use ethers::abi::Tokenizable;
         Bytes::from(ethers::abi::encode(&[
             initiator.into_token(),
             steps.to_vec().into_token(),
+            min_profit.into_token(),
         ]))
+    }
+
+    /// Piso on-chain em unidades do ativo de entrada. O contrato só libera a
+    /// transação se o lucro, depois do prêmio Aave, também cobrir o gás atual
+    /// e o lucro absoluto configurado.
+    fn minimum_profit_raw(&self, opp: &ArbitrageOpportunity, decimals: u32, cfg: &Config) -> U256 {
+        let configured = cfg
+            .arbitrage
+            .min_profit_absolute
+            .parse::<f64>()
+            .unwrap_or(0.0)
+            .max(0.0);
+        let required = (opp.gas_cost_usd + configured).max(0.0);
+        // f64_to_u256 trunca; arredonda um raw unit para cima para o piso nunca
+        // ficar abaixo do custo calculado.
+        let raw = f64_to_u256(required, decimals);
+        if required > 0.0 { raw.saturating_add(U256::one()) } else { raw }
     }
 
     // ========================================================================
@@ -971,13 +991,9 @@ impl ArbitrageClient {
             return Ok(BundleResult::skipped().with_execution_mode("same_block"));
         }
 
-        let (dry, simulate, asset, amount, steps, flashloan_decimals) = {
+        let (dry, simulate, asset, amount, steps, flashloan_decimals, min_profit_raw) = {
             let cfg = self.config.lock().await;
             let (asset, amount, steps) = self.extract_and_convert_opp_data(opp, &cfg, slippage_bps)?;
-
-            if asset != self.get_wallet_address()? {
-                return Err(anyhow!("Direct execution requires owned token"));
-            }
 
             if let Err(e) = self.apply_complexity_filters(&steps, &cfg) {
                 warn!("{}", e);
@@ -993,18 +1009,19 @@ impl ArbitrageClient {
                 amount,
                 steps,
                 cfg.flashloan.flashloan_decimals.unwrap_or(6) as u32,
+                self.minimum_profit_raw(opp, cfg.flashloan.flashloan_decimals.unwrap_or(6) as u32, &cfg),
             )
         };
 
         // APPROVE
-        if !dry && !simulate {
+        if !dry {
             if let Err(e) = self.approve_token_for_execution(asset, self.executor.address(), amount).await {
                 warn!("❌ Approve falhou: {}", e);
                 return Ok(BundleResult::skipped().with_execution_mode("approve_failed"));
             }
         }
 
-        let direct = self.executor.execute_arbitrage(asset, amount, steps.clone());
+        let direct = self.executor.execute_direct(asset, amount, steps.clone(), min_profit_raw);
 
         if simulate {
             info!("🔬 Simulando Direct Arbitrage...");
@@ -1038,7 +1055,7 @@ impl ArbitrageClient {
             return Ok(BundleResult::skipped().with_execution_mode("same_block"));
         }
 
-        let (dry, simulate, asset, amount, steps, flashloan_decimals) = {
+        let (dry, simulate, asset, amount, steps, flashloan_decimals, min_profit_raw) = {
             let cfg = self.config.lock().await;
             let (asset, amount, steps) = self.extract_and_convert_opp_data(opp, &cfg, slippage_bps)?;
 
@@ -1055,10 +1072,11 @@ impl ArbitrageClient {
                 amount,
                 steps,
                 cfg.flashloan.flashloan_decimals.unwrap_or(6) as u32,
+                self.minimum_profit_raw(opp, cfg.flashloan.flashloan_decimals.unwrap_or(6) as u32, &cfg),
             )
         };
 
-        let call = self.executor.execute_flashloan(asset, amount, steps);
+        let call = self.executor.execute_flashloan(asset, amount, steps, min_profit_raw);
 
         if simulate {
             info!("🔬 Simulando Flashloan...");
@@ -1092,7 +1110,7 @@ impl ArbitrageClient {
             return Ok(BundleResult::skipped().with_execution_mode("same_block"));
         }
 
-        let (dry, simulate, wrapper_addr, asset, amount, steps, flashloan_decimals) = {
+        let (dry, simulate, wrapper_addr, asset, amount, steps, flashloan_decimals, min_profit_raw) = {
             let cfg = self.config.lock().await;
 
             let wrapper_addr = Address::from_str(&cfg.wrapper.address)?;
@@ -1117,6 +1135,7 @@ impl ArbitrageClient {
                 amount,
                 steps,
                 cfg.flashloan.flashloan_decimals.unwrap_or(6) as u32,
+                self.minimum_profit_raw(opp, cfg.flashloan.flashloan_decimals.unwrap_or(6) as u32, &cfg),
             )
         };
 
@@ -1125,7 +1144,7 @@ impl ArbitrageClient {
             steps.iter().map(|x| x.clone().into_token()).collect()
         );
 
-        let params = Bytes::from(encode(&[executor_token, steps_token]));
+        let params = Bytes::from(encode(&[executor_token, steps_token, Token::Uint(min_profit_raw)]));
 
         let contract = FlashloanCaller::new(wrapper_addr, self.middleware.clone());
         let call = contract.trigger_flashloan(asset, amount, params);

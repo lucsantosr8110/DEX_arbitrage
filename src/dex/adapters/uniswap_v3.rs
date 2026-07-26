@@ -327,28 +327,22 @@ impl UniswapV3Dex {
             .map(|i| i.symbol)
             .unwrap_or_default();
         let notional = self.quote_notional_usd();
-        let fallback_amt = U256::exp10(dec_a as usize);
+        if symbol_a.is_empty() {
+            debug!("[{}] impacto: symbol não resolvido p/ {:?}", DEX_NAME, token_a);
+            return Ok(None);
+        }
         // ~10%, 100%, 200% do notional configurado (default $100 → $10/$100/$200).
-        let a_small = if symbol_a.is_empty() {
-            fallback_amt
-        } else {
-            quote_amount_for_usd(&symbol_a, dec_a, notional * 0.1)
-                .await
-                .unwrap_or(fallback_amt)
+        let a_small = match quote_amount_for_usd(&symbol_a, dec_a, notional * 0.1).await {
+            Ok(amount) => amount,
+            Err(e) => { debug!("[{}] impacto sem notional: {}", DEX_NAME, e); return Ok(None); }
         };
-        let a_mid = if symbol_a.is_empty() {
-            fallback_amt
-        } else {
-            quote_amount_for_usd(&symbol_a, dec_a, notional)
-                .await
-                .unwrap_or(fallback_amt)
+        let a_mid = match quote_amount_for_usd(&symbol_a, dec_a, notional).await {
+            Ok(amount) => amount,
+            Err(e) => { debug!("[{}] impacto sem notional: {}", DEX_NAME, e); return Ok(None); }
         };
-        let a_big = if symbol_a.is_empty() {
-            fallback_amt
-        } else {
-            quote_amount_for_usd(&symbol_a, dec_a, notional * 2.0)
-                .await
-                .unwrap_or(fallback_amt)
+        let a_big = match quote_amount_for_usd(&symbol_a, dec_a, notional * 2.0).await {
+            Ok(amount) => amount,
+            Err(e) => { debug!("[{}] impacto sem notional: {}", DEX_NAME, e); return Ok(None); }
         };
         let amounts_to_test: [U256; 3] = [a_small, a_mid, a_big];
 
@@ -496,12 +490,16 @@ impl DexContract for UniswapV3Dex {
             .await
             .map(|i| i.symbol)
             .unwrap_or_default();
-        let amount_in_test = if symbol_a_test.is_empty() {
-            U256::exp10(dec_a as usize)
-        } else {
-            quote_amount_for_usd(&symbol_a_test, dec_a, self.quote_notional_usd())
-                .await
-                .unwrap_or_else(|_| U256::exp10(dec_a as usize))
+        if symbol_a_test.is_empty() {
+            debug!("[{}] symbol não resolvido p/ {:?}", DEX_NAME, token_a);
+            return Ok(None);
+        }
+        let amount_in_test = match quote_amount_for_usd(&symbol_a_test, dec_a, self.quote_notional_usd()).await {
+            Ok(amount) => amount,
+            Err(e) => {
+                debug!("[{}] notional indisponível: {}", DEX_NAME, e);
+                return Ok(None);
+            }
         };
         let mut quotes: Vec<(u32, U256)> = Vec::with_capacity(FEE_TIERS.len());
 
