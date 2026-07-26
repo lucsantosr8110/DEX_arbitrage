@@ -273,21 +273,34 @@ impl ArbitrageEngine {
             return false;
         }
 
-        let is_stable = |t: &str| matches!(t, "USDT" | "USDC" | "DAI");
+        // M14: símbolos fora do universo catalogado não têm faixa de preço
+        // confiável. Rejeitar por padrão evita que quote absurdo passe pelo
+        // fallback amplo; novos ativos devem entrar em pairs.metadata.
+        const KNOWN_TOKENS: &[&str] = &[
+            "USDT", "USDC", "USDC.E", "DAI", "WETH", "WMATIC", "WPOL", "WBTC",
+            "LINK", "UNI", "LDO", "CRV", "AAVE", "SUSHI", "GRT", "GHST", "SAND",
+        ];
+        let token_in = token_in.to_ascii_uppercase();
+        let token_out = token_out.to_ascii_uppercase();
+        if !KNOWN_TOKENS.contains(&token_in.as_str()) || !KNOWN_TOKENS.contains(&token_out.as_str()) {
+            return false;
+        }
 
-        match (is_stable(token_in), is_stable(token_out)) {
+        let is_stable = |t: &str| matches!(t, "USDT" | "USDC" | "USDC.E" | "DAI");
+
+        match (is_stable(&token_in), is_stable(&token_out)) {
             // Ambos stablecoins: ~1.0
             (true, true) => price >= 0.80 && price <= 1.20,
 
             // stable -> non-stable: "how many tokens per 1 stable"
-            (true, false) => match token_out {
+            (true, false) => match token_out.as_str() {
                 "WETH" => price >= 0.00005 && price <= 0.002,   // ~0.00034 WETH/USDT
                 "WMATIC" => price >= 1.0 && price <= 50.0,       // ~7.14 WMATIC/USDT
-                _ => price >= 0.0000001 && price <= 10_000_000.0, // fallback amplo
+                _ => price >= 0.0000001 && price <= 10_000_000.0,
             },
 
             // non-stable -> stable: "how many stables per 1 token"
-            (false, true) => match token_in {
+            (false, true) => match token_in.as_str() {
                 "WETH" => price >= 500.0 && price <= 15_000.0,    // ~2900 USDT/WETH
                 "WMATIC" => price >= 0.01 && price <= 2.0,        // ~0.14 USDT/WMATIC
                 "LINK" => price >= 1.0 && price <= 100.0,         // ~$5-30
@@ -298,11 +311,11 @@ impl ArbitrageEngine {
                 "SUSHI" => price >= 0.5 && price <= 20.0,
                 "GRT" => price >= 0.05 && price <= 5.0,
                 "LDO" => price >= 0.5 && price <= 20.0,
-                _ => price >= 0.0000001 && price <= 10_000_000.0, // fallback amplo
+                _ => price >= 0.0000001 && price <= 10_000_000.0,
             },
 
             // Ambos non-stable: ratio entre tokens
-            (false, false) => match (token_in, token_out) {
+            (false, false) => match (token_in.as_str(), token_out.as_str()) {
                 ("WETH", "WMATIC") => price >= 500.0 && price <= 100_000.0,  // ~21k
                 ("WMATIC", "WETH") => price >= 0.000001 && price <= 0.01,    // ~0.000047
                 _ => price >= 0.0000001 && price <= 10_000_000.0,
@@ -912,7 +925,12 @@ impl ArbitrageEngine {
                 .flashloan
                 .fee_pct
                 .unwrap_or(economics::AAVE_V3_PREMIUM_PCT);
-            economics::flashloan_fee_usd(trade_amount_usd, fee_pct)
+            let amount_in_tokens = u256_to_f64(amount_in, start_decimals);
+            economics::flashloan_fee_usd_from_amount(
+                amount_in_tokens,
+                1.0,
+                fee_pct,
+            )
         } else {
             0.0
         };
@@ -2947,5 +2965,11 @@ mod tests {
         ];
         assert!(ArbitrageEngine::is_stable_flashloan_centric(&path));
         assert!(!ArbitrageEngine::is_usdt_centric(&path));
+    }
+
+    #[test]
+    fn realistic_price_rejects_unknown_token_fallback() {
+        assert!(!ArbitrageEngine::is_realistic_price(1.0, "UNKNOWN", "USDC"));
+        assert!(ArbitrageEngine::is_realistic_price(1.0, "USDC.E", "USDT"));
     }
 }

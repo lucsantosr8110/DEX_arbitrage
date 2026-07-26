@@ -24,12 +24,15 @@ use ethers::{
     types::{Eip1559TransactionRequest, U256},
 };
 use k256::ecdsa::SigningKey;
-use std::{str::FromStr, sync::Arc};
+use std::{str::FromStr, sync::Arc, time::Instant as StdInstant};
 use tokio::{
     sync::Mutex,
     time::{timeout, Duration},
 };
 use tracing::{warn, info, debug};
+
+const DEFAULT_AAVE_POOL_POLYGON: &str = "0x794a61358D6845594F94dc1DB02A252b5b4814aD";
+const FLASHLOAN_PREMIUM_ABI: &str = r#"[{"inputs":[],"name":"FLASHLOAN_PREMIUM_TOTAL","outputs":[{"type":"uint128"}],"stateMutability":"view","type":"function"}]"#;
 
 // ============================================================================
 // Exec Strategy
@@ -87,6 +90,8 @@ pub struct ArbitrageClient {
     >,
     /// Hub paper (CSV async). Lazy-init sob flag.
     paper_hub: Arc<Mutex<Option<Arc<PaperValidationHub>>>>,
+    /// Premium Aave on-chain cache (M5), refreshed at most hourly.
+    flashloan_fee_cache: Arc<Mutex<Option<(StdInstant, f64)>>>,
 }
 
 impl ArbitrageClient {
@@ -122,6 +127,44 @@ impl ArbitrageClient {
             execution_engine,
             last_exec_block: Arc::new(Mutex::new(None)),
             paper_hub,
+            flashloan_fee_cache: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    async fn current_flashloan_fee_pct(
+        &self,
+        pool_address: Option<&str>,
+        fallback_pct: f64,
+    ) -> f64 {
+        const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+        {
+            let cache = self.flashloan_fee_cache.lock().await;
+            if let Some((at, pct)) = *cache {
+                if at.elapsed() < CACHE_TTL {
+                    return pct;
+                }
+            }
+        }
+
+        let address = pool_address
+            .and_then(|raw| Address::from_str(raw).ok())
+            .or_else(|| Address::from_str(DEFAULT_AAVE_POOL_POLYGON).ok());
+        let Some(address) = address else { return fallback_pct; };
+        let Ok(abi) = serde_json::from_str::<ethers::abi::Abi>(FLASHLOAN_PREMIUM_ABI) else {
+            return fallback_pct;
+        };
+        let pool = Contract::new(address, abi, self.middleware.clone());
+        match pool.method::<_, U256>("FLASHLOAN_PREMIUM_TOTAL", ()) {
+            Ok(call) => match call.call().await {
+                Ok(bps) if bps <= U256::from(10_000u64) => {
+                    let pct = bps.as_u64() as f64 / 10_000.0;
+                    *self.flashloan_fee_cache.lock().await = Some((StdInstant::now(), pct));
+                    info!("Aave premium on-chain: {:.2} bps", pct * 10_000.0);
+                    pct
+                }
+                _ => fallback_pct,
+            },
+            Err(_) => fallback_pct,
         }
     }
 
@@ -428,7 +471,7 @@ impl ArbitrageClient {
         // NOTE: update_execution_block() era chamado AQUI (antes da execução),
         // o que faria debounce_same_block() sempre retornar true se fosse
         // implementado. Movido para após TX confirmada em send_and_confirm_transaction.
-        let (strategy, min_profit, risk_cfg, slippage_bps, flashloan_decimals, fee_pct, max_premium_bps, adverse_move_bps) = {
+        let (strategy, min_profit, risk_cfg, slippage_bps, flashloan_decimals, configured_fee_pct, pool_address, max_premium_bps, adverse_move_bps) = {
             let cfg = self.config.lock().await;
 
             (
@@ -442,9 +485,17 @@ impl ArbitrageClient {
     cfg.flashloan.flashloan_decimals.unwrap_or(6) as u32,
     // Mesma fonte do engine (`recalculate_profitability`); default 5 bps Aave V3.
     cfg.flashloan.fee_pct.unwrap_or(economics::AAVE_V3_PREMIUM_PCT),
+    cfg.flashloan.aave_pool_address.clone(),
     cfg.flashloan.max_premium_bps,
     cfg.execution.adverse_move_bps,
 )
+        };
+
+        let fee_pct = if matches!(strategy, ExecutionStrategy::Direct) {
+            configured_fee_pct
+        } else {
+            self.current_flashloan_fee_pct(pool_address.as_deref(), configured_fee_pct)
+                .await
         };
 
         // A11: `flashloan.slippage_bps` é parâmetro morto — não controla slippagem
@@ -487,9 +538,8 @@ impl ArbitrageClient {
 
         // A5: valida a partir do GROSS (uma dedução de gas + Aave fee_pct).
         let token_price = opp.token_price_usd.unwrap_or(1.0);
-        let flashloan_fee_token = self.calculate_flashloan_fee(opp.amount_in, fee_pct);
-        let flashloan_fee_usd =
-            self.token_amount_to_usd(flashloan_fee_token, token_price, flashloan_decimals);
+        let principal_usd = self.token_amount_to_usd(opp.amount_in, token_price, flashloan_decimals);
+        let flashloan_fee_usd = economics::flashloan_fee_usd(principal_usd, fee_pct);
         // A16: adverse_move era ignorado aqui (engine inclui). Repassar p/ o
         // gate p/ ficar consistente com `recalculate_profitability`.
         let trade_amount_usd = opp.estimated_volume_usd.max(0.0);
@@ -584,15 +634,20 @@ impl ArbitrageClient {
             }
         }
 
-        let (slippage_bps, fee_pct, flashloan_decimals, adverse_move_bps) = {
+        let (slippage_bps, configured_fee_pct, pool_address, flashloan_decimals, adverse_move_bps) = {
             let cfg = self.config.lock().await;
             (
                 cfg.flashloan.slippage_bps.unwrap_or(50) as u64,
                 cfg.flashloan.fee_pct.unwrap_or(economics::AAVE_V3_PREMIUM_PCT),
+                cfg.flashloan.aave_pool_address.clone(),
                 cfg.flashloan.flashloan_decimals.unwrap_or(6) as u32,
                 cfg.execution.adverse_move_bps,
             )
         };
+
+        let fee_pct = self
+            .current_flashloan_fee_pct(pool_address.as_deref(), configured_fee_pct)
+            .await;
 
         // A6: igual ao path de exec real — recalcular net após gas fresca
         // (escalada por hops reais da rota, M4).
@@ -606,9 +661,8 @@ impl ArbitrageClient {
         };
 
         let token_price = opp.token_price_usd.unwrap_or(1.0);
-        let flashloan_fee_token = self.calculate_flashloan_fee(opp.amount_in, fee_pct);
-        let flashloan_fee_usd =
-            self.token_amount_to_usd(flashloan_fee_token, token_price, flashloan_decimals);
+        let principal_usd = self.token_amount_to_usd(opp.amount_in, token_price, flashloan_decimals);
+        let flashloan_fee_usd = economics::flashloan_fee_usd(principal_usd, fee_pct);
         let adverse_usd =
             economics::adverse_move_usd(opp.estimated_volume_usd.max(0.0), adverse_move_bps);
         opp.net_profit_usd = economics::net_profit_usd(

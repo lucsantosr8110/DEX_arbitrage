@@ -21,6 +21,7 @@ enable_frontend = false
 enabled = true
 executor_address = "0x6c4EC038B9fD25288c4C024DDd39aD05bFd19804"
 wrapper_address = "0xa7bbBa00Ac6776bDF79e55411D28c7Ee09dCA5C1"
+aave_pool_address = "0x794a61358D6845594F94dc1DB02A252b5b4814aD"
 capital_usd = 100.0
 min_profit_usd = 0.00
 slippage_tolerance_pct = 0.50

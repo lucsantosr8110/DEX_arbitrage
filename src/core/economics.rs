@@ -99,6 +99,17 @@ pub fn flashloan_fee_usd(trade_amount_usd: f64, fee_pct: f64) -> f64 {
     sane(trade_amount_usd) * sane(fee_pct)
 }
 
+/// Prêmio calculado a partir do principal realmente emprestado, convertido
+/// para USD pelo preço do token inicial (M6).
+pub fn flashloan_fee_usd_from_amount(
+    amount_in_tokens: f64,
+    token_price_usd: f64,
+    fee_pct: f64,
+) -> f64 {
+    let amount_usd = sane(amount_in_tokens) * sane(token_price_usd);
+    flashloan_fee_usd(amount_usd, fee_pct)
+}
+
 /// Buffer opcional de drift quote→execução. **Não** é price impact.
 pub fn adverse_move_usd(trade_amount_usd: f64, adverse_move_bps: u32) -> f64 {
     sane(trade_amount_usd) * (adverse_move_bps as f64 / 10_000.0)
@@ -218,6 +229,11 @@ mod tests {
             },
         );
         assert!(net < delta);
+    }
+
+    #[test]
+    fn flashloan_fee_uses_principal_token_value() {
+        assert!((flashloan_fee_usd_from_amount(100.0, 0.999, 0.0005) - 0.04995).abs() < 1e-12);
     }
 
     #[test]
