@@ -1029,23 +1029,17 @@ pub fn compute_top_spreads(
         }
     }
 
-    let mut ranked: Vec<(String, Vec<(String, f64)>, f64)> = forward_by_pair
+    // M3: ranking por net_usd (ou cycle_rate), não por tui_spread_pct (single-dir).
+    // Antes pares com spread nominal alto mas cycle_rate ≤ 1 (sem arb real)
+    // ficavam acima de pares com net positivo. Agora computa analyze_pair_spread
+    // (cycle_rate = buy×sell, fee-inclusive) e ordena por net desc; tui_spread
+    // permanece só como coluna informativa em TopSpreadInfo.
+    let mut ranked: Vec<TopSpreadInfo> = forward_by_pair
         .iter()
         .filter(|(_, v)| v.len() >= 2)
         .map(|(p, v)| {
             let fwd = v.clone();
-            let spread = tui_spread_pct(&fwd);
-            (p.clone(), fwd, spread)
-        })
-        .filter(|(_, _, s)| s.is_finite() && *s > 0.0)
-        .collect();
-    ranked.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-
-    ranked
-        .into_iter()
-        .take(n)
-        .map(|(pair, fwd, _)| {
-            let reverse = pair
+            let reverse = p
                 .split_once('-')
                 .map(|(a, b)| format!("{}-{}", b, a));
             let rev: Vec<(String, f64)> = reverse
@@ -1053,9 +1047,24 @@ pub fn compute_top_spreads(
                 .and_then(|r| forward_by_pair.get(r))
                 .cloned()
                 .unwrap_or_default();
-            analyze_pair_spread(&pair, &fwd, &rev, cost)
+            analyze_pair_spread(p, &fwd, &rev, cost)
         })
-        .collect()
+        .filter(|info| info.cycle_rate.is_some())
+        .collect();
+    ranked.sort_by(|a, b| {
+        // net_usd desc; sem net → −∞. Tiebreak: cycle_rate desc.
+        let na = a.net_usd.unwrap_or(f64::NEG_INFINITY);
+        let nb = b.net_usd.unwrap_or(f64::NEG_INFINITY);
+        nb.partial_cmp(&na)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                let ra = a.cycle_rate.unwrap_or(0.0);
+                let rb = b.cycle_rate.unwrap_or(0.0);
+                rb.partial_cmp(&ra).unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+
+    ranked.into_iter().take(n).collect()
 }
 
 /// Formata TVL USD compacto: $1.2M / $340k / $123. None/inválido → "tvl=?".
@@ -1099,18 +1108,37 @@ async fn log_top_n_spreads(
         }
     }
 
-    // Ranqueia por Spread% do TUI (desc); só pares com ≥2 venues.
-    let mut ranked: Vec<(String, Vec<(String, f64)>, f64)> = forward_by_pair
+    // M3: igual ao caminho sync (`compute_top_spreads`), ranqueia por net_usd,
+    // não pelo spread single-dir do TUI. Assim log assíncrono não prioriza
+    // spread nominal alto sem lucro líquido projetado.
+    let mut ranked: Vec<TopSpreadInfo> = forward_by_pair
         .iter()
         .filter(|(_, v)| v.len() >= 2)
         .map(|(p, v)| {
             let fwd = v.clone();
-            let spread = tui_spread_pct(&fwd);
-            (p.clone(), fwd, spread)
+            let reverse = p
+                .split_once('-')
+                .map(|(a, b)| format!("{}-{}", b, a));
+            let rev: Vec<(String, f64)> = reverse
+                .as_ref()
+                .and_then(|r| forward_by_pair.get(r))
+                .cloned()
+                .unwrap_or_default();
+            analyze_pair_spread(p, &fwd, &rev, adj_cost)
         })
-        .filter(|(_, _, s)| s.is_finite() && *s > 0.0)
+        .filter(|info| info.cycle_rate.is_some())
         .collect();
-    ranked.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.sort_by(|a, b| {
+        let na = a.net_usd.unwrap_or(f64::NEG_INFINITY);
+        let nb = b.net_usd.unwrap_or(f64::NEG_INFINITY);
+        nb.partial_cmp(&na)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                let ra = a.cycle_rate.unwrap_or(0.0);
+                let rb = b.cycle_rate.unwrap_or(0.0);
+                rb.partial_cmp(&ra).unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
 
     let cfg = dm.config_ref();
     // A10: fee_hint por perna. Antes `unwrap_or(0)` quando venue sem `fee_tier` no
@@ -1128,16 +1156,8 @@ async fn log_top_n_spreads(
             })
     };
 
-    for (pair, fwd, tui_spread) in ranked.into_iter().take(n) {
-        let reverse = pair
-            .split_once('-')
-            .map(|(a, b)| format!("{}-{}", b, a));
-        let rev: Vec<(String, f64)> = reverse
-            .as_ref()
-            .and_then(|r| forward_by_pair.get(r))
-            .cloned()
-            .unwrap_or_default();
-        let info = analyze_pair_spread(&pair, &fwd, &rev, adj_cost);
+    for info in ranked.into_iter().take(n) {
+        let tui_spread = info.tui_spread_pct;
 
         // TVL read-only de cada perna do melhor 2-hop. None = fail-open (Curve, fee
         // desconhecido, etc.). Só lê quando fee_hint resolvido — fee=0 p/ V3 é pool
@@ -2005,7 +2025,7 @@ mod tests {
         assert!(compute_top_spreads(&pr, &AdjCostParams::default(), 0).is_empty());
     }
 
-    /// Ordenado desc por tui_spread%, ≤n, sem campo TVL (TopSpreadInfo não tem).
+    /// Ordenado desc por net_usd, ≤n, sem campo TVL (TopSpreadInfo não tem).
     #[test]
     fn compute_top_spreads_sync_sem_tvl_ordenado_desc() {
         let mut pr: HashMap<String, HashMap<String, f64>> = HashMap::new();
@@ -2023,20 +2043,21 @@ mod tests {
         let rows = compute_top_spreads(&pr, &AdjCostParams::default(), 5);
         assert!(rows.len() <= 5);
         assert!(!rows.is_empty(), "deve haver ≥1 spread");
-        // Ordenado desc: primeiro ≥ segundo.
+        // Ordenado por net USD desc; spread single-dir é apenas informativo.
         for w in rows.windows(2) {
             assert!(
-                w[0].tui_spread_pct >= w[1].tui_spread_pct,
-                "deve ser desc: {} < {}",
-                w[0].tui_spread_pct,
-                w[1].tui_spread_pct
+                w[0].net_usd.unwrap_or(f64::NEG_INFINITY)
+                    >= w[1].net_usd.unwrap_or(f64::NEG_INFINITY),
+                "net deve ser desc: {:?} < {:?}",
+                w[0].net_usd,
+                w[1].net_usd
             );
         }
         // TopSpreadInfo não carrega TVL — struct não tem campo tvl (compilação garante).
         let _ = rows[0].pair.clone(); // acessível (pub)
     }
 
-    /// Par sem reverse cotado → cycle_rate None.
+    /// Par sem reverse cotado não entra no ranking por net_usd.
     #[test]
     fn compute_top_spreads_no_reverse_cycle_none() {
         let mut pr: HashMap<String, HashMap<String, f64>> = HashMap::new();
@@ -2044,9 +2065,9 @@ mod tests {
         pr.insert("QuickSwap".into(), m(&[("X-Y", 1.0)]));
         pr.insert("SushiSwap".into(), m(&[("X-Y", 1.05)]));
         let rows = compute_top_spreads(&pr, &AdjCostParams::default(), 5);
-        let xy = rows.iter().find(|r| r.pair == "X-Y").expect("X-Y no top");
-        assert!(xy.cycle_rate.is_none(), "sem reverse → cycle_rate None");
-        assert!(xy.net_usd.is_none());
-        assert!(xy.leg1.is_none() && xy.leg2.is_none());
+        assert!(
+            rows.iter().all(|r| r.pair != "X-Y"),
+            "sem reverse não tem net_usd e não deve entrar no ranking"
+        );
     }
 }
