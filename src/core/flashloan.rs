@@ -168,6 +168,23 @@ impl ArbitrageClient {
         }
     }
 
+    /// Lê premium no boot e sincroniza config compartilhada antes do radar.
+    pub(crate) async fn refresh_flashloan_premium(&self) {
+        let (enabled, pool, fallback) = {
+            let cfg = self.config.lock().await;
+            (
+                cfg.flashloan.enabled,
+                cfg.flashloan.aave_pool_address.clone(),
+                cfg.flashloan.fee_pct.unwrap_or(economics::AAVE_V3_PREMIUM_PCT),
+            )
+        };
+        if !enabled {
+            return;
+        }
+        let pct = self.current_flashloan_fee_pct(pool.as_deref(), fallback).await;
+        self.config.lock().await.flashloan.fee_pct = Some(pct);
+    }
+
     async fn ensure_paper_hub(&self) -> Option<Arc<PaperValidationHub>> {
         let (enabled, path, window) = {
             let cfg = self.config.lock().await;

@@ -122,6 +122,9 @@ impl Bot {
 
         drop(cfg_guard);
 
+        // M5: sincroniza prêmio Aave antes da primeira descoberta/ranking.
+        arbitrage_client.refresh_flashloan_premium().await;
+
         metrics::inc_bot_start_total();
 
         if telegram.is_enabled() {
