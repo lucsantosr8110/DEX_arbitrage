@@ -155,12 +155,26 @@ fn raw_to_usd(raw: U256, decimals: u8, price_usd: f64) -> f64 {
     if price_usd <= 0.0 || !price_usd.is_finite() {
         return 0.0;
     }
-    let dec = decimals.min(36) as i32;
-    let denom = 10f64.powi(dec);
-    let amt = {
-        let capped = raw.min(U256::from(u128::MAX));
-        capped.as_u128() as f64 / denom
+    // M10: antes fazia `raw.min(u128::MAX).as_u128() as f64 / 10^dec` — truncava
+    // bits antes da divisão (balances grandes perdiam magnitude) e `powi(36)`
+    // ~4.6e35 perto do limite f64 podia gerar inf. Agora divide no domínio U256:
+    // se dec > 18, pré-escala (raw / 10^(dec-18)) e usa 18 no f64; se dec <= 18,
+    // (raw × 10^(18-dec)) / 1e18. Limita dec a 36 (sanidade) e nunca passa de
+    // u128 para f64 sem ter reduzido a escala primeiro.
+    let dec = decimals.min(36) as usize;
+    let amount_18: U256 = if dec >= 18 {
+        // raw / 10^(dec-18) → representa o valor com 18 decimais de precisão.
+        raw / U256::exp10(dec - 18)
+    } else {
+        raw * U256::exp10(18 - dec)
     };
+    // amount_18 agora é o valor em "18 decimais"; cabe em u128 na prática
+    // (TVL de pool não chega a 1e18 unidades-de-18 = 1e0... mas mesmo que chegue,
+    // o cap em u128 só roça se amount_18 > 3.4e38, ou seja >$3.4e20 — absurdo).
+    let amt = (amount_18.min(U256::from(u128::MAX))).as_u128() as f64 / 1e18;
+    if !amt.is_finite() {
+        return 0.0;
+    }
     amt * price_usd
 }
 
@@ -593,6 +607,21 @@ mod tests {
         let bal_weth = U256::from(2u64) * U256::exp10(18);
         let tvl = pool_tvl_usd_from_balances(bal_usdc, 6, 1.0, bal_weth, 18, 2000.0);
         assert!((tvl - 5000.0).abs() < 1e-6, "tvl={tvl}");
+    }
+
+    /// M10: raw_to_usd antes truncava em u128 antes da divisão. Balance grande
+    /// (ex: 1e30 raw) com dec 18 deveria dar 1e12 unidades; pré-escala em U256
+    /// preserva magnitude. E dec 36 não gera inf.
+    #[test]
+    fn raw_to_usd_preserves_large_balances_no_inf() {
+        // 1e30 raw / 1e18 = 1e12 unidades @ $1 = $1e12
+        let big = U256::from(10u64).pow(U256::from(30));
+        let usd = pool_tvl_usd_from_balances(big, 18, 1.0, U256::zero(), 18, 0.0);
+        assert!(usd.is_finite(), "raw_to_usd gerou inf/nan: {usd}");
+        assert!((usd - 1e12).abs() < 1e3, "esperava ~1e12, veio {usd}");
+        // dec 36 (cap): 1e30 raw / 1e(36-18) = 1e12 / 1e18 ... = 1e-6 unidades
+        let usd36 = pool_tvl_usd_from_balances(big, 36, 1.0, U256::zero(), 18, 0.0);
+        assert!(usd36.is_finite(), "dec 36 gerou inf: {usd36}");
     }
 
     #[test]

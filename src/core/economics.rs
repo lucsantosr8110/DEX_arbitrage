@@ -109,6 +109,12 @@ pub fn net_profit_usd(gross_profit_usd: f64, costs: &TradeCosts) -> f64 {
     if !gross_profit_usd.is_finite() {
         return f64::NEG_INFINITY;
     }
+    // M18: se algum custo virar NaN/inf (regressão futura em gas_usd, etc.),
+    // `gross - NaN = NaN`, e `NaN < min_profit` é false → aprovaria opp inválida.
+    // Tratar custo não-finito como infinito (net → −∞) p/ o gate rejeitar.
+    if !costs.total_usd().is_finite() {
+        return f64::NEG_INFINITY;
+    }
     gross_profit_usd - costs.total_usd()
 }
 
@@ -268,5 +274,23 @@ mod tests {
         assert_eq!(flashloan_fee_usd(f64::INFINITY, 0.0005), 0.0);
         // rate < 1 => gross negativo (prejuízo), preservado
         assert!(gross_profit_usd(100.0, 0.999) < 0.0);
+    }
+
+    /// M18: custo NaN/inf não vira net NaN (que aprovaria opp no gate).
+    #[test]
+    fn net_profit_rejects_nonfinite_costs() {
+        let nan_costs = TradeCosts {
+            gas_usd: f64::NAN,
+            flashloan_fee_usd: 0.0,
+            adverse_move_usd: 0.0,
+        };
+        assert_eq!(net_profit_usd(1.0, &nan_costs), f64::NEG_INFINITY);
+        let inf_costs = TradeCosts {
+            gas_usd: f64::INFINITY,
+            flashloan_fee_usd: 0.0,
+            adverse_move_usd: 0.0,
+        };
+        // inf - inf seria NaN; somar inf no total e subtrair gross finito dá -inf.
+        assert!(net_profit_usd(1.0, &inf_costs) < 0.0);
     }
 }
