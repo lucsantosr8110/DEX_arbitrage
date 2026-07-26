@@ -19,7 +19,7 @@ enable_frontend = false
 # ======================================================================
 [flashloan]
 enabled = true
-executor_address = "0x9AA152D9b78BF5daF82827D207cc2D04482CA32f"
+executor_address = "0x6c4EC038B9fD25288c4C024DDd39aD05bFd19804"
 wrapper_address = "0xa7bbBa00Ac6776bDF79e55411D28c7Ee09dCA5C1"
 capital_usd = 100.0
 min_profit_usd = 0.00
@@ -35,7 +35,7 @@ flashloan_decimals = 6
 # ======================================================================
 [arbitrage]
 enabled = true
-executor_address = "0x9AA152D9b78BF5daF82827D207cc2D04482CA32f"
+executor_address = "0x6c4EC038B9fD25288c4C024DDd39aD05bFd19804"
 advanced_filters_enabled = true
 min_profit_threshold_usd = 0.00
 min_profit_percent = "0.0"
@@ -252,7 +252,7 @@ timeout_seconds = 8
 # EXECUTOR / GAS (CORRIGIDO: "stations" restaurado)
 # ======================================================================
 [executor]
-address = "0x9AA152D9b78BF5daF82827D207cc2D04482CA32f"
+address = "0x6c4EC038B9fD25288c4C024DDd39aD05bFd19804"
 validate_signature_hash = true
 max_flashloan_premium = 2
 contract_type = "StandardExecutor"
