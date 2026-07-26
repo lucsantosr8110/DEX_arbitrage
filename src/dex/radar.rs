@@ -15,6 +15,7 @@ use crate::{
     },
     dex::{
         circuit_breaker::DexCircuitBreaker,
+        cached_fee_tier,
         liquidity::min_pool_liquidity_usd_for_dex,
         manager::DexManager,
         price_cache::PriceCache,
@@ -713,6 +714,19 @@ pub fn extract_edges(
 
         // Contabilizar economia do ciclo (gross == fee-inclusive product)
         if best_cycle_rate > 1.0 {
+            let gross_profit_pct = (best_cycle_rate - 1.0) * 100.0;
+            // A9: guard MAX_SPREAD_PCT ANTES do push em adj_cycles. Antes o push
+            // acontecia primeiro (linha ~744) e só depois `if spread > MAX continue`
+            // — ciclos dust-pool com spread > 50% entravam em adj_total /
+            // gross_positive / net_positive no [ADJ-SUMMARY], inflando oportunidade
+            // real. Agora descarta antes de qualquer contagem.
+            if gross_profit_pct > MAX_SPREAD_PCT {
+                debug!(
+                    "🚫 [DUST] {} spread={:.2}% > {:.0}% — pool raso, descartado antes do adj_cycles.push",
+                    pair, gross_profit_pct, MAX_SPREAD_PCT
+                );
+                continue;
+            }
             // INSTRUMENTAÇÃO `adj`: coleta composição + executabilidade p/ log
             // estruturado (persistência fica no caller, que tem estado entre scans).
             let (token_a, token_b) = pair.split_once('-').unwrap_or((pair.as_str(), ""));
@@ -740,7 +754,6 @@ pub fn extract_edges(
                 .map(|l| format!("{}|{}>{}", l.venue, l.token_in, l.token_out))
                 .collect::<Vec<_>>()
                 .join("||");
-            let gross_profit_pct = (best_cycle_rate - 1.0) * 100.0;
             adj_cycles.push(AdjCycleInfo {
                 cycle_key,
                 pair: pair.clone(),
@@ -775,15 +788,27 @@ pub fn extract_edges(
             );
         }
 
-        if spread_pct > MAX_SPREAD_PCT {
+        // A8: dedup mirror em edges/count. `extract_edges` itera ambos os sentidos
+        // do par (generate_full_pair_list é direcional), e A-B / B-A produzem o
+        // MESMO round-trip econômico (cycle_rate idêntico). Sem este filtro, cada
+        // ciclo vira 2 EdgeInfo no log/CSV `[EDGE]` e 2 sinais em `count` —
+        // double-count direto. Mantém só a direção canônica (pair < reverse),
+        // empatando estável-true via `canonical_pair_name` p/ label consistente
+        // com `adj_cycles` (que dedupa por `adj_canonical_key` em separado).
+        let is_canonical_dir = match &reverse_pair {
+            Some(rp) => pair.as_str() < rp.as_str(),
+            None => true,
+        };
+        if !is_canonical_dir {
             continue;
         }
         if spread_pct >= 0.03 {
             count += 1;
         }
         if spread_pct >= 0.01 {
+            let (ta, tb) = pair.split_once('-').unwrap_or((pair.as_str(), ""));
             edges.push(EdgeInfo {
-                pair: pair.clone(),
+                pair: canonical_pair_name(ta, tb),
                 buy_dex: best_buy_dex,
                 sell_dex: best_sell_dex,
                 spread_pct,
@@ -1089,12 +1114,19 @@ async fn log_top_n_spreads(
     ranked.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
 
     let cfg = dm.config_ref();
-    let fee_for = |venue: &str| {
-        cfg.dex
-            .iter()
-            .find(|d| d.name.eq_ignore_ascii_case(venue))
-            .and_then(|d| d.fee_tier)
-            .unwrap_or(0)
+    // A10: fee_hint por perna. Antes `unwrap_or(0)` quando venue sem `fee_tier` no
+    // config — p/ V3 (tiers 100/500/3000/10000) fee=0 resolve pool inexistente ou
+    // diferente do cotado → TVL do pool errado → shallow-flag e diagnóstico falsos.
+    // Agora: fee_tier real do adapter (cache populado pelo multicall best-fee do
+    // V3) → fallback config.fee_tier → None (fail-open, TVL não lida) em vez de 0.
+    let fee_for = |venue: &str, token_in: &str, token_out: &str| -> Option<u32> {
+        cached_fee_tier(venue, token_in, token_out)
+            .or_else(|| {
+                cfg.dex
+                    .iter()
+                    .find(|d| d.name.eq_ignore_ascii_case(venue))
+                    .and_then(|d| d.fee_tier)
+            })
     };
 
     for (pair, fwd, tui_spread) in ranked.into_iter().take(n) {
@@ -1108,14 +1140,19 @@ async fn log_top_n_spreads(
             .unwrap_or_default();
         let info = analyze_pair_spread(&pair, &fwd, &rev, adj_cost);
 
-        // TVL read-only de cada perna do melhor 2-hop. None = fail-open (Curve, etc.).
+        // TVL read-only de cada perna do melhor 2-hop. None = fail-open (Curve, fee
+        // desconhecido, etc.). Só lê quando fee_hint resolvido — fee=0 p/ V3 é pool
+        // errado (ver A10).
         let (tvl1_str, shallow1) = match &info.leg1 {
             Some(l) => {
-                let tvl = dm
-                    .pool_tvl_usd(&l.venue, &l.token_in, &l.token_out, fee_for(&l.venue))
-                    .await
-                    .ok()
-                    .flatten();
+                let tvl = match fee_for(&l.venue, &l.token_in, &l.token_out) {
+                    Some(fee) => dm
+                        .pool_tvl_usd(&l.venue, &l.token_in, &l.token_out, fee)
+                        .await
+                        .ok()
+                        .flatten(),
+                    None => None,
+                };
                 let min = min_pool_liquidity_usd_for_dex(cfg, &l.venue);
                 let shallow = matches!(tvl, Some(t) if t < min);
                 (fmt_tvl(tvl), shallow)
@@ -1124,11 +1161,14 @@ async fn log_top_n_spreads(
         };
         let (tvl2_str, shallow2) = match &info.leg2 {
             Some(l) => {
-                let tvl = dm
-                    .pool_tvl_usd(&l.venue, &l.token_in, &l.token_out, fee_for(&l.venue))
-                    .await
-                    .ok()
-                    .flatten();
+                let tvl = match fee_for(&l.venue, &l.token_in, &l.token_out) {
+                    Some(fee) => dm
+                        .pool_tvl_usd(&l.venue, &l.token_in, &l.token_out, fee)
+                        .await
+                        .ok()
+                        .flatten(),
+                    None => None,
+                };
                 let min = min_pool_liquidity_usd_for_dex(cfg, &l.venue);
                 let shallow = matches!(tvl, Some(t) if t < min);
                 (fmt_tvl(tvl), shallow)
