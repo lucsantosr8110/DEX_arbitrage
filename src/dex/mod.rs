@@ -411,11 +411,9 @@ pub mod get_token_decimals;
 pub mod liquidity;
 pub mod metadata_warm;
 pub mod manager;
-pub mod price_cache;
 pub mod radar;
 pub mod rate_limiter;
 pub mod resilient_dex_system;
-pub mod spread;
 
 // ================================================================
 // REEXPORTS
@@ -427,7 +425,6 @@ pub use adapters::{
 pub use error::{DexError, DexResult};
 pub use get_token_decimals::{cache_token_decimals, cached_token_decimals, get_token_decimals};
 pub use manager::DexManager;
-pub use price_cache::PriceCache;
 pub use radar::start_high_hit_rate_radar;
 
 // ================================================================

@@ -18,7 +18,6 @@ use crate::{
         cached_fee_tier,
         liquidity::min_pool_liquidity_usd_for_dex,
         manager::DexManager,
-        price_cache::PriceCache,
         rate_limiter::{ALCHEMY_RATE_LIMITER, DEX_RATE_LIMITER},
     },
 };
@@ -1499,7 +1498,6 @@ pub async fn start_high_hit_rate_radar(
     dm: Arc<DexManager>,
     cfg: Arc<Mutex<Config>>,
     adj_cost: Arc<AdjCostParams>,
-    _price_cache: Arc<PriceCache>,
     cb: Arc<DexCircuitBreaker>,
     price_tx: mpsc::Sender<HashMap<String, HashMap<String, f64>>>,
     mut shutdown_rx: broadcast::Receiver<()>

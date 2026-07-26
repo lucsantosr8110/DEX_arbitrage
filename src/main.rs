@@ -25,7 +25,7 @@ use flashloan_bot::{
     config::Config,
     core::bot::Bot,
     dex::{
-        circuit_breaker::DexCircuitBreaker, manager::DexManager, price_cache::PriceCache,
+        circuit_breaker::DexCircuitBreaker, manager::DexManager,
         radar::{compute_top_spreads, extract_edges, start_high_hit_rate_radar, AdjCostParams, TopSpreadInfo},
     },
     // execution:: imports removidos: ExecutionEngine/MevConfig/gwei eram codigo morto
@@ -351,14 +351,12 @@ async fn main() -> Result<()> {
     info!("✅ WebSocket conectado.");
 
     // ============================================================
-    // 5️⃣ DexManager e Cache de Preços
+    // 5️⃣ DexManager
     // ============================================================
-    let price_cache = Arc::new(PriceCache::new(Duration::from_secs(10)));
     let dex_manager = Arc::new(
         DexManager::new(
             client_http.clone(),
             cfg_unlocked.clone(),
-            price_cache.clone(),
         )
         .await
         .context("❌ Falha ao inicializar DexManager")?,
@@ -454,7 +452,6 @@ async fn main() -> Result<()> {
         let config = config.clone();
         let adj_cost = adj_cost.clone();
         let price_tx = price_tx.clone();
-        let price_cache = price_cache.clone();
         let circuit_breaker = circuit_breaker.clone();
         let sd_rx = shutdown_tx.subscribe();
         let telegram = telegram.clone();
@@ -466,7 +463,6 @@ async fn main() -> Result<()> {
                 dex_manager,
                 config,
                 adj_cost,
-                price_cache,
                 circuit_breaker,
                 price_tx,
                 sd_rx,

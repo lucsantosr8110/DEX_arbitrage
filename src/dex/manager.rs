@@ -19,7 +19,6 @@ use crate::{
             curve::CurveDex, quickswap::QuickSwapDex, sushiswap::SushiSwapDex,
             uniswap_v2::UniswapV2Dex, uniswap_v3::UniswapV3Dex,
         },
-        price_cache::PriceCache,
         // ❌ `ArbitrageOpportunity` de `dex` (mod.rs) não é o usado para Flashloans.
         DexContract, TokenPairPrice,
     },
@@ -55,7 +54,6 @@ pub struct DexManager {
     active_adapters: Arc<RwLock<Vec<Arc<dyn DexContract + Send + Sync>>>>,
     health: Arc<RwLock<HashMap<String, bool>>>,
     error_count: Arc<RwLock<HashMap<String, u32>>>,
-    price_cache: Arc<PriceCache>,
     token_cache: Arc<TokenCache>,
     last_health_check: Arc<RwLock<Instant>>,
 }
@@ -67,7 +65,6 @@ impl DexManager {
     pub async fn new(
         client: Arc<AppMiddleware>,
         config: Arc<Config>,
-        price_cache: Arc<PriceCache>,
     ) -> Result<Self> {
         info!("🔧 Inicializando DexManager (TokenCache dinâmico)…");
 
@@ -129,7 +126,6 @@ impl DexManager {
             active_adapters: Arc::new(RwLock::new(adapters)),
             health: Arc::new(RwLock::new(health_map)),
             error_count: Arc::new(RwLock::new(error_map)),
-            price_cache,
             token_cache,
             last_health_check: Arc::new(RwLock::new(Instant::now())),
         };
@@ -147,7 +143,6 @@ impl DexManager {
         );
 
         manager.start_metadata_warm().await;
-        manager.start_dynamic_warm_up().await;
         manager.start_health_checker().await;
         Ok(manager)
     }
@@ -174,65 +169,6 @@ impl DexManager {
                 // Barulhento: não seguir cego com decimals errados.
                 error!("❌ Metadata warm-boot FALHOU: {:#}", e);
             }
-        }
-    }
-
-    /// ============================================================
-    /// 🔥 Warm-up dinâmico
-    /// ============================================================
-    pub async fn start_dynamic_warm_up(&self) {
-        let mgr = self.clone();
-        tokio::spawn(async move {
-            info!("🎯 Iniciando warm-up dinâmico com TokenCache…");
-            match mgr.dynamic_warm_up().await {
-                Ok(n) => info!("✅ Warm-up concluído: {} pares preparados", n),
-                Err(e) => warn!("⚠️ Warm-up falhou: {:?}", e),
-            }
-        });
-    }
-
-    async fn dynamic_warm_up(&self) -> Result<usize> {
-        let candidate_pairs: Vec<String> = self.config.pairs.monitor.clone();
-        let mut prepared: Vec<(String, Address, Address, U256)> = Vec::new();
-
-        for pair in candidate_pairs.iter() {
-            let (sym_a, sym_b) = self.parse_pair_name(pair);
-            if sym_a == "UNKNOWN" || sym_b == "UNKNOWN" {
-                continue;
-            }
-
-            let addr_a = match self.token_cache.get_by_symbol(&sym_a).await {
-                Some(a) => a.address,
-                None => continue,
-            };
-            let addr_b = match self.token_cache.get_by_symbol(&sym_b).await {
-                Some(b) => b.address,
-                None => continue,
-            };
-
-            for adapter in self.active_adapters.read().await.iter() {
-                let dex_name = adapter.name().to_string();
-                prepared.push((dex_name.clone(), addr_a, addr_b, U256::zero()));
-            }
-        }
-
-        if prepared.is_empty() {
-            warn!("⚠️ Nenhum par válido encontrado para warm-up");
-            return Ok(0);
-        }
-
-        let loaded = self.price_cache.warm_up(prepared).await;
-        Ok(loaded)
-    }
-
-    fn parse_pair_name(&self, pair: &str) -> (String, String) {
-        let normalized = pair.replace('/', "-").replace('_', "-");
-        let parts: Vec<&str> = normalized.split('-').collect();
-        if parts.len() == 2 {
-            (parts[0].trim().to_uppercase(), parts[1].trim().to_uppercase())
-        } else {
-            warn!("⚠️ Formato de par inválido: {}", pair);
-            ("UNKNOWN".into(), "UNKNOWN".into())
         }
     }
 
@@ -634,10 +570,6 @@ impl DexManager {
 
     pub fn get_token_cache(&self) -> Arc<TokenCache> {
         self.token_cache.clone()
-    }
-
-    pub fn get_price_cache(&self) -> Arc<PriceCache> {
-        self.price_cache.clone()
     }
 
     pub async fn get_active_adapters(&self) -> Vec<String> {
