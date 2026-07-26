@@ -45,7 +45,22 @@ const DEX_NAME: &str = "UniswapV3";
 // Cotação: todos os tiers (incl. 100 p/ métrica). Seleção executável: ver
 // `select_executable_v3_best_out` / `EXECUTABLE_V3_FEE_TIERS` em dex/mod.rs.
 const FEE_TIERS: [u32; 4] = QUOTE_V3_FEE_TIERS;
-const PRICE_DEVIATION_LIMIT: f64 = 0.20; // 20% desvio máximo
+const PRICE_DEVIATION_LIMIT: f64 = 0.20; // pares voláteis: 20% desvio máximo
+const STABLE_PRICE_DEVIATION_LIMIT: f64 = 0.02; // stable-stable: 2%
+
+#[inline]
+fn is_usd_stable(symbol: &str) -> bool {
+    matches!(symbol.to_ascii_uppercase().as_str(), "USDC" | "USDC.E" | "USDT" | "DAI")
+}
+
+#[inline]
+fn price_deviation_limit(token_a: &str, token_b: &str) -> f64 {
+    if is_usd_stable(token_a) && is_usd_stable(token_b) {
+        STABLE_PRICE_DEVIATION_LIMIT
+    } else {
+        PRICE_DEVIATION_LIMIT
+    }
+}
 
 // Endereços (usando addresses do mod.rs)
 const DEFAULT_QUOTER_V1: &str = addresses::UNISWAP_V3_QUOTER;
@@ -305,6 +320,12 @@ impl UniswapV3Dex {
             .await
             .map(|i| i.symbol)
             .unwrap_or_default();
+        let symbol_b = self
+            .token_cache
+            .get_by_address(&token_b)
+            .await
+            .map(|i| i.symbol)
+            .unwrap_or_default();
         let notional = self.quote_notional_usd();
         let fallback_amt = U256::exp10(dec_a as usize);
         // ~10%, 100%, 200% do notional configurado (default $100 → $10/$100/$200).
@@ -358,11 +379,11 @@ impl UniswapV3Dex {
             ((price - median_price) / median_price).abs()
         }).fold(0.0, f64::max);
 
-        // Se o desvio for muito alto (20%), rejeita.
-        if max_deviation > PRICE_DEVIATION_LIMIT { 
+        let deviation_limit = price_deviation_limit(&symbol_a, &symbol_b);
+        if max_deviation > deviation_limit {
             warn!(
-                 "[{}] Pool {}/{} (fee {}) divergência ALTA ({:.2}%) — Preço rejeitado.", 
-                 DEX_NAME, token_a, token_b, best_fee, max_deviation * 100.0
+                 "[{}] Pool {}/{} (fee {}) divergência ALTA ({:.2}% > {:.2}%) — Preço rejeitado.",
+                 DEX_NAME, token_a, token_b, best_fee, max_deviation * 100.0, deviation_limit * 100.0
             );
             return Ok(None);
         }
@@ -576,7 +597,10 @@ impl DexContract for UniswapV3Dex {
                         "quoteExactInputSingle",
                         (info.addr_a, info.addr_b, fee, info.amount_in, U256::zero()),
                     )?;
-                    multicall.add_call(call, true);
+                    // M16: um tier/pool inexistente pode reverter no Quoter.
+                    // `false` preserva os demais resultados do batch em vez de
+                    // descartar até nove pares válidos junto com uma falha.
+                    multicall.add_call(call, false);
                 }
             }
 
@@ -630,10 +654,11 @@ impl DexContract for UniswapV3Dex {
                         .iter()
                         .map(|p| ((p - mid) / mid).abs())
                         .fold(0.0_f64, f64::max);
-                    if max_dev > PRICE_DEVIATION_LIMIT {
+                    let deviation_limit = price_deviation_limit(&info.token_a, &info.token_b);
+                    if max_dev > deviation_limit {
                         debug!(
                             "[{}] multicall {}/{} — dispersão cross-tier {:.2}% > {}% (pool concentrada/rasa), descartado",
-                            DEX_NAME, info.token_a, info.token_b, max_dev * 100.0, PRICE_DEVIATION_LIMIT * 100.0
+                            DEX_NAME, info.token_a, info.token_b, max_dev * 100.0, deviation_limit * 100.0
                         );
                         continue;
                     }
@@ -733,5 +758,17 @@ impl DexContract for UniswapV3Dex {
 
     fn config(&self) -> &Arc<Config> {
         &self.config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stable_pair_uses_tighter_price_deviation_limit() {
+        assert_eq!(price_deviation_limit("USDC", "USDT"), 0.02);
+        assert_eq!(price_deviation_limit("DAI", "USDC"), 0.02);
+        assert_eq!(price_deviation_limit("WETH", "USDC"), 0.20);
     }
 }

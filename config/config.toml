@@ -551,7 +551,9 @@ refresh_interval = 1  # 1 SEGUNDO (HFT REAL)
 # ======================================================================
 [pairs.tokens]
 WMATIC = "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270"
-USDC   = "0x2791Bca1f2de4661ED88A30C99a7a9449Aa84174"
+# Circle USDC nativo Polygon PoS; USDC.e abaixo é o legado bridged PoS.
+USDC   = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"
+"USDC.e" = "0x2791Bca1f2de4661ED88A30C99a7a9449Aa84174"
 USDT   = "0xc2132D05D31c914a87C6611C10748AEb04B58e8F"
 WETH   = "0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619"
 DAI    = "0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063"
@@ -573,6 +575,7 @@ LDO    = "0xC3C7d422809852031b44ab29EEC9F1EfF2A58756"
 [pairs.metadata]
 WMATIC = { symbol = "WMATIC", decimals = 18 }
 USDC   = { symbol = "USDC", decimals = 6 }
+"USDC.e" = { symbol = "USDC.e", decimals = 6 }
 USDT   = { symbol = "USDT", decimals = 6 }
 WETH   = { symbol = "WETH", decimals = 18 }
 DAI    = { symbol = "DAI", decimals = 18 }

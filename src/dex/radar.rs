@@ -234,7 +234,8 @@ impl HighHitRateFilter {
         let Some(cur) = previous.get(dex_name) else { return true };
         let Some(&prev_price) = cur.get(canon_pair) else { return true };
 
-        // Média dos outros DEX
+        // M19: mediana dos outros DEX. Média deixa um pool raso/outlier puxar
+        // referência e pode pular uma divergência saudável ou cotar ruído.
         let mut others = vec![];
         for (d, map) in previous {
             if d == dex_name {
@@ -249,8 +250,11 @@ impl HighHitRateFilter {
             return true;
         }
 
-        let avg = others.iter().sum::<f64>() / others.len() as f64;
-        let spread = ((avg - prev_price).abs() / prev_price) * 100.0;
+        let reference = median(&others);
+        if reference <= 0.0 || !reference.is_finite() || !prev_price.is_finite() || prev_price <= 0.0 {
+            return true;
+        }
+        let spread = ((reference - prev_price).abs() / prev_price) * 100.0;
 
         spread >= self.min_spread_percent
     }
@@ -319,8 +323,7 @@ async fn collect_dex_prices(
             discarded = low_liq_cut,
             kept = result.len(),
             min_usd = min_liq,
-            total = crate::dex::liquidity::low_liquidity_discarded_count(),
-            "liquidity gate: pares cortados por TVL proxy < threshold"
+            "liquidity gate: pares cortados neste scan por TVL proxy < threshold"
         );
     }
 
@@ -684,7 +687,11 @@ pub fn extract_edges(
     let mut edges = Vec::new();
     let mut adj_cycles: Vec<AdjCycleInfo> = Vec::new();
     let mut evaluated = 0usize;
-    let mut negative_cycles = 0usize;
+    // M12: negativos também representam round-trips, portanto A-B/B-A devem
+    // contar uma vez, igual a `adj_cycles`. A chave inclui tokens e venues para
+    // não colapsar ciclos distintos no mesmo par.
+    let mut negative_cycle_keys: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     for (pair, dex_prices) in &map_pairs {
         if dex_prices.len() < 2 {
@@ -764,7 +771,22 @@ pub fn extract_edges(
                 has_curve_leg,
             });
         } else {
-            negative_cycles += 1;
+            let (token_a, token_b) = pair.split_once('-').unwrap_or((pair.as_str(), ""));
+            let negative_legs = [
+                AdjLeg {
+                    venue: best_buy_dex.clone(),
+                    token_in: token_a.to_string(),
+                    token_out: token_b.to_string(),
+                    rate: best_buy_price,
+                },
+                AdjLeg {
+                    venue: best_sell_dex.clone(),
+                    token_in: token_b.to_string(),
+                    token_out: token_a.to_string(),
+                    rate: best_sell_price,
+                },
+            ];
+            negative_cycle_keys.insert(adj_canonical_key(&negative_legs));
         }
 
         // Só emitir EDGE se cycle_rate > 1.0 (potencial bruto positivo)
@@ -854,8 +876,8 @@ pub fn extract_edges(
         }
     }
     let net_positive = deduped.iter().filter(|a| a.net_profit_usd > 0.0).count();
-    // gross/adj contam ciclos ÚNICOS pós-dedup (mirror A-B/B-A = 1), consistente com
-    // adj_total e net_positive. evaluated/negative_cycles permanecem por direção
+    // gross/adj e negativos contam ciclos ÚNICOS pós-dedup (mirror A-B/B-A = 1),
+    // consistente com adj_total e net_positive. `evaluated` permanece por direção
     // (cobertura do scan, não oportunidades).
     let gross_dedup = deduped.len();
 
@@ -863,7 +885,7 @@ pub fn extract_edges(
         evaluated,
         gross_positive: gross_dedup,
         venue_fee_adjusted_positive: gross_dedup,
-        negative_cycles_found: negative_cycles,
+        negative_cycles_found: negative_cycle_keys.len(),
         net_positive,
     };
 
@@ -1605,6 +1627,23 @@ mod tests {
     }
 
     #[test]
+    fn quick_filter_ignora_outlier_ao_calcular_referencia() {
+        let mut previous = HashMap::new();
+        previous.insert("QuickSwap".into(), m(&[("AAA-BBB", 0.99)]));
+        previous.insert("SushiSwap".into(), m(&[("AAA-BBB", 1.00)]));
+        previous.insert("UniswapV3".into(), m(&[("AAA-BBB", 1.00)]));
+        previous.insert("PoolRaso".into(), m(&[("AAA-BBB", 100.0)]));
+
+        let filter = HighHitRateFilter::new(true, 5.0);
+        let cb = DexCircuitBreaker::new(3, 60);
+
+        assert!(
+            !filter.should_analyze_dex_pair("QuickSwap", "AAA-BBB", &previous, &cb),
+            "mediana 1.0 mantém desvio de 0.99 abaixo do threshold; média seria puxada pelo outlier"
+        );
+    }
+
+    #[test]
     fn pares_monitor_curado_nao_injeta_matriz_m3() {
         let mut cfg = Config::default();
         cfg.pairs.liquidity_allowlist = vec![
@@ -1815,6 +1854,30 @@ mod tests {
         assert!(caxas.net_profit_usd > 0.0, "AAA-BBB net={:.4} deve ser > 0", caxas.net_profit_usd);
         let vitrine = adj.iter().find(|a| a.pair == "USDC-USDT").unwrap();
         assert!(vitrine.net_profit_usd < 0.0, "USDC-USDT net={:.4} deve ser < 0", vitrine.net_profit_usd);
+    }
+
+    /// M12: round-trip negativo visto em A-B e B-A é um único ciclo econômico.
+    #[test]
+    fn extract_edges_dedup_mirror_negative_cycles() {
+        let mut pr: HashMap<String, HashMap<String, f64>> = HashMap::new();
+        // Melhor ciclo cruzado nos dois sentidos = 0.99 × 0.98 < 1.0.
+        pr.insert(
+            "QuickSwap".into(),
+            m(&[("AAA-BBB", 0.99), ("BBB-AAA", 0.99)]),
+        );
+        pr.insert(
+            "SushiSwap".into(),
+            m(&[("AAA-BBB", 0.98), ("BBB-AAA", 0.98)]),
+        );
+
+        let (_n, _edges, econ, adj) = extract_edges(&pr, &AdjCostParams::default());
+
+        assert!(adj.is_empty());
+        assert_eq!(econ.evaluated, 2, "A-B e B-A são ambos avaliados");
+        assert_eq!(
+            econ.negative_cycles_found, 1,
+            "espelhos negativos devem contar como um ciclo"
+        );
     }
 
     /// Quotes fee-inclusive: cycle_rate == buy_price × sell_price (sem (1-fee)).

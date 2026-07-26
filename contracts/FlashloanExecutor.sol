@@ -120,7 +120,9 @@ contract FlashloanExecutor is ReentrancyGuard, IFlashLoanSimpleReceiver {
     address public constant SUSHISWAP_ROUTER   = 0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506;
     address public constant UNISWAP_V3_ROUTER  = 0xE592427A0AEce92De3Edee1F18E0157C05861564;
 
-    address public constant TOKEN_USDC         = 0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174;
+    // Circle USDC nativo Polygon PoS. USDC.e permanece para rotas/pools legados.
+    address public constant TOKEN_USDC         = 0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359;
+    address public constant TOKEN_USDC_E       = 0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174;
     address public constant TOKEN_DAI          = 0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063;
     address public constant TOKEN_WMATIC       = 0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270;
     address public constant TOKEN_USDT         = 0xc2132D05D31c914a87C6611C10748AEb04B58e8F;
@@ -553,13 +555,14 @@ contract FlashloanExecutor is ReentrancyGuard, IFlashLoanSimpleReceiver {
 
     function _setDefaultSlippageConfigs() internal {
         slippageConfigs[TOKEN_USDC]   = SlippageConfig(100, 300, true);
+        slippageConfigs[TOKEN_USDC_E] = SlippageConfig(100, 300, true);
         slippageConfigs[TOKEN_DAI]    = SlippageConfig(100, 300, true);
         slippageConfigs[TOKEN_WMATIC] = SlippageConfig(150, 400, true);
         slippageConfigs[TOKEN_USDT]   = SlippageConfig(100, 300, true);
     }
 
     function _setMaxAllowancesRoutersOnly() internal {
-        address[4] memory tokens  = [TOKEN_USDC, TOKEN_DAI, TOKEN_WMATIC, TOKEN_USDT];
+        address[5] memory tokens  = [TOKEN_USDC, TOKEN_USDC_E, TOKEN_DAI, TOKEN_WMATIC, TOKEN_USDT];
         address[3] memory routers = [QUICKSWAP_ROUTER, SUSHISWAP_ROUTER, UNISWAP_V3_ROUTER];
 
         for (uint256 i = 0; i < tokens.length; ) {
@@ -650,4 +653,4 @@ contract FlashloanExecutor is ReentrancyGuard, IFlashLoanSimpleReceiver {
     }
 
     receive() external payable {}
-}
+}

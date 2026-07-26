@@ -1360,7 +1360,13 @@ impl ArbitrageClient {
         _slippage_bps: u64,
     ) -> Result<(Address, U256, Vec<AbiSwapStep>)> {
 
-        let steps = ArbitrageEngine::sanitize_steps_for_execution(&opp.steps.0);
+        // M13: `USDC` e `USDC.e` são contratos distintos. Sanitiza com a
+        // identidade de endereço resolvida da config, não pelo ticker.
+        let steps = ArbitrageEngine::sanitize_steps_with_token_identity(&opp.steps.0, |symbol| {
+            self.get_token_addr(symbol, cfg)
+                .ok()
+                .map(|address| format!("{address:#x}"))
+        });
         let first = steps.first().context("Steps vazios")?;
 
         let token_in = self.get_token_addr(&first.token_in, cfg)?;

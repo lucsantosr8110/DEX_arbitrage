@@ -410,11 +410,33 @@ impl ArbitrageEngine {
 
     #[inline]
     pub fn sanitize_steps_for_execution(steps: &[ArbitrageStep]) -> Vec<ArbitrageStep> {
+        Self::sanitize_steps_with_token_identity(steps, |_| None)
+    }
+
+    /// Remove hop no-op pela identidade on-chain, não só pelo símbolo. Isto preserva
+    /// `USDC` (nativo) ↔ `USDC.e` (bridged), que possuem o mesmo ticker econômico
+    /// mas contratos diferentes na Polygon.
+    pub fn sanitize_steps_with_token_identity<F>(
+        steps: &[ArbitrageStep],
+        token_identity: F,
+    ) -> Vec<ArbitrageStep>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
         steps
             .iter()
             // force_usdt às vezes anexa hop no-op `USDT→USDT` → V2 IDENTICAL_ADDRESSES.
             .filter(|s| {
-                !s.token_in.eq_ignore_ascii_case(&s.token_out) && !s.token_in.is_empty()
+                if s.token_in.is_empty() || s.token_out.is_empty() {
+                    return false;
+                }
+                match (token_identity(&s.token_in), token_identity(&s.token_out)) {
+                    (Some(token_in), Some(token_out)) => token_in != token_out,
+                    // Sem endereço resolvido, mantém compatibilidade conservadora.
+                    (None, None) => !s.token_in.eq_ignore_ascii_case(&s.token_out),
+                    // Só uma ponta resolvida: não pode afirmar que é no-op.
+                    _ => true,
+                }
             })
             .map(|s| ArbitrageStep {
                 dex_name: Self::sanitize_dex_name(&s.dex_name),
@@ -734,26 +756,34 @@ impl ArbitrageEngine {
         let token_a = &path[0];
         let token_b = &path[1];
 
-        // C5: se não há step USDT↔token na rota original (direct A→B→A non-stable),
+        // M9: preserva stable de entrada (USDC ou USDT), em vez de fabricar USDT
+        // num ciclo iniciado em USDC. Para ciclo non-stable, USDT segue base padrão.
+        let base_token = if Self::is_usd_stable_symbol(token_a) {
+            token_a.as_str()
+        } else {
+            TARGET_BASE_TOKEN
+        };
+
+        // C5: se não há step stable↔token na rota original (direct A→B→A non-stable),
         // consultar o price_map global p/ melhor taxa cross-DEX. Antes retornava
         // 0.0 e toda direct non-stable era descartada silenciosamente.
-        let usdt_to_a = self.estimate_usdt_rate(token_a, steps, true, price_map);
-        let b_to_usdt = self.estimate_usdt_rate(token_b, steps, false, price_map);
+        let stable_to_a = self.estimate_stable_rate(base_token, token_a, steps, true, price_map);
+        let b_to_stable = self.estimate_stable_rate(base_token, token_b, steps, false, price_map);
 
-        let usdt_steps = vec![
-            Self::create_step(SANITIZED_PLACEHOLDER, TARGET_BASE_TOKEN, token_a, usdt_to_a),
+        let stable_steps = vec![
+            Self::create_step(SANITIZED_PLACEHOLDER, base_token, token_a, stable_to_a),
             steps[0].clone(), // Hop original A->B
-            Self::create_step(SANITIZED_PLACEHOLDER, token_b, TARGET_BASE_TOKEN, b_to_usdt),
+            Self::create_step(SANITIZED_PLACEHOLDER, token_b, base_token, b_to_stable),
         ];
 
-        let usdt_path = vec![
-            TARGET_BASE_TOKEN.into(),
+        let stable_path = vec![
+            base_token.into(),
             token_a.clone(),
             token_b.clone(),
-            TARGET_BASE_TOKEN.into(),
+            base_token.into(),
         ];
 
-        self.build_usdt_opportunity(usdt_path, usdt_steps, app_config).await
+        self.build_usdt_opportunity(stable_path, stable_steps, app_config).await
     }
 
     async fn build_usdt_opportunity(
@@ -1839,7 +1869,7 @@ impl ArbitrageEngine {
     // ------------------------------------------------------------
     #[inline]
     fn is_usd_stable_symbol(sym: &str) -> bool {
-        matches!(sym.to_ascii_uppercase().as_str(), "USDT" | "USDC")
+        matches!(sym.to_ascii_uppercase().as_str(), "USDT" | "USDC" | "USDC.E")
     }
 
     /// Ciclo fechado em USDT ou USDC (flashloan $1-stable).
@@ -2035,34 +2065,35 @@ impl ArbitrageEngine {
         economics::gas_usd_or_fallback(static_fallback) * scale
     }
 
-    fn estimate_usdt_rate(
+    fn estimate_stable_rate(
         &self,
+        base_token: &str,
         token: &str,
         steps: &[ArbitrageStep],
         is_input: bool,
         price_map: &HashMap<String, HashMap<String, f64>>,
     ) -> f64 {
         match token {
-            "USDC" | "USDT" | "DAI" => 1.0,
+            "USDC" | "USDC.E" | "USDT" | "DAI" => 1.0,
             _ => {
-                // 1) Procura nos steps por uma conversão direta com USDT já existente.
+                // 1) Procura nos steps por uma conversão direta com stable já existente.
                 for step in steps {
-                    if is_input && step.token_out == token && step.token_in == TARGET_BASE_TOKEN {
+                    if is_input && step.token_out == token && step.token_in == base_token {
                         return step.expected_rate;
                     }
-                    if !is_input && step.token_in == token && step.token_out == TARGET_BASE_TOKEN {
+                    if !is_input && step.token_in == token && step.token_out == base_token {
                         return step.expected_rate;
                     }
                 }
-                // 2) C5: sem step USDT direto — consultar price_map global p/ melhor
+                // 2) C5: sem step stable direto — consultar price_map global p/ melhor
                 // taxa cross-DEX. Antes retornava 0.0 e toda direct non-stable era
                 // descartada silenciosamente.
-                // is_input=true  → USDT→token (queremos token por USDT): key "USDT-{token}"
-                // is_input=false → token→USDT (queremos USDT por token): key "{token}-USDT"
+                // is_input=true  → stable→token: key "{stable}-{token}"
+                // is_input=false → token→stable: key "{token}-{stable}"
                 let key = if is_input {
-                    format!("{}-{}", TARGET_BASE_TOKEN, token)
+                    format!("{}-{}", base_token, token)
                 } else {
-                    format!("{}-{}", token, TARGET_BASE_TOKEN)
+                    format!("{}-{}", token, base_token)
                 };
                 let mut best: f64 = 0.0;
                 for dex_prices in price_map.values() {
@@ -2074,16 +2105,16 @@ impl ArbitrageEngine {
                 }
                 if best > 0.0 {
                     debug!(
-                        "✅ estimate_usdt_rate: USDT↔{} resolvido via price_map (key={}, rate={})",
-                        token, key, best
+                        "✅ estimate_stable_rate: {}↔{} resolvido via price_map (key={}, rate={})",
+                        base_token, token, key, best
                     );
                     return best;
                 }
                 // 3) Sem step direto nem cotação no price_map — rejeita (não inventa 1.0).
                 warn!(
-                    "⚠️ estimate_usdt_rate: sem conversão USDT↔{} (steps nem price_map, is_input={}). \
+                    "⚠️ estimate_stable_rate: sem conversão {}↔{} (steps nem price_map, is_input={}). \
                      Oportunidade rejeitada por preço inválido.",
-                    token, is_input
+                    base_token, token, is_input
                 );
                 0.0
             }
@@ -2644,6 +2675,25 @@ mod tests {
         assert_eq!(clean.len(), 2);
         assert_eq!(clean[0].token_out, "USDC");
         assert_eq!(clean[1].token_out, "USDT");
+    }
+
+    #[test]
+    fn sanitize_steps_keeps_distinct_usdc_contracts() {
+        let steps = vec![ArbitrageStep {
+            dex_name: "QuickSwap".into(),
+            token_in: "USDC".into(),
+            token_out: "USDC.e".into(),
+            amount_out_min: U256::from(1),
+            ..Default::default()
+        }];
+        let clean = ArbitrageEngine::sanitize_steps_with_token_identity(&steps, |symbol| {
+            match symbol {
+                "USDC" => Some("0x3c499c542cef5e3811e1192ce70d8cc03d5c3359".into()),
+                "USDC.e" => Some("0x2791bca1f2de4661ed88a30c99a7a9449aa84174".into()),
+                _ => None,
+            }
+        });
+        assert_eq!(clean.len(), 1, "USDC e USDC.e não são hop no-op");
     }
 
     /// next_opp_id deve incluir o prefixo no ID.

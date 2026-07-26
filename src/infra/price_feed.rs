@@ -184,7 +184,7 @@ impl CachedPriceFeed {
     // ✅ CORREÇÃO (E0308): Adicionado .to_string() para retornar String
     pub(crate) fn map_symbol(symbol: &str) -> String {
         match symbol.to_uppercase().as_str() {
-            "USDC" => "usd-coin".to_string(),
+            "USDC" | "USDC.E" => "usd-coin".to_string(),
             "USDT" => "tether".to_string(),
             "DAI" => "dai".to_string(),
             "WETH" | "ETH" => "ethereum".to_string(),
@@ -213,7 +213,7 @@ impl CachedPriceFeed {
     /// em micro-arbitragem isso mata rota lucrativa.
     pub fn fallback_price(symbol: &str) -> f64 {
         match symbol.to_uppercase().as_str() {
-            "USDC" | "USDT" | "DAI" => 1.0,
+            "USDC" | "USDC.E" | "USDT" | "DAI" => 1.0,
             "WETH" | "ETH" => 1875.0,
             "WBTC" | "BTC" => 64_000.0,
             // POL ≈ $0.077 (era 0.75 aqui: 10x acima do real).
