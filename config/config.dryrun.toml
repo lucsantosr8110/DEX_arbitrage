@@ -525,6 +525,10 @@ liquidity_allowlist = [
     "LINK", "UNI", "LDO",
 ]
 monitor = [
+    # Stable ↔ Stable (Curve am3CRV — única cobertura Curve)
+    "USDC-USDT",
+    "DAI-USDC",
+    "DAI-USDT",
     # Stable + bluechip + WBTC
     "USDC-WMATIC",
     "USDC-WETH",

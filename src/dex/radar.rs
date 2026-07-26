@@ -968,4 +968,31 @@ mod tests {
         // Melhor: 1.005 * 1.0 = 1.005 → 0.5%
         assert!((edges[0].spread_pct - 0.5).abs() < 1e-9);
     }
+
+    /// Curve (am3CRV) só cota stable-stable. Se o `monitor` não tiver
+    /// USDC-USDT / DAI-USDC / DAI-USDT, a coluna Curve fica 100% vazia e a
+    /// DEX cai do `dex_count` (silent drop, ver fix radar.rs). Este teste fixa
+    /// o requisito: monitor com stable-stable → pair set direcional inclui os
+    /// pares que Curve atende. Previne regressão (remover stable-stable = mata
+    /// Curve silenciosamente).
+    #[test]
+    fn monitor_com_stable_stable_gera_pares_direcionais_para_curve() {
+        let mut cfg = Config::default();
+        cfg.pairs.liquidity_allowlist = vec!["USDC".into(), "USDT".into(), "DAI".into()];
+        cfg.pairs.monitor = vec![
+            "USDC-USDT".into(),
+            "DAI-USDC".into(),
+            "DAI-USDT".into(),
+        ];
+        let pares = generate_full_pair_list(&cfg);
+
+        // Curve precisa das DUAS direções (get_dy(i,j) e get_dy(j,i)).
+        for esperado in [
+            "USDC-USDT", "USDT-USDC",
+            "DAI-USDC", "USDC-DAI",
+            "DAI-USDT", "USDT-DAI",
+        ] {
+            assert!(pares.contains(&esperado.to_string()), "falta {esperado} (Curve não cota)");
+        }
+    }
 }
