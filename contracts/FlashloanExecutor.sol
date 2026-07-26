@@ -3,7 +3,7 @@ pragma solidity ^0.8.24;
 
 /**
  * =============================================================
- * ⚡ FLASHLOAN EXECUTOR — v4.4.3-final-OZ5-fixed (Polygon Mainnet)
+ * ⚡ FLASHLOAN EXECUTOR — v4.4.4-audit-fix (Polygon Mainnet)
  * -------------------------------------------------------------
  * ✅ Compatível com OpenZeppelin Contracts v5.4.x
  * ✅ Wrapper dinâmico + multi-wrapper (authorizedWrappers)
@@ -11,6 +11,10 @@ pragma solidity ^0.8.24;
  * • initiator == wrapperAddress
  * • authorizedWrappers[initiator]
  * • initiator == address(this) (execução direta)
+ * ✅ AUDIT 2026-07-25:
+ * • executeDirect ERC20 reverte em perda (require finalAmount >= amount)
+ * • executeOperation chama _validateSteps (defesa em profundidade)
+ * • executeOperation respeita paused (whenNotPaused)
  * ✅ USDT-safe approvals (zera antes quando necessário)
  * ✅ MIN_AMOUNT dinâmico por decimals() do token
  * ✅ Uniswap V3 fees (Polygon): 500 / 3000 / 10000
@@ -300,6 +304,8 @@ contract FlashloanExecutor is ReentrancyGuard, IFlashLoanSimpleReceiver {
             finalAmount = delta; // Valor total devolvido em MATIC
         } else {
             // ERC20: devolve capital + lucro
+            // AUDIT fix #1: reverter em perda — paridade com o caminho nativo (delta >= amount).
+            require(finalAmount >= amount, "Cycle did not return capital");
             if (finalAmount > amount) {
                 profit = finalAmount - amount;
                 totalProfit += profit;
@@ -321,7 +327,7 @@ contract FlashloanExecutor is ReentrancyGuard, IFlashLoanSimpleReceiver {
         uint256 premium,
         address initiator,
         bytes calldata params
-    ) external nonReentrant returns (bool) {
+    ) external nonReentrant whenNotPaused returns (bool) {
         require(msg.sender == AAVE_POOL, "Only Aave");
         require(amount >= _minAmount(asset), "Amount below minimum");
 
@@ -332,6 +338,10 @@ contract FlashloanExecutor is ReentrancyGuard, IFlashLoanSimpleReceiver {
         require(isValidInitiator, "Invalid initiator");
 
         (address executorAddr, SwapStep[] memory steps) = abi.decode(params, (address, SwapStep[]));
+
+        // AUDIT fix #2: validar steps vindos via callback (FlashloanCaller passa params cru).
+        // Defesa em profundidade — alinha com executeFlashloan/executeDirect.
+        _validateStepsMemory(steps, asset);
 
         totalFlashloans++;
         totalPremiumPaid += premium;
@@ -517,6 +527,25 @@ contract FlashloanExecutor is ReentrancyGuard, IFlashLoanSimpleReceiver {
                 require(steps[0].tokenIn == initialAsset, "First token mismatch");
             } else {
                 require(steps[i-1].tokenOut == steps[i].tokenIn, "Token sequence broken");
+            }
+            unchecked { ++i; }
+        }
+    }
+
+    // AUDIT fix #2: versão memory para o callback (params decodificados vêm em memory).
+    function _validateStepsMemory(SwapStep[] memory steps, address initialAsset) internal pure {
+        require(steps.length > 0, "No steps provided");
+        require(steps.length <= MAX_STEPS, "Too many steps");
+        require(steps[steps.length - 1].tokenOut == initialAsset, "Final token mismatch");
+
+        for (uint256 i = 0; i < steps.length; ) {
+            require(steps[i].tokenIn != address(0) && steps[i].tokenOut != address(0), "Zero token in swap");
+            require(steps[i].amountOutMin > 0, "Min out is zero");
+
+            if (i == 0) {
+                require(steps[0].tokenIn == initialAsset, "First token mismatch");
+            } else {
+                require(steps[i - 1].tokenOut == steps[i].tokenIn, "Token sequence broken");
             }
             unchecked { ++i; }
         }
