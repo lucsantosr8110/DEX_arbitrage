@@ -183,9 +183,12 @@ pub trait DexContract: Send + Sync {
     // âœ… Assinatura correta
     async fn get_price(&self, token_a: &Address, token_b: &Address) -> Result<Option<f64>>;
     
+    /// Cota um lote no bloco informado. Todos os venues de um scan devem usar
+    /// o mesmo `quote_block`, evitando spreads fabricados entre blocos distintos.
     async fn get_prices_multicall(
         &self,
         pairs: &[(String, String)],
+        quote_block: Option<ethers::types::U64>,
     ) -> Result<Vec<TokenPairPrice>>;
 
     async fn swap(&self, token_in: Address, token_out: Address, amount_in: U256) -> Result<U256>;

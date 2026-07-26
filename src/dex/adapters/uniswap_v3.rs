@@ -33,7 +33,7 @@ use async_trait::async_trait;
 use ethers::{
     abi::{Abi, Token},
     contract::{Contract, Multicall},
-    types::{Address, U256},
+    types::{Address, U64, U256},
 };
 use std::{str::FromStr, sync::Arc};
 use tracing::{debug, info, warn};
@@ -562,7 +562,11 @@ impl DexContract for UniswapV3Dex {
     // O Multicall é mantido inalterado, pois é otimizado para velocidade 
     // e confia no revert do Quoter. A lógica de preço principal (get_price)
     // agora é mais robusta para fallback.
-    async fn get_prices_multicall(&self, pairs: &[(String, String)]) -> Result<Vec<TokenPairPrice>> {
+    async fn get_prices_multicall(
+        &self,
+        pairs: &[(String, String)],
+        quote_block: Option<U64>,
+    ) -> Result<Vec<TokenPairPrice>> {
         if self.disable_multicall {
             warn!("[{}] Multicall desativado — fallback para chamadas diretas", DEX_NAME);
             let mut results = Vec::new();
@@ -591,6 +595,9 @@ impl DexContract for UniswapV3Dex {
 
         for batch in call_data.chunks(MULTICALL_BATCH_SIZE) {
             let mut multicall = Multicall::new(self.client.clone(), None).await?;
+            if let Some(block) = quote_block {
+                multicall = multicall.block(block);
+            }
             for info in batch {
                 for &fee in &FEE_TIERS {
                     let call = quoter.method::<_, U256>(

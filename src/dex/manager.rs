@@ -27,7 +27,7 @@ use crate::{
     AppMiddleware,
 };
 use anyhow::{anyhow, Context, Result};
-use ethers::types::{Address, U256};
+use ethers::{providers::Middleware, types::{Address, U64, U256}};
 use std::{
     collections::HashMap,
     str::FromStr,
@@ -350,6 +350,7 @@ impl DexManager {
         &self,
         adapter_name: &str,
         pairs: &[String],
+        quote_block: Option<U64>,
     ) -> Result<Vec<TokenPairPrice>> {
         let mut prices = Vec::new();
         
@@ -392,7 +393,7 @@ impl DexManager {
         // ✅ Timeout para operação completa
         let multicall_result = tokio::time::timeout(
             MULTICALL_TOTAL_TIMEOUT,
-            adapter.get_prices_multicall(&converted_pairs)
+            adapter.get_prices_multicall(&converted_pairs, quote_block)
         ).await;
         
         match multicall_result {
@@ -422,6 +423,14 @@ impl DexManager {
         }
         
         Ok(prices)
+    }
+
+    /// Snapshot do bloco para todas as cotações de um scan.
+    pub async fn quote_block_number(&self) -> Result<U64> {
+        self.client
+            .get_block_number()
+            .await
+            .context("falha ao obter bloco para snapshot de cotações")
     }
 
     /// Referência ao config (threshold de liquidez, etc.).

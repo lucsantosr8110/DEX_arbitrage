@@ -285,6 +285,7 @@ async fn collect_dex_prices(
     dm: Arc<DexManager>,
     cb: Arc<DexCircuitBreaker>,
     retry: SmartRetryManager,
+    quote_block: ethers::types::U64,
 ) -> Result<(String, HashMap<String, f64>)> {
 
     let mut filtered = vec![];
@@ -303,7 +304,10 @@ async fn collect_dex_prices(
             let dm2 = dm.clone();
             let ad = adapter.clone();
             let batch = filtered.clone();
-            Box::pin(async move { dm2.get_prices_multicall(&ad, &batch).await })
+            Box::pin(async move {
+                dm2.get_prices_multicall(&ad, &batch, Some(quote_block))
+                    .await
+            })
         })
         .await?;
 
@@ -1374,6 +1378,8 @@ async fn execute_radar_cycle(
 
     let adapters = get_healthy_adapters(dm, &cb).await;
     let qf = HighHitRateFilter::new(qf_enabled, min_spread);
+    let quote_block = dm.quote_block_number().await?;
+    debug!(block = %quote_block, "snapshot único para cotações cross-DEX");
 
     let mut tasks = task::JoinSet::new();
 
@@ -1386,7 +1392,7 @@ async fn execute_radar_cycle(
         let qf2 = qf.clone();
 
         tasks.spawn(async move {
-            collect_dex_prices(ad, batch, qf2, prev, dm2, cb2, retry2).await
+            collect_dex_prices(ad, batch, qf2, prev, dm2, cb2, retry2, quote_block).await
         });
     }
 

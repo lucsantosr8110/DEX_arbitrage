@@ -22,20 +22,21 @@ use async_trait::async_trait;
 use ethers::{
     abi::{Abi, Token},
     contract::{Contract, Multicall},
-    types::{Address, U256},
+    types::{Address, U64, U256},
 };
 use std::{str::FromStr, sync::Arc};
 use tracing::{debug, info, warn};
 
 const DEX_NAME: &str = "Curve";
 
-// AUDIT 2026-07-25: endereços RAW dos stables na Polygon. O `get_price` (path
+// Endereços RAW dos stables na Polygon. O `get_price` (path
 // fallback) recebe endereços raw do token_cache, mas `pool_tokens` guarda só os
 // amTokens (amDAI/amUSDC/amUSDT). Sem este mapa, `resolve_am_to_symbol` nunca
 // casava → fallback Curve sempre retornava None, mesmo p/ stable-stable.
 const RAW_STABLE_TO_SYMBOL: &[(&str, &str)] = &[
     ("0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063", "DAI"),  // DAI  raw
-    ("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174", "USDC"), // USDC raw
+    // amUSDC no pool é o USDC.e bridged, não o USDC nativo Circle (0x3c49...).
+    ("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174", "USDC.e"),
     ("0xc2132D05D31c914a87C6611C10748AEb04B58e8F", "USDT"), // USDT raw
 ];
 
@@ -207,7 +208,11 @@ impl DexContract for CurveDex {
         Ok(normalize_price(price))
     }
 
-    async fn get_prices_multicall(&self, pairs: &[(String, String)]) -> Result<Vec<TokenPairPrice>> {
+    async fn get_prices_multicall(
+        &self,
+        pairs: &[(String, String)],
+        quote_block: Option<U64>,
+    ) -> Result<Vec<TokenPairPrice>> {
         let abi = Self::load_abi(CURVE_POOL_ABI)?;
         let pool = Contract::new(self.pool_address, abi, self.client.clone());
 
@@ -247,10 +252,13 @@ impl DexContract for CurveDex {
 
         if calls.is_empty() { return Ok(Vec::new()); }
         let mut multicall = Multicall::new(self.client.clone(), None).await?;
+        if let Some(block) = quote_block {
+            multicall = multicall.block(block);
+        }
         for info in &calls {
             let call = pool.method::<_, U256>("get_dy", (info.idx_a as i128, info.idx_b as i128, info.amount_in))?;
             // I1: uma falha de par não invalida todo lote Curve.
-            multicall.add_call(call, false);
+            multicall.add_call(call, true);
         }
         ALCHEMY_RATE_LIMITER.acquire().await?;
         let raw: Vec<Result<Token, _>> = multicall.call_raw().await?;
@@ -356,7 +364,7 @@ impl DexContract for CurveDex {
 fn default_stable_pool_tokens() -> Vec<(Address, u8, String)> {
     vec![
         (Address::from_str(AM_DAI).unwrap(), 18, "DAI".to_string()),
-        (Address::from_str(AM_USDC).unwrap(), 6, "USDC".to_string()),
+        (Address::from_str(AM_USDC).unwrap(), 6, "USDC.e".to_string()),
         (Address::from_str(AM_USDT).unwrap(), 6, "USDT".to_string()),
     ]
 }
@@ -387,7 +395,7 @@ fn stable_metadata_for_am_token(address: Address) -> Option<(u8, &'static str)> 
     let address = format!("{address:#x}").to_ascii_lowercase();
     match address.as_str() {
         a if a == AM_DAI.to_ascii_lowercase() => Some((18, "DAI")),
-        a if a == AM_USDC.to_ascii_lowercase() => Some((6, "USDC")),
+        a if a == AM_USDC.to_ascii_lowercase() => Some((6, "USDC.e")),
         a if a == AM_USDT.to_ascii_lowercase() => Some((6, "USDT")),
         _ => None,
     }
@@ -431,7 +439,8 @@ mod tests {
     fn stable_pool_index_finds_three_stables() {
         let pt = pool_tokens();
         assert_eq!(stable_pool_index(&pt, "DAI"), Some(0));
-        assert_eq!(stable_pool_index(&pt, "USDC"), Some(1));
+        assert_eq!(stable_pool_index(&pt, "USDC.e"), Some(1));
+        assert_eq!(stable_pool_index(&pt, "USDC"), None, "USDC nativo não é amUSDC");
         assert_eq!(stable_pool_index(&pt, "USDT"), Some(2));
         assert_eq!(stable_pool_index(&pt, "dai"), Some(0)); // case-insensitive
     }
@@ -439,7 +448,7 @@ mod tests {
     #[test]
     fn discovered_am_tokens_keep_symbol_and_decimals() {
         let usdc = Address::from_str(AM_USDC).unwrap();
-        assert_eq!(stable_metadata_for_am_token(usdc), Some((6, "USDC")));
+        assert_eq!(stable_metadata_for_am_token(usdc), Some((6, "USDC.e")));
         assert_eq!(stable_metadata_for_am_token(Address::zero()), None);
     }
 
@@ -453,7 +462,7 @@ mod tests {
         }
     }
 
-    /// AUDIT fix: o path get_price (fallback) recebe endereços RAW (USDC 0x2791…,
+    /// O path get_price (fallback) recebe endereços RAW (USDC.e 0x2791…,
     /// USDT 0xc213…, DAI 0x8f3C…) — não os amTokens. Sem o mapa raw, o fallback
     /// Curve sempre retornava None. Agora resolve.
     #[test]
@@ -463,7 +472,7 @@ mod tests {
         let dai = Address::from_str("0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063").unwrap();
         let weth = Address::from_str("0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619").unwrap();
 
-        assert_eq!(stable_symbol_for_address(&usdc).as_deref(), Some("USDC"));
+        assert_eq!(stable_symbol_for_address(&usdc).as_deref(), Some("USDC.e"));
         assert_eq!(stable_symbol_for_address(&usdt).as_deref(), Some("USDT"));
         assert_eq!(stable_symbol_for_address(&dai).as_deref(), Some("DAI"));
         assert_eq!(stable_symbol_for_address(&weth), None); // não-stable → None

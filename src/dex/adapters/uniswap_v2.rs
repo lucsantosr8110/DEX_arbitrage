@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use ethers::{
     abi::{Abi, Token},
     contract::{Contract, Multicall}, 
-    types::{Address, U256},
+    types::{Address, U64, U256},
 };
 use std::{collections::HashSet, str::FromStr, sync::Arc};
 use tracing::{debug, info, warn};
@@ -234,6 +234,7 @@ impl DexContract for V2Dex {
     async fn get_prices_multicall(
         &self,
         pairs: &[(String, String)],
+        quote_block: Option<U64>,
     ) -> Result<Vec<TokenPairPrice>> {
         
         let mut prices = Vec::new();
@@ -248,12 +249,15 @@ impl DexContract for V2Dex {
         }
 
         let mut multicall_direct = Multicall::new(self.client.clone(), None).await?;
+        if let Some(block) = quote_block {
+            multicall_direct = multicall_direct.block(block);
+        }
         
         for info in &call_data_list {
             let path = vec![info.addr_a, info.addr_b];
             let call = contract.method::<_, Vec<U256>>("getAmountsOut", (info.amount_in, path))?;
             // Pool ausente/revertido não deve descartar cotações válidas do lote.
-            multicall_direct.add_call(call, false);
+            multicall_direct.add_call(call, true);
         }
 
         debug!("⚡ [{}] Multicall Pass 1 (Direct) - {} chamadas", self.name(), call_data_list.len());

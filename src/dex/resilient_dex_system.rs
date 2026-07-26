@@ -111,9 +111,10 @@ impl<D: DexContract + Send + Sync + 'static> DexContract for ResilientDex<D> {
     async fn get_prices_multicall(
         &self,
         pairs: &[(String, String)],
+        quote_block: Option<ethers::types::U64>,
     ) -> Result<Vec<TokenPairPrice>> {
         // Para multicall, tentamos o primário. Se falhar, tentamos o fallback.
-        match self.primary.get_prices_multicall(pairs).await {
+        match self.primary.get_prices_multicall(pairs, quote_block).await {
             Ok(prices) if !prices.is_empty() => {
                 debug!("✅ [ResilientDex] Multicall bem-sucedido no primary {}", self.primary.name());
                 Ok(prices)
@@ -122,7 +123,7 @@ impl<D: DexContract + Send + Sync + 'static> DexContract for ResilientDex<D> {
                 // Sucesso, mas sem preços (sem liquidez). Tentar fallback.
                 debug!("📭 [ResilientDex] Multicall no primary {} sem resultados, tentando fallback...", self.primary.name());
                 if let Some(fallback) = &self.fallback {
-                    fallback.get_prices_multicall(pairs).await
+                    fallback.get_prices_multicall(pairs, quote_block).await
                 } else {
                     Ok(vec![]) // Sem fallback, retorna vazio
                 }
@@ -130,7 +131,7 @@ impl<D: DexContract + Send + Sync + 'static> DexContract for ResilientDex<D> {
             Err(e) => {
                 warn!("⚠️ [ResilientDex] Multicall no primary {} falhou: {}. Tentando fallback...", self.primary.name(), e);
                    if let Some(fallback) = &self.fallback {
-                    fallback.get_prices_multicall(pairs).await
+                    fallback.get_prices_multicall(pairs, quote_block).await
                 } else {
                     Err(e) // Sem fallback, propaga o erro
                 }
