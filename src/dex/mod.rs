@@ -208,6 +208,22 @@ pub trait DexContract: Send + Sync {
         let _ = fee_hint;
         self.get_pair_or_pool_address(token_a, token_b).await
     }
+
+    /// Endereços dos tokens cujo `balanceOf(pool)` representa a TVL do par.
+    /// Default: `None` → o gate usa os próprios tokens do par (V2/V3: o pool
+    /// custodia os tokens raw). Curve (am3CRV) sobrescreve: a pool custodia
+    /// **amTokens**, não os stables raw, então `balanceOf(raw_token, pool) ≈ 0`
+    /// → TVL 0 → preço Curve descartado mesmo a pool sendo líquida. Retorna os
+    /// amTokens correspondentes para o gate medir a custódia real. Decimais e
+    /// preço do amToken == do raw (amUSDC 6dec $1 == USDC 6dec $1), então só o
+    /// endereço do `balanceOf` muda. (Audit A12)
+    async fn liquidity_token_addresses(
+        &self,
+        _token_a: Address,
+        _token_b: Address,
+    ) -> Option<(Address, Address)> {
+        None
+    }
     async fn get_token_address(&self, symbol_or_address: &str) -> Result<Address> {
         use std::str::FromStr;
         let cache = TokenCache::global(self.config().clone()).await;

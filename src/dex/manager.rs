@@ -515,6 +515,7 @@ impl DexManager {
         let client = self.client.clone();
         let token_cache = self.token_cache.clone();
         let ad = adapter.clone();
+        let ad_liq = adapter.clone();
 
         crate::dex::liquidity::filter_token_prices_by_liquidity(
             client,
@@ -524,6 +525,10 @@ impl DexManager {
             move |_dex, a, b, fee| {
                 let ad = ad.clone();
                 async move { ad.get_pool_address_for_liquidity(a, b, fee).await }
+            },
+            move |_dex, a, b| {
+                let ad = ad_liq.clone();
+                async move { ad.liquidity_token_addresses(a, b).await }
             },
         )
         .await
@@ -551,6 +556,7 @@ impl DexManager {
         let client = self.client.clone();
         let token_cache = self.token_cache.clone();
         let ad = adapter.clone();
+        let ad_liq = adapter.clone();
 
         crate::dex::liquidity::read_pool_tvl_usd(
             client,
@@ -562,6 +568,10 @@ impl DexManager {
             move |_dex, a, b, fee| {
                 let ad = ad.clone();
                 async move { ad.get_pool_address_for_liquidity(a, b, fee).await }
+            },
+            move |_dex, a, b| {
+                let ad = ad_liq.clone();
+                async move { ad.liquidity_token_addresses(a, b).await }
             },
         )
         .await

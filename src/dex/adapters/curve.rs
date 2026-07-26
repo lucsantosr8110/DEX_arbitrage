@@ -267,14 +267,12 @@ impl DexContract for CurveDex {
     }
 
     /// Gate de liquidez: am3CRV custodia **amTokens** (amDAI/amUSDC/amUSDT), não os
-    /// stables raw. O gate genérico faz `balanceOf(token_do_par, pool)` — com token
-    /// raw isso dá ~0 (pool não custodia USDC 0x2791, e sim amUSDC 0x1a13) → TVL
-    /// proxy 0 → preço Curve descartado mesmo a pool sendo líquida (~$2.3M).
-    ///
-    /// Fail-open: não medir TVL aqui. A pool é known-liquid (am3CRV, fee 0.04%,
-    /// TVL verificado on-chain). Sobrescreve o default que chama
-    /// `get_pair_or_pool_address` (que agora resolve raw → Some(pool) e ativaria
-    /// o gate com token errado).
+    /// stables raw. Antes (commit 3d8f161) o gate reportava pool=None (fail-open)
+    /// porque o gate genérico media `balanceOf(raw_token, pool) ≈ 0` → TVL 0 →
+    /// preço descartado. Agora o hook `liquidity_token_addresses` retorna os
+    /// amTokens, então o gate mede a custódia real e podemos reportar a pool
+    /// de verdade. A pool é am3CRV (CURVE_AAVE_POOL), known-liquid ~$2.3M.
+    /// (Audit A12)
     async fn get_pool_address_for_liquidity(
         &self,
         _token_a: Address,
@@ -282,6 +280,39 @@ impl DexContract for CurveDex {
         _fee_hint: u32,
     ) -> Result<Option<Address>> {
         Ok(curve_liquidity_pool_address())
+    }
+
+    /// A12: a pool am3CRV custodia **amTokens**, não os stables raw. O gate
+    /// genérico mede `balanceOf(token_do_par, pool)` — com token raw isso dá ~0
+    /// → TVL 0 → preço Curve descartado mesmo a pool sendo líquida. Aqui
+    /// retornamos os amTokens correspondentes aos tokens do par, para o gate
+    /// medir a custódia real. Decimais e preço do amToken == do raw
+    /// (amUSDC 6dec $1 == USDC 6dec $1), então só o endereço do balanceOf muda.
+    /// Se algum token não for stable do pool, devolve None → gate usa raw
+    /// (fallback seguro, embora Curve só liste stables).
+    async fn liquidity_token_addresses(
+        &self,
+        token_a: Address,
+        token_b: Address,
+    ) -> Option<(Address, Address)> {
+        // Resolve símbolo (amToken OU raw stable) → acha o amToken do pool.
+        // Inlined (2x) em vez de closure p/ poder `.await` (`resolve_am_to_symbol`
+        // é async). Decimals do amToken == do raw, então só o endereço muda.
+        let am_a = {
+            let sym = self.resolve_am_to_symbol(&token_a).await?;
+            self.pool_tokens
+                .iter()
+                .find(|(_, _, s)| s.eq_ignore_ascii_case(&sym))
+                .map(|(am, _, _)| *am)?
+        };
+        let am_b = {
+            let sym = self.resolve_am_to_symbol(&token_b).await?;
+            self.pool_tokens
+                .iter()
+                .find(|(_, _, s)| s.eq_ignore_ascii_case(&sym))
+                .map(|(am, _, _)| *am)?
+        };
+        Some((am_a, am_b))
     }
 
     fn config(&self) -> &Arc<Config> {
@@ -324,16 +355,12 @@ fn stable_symbol_for_address(addr: &Address) -> Option<String> {
     None
 }
 
-/// Endereço de pool a reportar ao gate de liquidez (radar.rs →
-/// `filter_prices_by_liquidity`). Retorna `None` (fail-open) porque o gate
-/// genérico mede `balanceOf(token_do_par, pool)` com os stables **raw**, mas a
-/// am3CRV custodia amTokens — `USDC(0x2791).balanceOf(pool) ≈ 0` → TVL proxy 0 →
-/// preço descartado. Pool é known-liquid (~$2.3M), então não medir é seguro.
-///
-/// Guarda de regressão: NÃO mudar para `Some(pool_address)` sem refatorar o
-/// gate p/ medir amTokens — ver teste `curve_liquidity_gate_is_fail_open`.
+/// Endereço de pool a reportar ao gate de liquidez. Após A12 (hook
+/// `liquidity_token_addresses` retorna amTokens), o gate mede a custódia real
+/// → reportamos a pool de verdade em vez de fail-open. Mantido como helper
+/// p/ o teste de regressão `curve_liquidity_gate_reports_pool`.
 fn curve_liquidity_pool_address() -> Option<Address> {
-    None
+    Address::from_str(CURVE_AAVE_POOL).ok()
 }
 
 #[cfg(test)]
@@ -379,15 +406,15 @@ mod tests {
         assert_eq!(stable_symbol_for_address(&weth), None); // não-stable → None
     }
 
-    /// Guarda de regressão: o gate de liquidez (radar.rs filter_prices_by_liquidity)
-    /// mede `balanceOf(token_do_par, pool)` com os stables RAW. A am3CRV custodia
-    /// amTokens, então `USDC(0x2791).balanceOf(pool) ≈ 0` → TVL 0 → preço Curve
-    /// descartado. Por isso Curve reporta pool=None ao gate (fail-open).
-    ///
-    /// NÃO mudar para Some(pool) sem refatorar o gate p/ medir amTokens. am3CRV é
-    /// known-liquid (~$2.3M, verificado via RPC: amUSDC.balanceOf(pool)≈838k).
+    /// Guarda de regressão A12: o gate de liquidez agora mede `balanceOf` dos
+    /// amTokens (hook `liquidity_token_addresses`), não mais dos stables raw.
+    /// Logo Curve reporta a pool real (CURVE_AAVE_POOL) ao gate, em vez de
+    /// fail-open None. Pool é known-liquid (~$2.3M, amUSDC.balanceOf(pool)≈838k).
     #[test]
-    fn curve_liquidity_gate_is_fail_open() {
-        assert!(curve_liquidity_pool_address().is_none());
+    fn curve_liquidity_gate_reports_pool() {
+        assert_eq!(
+            curve_liquidity_pool_address(),
+            Some(Address::from_str(CURVE_AAVE_POOL).unwrap())
+        );
     }
 }

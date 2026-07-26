@@ -32,16 +32,26 @@ use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 /// Contador global: pares descartados por TVL < threshold (análogo a fee100).
 static LOW_LIQUIDITY_DISCARDED: AtomicU64 = AtomicU64::new(0);
 
-/// Cache `dex:TOKENA-TOKENB` (canônico) → endereço do pool/pair.
-static POOL_ADDR_CACHE: Lazy<RwLock<HashMap<String, Address>>> =
+/// Cache `dex:TOKENA-TOKENB` (canônico) → (endereço do pool/pair, instante do
+/// cache). TTL: pool migrations (V3 re-deploy, Curve pool swap) deixariam o
+/// endereço stale permanente → `balanceOf` contra pool migrado = 0 ou reverte
+/// → TVL 0 → preço descartado, silencioso e permanente. Expira após
+/// `POOL_ADDR_CACHE_TTL` (1h); miss re-resolve. (Audit A15)
+static POOL_ADDR_CACHE: Lazy<RwLock<HashMap<String, (Address, Instant)>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
-/// Decimals cacheados por endereço de token (evita re-resolve).
+/// TTL do `POOL_ADDR_CACHE`. 1h: longo o bastante p/ amortizar resolve em
+/// scans sequenciais, curto o bastante p/ não prender pool migrado.
+const POOL_ADDR_CACHE_TTL: Duration = Duration::from_secs(3600);
+
+/// Decimals cacheados por endereço de token (evita re-resolve). Sem TTL:
+/// decimals são imutáveis pelo lifetime do contrato (não migram).
 static DECIMALS_CACHE: Lazy<RwLock<HashMap<Address, u8>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
@@ -109,7 +119,13 @@ fn pool_cache_key(dex: &str, token_a: &str, token_b: &str, fee_tier: u32) -> Str
 
 pub fn cached_pool_address(dex: &str, token_a: &str, token_b: &str, fee_tier: u32) -> Option<Address> {
     let key = pool_cache_key(dex, token_a, token_b, fee_tier);
-    POOL_ADDR_CACHE.read().ok()?.get(&key).copied()
+    let g = POOL_ADDR_CACHE.read().ok()?;
+    let (pool, at) = g.get(&key)?;
+    // A15: expira entrada stale (pool migration). Miss → caller re-resolve.
+    if at.elapsed() > POOL_ADDR_CACHE_TTL {
+        return None;
+    }
+    Some(*pool)
 }
 
 pub fn cache_pool_address(dex: &str, token_a: &str, token_b: &str, fee_tier: u32, pool: Address) {
@@ -118,7 +134,7 @@ pub fn cache_pool_address(dex: &str, token_a: &str, token_b: &str, fee_tier: u32
     }
     let key = pool_cache_key(dex, token_a, token_b, fee_tier);
     if let Ok(mut g) = POOL_ADDR_CACHE.write() {
-        g.insert(key, pool);
+        g.insert(key, (pool, Instant::now()));
     }
 }
 
@@ -187,16 +203,19 @@ fn cached_decimals(token: Address, hint: u8) -> u8 {
 ///
 /// **Fail-open:** se não der para medir (pool miss / multicall / sem preço),
 /// mantém o quote — só descarta quando TVL foi medido e está < threshold.
-pub async fn filter_token_prices_by_liquidity<F, Fut>(
+pub async fn filter_token_prices_by_liquidity<F, Fut, G, Gut>(
     client: Arc<AppMiddleware>,
     token_cache: &TokenCache,
     prices: Vec<TokenPairPrice>,
     min_usd: f64,
     mut resolve_pool: F,
+    mut resolve_liq_tokens: G,
 ) -> Result<Vec<TokenPairPrice>>
 where
     F: FnMut(String, Address, Address, u32) -> Fut,
     Fut: std::future::Future<Output = Result<Option<Address>>>,
+    G: FnMut(String, Address, Address) -> Gut,
+    Gut: std::future::Future<Output = Option<(Address, Address)>>,
 {
     if prices.is_empty() || min_usd <= 0.0 {
         return Ok(prices);
@@ -244,20 +263,31 @@ where
         let dec_a = cached_decimals(info_a.address, info_a.decimals);
         let dec_b = cached_decimals(info_b.address, info_b.decimals);
 
+        // A12: tokens cujo balanceOf(pool) representa a TVL. Default = raw
+        // (V2/V3). Curve am3CRV custodia amTokens → resolve p/ amToken quando o
+        // adapter reportar. Sem isso balanceOf(raw, pool) ≈ 0 → preço descartado.
+        let liq = resolve_liq_tokens(tp.dex_name.clone(), info_a.address, info_b.address).await;
+        let (bal_a_addr, bal_b_addr) = match liq {
+            Some((la, lb)) => (la, lb),
+            None => (info_a.address, info_b.address),
+        };
+        let dec_a = cached_decimals(bal_a_addr, dec_a);
+        let dec_b = cached_decimals(bal_b_addr, dec_b);
+
         if let Some(p) = cached_pool_address(&tp.dex_name, &tp.token_a, &tp.token_b, fee) {
             items.push(Item {
                 tp,
                 pool: p,
-                addr_a: info_a.address,
-                addr_b: info_b.address,
+                addr_a: bal_a_addr,
+                addr_b: bal_b_addr,
                 dec_a,
                 dec_b,
             });
         } else {
             pending.push(Pending {
                 tp,
-                addr_a: info_a.address,
-                addr_b: info_b.address,
+                addr_a: bal_a_addr,
+                addr_b: bal_b_addr,
                 dec_a,
                 dec_b,
                 fee,
@@ -408,7 +438,7 @@ where
 /// Retorna `Ok(None)` p/ qualquer falha mensurável (pool miss, token_cache miss,
 /// multicall fail, sem preço, decode miss) — **fail-open**, nunca erro fatal.
 /// Usado pelo log `[TOPSPREAD]` p/ revelar pool raso vs pool profundo.
-pub async fn read_pool_tvl_usd<F, Fut>(
+pub async fn read_pool_tvl_usd<F, Fut, G, Gut>(
     client: Arc<AppMiddleware>,
     token_cache: &TokenCache,
     dex_name: &str,
@@ -416,10 +446,13 @@ pub async fn read_pool_tvl_usd<F, Fut>(
     token_b: &str,
     fee_hint: u32,
     mut resolve_pool: F,
+    mut resolve_liq_tokens: G,
 ) -> Result<Option<f64>>
 where
     F: FnMut(String, Address, Address, u32) -> Fut,
     Fut: std::future::Future<Output = Result<Option<Address>>>,
+    G: FnMut(String, Address, Address) -> Gut,
+    Gut: std::future::Future<Output = Option<(Address, Address)>>,
 {
     let (Some(info_a), Some(info_b)) = (
         token_cache.get_by_symbol(token_a).await,
@@ -427,8 +460,21 @@ where
     ) else {
         return Ok(None); // fail-open: token_cache miss
     };
-    let dec_a = cached_decimals(info_a.address, info_a.decimals);
-    let dec_b = cached_decimals(info_b.address, info_b.decimals);
+    let raw_dec_a = cached_decimals(info_a.address, info_a.decimals);
+    let raw_dec_b = cached_decimals(info_b.address, info_b.decimals);
+
+    // A12: tokens cujo balanceOf(pool) representa a TVL. Default = raw (V2/V3).
+    // Curve am3CRV custodia amTokens → resolve p/ amToken. Sem isso
+    // balanceOf(raw, pool) ≈ 0 → TVL 0 → preço descartado (pool líquida).
+    let liq = resolve_liq_tokens(dex_name.to_string(), info_a.address, info_b.address).await;
+    let (bal_a_addr, dec_a) = match liq {
+        Some((la, _)) => (la, cached_decimals(la, raw_dec_a)),
+        None => (info_a.address, raw_dec_a),
+    };
+    let (bal_b_addr, dec_b) = match liq {
+        Some((_, lb)) => (lb, cached_decimals(lb, raw_dec_b)),
+        None => (info_b.address, raw_dec_b),
+    };
 
     // 1) Pool address (cache ou resolve).
     let pool = if let Some(p) = cached_pool_address(dex_name, token_a, token_b, fee_hint) {
@@ -450,10 +496,11 @@ where
         }
     };
 
-    // 2) Multicall balanceOf (2 calls, 1 round-trip).
+    // 2) Multicall balanceOf (2 calls, 1 round-trip). Usa os tokens de custódia
+    // (amToken p/ Curve, raw p/ V2/V3) — ver A12.
     let mut multicall = Multicall::new(client.clone(), None).await?;
-    let erc_a = ERC20::new(info_a.address, client.clone());
-    let erc_b = ERC20::new(info_b.address, client.clone());
+    let erc_a = ERC20::new(bal_a_addr, client.clone());
+    let erc_b = ERC20::new(bal_b_addr, client.clone());
     multicall.add_call(erc_a.balance_of(pool), true);
     multicall.add_call(erc_b.balance_of(pool), true);
 
