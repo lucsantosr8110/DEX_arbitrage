@@ -25,9 +25,19 @@ use ethers::{
     types::{Address, U256},
 };
 use std::{str::FromStr, sync::Arc};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 const DEX_NAME: &str = "Curve";
+
+// AUDIT 2026-07-25: endereços RAW dos stables na Polygon. O `get_price` (path
+// fallback) recebe endereços raw do token_cache, mas `pool_tokens` guarda só os
+// amTokens (amDAI/amUSDC/amUSDT). Sem este mapa, `resolve_am_to_symbol` nunca
+// casava → fallback Curve sempre retornava None, mesmo p/ stable-stable.
+const RAW_STABLE_TO_SYMBOL: &[(&str, &str)] = &[
+    ("0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063", "DAI"),  // DAI  raw
+    ("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174", "USDC"), // USDC raw
+    ("0xc2132D05D31c914a87C6611C10748AEb04B58e8F", "USDT"), // USDT raw
+];
 
 // ABI mínima para Curve pool (get_dy + coins)
 const CURVE_POOL_ABI: &str = r#"[
@@ -76,11 +86,7 @@ impl CurveDex {
         let token_cache = TokenCache::global(config.clone()).await;
 
         // Ordem real do pool (verificado via API): amDAI(idx 0), amUSDC(idx 1), amUSDT(idx 2)
-        let pool_tokens = vec![
-            (Address::from_str(AM_DAI).unwrap(), 18, "DAI".to_string()),
-            (Address::from_str(AM_USDC).unwrap(), 6, "USDC".to_string()),
-            (Address::from_str(AM_USDT).unwrap(), 6, "USDT".to_string()),
-        ];
+        let pool_tokens = default_stable_pool_tokens();
 
         info!("✅ {}Dex inicializado | pool={} | 3 stables (0.04% fee)", DEX_NAME, pool_addr);
         Self {
@@ -97,9 +103,7 @@ impl CurveDex {
     }
 
     fn pool_index(&self, symbol: &str) -> Option<usize> {
-        self.pool_tokens
-            .iter()
-            .position(|(_, _, orig)| orig.eq_ignore_ascii_case(symbol))
+        stable_pool_index(&self.pool_tokens, symbol)
     }
 
     fn quote_notional_usd(&self) -> f64 {
@@ -111,10 +115,17 @@ impl CurveDex {
     }
 
     async fn resolve_am_to_symbol(&self, addr: &Address) -> Option<String> {
-        self.pool_tokens
+        // 1) Match direto contra os amTokens do pool.
+        if let Some((_, _, sym)) = self
+            .pool_tokens
             .iter()
             .find(|(am_addr, _, _)| am_addr == addr)
-            .map(|(_, _, sym)| sym.clone())
+        {
+            return Some(sym.clone());
+        }
+        // 2) AUDIT fix: fallback p/ endereço RAW do stable (path get_price recebe
+        //    endereços raw do token_cache, não amTokens).
+        stable_symbol_for_address(addr)
     }
 
     fn symbol_from_pair(&self, pair: &str) -> Option<String> {
@@ -188,6 +199,13 @@ impl DexContract for CurveDex {
                 self.pool_index(token_a),
                 self.pool_index(token_b),
             ) else {
+                // AUDIT 2026-07-25: par fora do pool stable (ex.: DAI-WETH). Curve
+                // não serve este par — `–` é honesto. Log em debug p/ não spammar
+                // (o resumo de exclusão da DEX é barulhento no radar).
+                debug!(
+                    "[{}] sem pool p/ {}-{} (não é stable-stable) — pulando",
+                    DEX_NAME, token_a, token_b
+                );
                 continue;
             };
 
@@ -254,5 +272,80 @@ impl DexContract for CurveDex {
 
     fn client(&self) -> &Arc<AppMiddleware> {
         &self.client
+    }
+}
+
+// ============================================================
+// FUNÇÕES PURAS (testáveis sem RPC/AppMiddleware)
+// ============================================================
+
+/// Ordem real do pool am3CRV: amDAI(0), amUSDC(1), amUSDT(2).
+fn default_stable_pool_tokens() -> Vec<(Address, u8, String)> {
+    vec![
+        (Address::from_str(AM_DAI).unwrap(), 18, "DAI".to_string()),
+        (Address::from_str(AM_USDC).unwrap(), 6, "USDC".to_string()),
+        (Address::from_str(AM_USDT).unwrap(), 6, "USDT".to_string()),
+    ]
+}
+
+/// Índice de um símbolo no pool (None → não suportado → `–` honesto).
+fn stable_pool_index(pool_tokens: &[(Address, u8, String)], symbol: &str) -> Option<usize> {
+    pool_tokens
+        .iter()
+        .position(|(_, _, orig)| orig.eq_ignore_ascii_case(symbol))
+}
+
+/// Resolve um endereço (amToken OU raw stable) p/ símbolo. Usado pelo path
+/// `get_price` (fallback) que recebe endereços raw do token_cache.
+fn stable_symbol_for_address(addr: &Address) -> Option<String> {
+    for (raw, sym) in RAW_STABLE_TO_SYMBOL {
+        if format!("{:?}", addr).to_lowercase() == raw.to_lowercase() {
+            return Some((*sym).to_string());
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pool_tokens() -> Vec<(Address, u8, String)> {
+        default_stable_pool_tokens()
+    }
+
+    #[test]
+    fn stable_pool_index_finds_three_stables() {
+        let pt = pool_tokens();
+        assert_eq!(stable_pool_index(&pt, "DAI"), Some(0));
+        assert_eq!(stable_pool_index(&pt, "USDC"), Some(1));
+        assert_eq!(stable_pool_index(&pt, "USDT"), Some(2));
+        assert_eq!(stable_pool_index(&pt, "dai"), Some(0)); // case-insensitive
+    }
+
+    /// Q2: Curve é stable-only. Pares não-stable (WETH, WMATIC, WBTC, LINK…)
+    /// não têm pool → `None` → `–` honesto. Nada de inventar preço.
+    #[test]
+    fn stable_pool_index_rejects_non_stables() {
+        let pt = pool_tokens();
+        for sym in ["WETH", "WMATIC", "WBTC", "LINK", "UNI", "LDO", "AAVE"] {
+            assert_eq!(stable_pool_index(&pt, sym), None, "{sym} não deveria ter pool");
+        }
+    }
+
+    /// AUDIT fix: o path get_price (fallback) recebe endereços RAW (USDC 0x2791…,
+    /// USDT 0xc213…, DAI 0x8f3C…) — não os amTokens. Sem o mapa raw, o fallback
+    /// Curve sempre retornava None. Agora resolve.
+    #[test]
+    fn raw_stable_address_resolves_to_symbol() {
+        let usdc = Address::from_str("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174").unwrap();
+        let usdt = Address::from_str("0xc2132D05D31c914a87C6611C10748AEb04B58e8F").unwrap();
+        let dai = Address::from_str("0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063").unwrap();
+        let weth = Address::from_str("0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619").unwrap();
+
+        assert_eq!(stable_symbol_for_address(&usdc).as_deref(), Some("USDC"));
+        assert_eq!(stable_symbol_for_address(&usdt).as_deref(), Some("USDT"));
+        assert_eq!(stable_symbol_for_address(&dai).as_deref(), Some("DAI"));
+        assert_eq!(stable_symbol_for_address(&weth), None); // não-stable → None
     }
 }

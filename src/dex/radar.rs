@@ -715,6 +715,16 @@ async fn execute_radar_cycle(
             Ok(Ok((dex, map))) => {
                 if !map.is_empty() {
                     out.insert(dex, map);
+                } else {
+                    // AUDIT 2026-07-25: DEX saudável mas 0 cotações válidas nesta
+                    // rodada (ex.: Curve quando o pair set não tem stable-stable).
+                    // Antes isto era silencioso — a DEX simplesmente sumia do
+                    // `dex_count` sem log. Agora é barulhento para distinguir
+                    // "sem pool p/ estes pares" de "falha de init/RPC".
+                    warn!(
+                        "🔻 DEX {} retornou 0 cotações — excluída do resumo (pair set sem pares suportados?)",
+                        dex
+                    );
                 }
             }
             Ok(Err(e)) => warn!("Erro no DEX: {:?}", e),
