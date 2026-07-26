@@ -18,6 +18,7 @@ use std::{
     sync::RwLock,
     time::{Duration, Instant},
 };
+use tokio::sync::Mutex;
 use tracing::debug;
 
 // ============================================================
@@ -28,16 +29,30 @@ use tracing::debug;
 struct CachedEntry {
     price_usd: f64,
     timestamp: Instant,
+    /// True se veio do fallback heurístico (Coingecko falhou). Fallback usa TTL
+    /// curto p/ não prender o bot em preço stale após recover. (Audit A14)
+    is_fallback: bool,
 }
 
 #[derive(Clone)]
 pub struct CachedPriceFeed {
     client: Client,
     ttl: Duration,
+    /// TTL do fallback heurístico. Coingecko free-tier cai e recupera rápido;
+    /// cachear fallback pelo TTL cheio (120s) deixava notional/TVL medidos
+    /// errado por até 2min após recover. 15s: recupera rápido sem re-bater API.
+    fallback_ttl: Duration,
 }
 
 static CACHE: Lazy<RwLock<HashMap<String, CachedEntry>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
+
+/// Single-flight do fetch (Audit A13). Sem isto, N coroutines (radar + liquidity
+/// gate + warm_up) veem cache miss, todas batem Coingecko, todas escrevem —
+/// free-tier 10/min estoura 429. Mutex global serializa fetches; o cache é
+/// re-checado sob o lock (double-checked) p/ quem chegar atrasado pegar o
+/// resultado do primeiro. Serial é OK p/ free-tier (evita burst).
+static FETCH_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 /// Instância global do feed.
 ///
@@ -61,33 +76,43 @@ impl CachedPriceFeed {
                 .build()
                 .unwrap(),
             ttl: Duration::from_secs(120),
+            fallback_ttl: Duration::from_secs(15),
         }
     }
 
     /// 🔍 Obtém preço em USD, com cache e fallback seguro
     pub async fn get_price(&self, symbol: &str) -> Result<f64> {
-        // 1️⃣ Verifica cache
-        {
-            let cache = CACHE.read().unwrap();
-            if let Some(entry) = cache.get(&symbol.to_lowercase()) {
-                if entry.timestamp.elapsed() < self.ttl {
-                    debug!(target: "price_feed", symbol, price_usd = entry.price_usd, "💾 Cache HIT");
-                    return Ok(entry.price_usd);
-                }
-            }
+        let key = symbol.to_lowercase();
+
+        // 1️⃣ Verifica cache (TTL depende se é fallback — A14)
+        if let Some(price) = self.read_fresh_cache(&key) {
+            return Ok(price);
         }
 
-        // 2️⃣ Atualiza via Coingecko
+        // 2️⃣ Single-flight (A13): só um fetch por vez. Outros waiters pegam o
+        // resultado do primeiro via re-check do cache sob o lock.
+        let _guard = FETCH_LOCK.lock().await;
+
+        // Double-checked: outro waiter pode ter preenchido o cache enquanto
+        // esperávamos o lock.
+        if let Some(price) = self.read_fresh_cache(&key) {
+            return Ok(price);
+        }
+
+        // 3️⃣ Atualiza via Coingecko
         match self.fetch_from_coingecko(symbol).await {
             Ok(price) => {
-                let mut cache = CACHE.write().unwrap();
-                cache.insert(
-                    symbol.to_lowercase(),
-                    CachedEntry {
-                        price_usd: price,
-                        timestamp: Instant::now(),
-                    },
-                );
+                {
+                    let mut cache = CACHE.write().unwrap();
+                    cache.insert(
+                        key.clone(),
+                        CachedEntry {
+                            price_usd: price,
+                            timestamp: Instant::now(),
+                            is_fallback: false,
+                        },
+                    );
+                }
                 debug!(target: "price_feed", symbol, price_usd = price, "🌐 Cache MISS — atualizando");
                 Ok(price)
             }
@@ -96,21 +121,40 @@ impl CachedPriceFeed {
                 // rate-limita a API gratuita e gera milhares de WARN por minuto.
                 // O fallback heurístico é suficiente para DIMENSIONAR o notional
                 // (o preço que vale para lucro é sempre o que o DEX devolve), então
-                // cacheamos o fallback pelo mesmo TTL e seguimos em silêncio.
+                // cacheamos o fallback — mas com TTL curto (A14), p/ recuperação
+                // rápida do Coingecko não prender o bot em preço stale por 2min.
                 let price = Self::fallback_price(symbol);
                 {
                     let mut cache = CACHE.write().unwrap();
                     cache.insert(
-                        symbol.to_lowercase(),
+                        key.clone(),
                         CachedEntry {
                             price_usd: price,
                             timestamp: Instant::now(),
+                            is_fallback: true,
                         },
                     );
                 }
-                debug!(target: "price_feed", symbol, error = %e, fallback = price, "preço via fallback heurístico (cacheado)");
+                debug!(target: "price_feed", symbol, error = %e, fallback = price, "preço via fallback heurístico (cacheado TTL curto)");
                 Ok(price)
             }
+        }
+    }
+
+    /// Lê cache se a entrada ainda está fresca (TTL real vs fallback, A14).
+    fn read_fresh_cache(&self, key: &str) -> Option<f64> {
+        let cache = CACHE.read().unwrap();
+        let entry = cache.get(key)?;
+        let ttl = if entry.is_fallback {
+            self.fallback_ttl
+        } else {
+            self.ttl
+        };
+        if entry.timestamp.elapsed() < ttl {
+            debug!(target: "price_feed", key, price_usd = entry.price_usd, fallback = entry.is_fallback, "💾 Cache HIT");
+            Some(entry.price_usd)
+        } else {
+            None
         }
     }
 
