@@ -192,26 +192,27 @@ impl ArbitrageClient {
         gross_profit_usd: f64,
         gas_cost_usd: f64,
         flashloan_fee_usd: f64,
+        adverse_move_usd: f64,
     ) -> Result<(), FlashloanError> {
         let net_profit_usd = economics::net_profit_usd(
             gross_profit_usd,
             &economics::TradeCosts {
                 gas_usd: gas_cost_usd,
                 flashloan_fee_usd,
-                adverse_move_usd: 0.0,
+                adverse_move_usd,
             },
         );
 
         if net_profit_usd <= 0.0 {
             return Err(FlashloanError::InsufficientProfit(format!(
-                "Net profit ${:.4} <= 0 (gross: ${:.4}, gas: ${:.4}, flashloan_fee: ${:.4})",
-                net_profit_usd, gross_profit_usd, gas_cost_usd, flashloan_fee_usd
+                "Net profit ${:.4} <= 0 (gross: ${:.4}, gas: ${:.4}, flashloan_fee: ${:.4}, adverse: ${:.4})",
+                net_profit_usd, gross_profit_usd, gas_cost_usd, flashloan_fee_usd, adverse_move_usd
             )));
         }
 
         info!(
-            "💰 Profit validation: ${:.4} net (${:.4} gross - ${:.4} gas - ${:.4} flashloan)",
-            net_profit_usd, gross_profit_usd, gas_cost_usd, flashloan_fee_usd
+            "💰 Profit validation: ${:.4} net (${:.4} gross - ${:.4} gas - ${:.4} flashloan - ${:.4} adverse)",
+            net_profit_usd, gross_profit_usd, gas_cost_usd, flashloan_fee_usd, adverse_move_usd
         );
 
         Ok(())
@@ -427,7 +428,7 @@ impl ArbitrageClient {
         // NOTE: update_execution_block() era chamado AQUI (antes da execução),
         // o que faria debounce_same_block() sempre retornar true se fosse
         // implementado. Movido para após TX confirmada em send_and_confirm_transaction.
-        let (strategy, min_profit, risk_cfg, slippage_bps, flashloan_decimals, fee_pct, max_premium_bps) = {
+        let (strategy, min_profit, risk_cfg, slippage_bps, flashloan_decimals, fee_pct, max_premium_bps, adverse_move_bps) = {
             let cfg = self.config.lock().await;
 
             (
@@ -442,8 +443,22 @@ impl ArbitrageClient {
     // Mesma fonte do engine (`recalculate_profitability`); default 5 bps Aave V3.
     cfg.flashloan.fee_pct.unwrap_or(economics::AAVE_V3_PREMIUM_PCT),
     cfg.flashloan.max_premium_bps,
+    cfg.execution.adverse_move_bps,
 )
         };
+
+        // A11: `flashloan.slippage_bps` é parâmetro morto — não controla slippagem
+        // algum. A slippagem real vem de `execution.max_slippage_bps` + `safety_margin_bps`
+        // via `apply_slippage_safe` (core/arbitrage.rs). Avisar o operador que ajustar
+        // este campo no TOML não muda comportamento, p/ evitar falso sentimento de
+        // controle de risco.
+        if self.config.lock().await.flashloan.slippage_bps.is_some() {
+            warn!(
+                "flashloan.slippage_bps está definido no TOML mas é ignorado: a slippagem \
+                 real é controlada por execution.max_slippage_bps + safety_margin_bps. \
+                 Remova o campo ou migre para execution.max_slippage_bps."
+            );
+        }
 
         let configured_premium_bps = (fee_pct * 10_000.0).round();
         if !configured_premium_bps.is_finite()
@@ -474,17 +489,33 @@ impl ArbitrageClient {
         let flashloan_fee_token = self.calculate_flashloan_fee(opp.amount_in, fee_pct);
         let flashloan_fee_usd =
             self.token_amount_to_usd(flashloan_fee_token, token_price, flashloan_decimals);
+        // A16: adverse_move era ignorado aqui (engine inclui). Repassar p/ o
+        // gate p/ ficar consistente com `recalculate_profitability`.
+        let trade_amount_usd = opp.estimated_volume_usd.max(0.0);
+        let adverse_usd = economics::adverse_move_usd(trade_amount_usd, adverse_move_bps);
 
         if let Err(e) = self.validate_profit_after_fees(
             opp.estimated_profit_usd, // GROSS
             gas_cost,
             flashloan_fee_usd,
+            adverse_usd,
         ) {
             warn!("{}", e);
             return Ok(BundleResult::skipped().with_execution_mode("insufficient_profit"));
         }
 
-        // net_profit recalculado corretamente abaixo
+        // A6: net_profit NÃO era recalculado após gas fresca — gate `:489`
+        // usava net antigo (computado pelo engine com gas anterior). Se gas
+        // fresco < gas do engine, opps lucrativas eram descartadas. Recalcular
+        // com a mesma fórmula única do economics.
+        opp.net_profit_usd = economics::net_profit_usd(
+            opp.estimated_profit_usd,
+            &economics::TradeCosts {
+                gas_usd: gas_cost,
+                flashloan_fee_usd,
+                adverse_move_usd: adverse_usd,
+            },
+        );
 
         if opp.net_profit_usd < min_profit {
             info!("💰 Profit skip: ${:.4} < ${:.4}", opp.net_profit_usd, min_profit);
@@ -552,23 +583,39 @@ impl ArbitrageClient {
             }
         }
 
-        let (slippage_bps, fee_pct, flashloan_decimals) = {
+        let (slippage_bps, fee_pct, flashloan_decimals, adverse_move_bps) = {
             let cfg = self.config.lock().await;
             (
                 cfg.flashloan.slippage_bps.unwrap_or(50) as u64,
                 cfg.flashloan.fee_pct.unwrap_or(economics::AAVE_V3_PREMIUM_PCT),
                 cfg.flashloan.flashloan_decimals.unwrap_or(6) as u32,
+                cfg.execution.adverse_move_bps,
             )
         };
 
-        if let Ok(v) = self.gas_estimator.estimate_arbitrage_gas_usd().await {
-            opp.gas_cost_usd = v;
-        }
+        // A6: igual ao path de exec real — recalcular net após gas fresca.
+        let gas_cost = match self.gas_estimator.estimate_arbitrage_gas_usd().await {
+            Ok(v) => {
+                opp.gas_cost_usd = v;
+                v
+            }
+            Err(_) => opp.gas_cost_usd,
+        };
 
         let token_price = opp.token_price_usd.unwrap_or(1.0);
         let flashloan_fee_token = self.calculate_flashloan_fee(opp.amount_in, fee_pct);
         let flashloan_fee_usd =
             self.token_amount_to_usd(flashloan_fee_token, token_price, flashloan_decimals);
+        let adverse_usd =
+            economics::adverse_move_usd(opp.estimated_volume_usd.max(0.0), adverse_move_bps);
+        opp.net_profit_usd = economics::net_profit_usd(
+            opp.estimated_profit_usd,
+            &economics::TradeCosts {
+                gas_usd: gas_cost,
+                flashloan_fee_usd,
+                adverse_move_usd: adverse_usd,
+            },
+        );
 
         match self
             .run_paper_validation(opp, slippage_bps, flashloan_fee_usd, would_execute)
@@ -1549,7 +1596,7 @@ mod tests {
     fn profit_validation_ok_when_net_positive() {
         let client = make_client();
         // gross $5 - gas $0.50 - fee $0.50 => net $4.00
-        let res = client.validate_profit_after_fees(5.0, 0.50, 0.50);
+        let res = client.validate_profit_after_fees(5.0, 0.50, 0.50, 0.0);
         assert!(res.is_ok(), "deveria aceitar profit positivo: {:?}", res);
     }
 
@@ -1557,7 +1604,7 @@ mod tests {
     fn profit_validation_rejects_net_zero_or_negative() {
         let client = make_client();
         // gross $1 - gas $0.50 - fee $0.60 => net -$0.10
-        let res = client.validate_profit_after_fees(1.0, 0.50, 0.60);
+        let res = client.validate_profit_after_fees(1.0, 0.50, 0.60, 0.0);
         let err = res.expect_err("deveria rejeitar net negativo");
         assert!(matches!(err, FlashloanError::InsufficientProfit(_)));
         assert!(err.to_string().contains("Net profit"));
@@ -1570,7 +1617,7 @@ mod tests {
         let gross = 10.0_f64;
         let gas = 1.0_f64;
         let fee = 0.5_f64;
-        assert!(client.validate_profit_after_fees(gross, gas, fee).is_ok());
+        assert!(client.validate_profit_after_fees(gross, gas, fee, 0.0).is_ok());
         let expected_net = gross - gas - fee;
         assert!((expected_net - 8.5).abs() < 1e-12);
         // Se subtraísse de novo (double), net ficaria 8.5 - 1 - 0.5 = 7.0 — gate
@@ -1587,7 +1634,7 @@ mod tests {
         let fee_tok = client.calculate_flashloan_fee(amount, 0.0005);
         let fee_usd = client.token_amount_to_usd(fee_tok, 1.0, 6);
         assert!((fee_usd - 0.05).abs() < 1e-9, "fee_usd={fee_usd}");
-        assert!(client.validate_profit_after_fees(2.0, 0.1, fee_usd).is_ok());
+        assert!(client.validate_profit_after_fees(2.0, 0.1, fee_usd, 0.0).is_ok());
     }
 
     // ------------------------------------------------------------------------
