@@ -542,7 +542,7 @@ impl ArbitrageEngine {
                 i, opp.path, opp.spread_percent, opp.estimated_profit_usd
             );
 
-            if let Some(usdt_opp) = self.force_usdt_start_end_optimized(&mut opp, app_config).await
+            if let Some(usdt_opp) = self.force_usdt_start_end_optimized(&mut opp, price_map, app_config).await
             {
                 if Self::validate_opportunity(&usdt_opp).is_ok() {
                     info!(
@@ -645,6 +645,7 @@ impl ArbitrageEngine {
     async fn convert_to_usdt_centric(
         &self,
         opp: &mut ArbitrageOpportunity,
+        price_map: &HashMap<String, HashMap<String, f64>>,
         app_config: &Config,
     ) -> Option<ArbitrageOpportunity> {
         let path = &opp.path;
@@ -679,18 +680,19 @@ impl ArbitrageEngine {
         }
 
         debug!("🔄 Convertendo oportunidade não-USDT...");
-        self.convert_non_usdt_opportunity(path, steps, app_config).await
+        self.convert_non_usdt_opportunity(path, steps, price_map, app_config).await
     }
 
     async fn convert_non_usdt_opportunity(
         &self,
         original_path: &[String],
         original_steps: &[ArbitrageStep],
+        price_map: &HashMap<String, HashMap<String, f64>>,
         app_config: &Config,
     ) -> Option<ArbitrageOpportunity> {
         match (original_path.len(), original_steps.len()) {
             (3, 2) if !Self::is_stable_flashloan_centric(original_path) => {
-                self.convert_direct_arbitrage(original_path, original_steps, app_config)
+                self.convert_direct_arbitrage(original_path, original_steps, price_map, app_config)
                     .await
             }
             (4..=5, 3..=4) if Self::is_stable_flashloan_start(original_path) => {
@@ -717,6 +719,7 @@ impl ArbitrageEngine {
         &self,
         path: &[String],
         steps: &[ArbitrageStep],
+        price_map: &HashMap<String, HashMap<String, f64>>,
         app_config: &Config,
     ) -> Option<ArbitrageOpportunity> {
         if path.len() != 3 || steps.len() != 2 {
@@ -726,10 +729,11 @@ impl ArbitrageEngine {
         let token_a = &path[0];
         let token_b = &path[1];
 
-        // Importante: se não conseguimos inferir taxa USDT->token ou token->USDT de forma segura,
-        // retornamos 0.0 e o recálculo vai rejeitar por preço inválido (evita ilusões).
-        let usdt_to_a = self.estimate_usdt_rate(token_a, steps, true);
-        let b_to_usdt = self.estimate_usdt_rate(token_b, steps, false);
+        // C5: se não há step USDT↔token na rota original (direct A→B→A non-stable),
+        // consultar o price_map global p/ melhor taxa cross-DEX. Antes retornava
+        // 0.0 e toda direct non-stable era descartada silenciosamente.
+        let usdt_to_a = self.estimate_usdt_rate(token_a, steps, true, price_map);
+        let b_to_usdt = self.estimate_usdt_rate(token_b, steps, false, price_map);
 
         let usdt_steps = vec![
             Self::create_step(SANITIZED_PLACEHOLDER, TARGET_BASE_TOKEN, token_a, usdt_to_a),
@@ -2013,12 +2017,17 @@ impl ArbitrageEngine {
         economics::gas_usd_or_fallback(static_fallback)
     }
 
-    fn estimate_usdt_rate(&self, token: &str, steps: &[ArbitrageStep], is_input: bool) -> f64 {
+    fn estimate_usdt_rate(
+        &self,
+        token: &str,
+        steps: &[ArbitrageStep],
+        is_input: bool,
+        price_map: &HashMap<String, HashMap<String, f64>>,
+    ) -> f64 {
         match token {
             "USDC" | "USDT" | "DAI" => 1.0,
             _ => {
-                // Procura nos steps por uma conversão direta com USDT já existente.
-                // Se não achar, devolve 0.0 (não inventa 1.0), para a rota ser rejeitada.
+                // 1) Procura nos steps por uma conversão direta com USDT já existente.
                 for step in steps {
                     if is_input && step.token_out == token && step.token_in == TARGET_BASE_TOKEN {
                         return step.expected_rate;
@@ -2027,11 +2036,35 @@ impl ArbitrageEngine {
                         return step.expected_rate;
                     }
                 }
-                // ⚠️ Logar em warn: oportunidade descartada por falta de taxa USDT direta.
-                // Antes era silencioso (só debug), dificultando auditoria de oportunidades perdidas.
+                // 2) C5: sem step USDT direto — consultar price_map global p/ melhor
+                // taxa cross-DEX. Antes retornava 0.0 e toda direct non-stable era
+                // descartada silenciosamente.
+                // is_input=true  → USDT→token (queremos token por USDT): key "USDT-{token}"
+                // is_input=false → token→USDT (queremos USDT por token): key "{token}-USDT"
+                let key = if is_input {
+                    format!("{}-{}", TARGET_BASE_TOKEN, token)
+                } else {
+                    format!("{}-{}", token, TARGET_BASE_TOKEN)
+                };
+                let mut best: f64 = 0.0;
+                for dex_prices in price_map.values() {
+                    if let Some(&rate) = dex_prices.get(&key) {
+                        if rate.is_finite() && rate > 0.0 && rate > best {
+                            best = rate;
+                        }
+                    }
+                }
+                if best > 0.0 {
+                    debug!(
+                        "✅ estimate_usdt_rate: USDT↔{} resolvido via price_map (key={}, rate={})",
+                        token, key, best
+                    );
+                    return best;
+                }
+                // 3) Sem step direto nem cotação no price_map — rejeita (não inventa 1.0).
                 warn!(
-                    "⚠️ estimate_usdt_rate: sem conversão direta USDT↔{} nos steps (is_input={}). \
-                     Oportunidade será rejeitada por preço inválido.",
+                    "⚠️ estimate_usdt_rate: sem conversão USDT↔{} (steps nem price_map, is_input={}). \
+                     Oportunidade rejeitada por preço inválido.",
                     token, is_input
                 );
                 0.0
@@ -2146,9 +2179,10 @@ impl ArbitrageEngine {
     async fn force_usdt_start_end_optimized(
         &self,
         opp: &mut ArbitrageOpportunity,
+        price_map: &HashMap<String, HashMap<String, f64>>,
         app_config: &Config,
     ) -> Option<ArbitrageOpportunity> {
-        self.convert_to_usdt_centric(opp, app_config).await
+        self.convert_to_usdt_centric(opp, price_map, app_config).await
     }
 }
 
