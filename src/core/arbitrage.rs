@@ -7,7 +7,7 @@ use crate::{
     AppMiddleware,
 };
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use ethers::types::{Address, U256};
 use std::{
@@ -33,6 +33,12 @@ const MAX_TRADE_AMOUNT_USD: f64 = 100.0;
 const MAX_TRADE_AMOUNT_FLASHLOAN_USD: f64 = 10_000.0;
 const MAX_REALISTIC_SPREAD: f64 = 100.0;
 const MAX_REALISTIC_PROFIT_RATIO: f64 = 0.50;
+/// C4: piso mínimo de output esperado (em raw units) para que um hop seja
+/// considerado viável. Abaixo disso, `apply_slippage_safe` colapsa para
+/// `U256::one()` (integer division trunca p/ 0) — `amount_out_min = 1`
+/// é "sem proteção" e abre janela de sandwich. Em vez de executar, rejeita
+/// a rota. 1000 raw = ~1e-15 de um token de 18 decimais — claramente dust.
+const MIN_EXPECTED_OUTPUT_RAW: u64 = 1_000;
 
 /// Contador atômico global para gerar IDs únicos de oportunidades.
 /// Evita colisões quando múltiplas oportunidades são criadas no mesmo milissegundo.
@@ -1005,6 +1011,16 @@ impl ArbitrageEngine {
                 safety_margin_bps,
             );
 
+            // C4: output esperado dust → `apply_slippage_safe` colapsa p/ 1
+            // (janela de sandwich). Rejeitar a rota inteira em vez de executar
+            // sem proteção efetiva.
+            if expected_output < U256::from(MIN_EXPECTED_OUTPUT_RAW) {
+                bail!(
+                    "hop {} ({}) output esperado {} < piso {} raw — rota inviável (sandwich guard)",
+                    idx, step.dex_name, expected_output, MIN_EXPECTED_OUTPUT_RAW
+                );
+            }
+
             // DEBUG
             let output_f64 = u256_to_f64(expected_output, output_decimals);
             let min_f64 = u256_to_f64(step.amount_out_min, output_decimals);
@@ -1889,6 +1905,14 @@ impl ArbitrageEngine {
             warn!(
                 "🚨 safety_margin_bps={} é PERIGOSAMENTE baixo (< 5000 = 50%). Aplicando clamp para 9500 (95%). \
                  Verifique config.toml [execution] safety_margin_bps — deve ser ~9800 (98%).",
+                safety_margin_bps
+            );
+        } else if safety_margin_bps < 9500 {
+            // A7: clamp silencioso era perigoso — operador config 8000 achando
+            // que é 80% era elevado p/ 9500 sem aviso. Agora logs.
+            warn!(
+                "⚠️ safety_margin_bps={} < 9500 será clamped p/ 9500 (95%). \
+                 Valor interpretado como 'manter X bps do output' — 9800 = 98%.",
                 safety_margin_bps
             );
         }
