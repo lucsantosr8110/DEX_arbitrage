@@ -31,7 +31,12 @@ const MAX_TRADE_AMOUNT_USD: f64 = 100.0;
 /// Limite máximo para trades com flashloan (separado do limite manual).
 /// Flashloans permitem operar com capital emprestado, então o limite pode ser maior.
 const MAX_TRADE_AMOUNT_FLASHLOAN_USD: f64 = 10_000.0;
-const MAX_REALISTIC_SPREAD: f64 = 100.0;
+/// A1: teto de spread aceito no finder. Antes era 100.0 (final_rate ≤ 2.0),
+/// mas `calculate_total_rate_corrected` rejeita total_rate > 1.50 (spread
+/// > 50%). Opps com spread 50–100% passavam o finder e morriam no recálculo
+/// — work desperdiçado + contagem dupla "encontradas vs validadas".
+/// Unificado com a banda [0.90, 1.50] do recálculo: 50% = rate 1.50.
+const MAX_REALISTIC_SPREAD: f64 = 50.0;
 const MAX_REALISTIC_PROFIT_RATIO: f64 = 0.50;
 /// C4: piso mínimo de output esperado (em raw units) para que um hop seja
 /// considerado viável. Abaixo disso, `apply_slippage_safe` colapsa para
