@@ -274,7 +274,6 @@ estimated_gas_units = 400000
 max_gas_limit = 700000
 fallback_strategy = "conservative"
 prediction_window = 2
-eth_price_usd = 0.102083
 gas_buffer_percent = 110
 gas_cost_limit_usd = 0.50
 eip1559_enabled = true
@@ -285,6 +284,7 @@ max_fee_multiplier = 1.5
 etherchain = false
 blocknative = false
 pokt = false
+polygon_oracle_url = "https://gasstation.polygon.technology/v2"
 
 [gas.optimization]
 auto_adjust = true

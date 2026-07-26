@@ -1076,9 +1076,23 @@ pub struct GasStationsConfig {
     pub etherchain: bool,
     pub blocknative: bool,
     pub pokt: bool,
+    /// URL do Polygon Gas Oracle (M20). Parametrizada p/ não consultar oracle
+    /// errado em outra chain silenciosamente.
+    #[serde(default = "default_polygon_oracle_url")]
+    pub polygon_oracle_url: String,
+}
+fn default_polygon_oracle_url() -> String {
+    "https://gasstation.polygon.technology/v2".to_string()
 }
 impl Default for GasStationsConfig {
-    fn default() -> Self { Self { etherchain: false, blocknative: false, pokt: false } }
+    fn default() -> Self {
+        Self {
+            etherchain: false,
+            blocknative: false,
+            pokt: false,
+            polygon_oracle_url: default_polygon_oracle_url(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -1107,7 +1121,6 @@ pub struct GasConfig {
     pub fallback_strategy: String,
     pub prediction_window: u64,
     pub default_gas_limit: u64,
-    pub eth_price_usd: f64,
     pub gas_buffer_percent: u32,
     pub gas_cost_limit_usd: f64,
     pub eip1559_enabled: bool,
@@ -1136,7 +1149,6 @@ impl Default for GasConfig {
             fallback_strategy: "average".to_string(),
             prediction_window: 10,
             default_gas_limit: 1_000_000,
-            eth_price_usd: 1.0,
             gas_buffer_percent: 10,
             gas_cost_limit_usd: 5.0,
             eip1559_enabled: true,

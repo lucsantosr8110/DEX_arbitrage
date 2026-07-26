@@ -112,6 +112,14 @@ where
                 let priority_fee = gwei_f64(prio_gwei);
 
                 self.set_cached_gas(&cache_key, max_fee, priority_fee, base_fee).await;
+                // M7: popular base_fee_cache com o base_fee derivado do oracle
+                // (max_fee − priority). Antes ia p/ campo `_base_fee` (unused) e o
+                // custo fazia SEGUNDA RPC `get_cached_base_fee`. Agora quem ler
+                // base_fee em seguida pega do cache (0 RPCs extra).
+                {
+                    let mut cache = self.base_fee_cache.write().await;
+                    *cache = Some((base_fee, Instant::now()));
+                }
                 info!(
                     "🔗 [GasOracleSync] Oracle → Base: {:.2} | Priority: {:.2} | Max: {:.2} Gwei",
                     max_fee_gwei - prio_gwei,
@@ -165,7 +173,14 @@ where
             }
         }
 
-        match self.http.get("https://gasstation.polygon.technology/v2").send().await {
+        // M20: URL do oracle parametrizada por config.gas.stations.polygon_oracle_url.
+        // Antes hardcoded `https://gasstation.polygon.technology/v2` — em outra
+        // chain o bot consultaria oracle errado silenciosamente.
+        let url = {
+            let cfg = self.config.lock().await;
+            cfg.gas.stations.polygon_oracle_url.clone()
+        };
+        match self.http.get(&url).send().await {
             Ok(resp) => {
                 if resp.status().is_success() {
                     let oracle: PolygonGasOracle = resp.json().await?;
@@ -231,42 +246,37 @@ where
     // ============================================================
     // 💵 Estimativa de custo
     // ============================================================
-    pub async fn estimate_arbitrage_gas_usd(&self) -> Result<f64> {
+    /// Custo de gás para uma rota de `n_hops` pernas. (Audit M4)
+    ///
+    /// Antes `gas_units` era fixo (`estimated_gas_units`, 400k) independente de
+    /// hops — rotas 4-5 hops queimam > 400k (V2 ≈ 80-110k/hop, V3 ≈ 150-180k/hop,
+    /// +overhead Aave). Custo subestimado em rotas longas → hurdle baixo →
+    /// executa opps que dão prejuízo. Agora escala: `base_per_hop × n_hops +
+    /// flashloan_overhead`, derivando `base_per_hop` de `estimated_gas_units`
+    /// (interpretado como rota de 3 hops) menos `flashloan.gas_overhead`.
+    pub async fn estimate_gas_usd_for_hops(&self, n_hops: usize) -> Result<f64> {
         let cfg = self.config.lock().await.clone();
         let gas_cfg = &cfg.gas;
 
         let ttl = Duration::from_secs(gas_cfg.cache_ttl.max(10));
+
+        // M7: populate_dynamic_gas pode popular base_fee_cache via oracle, evitando
+        // a segunda RPC `get_cached_base_fee` que antes sempre rodava.
+        let (_, priority_fee) =
+            self.populate_dynamic_gas(&mut Eip1559TransactionRequest::default())
+                .await?;
         let base_fee = self
             .get_cached_base_fee(ttl)
             .await?
             .unwrap_or(gwei(gas_cfg.default_gas_price_gwei as u64));
 
-        let (_, priority_fee) =
-            self.populate_dynamic_gas(&mut Eip1559TransactionRequest::default())
-                .await?;
-
         let base_fee_gwei = u256_to_f64(base_fee, 9);
         let priority_gwei = u256_to_f64(priority_fee, 9);
         let eff = base_fee_gwei * 1.05 + priority_gwei;
 
-        // `default_gas_limit`/`max_gas_limit` são TETOS da tx, não consumo esperado.
-        // Para decidir lucro o que importa é o gás realmente queimado; usar o teto
-        // infla o custo. `gas.estimated_gas_units` traz o consumo esperado da rota
-        // (flashloan Aave + 3 swaps ≈ 400k); só cai no teto se não configurado.
-        let gas_units = if gas_cfg.estimated_gas_units > 0 {
-            gas_cfg.estimated_gas_units as f64
-        } else if gas_cfg.default_gas_limit == 0 {
-            gas_cfg.max_gas_limit as f64
-        } else {
-            gas_cfg.default_gas_limit as f64
-        };
+        let gas_units = Self::gas_units_for_hops(gas_cfg, &cfg, n_hops);
 
         // Preço do POL (token de gás da Polygon) via Coingecko com cache de 2 min.
-        //
-        // `PRICE_FEED` já tem fallback heurístico próprio e devolve Err só em caso
-        // patológico; nesse caso usamos o mesmo fallback, NÃO `gas_cfg.eth_price_usd`
-        // — esse campo é um estático de config (0.102083) que ninguém atualiza e
-        // era um terceiro preço divergente na cadeia.
         let matic_price = crate::infra::price_feed::PRICE_FEED
             .get_price("WMATIC")
             .await
@@ -277,11 +287,38 @@ where
         crate::core::economics::publish_live_gas_usd(cost);
 
         info!(
-            "⛽ [GasEstimator] base={:.2} | prio={:.2} | eff={:.2} | units={} | custo=${:.6}",
-            base_fee_gwei, priority_gwei, eff, gas_units, cost
+            "⛽ [GasEstimator] base={:.2} | prio={:.2} | eff={:.2} | hops={} | units={:.0} | custo=${:.6}",
+            base_fee_gwei, priority_gwei, eff, n_hops, gas_units, cost
         );
 
         Ok(cost)
+    }
+
+    /// Backward-compat: custo para rota de 3 hops (referência do
+    /// `estimated_gas_units`). Callers sem `n_hops` explícito caem aqui.
+    pub async fn estimate_arbitrage_gas_usd(&self) -> Result<f64> {
+        self.estimate_gas_usd_for_hops(3).await
+    }
+
+    /// `gas_units` escalado por hops (M4). Deriva `base_per_hop` de
+    /// `estimated_gas_units` (rota de 3 hops) e `flashloan.gas_overhead`. Sem
+    /// `estimated_gas_units`, cai em `default_gas_limit`/`max_gas_limit` (teto).
+    fn gas_units_for_hops(gas_cfg: &crate::config::GasConfig, cfg: &Config, n_hops: usize) -> f64 {
+        let hops = n_hops.max(1) as f64;
+        if gas_cfg.estimated_gas_units > 0 {
+            let overhead = cfg
+                .flashloan
+                .gas_overhead
+                .unwrap_or(100_000)
+                .min(gas_cfg.estimated_gas_units);
+            let base_per_hop = (gas_cfg.estimated_gas_units - overhead) as f64 / 3.0;
+            return base_per_hop * hops + overhead as f64;
+        }
+        if gas_cfg.default_gas_limit == 0 {
+            gas_cfg.max_gas_limit as f64
+        } else {
+            gas_cfg.default_gas_limit as f64
+        }
     }
 
     // ============================================================
@@ -419,5 +456,23 @@ mod tests {
             cfg.estimated_gas_units < cfg.max_gas_limit,
             "consumo esperado deve ser menor que o teto"
         );
+    }
+
+    /// M4: gas_units escala por hops reais, não fixo. Rota de 3 hops = referência
+    /// (estimated_gas_units). 4 hops > 3 hops > 2 hops.
+    #[test]
+    fn gas_units_scale_with_hops() {
+        let gas_cfg = crate::config::GasConfig::default();
+        let cfg = crate::config::Config::default();
+        let u3 = GasEstimator::<ethers::providers::Provider<ethers::providers::Http>>::gas_units_for_hops(&gas_cfg, &cfg, 3);
+        let u2 = GasEstimator::<ethers::providers::Provider<ethers::providers::Http>>::gas_units_for_hops(&gas_cfg, &cfg, 2);
+        let u4 = GasEstimator::<ethers::providers::Provider<ethers::providers::Http>>::gas_units_for_hops(&gas_cfg, &cfg, 4);
+        // 3 hops deve reproduzir o estimated_gas_units de referência.
+        assert!((u3 - gas_cfg.estimated_gas_units as f64).abs() < 1e-6, "3 hops={u3} ref={}", gas_cfg.estimated_gas_units);
+        assert!(u4 > u3, "4 hops ({u4}) deve custar mais que 3 ({u3})");
+        assert!(u2 < u3, "2 hops ({u2}) deve custar menos que 3 ({u3})");
+        // 0 hops (degen) não divide por zero — clamp em 1.
+        let u0 = GasEstimator::<ethers::providers::Provider<ethers::providers::Http>>::gas_units_for_hops(&gas_cfg, &cfg, 0);
+        assert!(u0.is_finite() && u0 > 0.0);
     }
 }

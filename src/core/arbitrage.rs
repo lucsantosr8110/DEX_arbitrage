@@ -873,7 +873,9 @@ impl ArbitrageEngine {
         let gross_profit_usd = economics::gross_profit_usd(trade_amount_usd, total_rate);
 
         // Custos reais, um de cada. NÃO deduzir fee/price impact de novo.
-        let gas_cost_usd = self.estimate_gas_cost(app_config).await;
+        let gas_cost_usd = self
+            .estimate_gas_cost(app_config, opp.steps.0.len())
+            .await;
 
         let flashloan_fee_usd = if app_config.flashloan.enabled {
             let fee_pct = app_config
@@ -2016,10 +2018,21 @@ impl ArbitrageEngine {
     /// do POL). `execution.estimate_base_gas_usd` só vale como fallback até a
     /// primeira medição — antes, este era um segundo modelo permanente, que
     /// divergia do executor e do risk manager.
-    async fn estimate_gas_cost(&self, app_config: &Config) -> f64 {
-        let complexity_factor = 1.0 + (app_config.arbitrage.max_path_length as f64 * 0.05);
-        let static_fallback = app_config.execution.estimate_base_gas_usd * complexity_factor;
-        economics::gas_usd_or_fallback(static_fallback)
+    /// Custo de gás do gate do finder.
+    ///
+    /// Prefere a medição viva publicada pelo `GasEstimator` (oracle/RPC + preço
+    /// do POL). `execution.estimate_base_gas_usd` só vale como fallback até a
+    /// primeira medição — antes, este era um segundo modelo permanente, que
+    /// divergia do executor e do risk manager.
+    ///
+    /// M4: escala por `n_hops` reais da rota (referência = 3 hops), não pelo
+    /// teto `max_path_length`. Antes rotas longas (4-5 hops) subestimavam custo
+    /// → hurdle baixo → executa opps que dão prejuízo. O live publicado pelo
+    /// executor é referência de 3 hops, então aplicamos o mesmo scale aqui.
+    async fn estimate_gas_cost(&self, app_config: &Config, n_hops: usize) -> f64 {
+        let scale = n_hops.max(1) as f64 / 3.0;
+        let static_fallback = app_config.execution.estimate_base_gas_usd * scale;
+        economics::gas_usd_or_fallback(static_fallback) * scale
     }
 
     fn estimate_usdt_rate(

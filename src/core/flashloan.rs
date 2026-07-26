@@ -474,8 +474,9 @@ impl ArbitrageClient {
             return Ok(BundleResult::skipped().with_execution_mode("premium_cap"));
         }
 
-        // GAS - Estimativa atualizada
-        let gas_cost = match self.gas_estimator.estimate_arbitrage_gas_usd().await {
+        // GAS - Estimativa atualizada (escalada por hops reais da rota, M4).
+        let n_hops = opp.steps.0.len().max(1);
+        let gas_cost = match self.gas_estimator.estimate_gas_usd_for_hops(n_hops).await {
             Ok(v) => {
                 opp.gas_cost_usd = v;
                 metrics::set_last_gas_usd(v);
@@ -593,8 +594,10 @@ impl ArbitrageClient {
             )
         };
 
-        // A6: igual ao path de exec real — recalcular net após gas fresca.
-        let gas_cost = match self.gas_estimator.estimate_arbitrage_gas_usd().await {
+        // A6: igual ao path de exec real — recalcular net após gas fresca
+        // (escalada por hops reais da rota, M4).
+        let n_hops = opp.steps.0.len().max(1);
+        let gas_cost = match self.gas_estimator.estimate_gas_usd_for_hops(n_hops).await {
             Ok(v) => {
                 opp.gas_cost_usd = v;
                 v
