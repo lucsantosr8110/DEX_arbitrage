@@ -47,10 +47,6 @@ const DEX_NAME: &str = "UniswapV3";
 const FEE_TIERS: [u32; 4] = QUOTE_V3_FEE_TIERS;
 const PRICE_DEVIATION_LIMIT: f64 = 0.20; // 20% desvio máximo
 
-// Assumindo WETH (ETH principal em Polygon) para comparação com USD
-// Se o bot estiver no Polygon, o WETH é 0x7ceb23fd...
-const ETH_TOKEN_ADDRESS: &str = "0x7ceb23fd6bc0add59e62ac25578270cff1b9f619"; 
-
 // Endereços (usando addresses do mod.rs)
 const DEFAULT_QUOTER_V1: &str = addresses::UNISWAP_V3_QUOTER;
 const FACTORY_ADDR: &str = addresses::UNISWAP_V3_FACTORY;
@@ -299,32 +295,42 @@ impl UniswapV3Dex {
         dec_a: u8,
         dec_b: u8,
     ) -> Result<Option<f64>> {
-        let is_a_eth = token_a == Address::from_str(ETH_TOKEN_ADDRESS).unwrap();
-
-        // Lógica simplificada: se for WETH (token de alto valor/liquidez), testamos com 10/100/500 unidades em base 10^18.
-        // Se for outro token, testamos com 1, 10, 50 unidades base 10^decimals, pois não temos oráculo para USD.
-        let _amount_multiplier = |base: u64| -> U256 {
-            U256::from(base) * U256::exp10(dec_a as usize) / U256::exp10(18) * U256::exp10(dec_a as usize)
-        };
-        
-        let amounts_to_test: [U256; 3] = if is_a_eth {
-             // WETH tem 18 decimais. Usamos 0.0035, 0.035, 0.175 WETH (~$10, ~$100, ~$500 no preço de $2800)
-             // Nota: Não temos o preço de USD em tempo real, então usamos uma escala que se assemelha a ordens pequenas.
-             // Para simplificar, focamos em ordens pequenas. O amount_in original de 1 WETH (U256::exp10(18)) é o problema.
-            [
-                U256::exp10(dec_a as usize) / U256::from(100), // 0.01 WETH (para testar)
-                U256::exp10(dec_a as usize) / U256::from(30),  // ~0.03 WETH ($100 USD)
-                U256::exp10(dec_a as usize) / U256::from(10),  // 0.1 WETH
-            ]
+        // C1/A5: dimensionar notionais via price_feed (igual V2). Antes era
+        // 1/10/50 unidades hardcoded — para WBTC (8 dec) = $64k/$640k/$3.2M,
+        // para SHIB = $0.0005. Notionais absurdos geravam price-impact errado
+        // → falsos negativos em alt-coins, falsos positivos em majors.
+        let symbol_a = self
+            .token_cache
+            .get_by_address(&token_a)
+            .await
+            .map(|i| i.symbol)
+            .unwrap_or_default();
+        let notional = self.quote_notional_usd();
+        let fallback_amt = U256::exp10(dec_a as usize);
+        // ~10%, 100%, 200% do notional configurado (default $100 → $10/$100/$200).
+        let a_small = if symbol_a.is_empty() {
+            fallback_amt
         } else {
-             // Para outros tokens, testamos 1, 10, 50 unidades do token.
-            [
-                U256::exp10(dec_a as usize), 
-                U256::exp10(dec_a as usize) * U256::from(10), 
-                U256::exp10(dec_a as usize) * U256::from(50),
-            ]
+            quote_amount_for_usd(&symbol_a, dec_a, notional * 0.1)
+                .await
+                .unwrap_or(fallback_amt)
         };
-    
+        let a_mid = if symbol_a.is_empty() {
+            fallback_amt
+        } else {
+            quote_amount_for_usd(&symbol_a, dec_a, notional)
+                .await
+                .unwrap_or(fallback_amt)
+        };
+        let a_big = if symbol_a.is_empty() {
+            fallback_amt
+        } else {
+            quote_amount_for_usd(&symbol_a, dec_a, notional * 2.0)
+                .await
+                .unwrap_or(fallback_amt)
+        };
+        let amounts_to_test: [U256; 3] = [a_small, a_mid, a_big];
+
         let mut prices = Vec::new();
 
         for amount_in in amounts_to_test.iter() {
@@ -332,14 +338,18 @@ impl UniswapV3Dex {
                 prices.push(price);
             }
         }
-        
-        // Se menos de dois preços válidos foram retornados, rejeita
-        if prices.len() < 2 {
-            warn!("[{}] Pool {}/{} (fee {}) - Não foi possível cotar preço confiável em 2+ amounts", DEX_NAME, token_a, token_b, best_fee);
+
+        // Exige os 3 quotes p/ mediana robusta (A4: com 2, prices[len/2]=prices[1]
+        // é o maior, não mediana — viés p/ cima).
+        if prices.len() < 3 {
+            warn!(
+                "[{}] Pool {}/{} (fee {}) - Não foi possível cotar preço confiável em 3 amounts ({}/3)",
+                DEX_NAME, token_a, token_b, best_fee, prices.len()
+            );
             return Ok(None);
         }
 
-        // 4. Calcula a mediana dos preços
+        // 4. Calcula a mediana dos preços (3 elementos → prices[1] é mediana)
         prices.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let median_price = prices[prices.len() / 2];
 
@@ -456,8 +466,22 @@ impl DexContract for UniswapV3Dex {
             return Ok(None);
         };
 
-        // Cota todos os tiers (incl. 100 p/ métrica); seleciona só executáveis.
-        let amount_in_test = U256::exp10(dec_a as usize);
+        // C1: dimensionar amount_in_test pelo notional configurado (igual ao
+        // multicall) em vez de 1 unidade — tier que vence em 1 unidade pode
+        // não ser o melhor no notional real (V3 concentrada muda ranking c/ size).
+        let symbol_a_test = self
+            .token_cache
+            .get_by_address(token_a)
+            .await
+            .map(|i| i.symbol)
+            .unwrap_or_default();
+        let amount_in_test = if symbol_a_test.is_empty() {
+            U256::exp10(dec_a as usize)
+        } else {
+            quote_amount_for_usd(&symbol_a_test, dec_a, self.quote_notional_usd())
+                .await
+                .unwrap_or_else(|_| U256::exp10(dec_a as usize))
+        };
         let mut quotes: Vec<(u32, U256)> = Vec::with_capacity(FEE_TIERS.len());
 
         for &fee in &FEE_TIERS {

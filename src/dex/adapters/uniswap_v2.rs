@@ -181,11 +181,29 @@ impl DexContract for UniswapV2Dex {
             return Ok(None);
         };
 
-        let amount_in = U256::exp10(decimals_a as usize);
+        // C1: dimensionar amount_in pelo notional configurado (igual ao path
+        // multicall) em vez de 1 unidade — spread medido no tamanho real de
+        // execução, consistente entre get_price e get_prices_multicall.
+        let symbol_a = self
+            .token_cache
+            .get_by_address(token_a)
+            .await
+            .map(|i| i.symbol)
+            .unwrap_or_default();
+        let amount_in = if symbol_a.is_empty() {
+            // Sem symbol no cache, não há como consultar price_feed — fallback
+            // p/ 1 unidade (comportamento anterior), mas loga.
+            debug!("[{}] get_price: symbol não resolvido p/ {:?}, usando 1 unidade", self.name(), token_a);
+            U256::exp10(decimals_a as usize)
+        } else {
+            quote_amount_for_usd(&symbol_a, decimals_a, self.quote_notional_usd())
+                .await
+                .unwrap_or_else(|_| U256::exp10(decimals_a as usize))
+        };
         let path = vec![*token_a, *token_b];
         let call = contract.method::<_, Vec<U256>>("getAmountsOut", (amount_in, path))?;
-        
-        ALCHEMY_RATE_LIMITER.acquire().await?; 
+
+        ALCHEMY_RATE_LIMITER.acquire().await?;
         match call.call().await {
             Ok(amounts) => {
                 if let Some(amount_out) = amounts.last() {

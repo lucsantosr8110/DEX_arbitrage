@@ -189,7 +189,21 @@ impl DexContract for SushiSwapDex {
             return Ok(None);
         };
 
-        let amount_in = U256::exp10(decimals_a as usize);
+        // C1: dimensionar amount_in pelo notional configurado (igual ao multicall).
+        let symbol_a = self
+            .token_cache
+            .get_by_address(token_a)
+            .await
+            .map(|i| i.symbol)
+            .unwrap_or_default();
+        let amount_in = if symbol_a.is_empty() {
+            debug!("[{}] get_price: symbol não resolvido p/ {:?}, usando 1 unidade", self.name(), token_a);
+            U256::exp10(decimals_a as usize)
+        } else {
+            quote_amount_for_usd(&symbol_a, decimals_a, self.quote_notional_usd())
+                .await
+                .unwrap_or_else(|_| U256::exp10(decimals_a as usize))
+        };
         let path = vec![*token_a, *token_b];
         let call = contract.method::<_, Vec<U256>>("getAmountsOut", (amount_in, path))?;
         
