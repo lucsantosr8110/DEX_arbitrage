@@ -397,23 +397,21 @@ impl ArbitrageClient {
         }
 
         if route.enabled && route.reject_high_slippage_routes {
-            // `amount_out_min` recebe no engine, no máximo, max_slippage_bps
-            // mais o incremento configurado por hop. Validar este pior caso
-            // impede que alteração de config abra margem além da rota inteira.
+            // `amount_out_min` já carrega orçamento real calculado pelo engine.
+            // Não rejeitar pelo pior caso teórico: isso bloqueava toda rota de
+            // 3 hops mesmo com budget efetivo de poucos bps por perna.
             let hops = steps.len() as u64;
-            let base = config.execution.max_slippage_bps as u64;
-            let increment = config.execution.hop_slippage_increase_bps as u64;
-            let worst_cumulative_bps = hops
-                .saturating_mul(base)
-                .saturating_add(hops.saturating_sub(1).saturating_mul(hops) / 2 * increment);
             let configured_limit_bps = (route.max_cumulative_slippage * 100.0).floor();
             if !configured_limit_bps.is_finite()
                 || configured_limit_bps < 0.0
-                || worst_cumulative_bps > configured_limit_bps as u64
+                || (configured_limit_bps as u64)
+                    < hops.saturating_mul(crate::core::economics::MIN_SLIPPAGE_BPS as u64)
             {
                 let reason = format!(
-                    "worst cumulative slippage {} bps exceeds route limit {:.0} bps",
-                    worst_cumulative_bps, configured_limit_bps
+                    "route slippage limit {:.0} bps cannot preserve {} bps floor for {} hops",
+                    configured_limit_bps,
+                    crate::core::economics::MIN_SLIPPAGE_BPS,
+                    hops
                 );
                 self.log_route_rejection(steps, &reason);
                 return Err(FlashloanError::SlippageTooHigh(reason));
@@ -988,7 +986,9 @@ impl ArbitrageClient {
 
             (
                 cfg.execution.dry_run,
-                cfg.flashloan.simulate_before_execute.unwrap_or(true),
+                // Quote de cada hop é por notional; rota completa precisa eth_call
+                // sequencial antes de enviar, mesmo se flag foi desligada.
+                cfg.flashloan.simulate_before_execute.unwrap_or(true) || steps.len() > 1,
                 asset,
                 amount,
                 steps,
@@ -1049,7 +1049,8 @@ impl ArbitrageClient {
 
             (
                 cfg.execution.dry_run,
-                cfg.flashloan.simulate_before_execute.unwrap_or(true),
+                // Valida output real encadeado da rota antes de broadcast.
+                cfg.flashloan.simulate_before_execute.unwrap_or(true) || steps.len() > 1,
                 asset,
                 amount,
                 steps,
@@ -1109,7 +1110,8 @@ impl ArbitrageClient {
 
             (
                 cfg.execution.dry_run,
-                cfg.flashloan.simulate_before_execute.unwrap_or(true),
+                // Wrapper também executa hops encadeados; nunca pular preflight.
+                cfg.flashloan.simulate_before_execute.unwrap_or(true) || steps.len() > 1,
                 wrapper_addr,
                 asset,
                 amount,
@@ -2195,7 +2197,8 @@ mod tests {
             step(1, b, a, U256::from(99)),
         ];
         cfg.arbitrage.route_validation.max_hops = 3;
-        cfg.arbitrage.route_validation.max_cumulative_slippage = 0.5;
+        // Menos que 5 bps por hop não preserva piso de proteção.
+        cfg.arbitrage.route_validation.max_cumulative_slippage = 0.09;
         cfg.execution.max_slippage_bps = 50;
         cfg.execution.hop_slippage_increase_bps = 0;
         assert!(client.apply_complexity_filters(&two_hops, &cfg).is_err());

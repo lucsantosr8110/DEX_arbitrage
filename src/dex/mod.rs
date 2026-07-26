@@ -119,6 +119,21 @@ pub fn select_executable_v3_best_out(quotes: &[(u32, U256)]) -> Option<(u32, U25
 static FEE_TIER_CACHE: Lazy<RwLock<std::collections::HashMap<String, u32>>> =
     Lazy::new(|| RwLock::new(std::collections::HashMap::new()));
 
+// Melhor tier pode mudar conforme direção e notional. Cache canônico continua
+// apenas para compatibilidade; rota executável deve ler este cache direcional.
+static DIRECTIONAL_FEE_TIER_CACHE: Lazy<RwLock<std::collections::HashMap<String, u32>>> =
+    Lazy::new(|| RwLock::new(std::collections::HashMap::new()));
+
+#[inline]
+fn directional_fee_cache_key(dex_name: &str, token_in: &str, token_out: &str) -> String {
+    format!(
+        "{}:{}-{}",
+        dex_name,
+        token_in.to_ascii_uppercase(),
+        token_out.to_ascii_uppercase()
+    )
+}
+
 /// Chave canônica do par para `FEE_TIER_CACHE`.
 ///
 /// Convenção: símbolos em ASCII uppercase, ordenados lexicograficamente,
@@ -157,6 +172,9 @@ pub fn cache_fee_tier(dex_name: &str, token_a: &str, token_b: &str, fee_tier: u3
             dex_name, pair, fee_tier
         );
     }
+    if let Ok(mut cache) = DIRECTIONAL_FEE_TIER_CACHE.write() {
+        cache.insert(directional_fee_cache_key(dex_name, token_a, token_b), fee_tier);
+    }
 }
 
 /// Retorna o fee tier V3 do cache (`uint24`), ou `None` se miss.
@@ -164,6 +182,17 @@ pub fn cached_fee_tier(dex_name: &str, token_a: &str, token_b: &str) -> Option<u
     let pair = fee_cache_key(token_a, token_b);
     let key = format!("{}:{}", dex_name, pair);
     FEE_TIER_CACHE.read().ok()?.get(&key).cloned()
+}
+
+/// Tier selecionado pelo quote desta direção. Nunca usar cache canônico para
+/// preencher `ArbitrageStep`: A→B e B→A podem escolher pools/tier distintos.
+pub fn cached_directional_fee_tier(
+    dex_name: &str,
+    token_in: &str,
+    token_out: &str,
+) -> Option<u32> {
+    let key = directional_fee_cache_key(dex_name, token_in, token_out);
+    DIRECTIONAL_FEE_TIER_CACHE.read().ok()?.get(&key).cloned()
 }
 
 /// Lookup a partir de par direcional `"A-B"` (radar/engine). Normaliza via `fee_cache_key`.
@@ -552,7 +581,7 @@ pub fn all_trading_pairs() -> Vec<(String, String)> {
 #[cfg(test)]
 mod fee_tier_cache_tests {
     use super::{
-        cache_fee_tier, cached_fee_tier, cached_fee_tier_pair, fee_cache_key,
+        cache_fee_tier, cached_directional_fee_tier, cached_fee_tier, cached_fee_tier_pair, fee_cache_key,
         fee100_best_discarded_count, is_executable_v3_fee_tier, reset_fee100_best_discarded_count,
         select_executable_v3_best_out, EXECUTABLE_V3_FEE_TIERS, OBSERVED_V3_FEE_TIER_100,
     };
@@ -580,6 +609,20 @@ mod fee_tier_cache_tests {
         assert_eq!(
             cached_fee_tier_pair("UniswapV3", "USDC_CACHE_TEST-WETH"),
             Some(500)
+        );
+    }
+
+    #[test]
+    fn directional_fee_cache_does_not_overwrite_reverse_quote() {
+        cache_fee_tier("UniswapV3", "USDC_DIR_TEST", "WETH_DIR_TEST", 500);
+        cache_fee_tier("UniswapV3", "WETH_DIR_TEST", "USDC_DIR_TEST", 3000);
+        assert_eq!(
+            cached_directional_fee_tier("UniswapV3", "USDC_DIR_TEST", "WETH_DIR_TEST"),
+            Some(500)
+        );
+        assert_eq!(
+            cached_directional_fee_tier("UniswapV3", "WETH_DIR_TEST", "USDC_DIR_TEST"),
+            Some(3000)
         );
     }
 

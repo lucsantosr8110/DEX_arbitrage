@@ -45,6 +45,11 @@ const MAX_REALISTIC_PROFIT_RATIO: f64 = 0.50;
 /// a rota. 1000 raw = ~1e-15 de um token de 18 decimais — claramente dust.
 const MIN_EXPECTED_OUTPUT_RAW: u64 = 1_000;
 
+#[inline]
+fn gas_cost_for_hops(gas_for_three_hops_usd: f64, n_hops: usize) -> f64 {
+    gas_for_three_hops_usd * n_hops.max(1) as f64 / 3.0
+}
+
 /// Contador atômico global para gerar IDs únicos de oportunidades.
 /// Evita colisões quando múltiplas oportunidades são criadas no mesmo milissegundo.
 static OPP_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -780,13 +785,13 @@ impl ArbitrageEngine {
         // C5: se não há step stable↔token na rota original (direct A→B→A non-stable),
         // consultar o price_map global p/ melhor taxa cross-DEX. Antes retornava
         // 0.0 e toda direct non-stable era descartada silenciosamente.
-        let stable_to_a = self.estimate_stable_rate(base_token, token_a, steps, true, price_map);
-        let b_to_stable = self.estimate_stable_rate(base_token, token_b, steps, false, price_map);
+        let stable_to_a = self.estimate_stable_step(base_token, token_a, steps, true, price_map)?;
+        let b_to_stable = self.estimate_stable_step(base_token, token_b, steps, false, price_map)?;
 
         let stable_steps = vec![
-            Self::create_step(SANITIZED_PLACEHOLDER, base_token, token_a, stable_to_a),
+            stable_to_a,
             steps[0].clone(), // Hop original A->B
-            Self::create_step(SANITIZED_PLACEHOLDER, token_b, base_token, b_to_stable),
+            b_to_stable,
         ];
 
         let stable_path = vec![
@@ -1041,6 +1046,13 @@ impl ArbitrageEngine {
             );
         }
 
+        let hop_count = steps.len();
+        let route_limit_bps = (app_config.arbitrage.route_validation.max_cumulative_slippage
+            * 100.0)
+            .floor()
+            .max(economics::MIN_SLIPPAGE_BPS as f64 * hop_count as f64) as u32;
+        let mut used_slippage_bps = 0u32;
+
         for (idx, step) in steps.iter_mut().enumerate() {
             let input_decimals = self.get_token_decimals_smart(&step.token_in, app_config).await?;
             let output_decimals = self.get_token_decimals_smart(&step.token_out, app_config).await?;
@@ -1059,9 +1071,20 @@ impl ArbitrageEngine {
                 )
                 .await;
 
-            // Slippage acumulativo (BPS)
-            let adjusted_slippage_bps = base_slippage_bps
+            // Limite de rota é orçamento total, não veto estático de 3 hops.
+            // Reserva piso para pernas restantes, preservando proteção efetiva.
+            let proposed_slippage_bps = base_slippage_bps
                 .saturating_add((idx as u32).saturating_mul(hop_increase_bps));
+            let remaining = hop_count.saturating_sub(idx + 1) as u32;
+            let max_here = route_limit_bps
+                .saturating_sub(used_slippage_bps)
+                .saturating_sub(remaining.saturating_mul(economics::MIN_SLIPPAGE_BPS));
+            let adjusted_slippage_bps = proposed_slippage_bps
+                .min(max_here)
+                .max(economics::MIN_SLIPPAGE_BPS);
+            // Campo legado passa a carregar orçamento real para executor validar.
+            step.price_impact_bps = Some(adjusted_slippage_bps);
+            used_slippage_bps = used_slippage_bps.saturating_add(adjusted_slippage_bps);
 
             // Aplicar slippage seguro usando aritmética inteira (U256)
             step.amount_out_min = Self::apply_slippage_safe(
@@ -2078,65 +2101,62 @@ impl ArbitrageEngine {
     /// → hurdle baixo → executa opps que dão prejuízo. O live publicado pelo
     /// executor é referência de 3 hops, então aplicamos o mesmo scale aqui.
     async fn estimate_gas_cost(&self, app_config: &Config, n_hops: usize) -> f64 {
-        let scale = n_hops.max(1) as f64 / 3.0;
-        let static_fallback = app_config.execution.estimate_base_gas_usd * scale;
-        economics::gas_usd_or_fallback(static_fallback) * scale
+        gas_cost_for_hops(
+            economics::gas_usd_or_fallback(app_config.execution.estimate_base_gas_usd),
+            n_hops,
+        )
     }
 
-    fn estimate_stable_rate(
+    fn estimate_stable_step(
         &self,
         base_token: &str,
         token: &str,
         steps: &[ArbitrageStep],
         is_input: bool,
         price_map: &HashMap<String, HashMap<String, f64>>,
-    ) -> f64 {
-        match token {
-            "USDC" | "USDC.E" | "USDT" | "DAI" => 1.0,
-            _ => {
-                // 1) Procura nos steps por uma conversão direta com stable já existente.
-                for step in steps {
-                    if is_input && step.token_out == token && step.token_in == base_token {
-                        return step.expected_rate;
-                    }
-                    if !is_input && step.token_in == token && step.token_out == base_token {
-                        return step.expected_rate;
-                    }
-                }
-                // 2) C5: sem step stable direto — consultar price_map global p/ melhor
-                // taxa cross-DEX. Antes retornava 0.0 e toda direct non-stable era
-                // descartada silenciosamente.
-                // is_input=true  → stable→token: key "{stable}-{token}"
-                // is_input=false → token→stable: key "{token}-{stable}"
-                let key = if is_input {
-                    format!("{}-{}", base_token, token)
-                } else {
-                    format!("{}-{}", token, base_token)
-                };
-                let mut best: f64 = 0.0;
-                for dex_prices in price_map.values() {
-                    if let Some(&rate) = dex_prices.get(&key) {
-                        if rate.is_finite() && rate > 0.0 && rate > best {
-                            best = rate;
-                        }
-                    }
-                }
-                if best > 0.0 {
-                    debug!(
-                        "✅ estimate_stable_rate: {}↔{} resolvido via price_map (key={}, rate={})",
-                        base_token, token, key, best
-                    );
-                    return best;
-                }
-                // 3) Sem step direto nem cotação no price_map — rejeita (não inventa 1.0).
-                warn!(
-                    "⚠️ estimate_stable_rate: sem conversão {}↔{} (steps nem price_map, is_input={}). \
-                     Oportunidade rejeitada por preço inválido.",
-                    base_token, token, is_input
-                );
-                0.0
+    ) -> Option<ArbitrageStep> {
+        // 1) Procura nos steps por uma conversão direta com stable já existente.
+        for step in steps {
+            if is_input && step.token_out == token && step.token_in == base_token {
+                return Some(step.clone());
+            }
+            if !is_input && step.token_in == token && step.token_out == base_token {
+                return Some(step.clone());
             }
         }
+        // 2) Sem step estável direto: melhor quote real, preservando venue+tier.
+        let key = if is_input {
+            format!("{}-{}", base_token, token)
+        } else {
+            format!("{}-{}", token, base_token)
+        };
+        let mut best: Option<(&str, f64)> = None;
+        for (dex_name, dex_prices) in price_map {
+            if let Some(&rate) = dex_prices.get(&key) {
+                if rate.is_finite() && rate > 0.0
+                    && best.map(|(_, current)| rate > current).unwrap_or(true)
+                {
+                    best = Some((dex_name, rate));
+                }
+            }
+        }
+        if let Some((dex_name, rate)) = best {
+            debug!(
+                "✅ estimate_stable_step: {}↔{} via {} (key={}, rate={})",
+                base_token, token, dex_name, key, rate
+            );
+            return Some(if is_input {
+                Self::create_step(dex_name, base_token, token, rate)
+            } else {
+                Self::create_step(dex_name, token, base_token, rate)
+            });
+        }
+        // 3) Sem cotação real: rejeita, não inventa venue/rate.
+        warn!(
+            "⚠️ estimate_stable_step: sem conversão {}↔{} (is_input={})",
+            base_token, token, is_input
+        );
+        None
     }
 
     fn extract_usdt_pairs(prices: &HashMap<String, HashMap<String, f64>>) -> HashSet<String> {
@@ -2178,8 +2198,8 @@ impl ArbitrageEngine {
     #[inline]
     fn create_step(dex: &str, token_in: &str, token_out: &str, rate: f64) -> ArbitrageStep {
         let v3_fee_tier = if dex.eq_ignore_ascii_case("UniswapV3") {
-            // Mesma fonte do quote: FEE_TIER_CACHE via fee_cache_key
-            crate::dex::cached_fee_tier("UniswapV3", token_in, token_out)
+            // Mesma direção do quote; nunca recuperar tier reverso/canônico.
+            crate::dex::cached_directional_fee_tier("UniswapV3", token_in, token_out)
         } else {
             None
         };
@@ -2733,6 +2753,13 @@ mod tests {
         let rate = 2.0_f64;
         let out = ArbitrageEngine::expected_output_from_fee_inclusive_rate(amount_in, rate, 6, 6);
         assert_eq!(out, U256::from(200_000_000u64));
+    }
+
+    #[test]
+    fn gas_cost_scales_once_from_three_hop_baseline() {
+        assert!((gas_cost_for_hops(0.008, 2) - 0.008 * 2.0 / 3.0).abs() < 1e-12);
+        assert!((gas_cost_for_hops(0.008, 3) - 0.008).abs() < 1e-12);
+        assert!((gas_cost_for_hops(0.008, 4) - 0.008 * 4.0 / 3.0).abs() < 1e-12);
     }
 
     /// A6: slippage+safety aplicados UMA vez; min não é duplamente descontado.

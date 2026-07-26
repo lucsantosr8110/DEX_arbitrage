@@ -288,8 +288,11 @@ where
             .unwrap_or_else(|_| crate::infra::price_feed::CachedPriceFeed::fallback_price("WMATIC"));
         let cost = gas_units * (eff * 1e-9) * matic_price;
 
-        // Fonte única de gás para finder / executor / risk manager.
-        crate::core::economics::publish_live_gas_usd(cost);
+        // Finder guarda referência canônica de 3 hops; publicar uma rota de
+        // 2/4 hops e depois escalá-la de novo distorce custo por 33%.
+        if n_hops == 3 {
+            crate::core::economics::publish_live_gas_usd(cost);
+        }
 
         info!(
             "⛽ [GasEstimator] base={:.2} | prio={:.2} | eff={:.2} | hops={} | units={:.0} | custo=${:.6}",

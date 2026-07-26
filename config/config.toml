@@ -52,14 +52,14 @@ simulate_prices = true
 execution_mode = "flashloan"
 safety_margin = "1.0"
 cooldown_seconds = 10  # runtime forca minimo 10s
-max_path_length = 3
+max_path_length = 4
 
 # ======================================================================
 # TRIANGULAR & CROSS-DEX
 # ======================================================================
 [arbitrage.triangular]
 enabled = true
-max_hops = 3
+max_hops = 4
 min_triangle_profit = "0.0005"
 intra_dex_only = false
 venues = ["UniswapV3", "QuickSwap", "SushiSwap"]
@@ -82,7 +82,7 @@ revert_blacklist_duration_ms = 30000
 # obrigatório para flashloan, logo não há flag para desligá-lo.
 [arbitrage.route_validation]
 enabled = true
-max_hops = 3
+max_hops = 4
 min_liquidity_per_hop = "50.0"
 reject_high_slippage_routes = true
 max_cumulative_slippage = 1.2
