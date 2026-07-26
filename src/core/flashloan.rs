@@ -852,25 +852,26 @@ impl ArbitrageClient {
             return Ok(BundleResult::skipped().with_execution_mode("same_block"));
         }
 
-        let (dry, simulate, asset, amount, steps) = {
+        let (dry, simulate, asset, amount, steps, flashloan_decimals) = {
             let cfg = self.config.lock().await;
             let (asset, amount, steps) = self.extract_and_convert_opp_data(opp, &cfg, slippage_bps)?;
-            
+
             if asset != self.get_wallet_address()? {
                 return Err(anyhow!("Direct execution requires owned token"));
             }
-            
+
             if let Err(e) = self.apply_complexity_filters(&steps, &cfg) {
                 warn!("{}", e);
                 return Ok(BundleResult::skipped().with_execution_mode("complexity_reject"));
             }
-            
+
             (
                 cfg.execution.dry_run,
                 cfg.flashloan.simulate_before_execute.unwrap_or(true),
                 asset,
                 amount,
-                steps
+                steps,
+                cfg.flashloan.flashloan_decimals.unwrap_or(6) as u32,
             )
         };
 
@@ -899,7 +900,7 @@ impl ArbitrageClient {
             return Ok(BundleResult::new(true, opp.estimated_profit_usd, opp.gas_cost_usd));
         }
 
-        self.send_and_confirm_transaction(direct, opp, "direct").await
+        self.send_and_confirm_transaction(direct, opp, "direct", flashloan_decimals).await
     }
 
     // ========================================================================
@@ -916,21 +917,22 @@ impl ArbitrageClient {
             return Ok(BundleResult::skipped().with_execution_mode("same_block"));
         }
 
-        let (dry, simulate, asset, amount, steps) = {
+        let (dry, simulate, asset, amount, steps, flashloan_decimals) = {
             let cfg = self.config.lock().await;
             let (asset, amount, steps) = self.extract_and_convert_opp_data(opp, &cfg, slippage_bps)?;
-            
+
             if let Err(e) = self.apply_complexity_filters(&steps, &cfg) {
                 warn!("{}", e);
                 return Ok(BundleResult::skipped().with_execution_mode("complexity_reject"));
             }
-            
+
             (
                 cfg.execution.dry_run,
                 cfg.flashloan.simulate_before_execute.unwrap_or(true),
                 asset,
                 amount,
-                steps
+                steps,
+                cfg.flashloan.flashloan_decimals.unwrap_or(6) as u32,
             )
         };
 
@@ -951,7 +953,7 @@ impl ArbitrageClient {
             return Ok(BundleResult::new(true, opp.estimated_profit_usd, opp.gas_cost_usd));
         }
 
-        self.send_and_confirm_transaction(call, opp, "flashloan").await
+        self.send_and_confirm_transaction(call, opp, "flashloan", flashloan_decimals).await
     }
 
     // ========================================================================
@@ -968,17 +970,17 @@ impl ArbitrageClient {
             return Ok(BundleResult::skipped().with_execution_mode("same_block"));
         }
 
-        let (dry, simulate, wrapper_addr, asset, amount, steps) = {
+        let (dry, simulate, wrapper_addr, asset, amount, steps, flashloan_decimals) = {
             let cfg = self.config.lock().await;
 
             let wrapper_addr = Address::from_str(&cfg.wrapper.address)?;
             let (asset, amount, steps) = self.extract_and_convert_opp_data(opp, &cfg, slippage_bps)?;
-            
+
             if let Err(e) = self.validate_wrapper_steps(&steps, asset) {
                 warn!("❌ Steps inválidos para wrapper: {}", e);
                 return Ok(BundleResult::skipped().with_execution_mode("wrapper_invalid_steps"));
             }
-            
+
             if let Err(e) = self.apply_complexity_filters(&steps, &cfg) {
                 warn!("{}", e);
                 return Ok(BundleResult::skipped().with_execution_mode("complexity_reject"));
@@ -990,7 +992,8 @@ impl ArbitrageClient {
                 wrapper_addr,
                 asset,
                 amount,
-                steps
+                steps,
+                cfg.flashloan.flashloan_decimals.unwrap_or(6) as u32,
             )
         };
 
@@ -1019,7 +1022,7 @@ impl ArbitrageClient {
             return Ok(BundleResult::new(true, opp.estimated_profit_usd, opp.gas_cost_usd));
         }
 
-        self.send_and_confirm_transaction(call, opp, "wrapper").await
+        self.send_and_confirm_transaction(call, opp, "wrapper", flashloan_decimals).await
     }
 
     /// Valida steps para wrapper (igual contrato)
@@ -1149,7 +1152,8 @@ impl ArbitrageClient {
         &self,
         mut call: ContractCall<AppMiddleware, T>,
         opp: &ArbitrageOpportunity,
-        mode: &'static str
+        mode: &'static str,
+        flashloan_decimals: u32,
     ) -> Result<BundleResult> {
 
         // HARD GATE: paper / dry_run_only / dry_run — fisicamente impossível broadcast.
@@ -1197,7 +1201,8 @@ impl ArbitrageClient {
                                 // subsequentes no mesmo bloco (contrato exige).
                                 self.update_execution_block().await;
 
-                                let real_profit = self.extract_real_profit_from_receipt(&receipt)
+                                let real_profit = self
+                                    .extract_real_profit_from_receipt(&receipt, opp, flashloan_decimals)
                                     .unwrap_or(opp.estimated_profit_usd);
                                 
                                 return Ok(BundleResult::new(true, real_profit, opp.gas_cost_usd)
@@ -1229,7 +1234,69 @@ impl ArbitrageClient {
         Ok(BundleResult::skipped().with_execution_mode("max_retries_exceeded"))
     }
 
-    fn extract_real_profit_from_receipt(&self, _receipt: &TransactionReceipt) -> Option<f64> {
+    /// C3: decodifica o profit REAL do evento `FlashLoanSuccess` emitido pelo
+    /// `FlashloanExecutor` no receipt. Antes era stub `None` — PnL pós-execução
+    /// ficava = estimativa teórica, impossibilitando calibrar economics.
+    ///
+    /// Evento: `FlashLoanSuccess(address indexed asset, uint256 amount,
+    /// uint256 premium, uint256 profit, address indexed executor)`
+    /// — `profit` está em raw units do `asset` (decimais do token emprestado,
+    /// tipicamente USDT/USDC = 6). Converte p/ USD via token_price_usd do opp.
+    ///
+    /// Também cobre `DirectExecution` (mesma assinatura de campo profit na
+    /// posição 3 dos dados não-indexados).
+    fn extract_real_profit_from_receipt(
+        &self,
+        receipt: &TransactionReceipt,
+        opp: &ArbitrageOpportunity,
+        flashloan_decimals: u32,
+    ) -> Option<f64> {
+        use ethers::abi::ParamType;
+
+        // topic0 = keccak256("FlashLoanSuccess(address,uint256,uint256,uint256,address)")
+        let topic0 = H256::from(ethers::utils::keccak256(
+            b"FlashLoanSuccess(address,uint256,uint256,uint256,address)",
+        ));
+
+        for log in receipt.logs.iter() {
+            let Some(t0) = log.topics.first() else { continue };
+            if *t0 != topic0 {
+                continue;
+            }
+            // Dados não-indexados: amount, premium, profit (3 × 32 bytes).
+            let data = log.data.as_ref();
+            if data.len() < 96 {
+                warn!("FlashLoanSuccess: log data curto ({} bytes) — decode skip", data.len());
+                continue;
+            }
+            let tokens = match ethers::abi::decode(
+                &[
+                    ParamType::Uint(256),
+                    ParamType::Uint(256),
+                    ParamType::Uint(256),
+                ],
+                data,
+            ) {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!("FlashLoanSuccess: decode falhou: {e}");
+                    continue;
+                }
+            };
+            let profit_raw = match tokens.into_iter().nth(2) {
+                Some(Token::Uint(v)) => v,
+                _ => continue,
+            };
+            let token_price = opp.token_price_usd.unwrap_or(1.0);
+            let profit_usd = self.token_amount_to_usd(profit_raw, token_price, flashloan_decimals);
+            info!(
+                "💰 Profit real do receipt: {} raw ({} dec) → ${:.6} (price=${:.4})",
+                profit_raw, flashloan_decimals, profit_usd, token_price
+            );
+            return Some(profit_usd);
+        }
+        // Sem evento FlashLoanSuccess (ex.: wrapper path emite evento diferente
+        // ou TX revertedida em depth) — caller cai p/ estimated_profit_usd.
         None
     }
 
@@ -1385,6 +1452,54 @@ mod tests {
     // ------------------------------------------------------------------------
     // apply_slippage
     // ------------------------------------------------------------------------
+    // ------------------------------------------------------------------------
+    // extract_real_profit_from_receipt — C3
+    // ------------------------------------------------------------------------
+    fn flashloan_success_log(profit_raw: U256) -> ethers::types::Log {
+        use ethers::types::{Bytes, H256, Log};
+        let topic0 = H256::from(ethers::utils::keccak256(
+            b"FlashLoanSuccess(address,uint256,uint256,uint256,address)",
+        ));
+        // Dados não-indexados: amount, premium, profit (cada 32 bytes, padded).
+        let data = ethers::abi::encode(&[
+            Token::Uint(U256::from(1_000_000)), // amount
+            Token::Uint(U256::from(500)),       // premium
+            Token::Uint(profit_raw),            // profit
+        ]);
+        Log {
+            address: Address::zero(),
+            topics: vec![topic0],
+            data: Bytes::from(data),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn extract_real_profit_decodes_flashloan_success_event() {
+        let client = make_client();
+        // profit = 1.5 USDT (6 decimais) = 1_500_000 raw, preço USDT ≈ $1
+        let profit_raw = U256::from(1_500_000u64);
+        let log = flashloan_success_log(profit_raw);
+        let receipt = TransactionReceipt {
+            logs: vec![log],
+            ..Default::default()
+        };
+        let mut opp = ArbitrageOpportunity::default();
+        opp.token_price_usd = Some(1.0);
+        let profit_usd = client
+            .extract_real_profit_from_receipt(&receipt, &opp, 6)
+            .expect("deve decodificar profit");
+        assert!((profit_usd - 1.5).abs() < 1e-9, "profit_usd={}", profit_usd);
+    }
+
+    #[test]
+    fn extract_real_profit_returns_none_when_no_event() {
+        let client = make_client();
+        let receipt = TransactionReceipt::default();
+        let opp = ArbitrageOpportunity::default();
+        assert!(client.extract_real_profit_from_receipt(&receipt, &opp, 6).is_none());
+    }
+
     #[test]
     fn apply_slippage_reduces_by_bps() {
         let client = make_client();
