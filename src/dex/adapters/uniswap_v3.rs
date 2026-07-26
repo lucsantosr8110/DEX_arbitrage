@@ -598,9 +598,10 @@ impl DexContract for UniswapV3Dex {
                         (info.addr_a, info.addr_b, fee, info.amount_in, U256::zero()),
                     )?;
                     // M16: um tier/pool inexistente pode reverter no Quoter.
-                    // `false` preserva os demais resultados do batch em vez de
-                    // descartar até nove pares válidos junto com uma falha.
-                    multicall.add_call(call, false);
+                    // Em ethers Multicall >= v2, `true` permite a falha
+                    // individual; `call_raw` a devolve como Err sem descartar
+                    // os demais quotes do batch.
+                    multicall.add_call(call, true);
                 }
             }
 
