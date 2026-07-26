@@ -26,7 +26,7 @@ use flashloan_bot::{
     core::bot::Bot,
     dex::{
         circuit_breaker::DexCircuitBreaker, manager::DexManager, price_cache::PriceCache,
-        radar::{extract_edges, start_high_hit_rate_radar, AdjCostParams},
+        radar::{compute_top_spreads, extract_edges, start_high_hit_rate_radar, AdjCostParams, TopSpreadInfo},
     },
     // execution:: imports removidos: ExecutionEngine/MevConfig/gwei eram codigo morto
     infra::{
@@ -69,10 +69,33 @@ fn update_tui_state(
     tui_state: &Arc<std::sync::RwLock<tui::TuiState>>,
     adj_cost: &AdjCostParams,
     prices: &HashMap<String, HashMap<String, f64>>,
+    top_n: usize,
     cycle_count: u64,
     uptime: Duration,
 ) {
-    let (_, _, economics, _adj_cycles) = extract_edges(prices, adj_cost);
+    let (_, _, economics, adj_cycles) = extract_edges(prices, adj_cost);
+
+    // Net USD agregado: soma dos ciclos com net projetado > 0 (oportunidade real).
+    let net_usd_total: f64 = adj_cycles
+        .iter()
+        .map(|c| c.net_profit_usd)
+        .filter(|n| *n > 0.0)
+        .sum();
+
+    // Map canônico par → melhor net (p/ coluna Net$ da tabela de preços).
+    // adj_cycles é deduped por canonical pair; norm_pair casa direção-agnóstica.
+    let mut net_by_pair: HashMap<String, f64> = HashMap::new();
+    for c in &adj_cycles {
+        let key = tui::norm_pair(&c.pair);
+        net_by_pair
+            .entry(key)
+            .and_modify(|v| {
+                if c.net_profit_usd > *v {
+                    *v = c.net_profit_usd;
+                }
+            })
+            .or_insert(c.net_profit_usd);
+    }
 
     let mut rows: HashMap<String, tui::PriceRow> = HashMap::new();
     for (dex, dex_map) in prices {
@@ -83,6 +106,7 @@ fn update_tui_state(
                 sushiswap: None,
                 curve: None,
                 uniswap_v3: None,
+                net_usd: net_by_pair.get(&tui::norm_pair(pair)).copied(),
             });
             match dex.as_str() {
                 "QuickSwap" => row.quickswap = Some(*price),
@@ -97,6 +121,12 @@ fn update_tui_state(
     last_prices.sort_by(|a, b| a.pair.cmp(&b.pair));
     last_prices.truncate(20);
 
+    // Top-N spreads (sync, sem TVL) — espelha o log [TOPSPREAD].
+    let top_spreads: Vec<tui::TopSpreadRow> = compute_top_spreads(prices, adj_cost, top_n)
+        .into_iter()
+        .map(top_spread_row_from_info)
+        .collect();
+
     if let Ok(mut state) = tui_state.write() {
         state.running = true;
         state.uptime = uptime;
@@ -106,7 +136,22 @@ fn update_tui_state(
         state.gross_positive = economics.gross_positive as u32;
         state.net_positive = economics.net_positive as u32;
         state.negative_cycles = economics.negative_cycles_found as u32;
+        state.net_usd_total = net_usd_total;
+        state.top_spreads = top_spreads;
         state.last_prices = last_prices;
+    }
+}
+
+/// Mapeia `TopSpreadInfo` (radar, sync) → `TopSpreadRow` (TUI, subset sem TVL).
+fn top_spread_row_from_info(i: TopSpreadInfo) -> tui::TopSpreadRow {
+    tui::TopSpreadRow {
+        pair: i.pair,
+        tui_spread_pct: i.tui_spread_pct,
+        cycle_rate: i.cycle_rate,
+        net_usd: i.net_usd,
+        executable: i.executable,
+        has_curve_leg: i.has_curve_leg,
+        outlier: i.outlier,
     }
 }
 
@@ -446,6 +491,7 @@ async fn main() -> Result<()> {
         let telegram = telegram.clone();
         let tui_state = tui_state.clone();
         let adj_cost = adj_cost.clone();
+        let top_n = cfg_unlocked.log.top_spreads_n;
         let start_time = Instant::now();
 
         tokio::spawn(async move {
@@ -468,7 +514,7 @@ async fn main() -> Result<()> {
                                 debug!("📊 Ciclo #{} — {} DEXs", cycle_count, prices.len());
                             }
 
-                            update_tui_state(&tui_state, &adj_cost, &prices, cycle_count, start_time.elapsed());
+                            update_tui_state(&tui_state, &adj_cost, &prices, top_n, cycle_count, start_time.elapsed());
 
                             let mut bot_guard = bot.lock().await;
                             if let Err(e) = bot_guard.process_prices(prices).await {

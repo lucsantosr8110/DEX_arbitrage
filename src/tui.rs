@@ -37,7 +37,11 @@ pub struct TuiState {
     pub gross_positive: u32,
     pub net_positive: u32,
     pub negative_cycles: u32,
+    /// Soma USD dos ciclos com net projetado > 0 no último scan (oportunidade real).
+    pub net_usd_total: f64,
     pub last_prices: Vec<PriceRow>,
+    /// Top-N spreads por Spread% desc (espelha log `[TOPSPREAD]`, sem TVL).
+    pub top_spreads: Vec<TopSpreadRow>,
     pub recent_opps: Vec<String>,
 }
 
@@ -48,6 +52,22 @@ pub struct PriceRow {
     pub sushiswap: Option<f64>,
     pub curve: Option<f64>,
     pub uniswap_v3: Option<f64>,
+    /// Net projetado (USD) do melhor 2-hop do par. None = sem adj cycle.
+    pub net_usd: Option<f64>,
+}
+
+/// Linha do painel Top Spreads (sem TVL — TVL só no log `[TOPSPREAD]`).
+#[derive(Clone, Debug)]
+pub struct TopSpreadRow {
+    pub pair: String,
+    pub tui_spread_pct: f64,
+    /// None = sem reverse cotado (cycle_rate indisponível).
+    pub cycle_rate: Option<f64>,
+    /// None = sem 2-hop.
+    pub net_usd: Option<f64>,
+    pub executable: bool,
+    pub has_curve_leg: bool,
+    pub outlier: Option<String>,
 }
 
 impl Default for TuiState {
@@ -61,7 +81,9 @@ impl Default for TuiState {
             gross_positive: 0,
             net_positive: 0,
             negative_cycles: 0,
+            net_usd_total: 0.0,
             last_prices: Vec::new(),
+            top_spreads: Vec::new(),
             recent_opps: Vec::new(),
         }
     }
@@ -128,14 +150,22 @@ impl TuiApp {
             .constraints([
                 Constraint::Length(5),   // Header (border + 3 lines de conteúdo)
                 Constraint::Length(6),   // Status (border + 4 lines de conteúdo)
-                Constraint::Min(10),     // Prices (table) - mais espaço para tabela
+                Constraint::Min(10),     // Center: Prices | TopSpreads (split horizontal)
                 Constraint::Length(4),   // Footer (border + 2 lines de conteúdo)
             ])
             .split(f.area());
 
         self.draw_header(f, chunks[0]);
         self.draw_status(f, chunks[1]);
-        self.draw_prices(f, chunks[2]);
+
+        // Centro: preços à esquerda, top spreads à direita (cabe terminal 80x24).
+        let center = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .split(chunks[2]);
+        self.draw_prices(f, center[0]);
+        self.draw_top_spreads(f, center[1]);
+
         self.draw_footer(f, chunks[3]);
     }
 
@@ -189,6 +219,8 @@ impl TuiApp {
                 Span::raw(" | "),
                 Span::styled(format!("net+={}", state.net_positive), Style::default().fg(if state.net_positive > 0 { Color::Green } else { Color::Yellow })),
                 Span::raw(" | "),
+                Span::styled(format!("net=${:.2}", state.net_usd_total), Style::default().fg(if state.net_usd_total > 0.0 { Color::Green } else if state.net_usd_total < 0.0 { Color::Red } else { Color::Gray })),
+                Span::raw(" | "),
                 Span::styled(format!("neg={}", state.negative_cycles), Style::default().fg(Color::Gray)),
             ])),
         ];
@@ -206,8 +238,9 @@ impl TuiApp {
             Cell::from("QuickSwap").style(Style::default().fg(Color::Green)),
             Cell::from("SushiSwap").style(Style::default().fg(Color::Magenta)),
             Cell::from("Curve").style(Style::default().fg(Color::Yellow)),
-            Cell::from("UniswapV3").style(Style::default().fg(Color::Blue)),
+            Cell::from("UniV3").style(Style::default().fg(Color::Blue)),
             Cell::from("Spread%").style(Style::default().fg(Color::Red)),
+            Cell::from("Net$").style(Style::default().fg(Color::Cyan)),
         ]);
 
         let mut rows: Vec<Row> = Vec::new();
@@ -244,21 +277,80 @@ impl TuiApp {
                     else if spread > 0.1 { Style::default().fg(Color::Yellow) }
                     else { Style::default().fg(Color::Gray) }
                 ),
+                Cell::from(fmt_opt_net(p.net_usd)).style(
+                    if matches!(p.net_usd, Some(n) if n > 0.0) { Style::default().fg(Color::Green) }
+                    else if matches!(p.net_usd, Some(n) if n < 0.0) { Style::default().fg(Color::Red) }
+                    else { Style::default().fg(Color::Gray) }
+                ),
             ]));
         }
 
         let widths = [
-            Constraint::Length(16),     // Pair - mais espaço para nomes de pares
-            Constraint::Length(16),     // QuickSwap
-            Constraint::Length(16),     // SushiSwap
-            Constraint::Length(16),     // Curve
-            Constraint::Length(16),     // UniswapV3
-            Constraint::Length(12),     // Spread% - mais espaço para porcentagens
+            Constraint::Length(14),     // Pair
+            Constraint::Length(13),     // QuickSwap
+            Constraint::Length(13),     // SushiSwap
+            Constraint::Length(13),     // Curve
+            Constraint::Length(13),     // UniV3
+            Constraint::Length(10),     // Spread%
+            Constraint::Length(9),      // Net$
         ];
 
         let table = Table::new(rows, widths)
             .header(header)
             .block(Block::default().borders(Borders::ALL).title(" Preços Cross-DEX ").border_style(Style::default().fg(Color::Green)));
+
+        f.render_widget(table, area);
+    }
+
+    fn draw_top_spreads(&self, f: &mut Frame, area: Rect) {
+        let state = self.blocking_read();
+
+        let header = Row::new(vec![
+            Cell::from("Pair").style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Cell::from("Spread%").style(Style::default().fg(Color::Red)),
+            Cell::from("cyc").style(Style::default().fg(Color::Yellow)),
+            Cell::from("Net$").style(Style::default().fg(Color::Green)),
+            Cell::from("exec").style(Style::default().fg(Color::Gray)),
+        ]);
+
+        let mut rows: Vec<Row> = Vec::new();
+        for t in &state.top_spreads {
+            let pair_display = if t.pair.chars().count() > 10 {
+                format!("{}..", t.pair.chars().take(10).collect::<String>())
+            } else {
+                t.pair.clone()
+            };
+            let cyc = match t.cycle_rate {
+                Some(c) if c.is_finite() => format!("{:.4}", c),
+                _ => "N/A".to_string(),
+            };
+            let exec = if t.has_curve_leg {
+                "C".to_string() // perna Curve (vitrine)
+            } else if t.executable {
+                "y".to_string()
+            } else {
+                "n".to_string()
+            };
+            rows.push(Row::new(vec![
+                Cell::from(pair_display),
+                Cell::from(format!("{:.2}%", t.tui_spread_pct)),
+                Cell::from(cyc),
+                Cell::from(fmt_opt_net(t.net_usd)),
+                Cell::from(exec),
+            ]));
+        }
+
+        let widths = [
+            Constraint::Length(13), // Pair
+            Constraint::Length(9),  // Spread%
+            Constraint::Length(9),  // cyc
+            Constraint::Length(9),  // Net$
+            Constraint::Length(6),  // exec
+        ];
+
+        let table = Table::new(rows, widths)
+            .header(header)
+            .block(Block::default().borders(Borders::ALL).title(" Top Spreads ").border_style(Style::default().fg(Color::Magenta)));
 
         f.render_widget(table, area);
     }
@@ -293,6 +385,31 @@ fn format_opt(v: Option<f64>) -> String {
     }
 }
 
+/// Formata net USD: Some(v) → "$X.XX" (2 casas), None → "-".
+fn fmt_opt_net(v: Option<f64>) -> String {
+    match v {
+        Some(n) if n.is_finite() => format!("${:.2}", n),
+        _ => "-".to_string(),
+    }
+}
+
+/// Chave canônica de par (tokens sorted, direção-agnóstica): "WETH-USDC" ==
+/// "USDC-WETH" == "usdc-weth". Usado p/ casar adj_cycles (canonical) com
+/// PriceRow (direcional) sem depender da direção do label.
+pub fn norm_pair(pair: &str) -> String {
+    let (a, b) = match pair.split_once('-') {
+        Some(ab) => ab,
+        None => return pair.to_string(),
+    };
+    let au = a.to_ascii_uppercase();
+    let bu = b.to_ascii_uppercase();
+    if au <= bu {
+        format!("{}-{}", au, bu)
+    } else {
+        format!("{}-{}", bu, au)
+    }
+}
+
 // ============================================================
 // TUI Spawner
 // ============================================================
@@ -308,4 +425,28 @@ pub fn spawn_tui(state: Arc<RwLock<TuiState>>) {
             }
         });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn norm_pair_canonico_direcao_agnostica() {
+        assert_eq!(norm_pair("WETH-USDC"), "USDC-WETH");
+        assert_eq!(norm_pair("USDC-WETH"), "USDC-WETH");
+        assert_eq!(norm_pair("usdc-weth"), "USDC-WETH");
+        assert_eq!(norm_pair("USDC-USDT"), "USDC-USDT");
+        // par sem '-' → retorna como está (não panic).
+        assert_eq!(norm_pair("USDC"), "USDC");
+    }
+
+    #[test]
+    fn fmt_opt_net_tiers() {
+        assert_eq!(fmt_opt_net(Some(0.94)), "$0.94");
+        assert_eq!(fmt_opt_net(Some(-0.03)), "$-0.03");
+        assert_eq!(fmt_opt_net(Some(0.0)), "$0.00");
+        assert_eq!(fmt_opt_net(None), "-");
+        assert_eq!(fmt_opt_net(Some(f64::NAN)), "-");
+    }
 }

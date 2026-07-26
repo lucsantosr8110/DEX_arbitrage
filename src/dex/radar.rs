@@ -853,25 +853,25 @@ pub fn extract_edges(
 // próprios, não 1/rate_forward) e a profundidade de cada pool. Spread alto que
 // não fecha = cycle_rate real ≤1 OU pool raso destoando (TVL baixo, outlier).
 
-struct TopSpreadLeg {
-    venue: String,
-    token_in: String,
-    token_out: String,
-    rate: f64,
+pub struct TopSpreadLeg {
+    pub venue: String,
+    pub token_in: String,
+    pub token_out: String,
+    pub rate: f64,
 }
 
-struct TopSpreadInfo {
-    pair: String,
+pub struct TopSpreadInfo {
+    pub pair: String,
     /// Spread% single-dir do TUI: (max-min)/min*100 das cotações forward.
-    tui_spread_pct: f64,
-    leg1: Option<TopSpreadLeg>, // forward (buy), None se sem reverse
-    leg2: Option<TopSpreadLeg>, // reverse (sell), None se sem reverse
-    cycle_rate: Option<f64>,    // None se não há 2-hop buy≠sell
-    gross_pct: Option<f64>,
-    net_usd: Option<f64>,
-    outlier: Option<String>, // venue que destoa da mediana forward (suspeito raso)
-    executable: bool,
-    has_curve_leg: bool,
+    pub tui_spread_pct: f64,
+    pub leg1: Option<TopSpreadLeg>, // forward (buy), None se sem reverse
+    pub leg2: Option<TopSpreadLeg>, // reverse (sell), None se sem reverse
+    pub cycle_rate: Option<f64>,    // None se não há 2-hop buy≠sell
+    pub gross_pct: Option<f64>,
+    pub net_usd: Option<f64>,
+    pub outlier: Option<String>, // venue que destoa da mediana forward (suspeito raso)
+    pub executable: bool,
+    pub has_curve_leg: bool,
 }
 
 /// Spread% single-dir idêntico à coluna do TUI (`tui.rs:221-224`).
@@ -935,7 +935,7 @@ fn outlier_venue(forward: &[(String, f64)]) -> Option<String> {
 }
 
 /// Core puro (sem RPC) — testável. `reverse` vazio → sem perna reversa no scan.
-fn analyze_pair_spread(
+pub fn analyze_pair_spread(
     pair: &str,
     forward: &[(String, f64)],
     reverse: &[(String, f64)],
@@ -981,6 +981,57 @@ fn analyze_pair_spread(
         executable,
         has_curve_leg,
     }
+}
+
+/// TOP-N spreads (por Spread% do TUI, desc) — **sync, sem TVL/RPC**. Espelha o
+/// ranking do log `[TOPSPREAD]` mas sem ler profundidade (TVL fica só no log).
+/// Usado pelo painel do TUI. `n==0` → vazio.
+pub fn compute_top_spreads(
+    prices: &HashMap<String, HashMap<String, f64>>,
+    cost: &AdjCostParams,
+    n: usize,
+) -> Vec<TopSpreadInfo> {
+    if n == 0 || prices.is_empty() {
+        return Vec::new();
+    }
+
+    let mut forward_by_pair: HashMap<String, Vec<(String, f64)>> = HashMap::new();
+    for (dex, map) in prices {
+        for (pair, price) in map {
+            forward_by_pair
+                .entry(pair.clone())
+                .or_default()
+                .push((dex.clone(), *price));
+        }
+    }
+
+    let mut ranked: Vec<(String, Vec<(String, f64)>, f64)> = forward_by_pair
+        .iter()
+        .filter(|(_, v)| v.len() >= 2)
+        .map(|(p, v)| {
+            let fwd = v.clone();
+            let spread = tui_spread_pct(&fwd);
+            (p.clone(), fwd, spread)
+        })
+        .filter(|(_, _, s)| s.is_finite() && *s > 0.0)
+        .collect();
+    ranked.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+    ranked
+        .into_iter()
+        .take(n)
+        .map(|(pair, fwd, _)| {
+            let reverse = pair
+                .split_once('-')
+                .map(|(a, b)| format!("{}-{}", b, a));
+            let rev: Vec<(String, f64)> = reverse
+                .as_ref()
+                .and_then(|r| forward_by_pair.get(r))
+                .cloned()
+                .unwrap_or_default();
+            analyze_pair_spread(&pair, &fwd, &rev, cost)
+        })
+        .collect()
 }
 
 /// Formata TVL USD compacto: $1.2M / $340k / $123. None/inválido → "tvl=?".
@@ -1903,5 +1954,61 @@ mod tests {
         assert_eq!(fmt_tvl(None), "tvl=?");
         assert_eq!(fmt_tvl(Some(0.0)), "tvl=?");
         assert_eq!(fmt_tvl(Some(f64::NAN)), "tvl=?");
+    }
+
+    // ===== compute_top_spreads (sync, sem TVL) =====
+
+    /// n=0 → vazio. Sem TVL/RPC (fn sync).
+    #[test]
+    fn compute_top_spreads_n_zero_vazio() {
+        let mut pr: HashMap<String, HashMap<String, f64>> = HashMap::new();
+        pr.insert("QuickSwap".into(), m(&[("A-B", 1.0), ("B-A", 1.0)]));
+        pr.insert("SushiSwap".into(), m(&[("A-B", 1.02), ("B-A", 1.0)]));
+        assert!(compute_top_spreads(&pr, &AdjCostParams::default(), 0).is_empty());
+    }
+
+    /// Ordenado desc por tui_spread%, ≤n, sem campo TVL (TopSpreadInfo não tem).
+    #[test]
+    fn compute_top_spreads_sync_sem_tvl_ordenado_desc() {
+        let mut pr: HashMap<String, HashMap<String, f64>> = HashMap::new();
+        // A-B: spread 2% (1.0 vs 1.02)
+        pr.insert("QuickSwap".into(), m(&[("A-B", 1.0), ("B-A", 1.0)]));
+        pr.insert("SushiSwap".into(), m(&[("A-B", 1.02), ("B-A", 1.0)]));
+        // C-D: spread 1% (1.0 vs 1.01)
+        pr.insert("UniswapV3".into(), m(&[("C-D", 1.0), ("D-C", 1.0)]));
+        // segundo venue C-D via Sushi (merge no mesmo insert não sobrescreve — uso QuickSwap)
+        pr.insert(
+            "QuickSwap".into(),
+            m(&[("A-B", 1.0), ("B-A", 1.0), ("C-D", 1.01), ("D-C", 1.0)]),
+        );
+
+        let rows = compute_top_spreads(&pr, &AdjCostParams::default(), 5);
+        assert!(rows.len() <= 5);
+        assert!(!rows.is_empty(), "deve haver ≥1 spread");
+        // Ordenado desc: primeiro ≥ segundo.
+        for w in rows.windows(2) {
+            assert!(
+                w[0].tui_spread_pct >= w[1].tui_spread_pct,
+                "deve ser desc: {} < {}",
+                w[0].tui_spread_pct,
+                w[1].tui_spread_pct
+            );
+        }
+        // TopSpreadInfo não carrega TVL — struct não tem campo tvl (compilação garante).
+        let _ = rows[0].pair.clone(); // acessível (pub)
+    }
+
+    /// Par sem reverse cotado → cycle_rate None.
+    #[test]
+    fn compute_top_spreads_no_reverse_cycle_none() {
+        let mut pr: HashMap<String, HashMap<String, f64>> = HashMap::new();
+        // X-Y forward em 2 venues, mas sem Y-X em nenhuma → sem reverse.
+        pr.insert("QuickSwap".into(), m(&[("X-Y", 1.0)]));
+        pr.insert("SushiSwap".into(), m(&[("X-Y", 1.05)]));
+        let rows = compute_top_spreads(&pr, &AdjCostParams::default(), 5);
+        let xy = rows.iter().find(|r| r.pair == "X-Y").expect("X-Y no top");
+        assert!(xy.cycle_rate.is_none(), "sem reverse → cycle_rate None");
+        assert!(xy.net_usd.is_none());
+        assert!(xy.leg1.is_none() && xy.leg2.is_none());
     }
 }
