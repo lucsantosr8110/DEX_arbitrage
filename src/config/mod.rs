@@ -747,7 +747,12 @@ pub struct LogConfig {
     #[serde(default)] pub show_dex_responses: bool,
     #[serde(default)] pub export_prices_csv: bool,
     #[serde(default)] pub export_trades_csv: bool,
+    /// Top-N spreads (por Spread% do TUI, desc) logados por scan no `[TOPSPREAD]`.
+    /// Revela cycle_rate real bidirecional + TVL de cada pool do melhor 2-hop.
+    /// 0 = desliga. Default 5.
+    #[serde(default = "default_top_spreads_n")] pub top_spreads_n: usize,
 }
+fn default_top_spreads_n() -> usize { 5 }
 impl Default for LogConfig {
     fn default() -> Self {
         Self {
@@ -759,6 +764,7 @@ impl Default for LogConfig {
             show_dex_responses: false,
             export_prices_csv: false,
             export_trades_csv: false,
+            top_spreads_n: default_top_spreads_n(),
         }
     }
 }

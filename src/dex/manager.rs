@@ -529,6 +529,44 @@ impl DexManager {
         .await
     }
 
+    /// Lê TVL (USD) de UM pool, read-only, sem gas. Wrapper de
+    /// `liquidity::read_pool_tvl_usd` com o resolver do adapter
+    /// (`get_pool_address_for_liquidity`). `Ok(None)` = fail-open (Curve, pool
+    /// miss, sem preço). Usado pelo log `[TOPSPREAD]` p/ revelar pool raso.
+    pub async fn pool_tvl_usd(
+        &self,
+        dex_name: &str,
+        token_a: &str,
+        token_b: &str,
+        fee_hint: u32,
+    ) -> Result<Option<f64>> {
+        let adapters = self.active_adapters.read().await;
+        let adapter = adapters.iter().find(|a| a.name() == dex_name).cloned();
+        drop(adapters);
+
+        let Some(adapter) = adapter else {
+            return Ok(None); // fail-open: venue desconhecido
+        };
+
+        let client = self.client.clone();
+        let token_cache = self.token_cache.clone();
+        let ad = adapter.clone();
+
+        crate::dex::liquidity::read_pool_tvl_usd(
+            client,
+            &token_cache,
+            dex_name,
+            token_a,
+            token_b,
+            fee_hint,
+            move |_dex, a, b, fee| {
+                let ad = ad.clone();
+                async move { ad.get_pool_address_for_liquidity(a, b, fee).await }
+            },
+        )
+        .await
+    }
+
     // ✅ Método auxiliar para fallback
     async fn get_prices_fallback(
         &self,

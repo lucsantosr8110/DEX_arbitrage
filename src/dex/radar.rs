@@ -15,6 +15,7 @@ use crate::{
     },
     dex::{
         circuit_breaker::DexCircuitBreaker,
+        liquidity::min_pool_liquidity_usd_for_dex,
         manager::DexManager,
         price_cache::PriceCache,
         rate_limiter::{ALCHEMY_RATE_LIMITER, DEX_RATE_LIMITER},
@@ -631,6 +632,34 @@ pub struct CycleEconomics {
     pub net_positive: usize,
 }
 
+/// Melhor 2-hop cross-DEX: buy forward (venue A) × sell reverse (venue B), A≠B,
+/// maximizando `cycle_rate = buy_price × sell_price`. Quotes já fee+impact-inclusive
+/// (getAmountsOut/Quoter/get_dy) — NÃO reaplicar fee. Retorna `None` se não há
+/// combinação buy≠sell com cycle_rate > 0 (ex.: sem reverse, ou só 1 venue).
+///
+/// Compartilhado entre `extract_edges` (que só conta cycle_rate > 1.0) e
+/// `analyze_pair_spread` (top-N, que revela também os ≤1.0).
+fn best_two_hop(
+    forward: &[(String, f64)],
+    reverse: &[(String, f64)],
+) -> Option<(String, f64, String, f64, f64)> {
+    let mut best_rate: f64 = 0.0;
+    let mut best: Option<(String, f64, String, f64)> = None;
+    for (buy_venue, buy_price) in forward {
+        for (sell_venue, sell_price) in reverse {
+            if buy_venue == sell_venue {
+                continue;
+            }
+            let rate = buy_price * sell_price;
+            if rate > best_rate {
+                best_rate = rate;
+                best = Some((buy_venue.clone(), *buy_price, sell_venue.clone(), *sell_price));
+            }
+        }
+    }
+    best.map(|(bv, bp, sv, sp)| (bv, bp, sv, sp, best_rate))
+}
+
 /// Conta sinais de spread E extrai os edges (> 0.01%) para logging/audit.
 ///
 /// **VALIDAÇÃO CROSS-DEX**: Só emite EDGE quando `cycle_rate = buy_price × sell_price`
@@ -668,38 +697,17 @@ pub fn extract_edges(
         // Buscar preços do reverse pair se existir
         let reverse_dex_prices = reverse_pair.as_ref().and_then(|rp| map_pairs.get(rp));
 
-        // Calcular melhor cycle_rate cross-DEX com fees
-        let mut best_cycle_rate: f64 = 0.0;
-        let mut best_buy_dex = String::new();
-        let mut best_sell_dex = String::new();
-        let mut best_buy_price: f64 = 0.0;
-        let mut best_sell_price: f64 = 0.0;
+        // Melhor 2-hop cross-DEX (buy forward × sell reverse, A≠B), max cycle_rate.
+        let best = match reverse_dex_prices {
+            Some(rev_prices) => best_two_hop(dex_prices, rev_prices),
+            None => None,
+        };
 
-        if let Some(rev_prices) = reverse_dex_prices {
-            // Para cada combinação (buy_dex, sell_dex) onde buy ≠ sell
-            for (buy_dex, buy_price) in dex_prices {
-                for (sell_dex, sell_price) in rev_prices {
-                    if buy_dex == sell_dex {
-                        continue;
-                    }
-                    // Quotes (getAmountsOut / Quoter) já incluem fee AMM + impact.
-                    // NÃO aplicar (1-fee) de novo — isso era dedução dupla.
-                    let cycle_rate = buy_price * sell_price;
-                    if cycle_rate > best_cycle_rate {
-                        best_cycle_rate = cycle_rate;
-                        best_buy_dex = buy_dex.clone();
-                        best_sell_dex = sell_dex.clone();
-                        best_buy_price = *buy_price;
-                        best_sell_price = *sell_price;
-                    }
-                }
-            }
-        }
-
-        if best_cycle_rate == 0.0 {
+        let Some((best_buy_dex, best_buy_price, best_sell_dex, best_sell_price, best_cycle_rate)) = best
+        else {
             // Sem reverso disponível — não há como avaliar ciclo
             continue;
-        }
+        };
 
         evaluated += 1;
 
@@ -839,6 +847,287 @@ pub fn extract_edges(
 }
 
 // ============================================================
+// TOP-N SPREADS: cycle_rate real bidirecional + TVL por pool
+// ============================================================
+// Revela o que a coluna Spread% do TUI esconde: a perna REVERSA (com fee+impact
+// próprios, não 1/rate_forward) e a profundidade de cada pool. Spread alto que
+// não fecha = cycle_rate real ≤1 OU pool raso destoando (TVL baixo, outlier).
+
+struct TopSpreadLeg {
+    venue: String,
+    token_in: String,
+    token_out: String,
+    rate: f64,
+}
+
+struct TopSpreadInfo {
+    pair: String,
+    /// Spread% single-dir do TUI: (max-min)/min*100 das cotações forward.
+    tui_spread_pct: f64,
+    leg1: Option<TopSpreadLeg>, // forward (buy), None se sem reverse
+    leg2: Option<TopSpreadLeg>, // reverse (sell), None se sem reverse
+    cycle_rate: Option<f64>,    // None se não há 2-hop buy≠sell
+    gross_pct: Option<f64>,
+    net_usd: Option<f64>,
+    outlier: Option<String>, // venue que destoa da mediana forward (suspeito raso)
+    executable: bool,
+    has_curve_leg: bool,
+}
+
+/// Spread% single-dir idêntico à coluna do TUI (`tui.rs:221-224`).
+fn tui_spread_pct(forward: &[(String, f64)]) -> f64 {
+    if forward.len() < 2 {
+        return 0.0;
+    }
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    for (_, p) in forward {
+        if *p <= 0.0 || !p.is_finite() {
+            continue;
+        }
+        if *p < min {
+            min = *p;
+        }
+        if *p > max {
+            max = *p;
+        }
+    }
+    if min.is_finite() && min > 0.0 {
+        (max - min) / min * 100.0
+    } else {
+        0.0
+    }
+}
+
+/// Mediana dos preços forward (p/ outlier). 50º percentil da amostra ordenada.
+fn median(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut v: Vec<f64> = values.iter().copied().filter(|x| x.is_finite() && *x > 0.0).collect();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    if v.is_empty() {
+        return 0.0;
+    }
+    let mid = v.len() / 2;
+    if v.len() % 2 == 0 {
+        (v[mid - 1] + v[mid]) / 2.0
+    } else {
+        v[mid]
+    }
+}
+
+/// Venue cujo preço forward mais se afasta da mediana — o suspeito de pool raso
+/// que cria o spread aparente. None se <2 venues válidas.
+fn outlier_venue(forward: &[(String, f64)]) -> Option<String> {
+    let prices: Vec<f64> = forward.iter().map(|(_, p)| *p).collect();
+    let med = median(&prices);
+    if med <= 0.0 {
+        return None;
+    }
+    forward
+        .iter()
+        .filter(|(_, p)| p.is_finite() && *p > 0.0)
+        .max_by(|(_, a), (_, b)| {
+            (a - med).abs().partial_cmp(&(b - med).abs()).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(v, _)| v.clone())
+}
+
+/// Core puro (sem RPC) — testável. `reverse` vazio → sem perna reversa no scan.
+fn analyze_pair_spread(
+    pair: &str,
+    forward: &[(String, f64)],
+    reverse: &[(String, f64)],
+    cost: &AdjCostParams,
+) -> TopSpreadInfo {
+    let tui_spread_pct = tui_spread_pct(forward);
+    let best = best_two_hop(forward, reverse);
+    let (leg1, leg2, cycle_rate, gross_pct, net_usd, executable, has_curve_leg) = match best {
+        Some((bv, bp, sv, sp, rate)) => {
+            let (a, b) = pair.split_once('-').unwrap_or((pair, ""));
+            let leg1 = TopSpreadLeg {
+                venue: bv.clone(),
+                token_in: a.to_string(),
+                token_out: b.to_string(),
+                rate: bp,
+            };
+            let leg2 = TopSpreadLeg {
+                venue: sv.clone(),
+                token_in: b.to_string(),
+                token_out: a.to_string(),
+                rate: sp,
+            };
+            let gross = (rate - 1.0) * 100.0;
+            let net = cost.net_usd(gross);
+            let venues = [leg1.venue.as_str(), leg2.venue.as_str()];
+            let executable = route_all_legs_executable(venues.into_iter());
+            let has_curve = venues
+                .iter()
+                .any(|v| venue_curve_model(v) == CurveModel::StableSwap);
+            (Some(leg1), Some(leg2), Some(rate), Some(gross), Some(net), executable, has_curve)
+        }
+        None => (None, None, None, None, None, false, false),
+    };
+    TopSpreadInfo {
+        pair: pair.to_string(),
+        tui_spread_pct,
+        leg1,
+        leg2,
+        cycle_rate,
+        gross_pct,
+        net_usd,
+        outlier: outlier_venue(forward),
+        executable,
+        has_curve_leg,
+    }
+}
+
+/// Formata TVL USD compacto: $1.2M / $340k / $123. None/inválido → "tvl=?".
+fn fmt_tvl(tvl: Option<f64>) -> String {
+    match tvl {
+        Some(v) if v.is_finite() && v > 0.0 => {
+            if v >= 1e6 {
+                format!("tvl=${:.1}M", v / 1e6)
+            } else if v >= 1e3 {
+                format!("tvl=${:.0}k", v / 1e3)
+            } else {
+                format!("tvl=${:.0}", v)
+            }
+        }
+        _ => "tvl=?".to_string(),
+    }
+}
+
+/// Log dos TOP-N spreads (por Spread% do TUI, desc). Read-only: TVL via
+/// `DexManager::pool_tvl_usd` (balanceOf multicall, sem gas). Revela cycle_rate
+/// real bidirecional + profundidade de cada pool do melhor 2-hop daquele par.
+async fn log_top_n_spreads(
+    out: &HashMap<String, HashMap<String, f64>>,
+    dm: &Arc<DexManager>,
+    adj_cost: &AdjCostParams,
+    n: usize,
+    cycle: u64,
+) {
+    if n == 0 || out.is_empty() {
+        return;
+    }
+
+    // forward_by_pair: cada par (direcional) -> [(venue, price)]
+    let mut forward_by_pair: HashMap<String, Vec<(String, f64)>> = HashMap::new();
+    for (dex, map) in out {
+        for (pair, price) in map {
+            forward_by_pair
+                .entry(pair.clone())
+                .or_default()
+                .push((dex.clone(), *price));
+        }
+    }
+
+    // Ranqueia por Spread% do TUI (desc); só pares com ≥2 venues.
+    let mut ranked: Vec<(String, Vec<(String, f64)>, f64)> = forward_by_pair
+        .iter()
+        .filter(|(_, v)| v.len() >= 2)
+        .map(|(p, v)| {
+            let fwd = v.clone();
+            let spread = tui_spread_pct(&fwd);
+            (p.clone(), fwd, spread)
+        })
+        .filter(|(_, _, s)| s.is_finite() && *s > 0.0)
+        .collect();
+    ranked.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+    let cfg = dm.config_ref();
+    let fee_for = |venue: &str| {
+        cfg.dex
+            .iter()
+            .find(|d| d.name.eq_ignore_ascii_case(venue))
+            .and_then(|d| d.fee_tier)
+            .unwrap_or(0)
+    };
+
+    for (pair, fwd, tui_spread) in ranked.into_iter().take(n) {
+        let reverse = pair
+            .split_once('-')
+            .map(|(a, b)| format!("{}-{}", b, a));
+        let rev: Vec<(String, f64)> = reverse
+            .as_ref()
+            .and_then(|r| forward_by_pair.get(r))
+            .cloned()
+            .unwrap_or_default();
+        let info = analyze_pair_spread(&pair, &fwd, &rev, adj_cost);
+
+        // TVL read-only de cada perna do melhor 2-hop. None = fail-open (Curve, etc.).
+        let (tvl1_str, shallow1) = match &info.leg1 {
+            Some(l) => {
+                let tvl = dm
+                    .pool_tvl_usd(&l.venue, &l.token_in, &l.token_out, fee_for(&l.venue))
+                    .await
+                    .ok()
+                    .flatten();
+                let min = min_pool_liquidity_usd_for_dex(cfg, &l.venue);
+                let shallow = matches!(tvl, Some(t) if t < min);
+                (fmt_tvl(tvl), shallow)
+            }
+            None => ("tvl=?".to_string(), false),
+        };
+        let (tvl2_str, shallow2) = match &info.leg2 {
+            Some(l) => {
+                let tvl = dm
+                    .pool_tvl_usd(&l.venue, &l.token_in, &l.token_out, fee_for(&l.venue))
+                    .await
+                    .ok()
+                    .flatten();
+                let min = min_pool_liquidity_usd_for_dex(cfg, &l.venue);
+                let shallow = matches!(tvl, Some(t) if t < min);
+                (fmt_tvl(tvl), shallow)
+            }
+            None => ("tvl=?".to_string(), false),
+        };
+
+        let leg1_str = match &info.leg1 {
+            Some(l) => format!(
+                "leg1={}:{}→{}@{:.6}({}{})",
+                l.venue, l.token_in, l.token_out, l.rate, tvl1_str,
+                if shallow1 { " SHALLOW" } else { "" }
+            ),
+            None => "leg1=NONE".to_string(),
+        };
+        let leg2_str = match &info.leg2 {
+            Some(l) => format!(
+                "leg2={}:{}→{}@{:.6}({}{})",
+                l.venue, l.token_in, l.token_out, l.rate, tvl2_str,
+                if shallow2 { " SHALLOW" } else { "" }
+            ),
+            None => "leg2=NONE".to_string(),
+        };
+
+        // Sem reverse cotado → cycle_rate indisponível (razão do não-fechamento).
+        if info.cycle_rate.is_none() {
+            info!(
+                target: "topspread",
+                "[TOPSPREAD] scan={} {} tui_spread={:.2}% {} {} cycle_rate=N/A outlier={} reason=no-reverse",
+                cycle, info.pair, tui_spread, leg1_str, leg2_str,
+                info.outlier.as_deref().unwrap_or("?"),
+            );
+            continue;
+        }
+
+        info!(
+            target: "topspread",
+            "[TOPSPREAD] scan={} {} tui_spread={:.2}% {} {} cycle_rate={:.6} gross={:.2}% net=${:.4} exec={} curve={} outlier={}",
+            cycle, info.pair, tui_spread, leg1_str, leg2_str,
+            info.cycle_rate.unwrap_or(0.0),
+            info.gross_pct.unwrap_or(0.0),
+            info.net_usd.unwrap_or(0.0),
+            info.executable,
+            info.has_curve_leg,
+            info.outlier.as_deref().unwrap_or("?"),
+        );
+    }
+}
+
+// ============================================================
 // LOG DE AUDITORIA
 // ============================================================
 
@@ -941,12 +1230,13 @@ async fn execute_radar_cycle(
     cycle: u64,
 ) -> Result<(usize, Vec<EdgeInfo>)> {
 
-    let (pairs, qf_enabled, min_spread) = {
+    let (pairs, qf_enabled, min_spread, top_n) = {
         let cfg = cfg.lock().await;
         (
             generate_full_pair_list(&cfg),
             cfg.optimization.quick_filter_enabled,
             cfg.optimization.min_spread_percent,
+            cfg.log.top_spreads_n,
         )
     };
 
@@ -998,6 +1288,10 @@ async fn execute_radar_cycle(
     log_price_audit(&out, cycle);
     log_edge_summary(&edges, cycle);
     log_edge_audit(&edges, cycle);
+
+    // TOP-N spreads: revela o que a coluna Spread% do TUI esconde (perna reversa
+    // real + profundidade). Read-only (TVL via balanceOf), sem gas.
+    log_top_n_spreads(&out, dm, adj_cost, top_n, cycle).await;
 
     // INSTRUMENTAÇÃO `adj`: log estruturado por ciclo que passou o ajuste de custo.
     // Persistência: adj_tracker mantém {cycle_key -> AdjSeen} entre scans; `persist`
@@ -1487,5 +1781,127 @@ mod tests {
         ] {
             assert!(pares.contains(&esperado.to_string()), "falta {esperado} (Curve não cota)");
         }
+    }
+
+    // ===== TOP-N SPREAD (analyze_pair_spread / best_two_hop / tui_spread) =====
+
+    /// Spread% single-dir = (max-min)/min*100, idêntico à fórmula do TUI
+    /// (`tui.rs:221-224`).
+    #[test]
+    fn tui_spread_matches_tui_formula() {
+        let fwd = vec![
+            ("QuickSwap".to_string(), 0.000274),
+            ("SushiSwap".to_string(), 0.000279),
+            ("UniswapV3".to_string(), 0.000271),
+        ];
+        let spread = tui_spread_pct(&fwd);
+        let expected = (0.000279 - 0.000271) / 0.000271 * 100.0;
+        assert!((spread - expected).abs() < 1e-9, "spread={spread} expected={expected}");
+        // <2 venues → 0 (igual TUI).
+        assert_eq!(tui_spread_pct(&[("A".into(), 1.0)]), 0.0);
+    }
+
+    /// top-N revela também os ≤1.0 (diferente de extract_edges que só conta >1).
+    /// cycle_rate 0.9987 ainda retorna leg1/leg2/cycle_rate.
+    #[test]
+    fn analyze_pair_spread_best_two_hop_ignores_gt1_filter() {
+        let forward = vec![("QuickSwap".to_string(), 0.000274)];
+        // reverse: WETH→DAI = 3648.0 → cycle_rate = 0.000274 × 3648.0 = 0.999552 (<1)
+        let reverse = vec![("SushiSwap".to_string(), 3648.0)];
+        let info = analyze_pair_spread("DAI-WETH", &forward, &reverse, &AdjCostParams::default());
+        assert!(info.leg1.is_some(), "leg1 deve existir mesmo com cycle_rate < 1");
+        assert!(info.leg2.is_some(), "leg2 deve existir");
+        let cr = info.cycle_rate.expect("cycle_rate");
+        assert!(cr < 1.0, "cycle_rate={cr} deve ser < 1 (revela não-fechamento)");
+        assert!(info.gross_pct.unwrap() < 0.0, "gross deve ser negativo");
+        // extract_edges NÃO emite edge <1, mas analyze_pair_spread retorna o ciclo.
+        let mut pr: HashMap<String, HashMap<String, f64>> = HashMap::new();
+        pr.insert("QuickSwap".into(), m(&[("DAI-WETH", 0.000274), ("WETH-DAI", 3700.0)]));
+        pr.insert("SushiSwap".into(), m(&[("DAI-WETH", 0.000274), ("WETH-DAI", 3648.0)]));
+        let (_n, edges, _, _) = extract_edges(&pr, &AdjCostParams::default());
+        // Com cycle_rate < 1 (best = 0.000274 × 3648 = 0.9996), extract_edges não push.
+        assert!(edges.iter().all(|e| e.spread_pct > 0.0));
+    }
+
+    /// Sem reverse cotado → leg2=None, cycle_rate=None (razão do não-fechamento).
+    #[test]
+    fn analyze_pair_spread_no_reverse() {
+        let forward = vec![
+            ("QuickSwap".to_string(), 1.0),
+            ("SushiSwap".to_string(), 1.02),
+        ];
+        let info = analyze_pair_spread("DAI-USDC", &forward, &[], &AdjCostParams::default());
+        assert!(info.leg1.is_none(), "sem reverse → sem 2-hop → leg1=None");
+        assert!(info.leg2.is_none());
+        assert!(info.cycle_rate.is_none(), "sem cycle_rate sem reverse");
+        assert!(info.gross_pct.is_none());
+        // outlier ainda aponta o venue destoante no forward.
+        assert_eq!(info.outlier.as_deref(), Some("SushiSwap"));
+        assert!((info.tui_spread_pct - 2.0).abs() < 1e-9, "spread 2%");
+    }
+
+    /// Outlier = venue cujo preço mais se afasta da mediana forward.
+    /// [1.0, 1.0, 1.02] → mediana 1.0, outlier = o 1.02.
+    #[test]
+    fn analyze_pair_spread_outlier_is_median_deviant() {
+        let forward = vec![
+            ("QuickSwap".to_string(), 1.0),
+            ("SushiSwap".to_string(), 1.0),
+            ("UniswapV3".to_string(), 1.02),
+        ];
+        let info = analyze_pair_spread("X-Y", &forward, &[], &AdjCostParams::default());
+        assert_eq!(info.outlier.as_deref(), Some("UniswapV3"));
+    }
+
+    /// leg Curve → has_curve_leg=true, executable=false; QuickSwap+SushiSwap →
+    /// executable=true.
+    #[test]
+    fn analyze_pair_spread_executable_and_curve_flags() {
+        // QuickSwap (forward) × SushiSwap (reverse): ambos Cpmm executáveis.
+        let fwd = vec![("QuickSwap".to_string(), 1.01)];
+        let rev = vec![("SushiSwap".to_string(), 1.0)];
+        let info = analyze_pair_spread("A-B", &fwd, &rev, &AdjCostParams::default());
+        assert!(info.executable, "Quick×Sushi deve ser executável");
+        assert!(!info.has_curve_leg, "sem Curve");
+
+        // Curve (forward) × QuickSwap (reverse): Curve não executável pelo contrato.
+        let fwd_c = vec![("Curve".to_string(), 1.0001)];
+        let rev_c = vec![("QuickSwap".to_string(), 1.0001)];
+        let info_c = analyze_pair_spread("USDC-USDT", &fwd_c, &rev_c, &AdjCostParams::default());
+        assert!(!info_c.executable, "perna Curve → não executável");
+        assert!(info_c.has_curve_leg, "tem perna Curve");
+    }
+
+    /// Helper best_two_hop extraído não muda o ciclo existente: extract_edges
+    /// ainda emite os mesmos edges (>1.0) usando o mesmo helper.
+    #[test]
+    fn best_two_hop_shared_with_extract_edges() {
+        let mut pr: HashMap<String, HashMap<String, f64>> = HashMap::new();
+        pr.insert("QuickSwap".into(), m(&[("AAA-BBB", 1.0), ("BBB-AAA", 1.0)]));
+        pr.insert("SushiSwap".into(), m(&[("AAA-BBB", 1.01), ("BBB-AAA", 1.0)]));
+        let (n, edges, econ, adj) = extract_edges(&pr, &AdjCostParams::default());
+        assert!(!edges.is_empty(), "best_two_hop compartilhado mantém edges");
+        assert_eq!(adj.len(), 1, "1 ciclo único (dedup mirror)");
+        assert_eq!(econ.gross_positive, 1);
+        // best_two_hop direto no mesmo forward/reverse dá o mesmo cycle_rate.
+        let fwd = vec![("QuickSwap".to_string(), 1.0), ("SushiSwap".to_string(), 1.01)];
+        let rev = vec![("QuickSwap".to_string(), 1.0), ("SushiSwap".to_string(), 1.0)];
+        let best = best_two_hop(&fwd, &rev);
+        let (bv, _bp, sv, _sp, rate) = best.unwrap();
+        assert_eq!(bv, "SushiSwap");
+        assert_eq!(sv, "QuickSwap");
+        assert!((rate - 1.01).abs() < 1e-9, "rate={rate}");
+        let _ = n;
+    }
+
+    /// TVL formatação: $1.2M / $340k / $123 / tvl=? (None/inválido).
+    #[test]
+    fn fmt_tvl_compact_tiers() {
+        assert_eq!(fmt_tvl(Some(1_200_000.0)), "tvl=$1.2M");
+        assert_eq!(fmt_tvl(Some(340_000.0)), "tvl=$340k");
+        assert_eq!(fmt_tvl(Some(123.0)), "tvl=$123");
+        assert_eq!(fmt_tvl(None), "tvl=?");
+        assert_eq!(fmt_tvl(Some(0.0)), "tvl=?");
+        assert_eq!(fmt_tvl(Some(f64::NAN)), "tvl=?");
     }
 }

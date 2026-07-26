@@ -398,6 +398,101 @@ where
     Ok(kept)
 }
 
+/// Lê TVL (USD) de UM pool, read-only, sem gas. Reusa a mesma lógica do gate
+/// (`filter_token_prices_by_liquidity`): resolve/cacheia endereço do pool via
+/// `resolve_pool`, faz `balanceOf(token_a, pool)` + `balanceOf(token_b, pool)`
+/// num multicall (1 round-trip), e converte via `pool_tvl_usd_from_balances`
+/// + `PRICE_FEED`. Uniforme V2/V3/Curve (balanceOf serve p/ todos; Curve
+/// tipicamente resolve `None` → fail-open).
+///
+/// Retorna `Ok(None)` p/ qualquer falha mensurável (pool miss, token_cache miss,
+/// multicall fail, sem preço, decode miss) — **fail-open**, nunca erro fatal.
+/// Usado pelo log `[TOPSPREAD]` p/ revelar pool raso vs pool profundo.
+pub async fn read_pool_tvl_usd<F, Fut>(
+    client: Arc<AppMiddleware>,
+    token_cache: &TokenCache,
+    dex_name: &str,
+    token_a: &str,
+    token_b: &str,
+    fee_hint: u32,
+    mut resolve_pool: F,
+) -> Result<Option<f64>>
+where
+    F: FnMut(String, Address, Address, u32) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<Address>>>,
+{
+    let (Some(info_a), Some(info_b)) = (
+        token_cache.get_by_symbol(token_a).await,
+        token_cache.get_by_symbol(token_b).await,
+    ) else {
+        return Ok(None); // fail-open: token_cache miss
+    };
+    let dec_a = cached_decimals(info_a.address, info_a.decimals);
+    let dec_b = cached_decimals(info_b.address, info_b.decimals);
+
+    // 1) Pool address (cache ou resolve).
+    let pool = if let Some(p) = cached_pool_address(dex_name, token_a, token_b, fee_hint) {
+        p
+    } else {
+        match resolve_pool(
+            dex_name.to_string(),
+            info_a.address,
+            info_b.address,
+            fee_hint,
+        )
+        .await
+        {
+            Ok(Some(p)) if !p.is_zero() => {
+                cache_pool_address(dex_name, token_a, token_b, fee_hint, p);
+                p
+            }
+            _ => return Ok(None), // fail-open: pool resolve miss (Curve, etc.)
+        }
+    };
+
+    // 2) Multicall balanceOf (2 calls, 1 round-trip).
+    let mut multicall = Multicall::new(client.clone(), None).await?;
+    let erc_a = ERC20::new(info_a.address, client.clone());
+    let erc_b = ERC20::new(info_b.address, client.clone());
+    multicall.add_call(erc_a.balance_of(pool), true);
+    multicall.add_call(erc_b.balance_of(pool), true);
+
+    let raw: Vec<Result<Token, _>> = match multicall.call_raw().await {
+        Ok(r) => r,
+        Err(e) => {
+            debug!(
+                target: "liquidity",
+                pair = %format!("{}-{}", token_a, token_b),
+                dex = %dex_name,
+                "read_pool_tvl_usd: multicall failed ({e}) — fail-open"
+            );
+            return Ok(None);
+        }
+    };
+    let (bal_a, bal_b) = match (raw.get(0), raw.get(1)) {
+        (Some(Ok(Token::Uint(a))), Some(Ok(Token::Uint(b)))) => (*a, *b),
+        _ => {
+            debug!(
+                target: "liquidity",
+                pair = %format!("{}-{}", token_a, token_b),
+                dex = %dex_name,
+                "read_pool_tvl_usd: balanceOf decode miss — fail-open"
+            );
+            return Ok(None);
+        }
+    };
+
+    // 3) Preços via feed (stables fallback $1). Sem preço nos dois lados → fail-open.
+    let pa = token_price_usd(token_a).await;
+    let pb = token_price_usd(token_b).await;
+    if pa <= 0.0 && pb <= 0.0 {
+        return Ok(None);
+    }
+
+    let tvl = pool_tvl_usd_from_balances(bal_a, dec_a, pa, bal_b, dec_b, pb);
+    Ok(Some(tvl))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

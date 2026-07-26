@@ -186,6 +186,7 @@ show_gas_details = true
 show_dex_responses = false
 export_trades_csv = true
 export_prices_csv = false
+top_spreads_n = 5
 
 # ======================================================================
 # NETWORK
