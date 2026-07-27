@@ -47,7 +47,6 @@ pub struct TuiState {
     pub last_prices: Vec<PriceRow>,
     /// Top-N spreads por Spread% desc (espelha log `[TOPSPREAD]`, sem TVL).
     pub top_spreads: Vec<TopSpreadRow>,
-    pub recent_opps: Vec<String>,
     /// Instant do último scan de preços recebido (set em update_tui_state).
     /// None = nenhum scan chegou ainda. Usado p/ mostrar "último scan: Ns atrás"
     /// e detectar radar morto (WS caiu, sem novos blocos).
@@ -103,7 +102,6 @@ impl Default for TuiState {
             net_usd_total: 0.0,
             last_prices: Vec::new(),
             top_spreads: Vec::new(),
-            recent_opps: Vec::new(),
             last_update: None,
             render_tick: 0,
             start: Instant::now(),
@@ -119,8 +117,17 @@ pub struct TuiApp {
     state: Arc<RwLock<TuiState>>,
     shutdown_tx: broadcast::Sender<()>,
     event_rx: mpsc::Receiver<Event>,
-    _reader_shutdown: Arc<AtomicBool>,
-    _reader_handle: thread::JoinHandle<()>,
+    reader_shutdown: Arc<AtomicBool>,
+    reader_handle: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for TuiApp {
+    fn drop(&mut self) {
+        self.reader_shutdown.store(true, Ordering::Relaxed);
+        if let Some(h) = self.reader_handle.take() {
+            let _ = h.join();
+        }
+    }
 }
 
 impl TuiApp {
@@ -129,29 +136,23 @@ impl TuiApp {
         let reader_shutdown = Arc::new(AtomicBool::new(false));
         let sd = reader_shutdown.clone();
 
-        let _reader_handle = thread::spawn(move || {
-            // Thread dedicada: lê eventos do crossterm e encaminha via canal.
-            // A TUI principal nunca bloqueia em event::read() — se esta thread
-            // travar (poll true + read blocks), a TUI continua atualizando os
-            // dados e só perde input de teclado.
+        let handle = thread::spawn(move || {
             loop {
                 if sd.load(Ordering::Relaxed) {
                     break;
                 }
-                // poll com 100ms: granularidade suficiente para responder
-                // a input sem delay perceptível, mas sem travar pra sempre.
                 match crossterm::event::poll(Duration::from_millis(100)) {
                     Ok(true) => {
                         match crossterm::event::read() {
                             Ok(ev) => {
                                 if event_tx.send(ev).is_err() {
-                                    break; // receiver dropped
+                                    break;
                                 }
                             }
                             Err(_) => break,
                         }
                     }
-                    Ok(false) => {} // timeout, loop de novo
+                    Ok(false) => {}
                     Err(_) => break,
                 }
             }
@@ -161,8 +162,8 @@ impl TuiApp {
             state,
             shutdown_tx,
             event_rx,
-            _reader_shutdown: reader_shutdown,
-            _reader_handle,
+            reader_shutdown,
+            reader_handle: Some(handle),
         }
     }
 
@@ -218,7 +219,7 @@ impl TuiApp {
             // do bot_task. Antes o uptime só atualizava em update_tui_state,
             // que só é chamado pelo bot_task — se process_prices() travasse,
             // o uptime congelava junto.
-            if let Ok(mut s) = self.state.write() {
+            if let Ok(mut s) = self.state.try_write() {
                 s.render_tick = s.render_tick.wrapping_add(1);
                 s.uptime = s.start.elapsed();
             }
@@ -251,10 +252,6 @@ impl TuiApp {
                     }
                     Err(mpsc::TryRecvError::Empty) => break, // sem eventos por agora
                     Err(mpsc::TryRecvError::Disconnected) => {
-                        // Reader thread morreu. Log via eprint (único safe
-                        // em raw mode) e continua — a TUI ainda desenha.
-                        // O shutdown eventual vem pelo broadcast.
-                        eprintln!("[tui] event reader thread died");
                         break;
                     }
                 }
@@ -531,7 +528,12 @@ impl TuiApp {
     }
 
     fn blocking_read(&self) -> TuiState {
-        self.state.read().expect("tui state lock poisoned").clone()
+        match self.state.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => {
+                poisoned.into_inner().clone()
+            }
+        }
     }
 }
 

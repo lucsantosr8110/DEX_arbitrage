@@ -118,7 +118,6 @@ fn update_tui_state(
     }
     let mut last_prices: Vec<tui::PriceRow> = rows.into_values().collect();
     last_prices.sort_by(|a, b| a.pair.cmp(&b.pair));
-    last_prices.truncate(20);
 
     // Top-N spreads (sync, sem TVL) — espelha o log [TOPSPREAD].
     let top_spreads: Vec<tui::TopSpreadRow> = compute_top_spreads(prices, adj_cost, top_n)
