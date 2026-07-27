@@ -118,9 +118,10 @@ contract FlashloanExecutor is ReentrancyGuard, IFlashLoanSimpleReceiver {
         bool   enabled;
     }
 
-    /// @dev ABI tuple layout: (address, SwapStep[], uint256).
-    /// Field renamed from `executor` → `profitRecipient` (encoding unchanged).
-    /// This is the economic owner of flashloan profit — NOT msg.sender / relayer.
+    /// @dev Economic fields for flashloan callback.
+    /// Wire encoding is FLAT: `abi.encode(profitRecipient, steps, minProfit)`.
+    /// Do NOT `abi.encode(CallbackData)` / `abi.decode(params, (CallbackData))` —
+    /// struct typing adds an outer dynamic offset that breaks Rust + executeFlashloan.
     struct CallbackData {
         address profitRecipient;
         SwapStep[] steps;
@@ -365,7 +366,12 @@ contract FlashloanExecutor is ReentrancyGuard, IFlashLoanSimpleReceiver {
             initiator == address(this);
         require(isValidInitiator, "Invalid initiator");
 
-        CallbackData memory data = abi.decode(params, (CallbackData));
+        // Flat ABI: abi.encode(address, SwapStep[], uint256) — NOT abi.encode(CallbackData).
+        // Struct-typed decode expects an outer offset prefix and would revert on Rust/ethers
+        // and on this contract's own executeFlashloan params.
+        CallbackData memory data;
+        (data.profitRecipient, data.steps, data.minProfit) =
+            abi.decode(params, (address, SwapStep[], uint256));
         _requireAuthorizedProfitRecipient(data.profitRecipient);
 
         // AUDIT fix #2: validar steps vindos via callback (FlashloanCaller passa params cru).

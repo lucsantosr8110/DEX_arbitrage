@@ -21,9 +21,7 @@ use crate::{
         // ❌ `ArbitrageOpportunity` de `dex` (mod.rs) não é o usado para Flashloans.
         DexContract, TokenPairPrice,
     },
-    // ✅ CORREÇÃO: `u256_to_f64` vem de `dex` (via `utils`)
     infra::metrics,
-    utils::utils::u256_to_f64,
     AppMiddleware,
 };
 use anyhow::{anyhow, Context, Result};
@@ -246,9 +244,15 @@ impl DexManager {
     }
 
     fn calculate_flashloan_premium(&self, amount: U256) -> f64 {
-        let premium_rate = 0.0009; // Aave v3 é 0.09%
-        // Assumindo 6 decimais para stablecoins, idealmente deveria vir do token_cache
-        u256_to_f64(amount, 6) * premium_rate * 1.1 // Adiciona 10% de buffer
+        // Display/estimate only — execution gates use fixed_usd + on-chain premium.
+        let premium_bps = 9u64; // 0.09% Aave-ish placeholder + buffer handled below
+        let price = crate::core::fixed_usd::UsdE8(crate::core::fixed_usd::USD_E8_SCALE);
+        let principal = crate::core::fixed_usd::token_raw_to_usd_e8(amount, price, 6)
+            .unwrap_or(crate::core::fixed_usd::UsdE8::zero());
+        let fee = crate::core::fixed_usd::flashloan_fee_usd_e8(principal, premium_bps)
+            .unwrap_or(crate::core::fixed_usd::UsdE8::zero());
+        // +10% buffer (legacy behaviour)
+        fee.display_f64() * 1.1
     }
 
     async fn estimate_flashloan_gas(&self, _opp: &ArbitrageOpportunity) -> Result<u64> {

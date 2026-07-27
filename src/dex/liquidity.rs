@@ -17,6 +17,7 @@
 use crate::{
     config::{token_cache::TokenCache, Config},
     contracts::ERC20,
+    core::fixed_usd::{self, UsdE8},
     dex::TokenPairPrice,
     infra::price_feed::PRICE_FEED,
     AppMiddleware,
@@ -148,39 +149,63 @@ pub fn pool_tvl_usd_from_balances(
     decimals_b: u8,
     price_b_usd: f64,
 ) -> f64 {
-    raw_to_usd(bal_a, decimals_a, price_a_usd) + raw_to_usd(bal_b, decimals_b, price_b_usd)
+    match pool_tvl_usd_e8_from_balances(
+        bal_a,
+        decimals_a,
+        price_a_usd,
+        bal_b,
+        decimals_b,
+        price_b_usd,
+    ) {
+        Ok(e8) => e8.display_f64(),
+        Err(_) => 0.0,
+    }
 }
 
-fn raw_to_usd(raw: U256, decimals: u8, price_usd: f64) -> f64 {
+/// Integer TVL used by the liquidity gate (no silent u128 clip).
+pub fn pool_tvl_usd_e8_from_balances(
+    bal_a: U256,
+    decimals_a: u8,
+    price_a_usd: f64,
+    bal_b: U256,
+    decimals_b: u8,
+    price_b_usd: f64,
+) -> Result<UsdE8> {
+    let a = token_balance_to_usd_e8(bal_a, decimals_a, price_a_usd)?;
+    let b = token_balance_to_usd_e8(bal_b, decimals_b, price_b_usd)?;
+    a.checked_add(b)
+}
+
+fn token_balance_to_usd_e8(raw: U256, decimals: u8, price_usd: f64) -> Result<UsdE8> {
     if price_usd <= 0.0 || !price_usd.is_finite() {
-        return 0.0;
+        return Ok(UsdE8::zero());
     }
-    // M10: antes fazia `raw.min(u128::MAX).as_u128() as f64 / 10^dec` — truncava
-    // bits antes da divisão (balances grandes perdiam magnitude) e `powi(36)`
-    // ~4.6e35 perto do limite f64 podia gerar inf. Agora divide no domínio U256:
-    // se dec > 18, pré-escala (raw / 10^(dec-18)) e usa 18 no f64; se dec <= 18,
-    // (raw × 10^(18-dec)) / 1e18. Limita dec a 36 (sanidade) e nunca passa de
-    // u128 para f64 sem ter reduzido a escala primeiro.
-    let dec = decimals.min(36) as usize;
-    let amount_18: U256 = if dec >= 18 {
-        // raw / 10^(dec-18) → representa o valor com 18 decimais de precisão.
-        raw / U256::exp10(dec - 18)
-    } else {
-        raw * U256::exp10(18 - dec)
-    };
-    // amount_18 agora é o valor em "18 decimais"; cabe em u128 na prática
-    // (TVL de pool não chega a 1e18 unidades-de-18 = 1e0... mas mesmo que chegue,
-    // o cap em u128 só roça se amount_18 > 3.4e38, ou seja >$3.4e20 — absurdo).
-    let amt = (amount_18.min(U256::from(u128::MAX))).as_u128() as f64 / 1e18;
-    if !amt.is_finite() {
-        return 0.0;
-    }
-    amt * price_usd
+    let price = fixed_usd::usd_f64_to_e8_ceil(price_usd)?;
+    fixed_usd::token_raw_to_usd_e8(raw, price, decimals as u32)
 }
 
-/// True se TVL >= threshold (gate passa).
+/// Telemetry-only conversion. May lose precision for extreme magnitudes.
+/// Economic gates must use `pool_tvl_usd_e8_from_balances` / `fixed_usd`.
+#[allow(dead_code)]
+fn raw_to_usd_display_f64(raw: U256, decimals: u8, price_usd: f64) -> f64 {
+    token_balance_to_usd_e8(raw, decimals, price_usd)
+        .map(|u| u.display_f64())
+        .unwrap_or(0.0)
+}
+
+/// True se TVL >= threshold (gate passa) — comparação em UsdE8.
 pub fn passes_liquidity_gate(tvl_usd: f64, min_usd: f64) -> bool {
-    tvl_usd.is_finite() && tvl_usd >= min_usd
+    let Ok(tvl) = fixed_usd::usd_f64_to_e8_ceil(tvl_usd.max(0.0)) else {
+        return false;
+    };
+    let Ok(min) = fixed_usd::usd_f64_to_e8_ceil(min_usd.max(0.0)) else {
+        return false;
+    };
+    tvl.0 >= min.0 && min_usd.is_finite() && tvl_usd.is_finite()
+}
+
+pub fn passes_liquidity_gate_e8(tvl: UsdE8, min: UsdE8) -> bool {
+    tvl.0 >= min.0
 }
 
 async fn token_price_usd(symbol: &str) -> f64 {
@@ -409,8 +434,27 @@ where
             continue;
         }
 
-        let tvl = pool_tvl_usd_from_balances(bal_a, it.dec_a, pa, bal_b, it.dec_b, pb);
-        if passes_liquidity_gate(tvl, min_usd) {
+        let tvl_e8 = match pool_tvl_usd_e8_from_balances(bal_a, it.dec_a, pa, bal_b, it.dec_b, pb)
+        {
+            Ok(v) => v,
+            Err(e) => {
+                debug!(
+                    target: "liquidity",
+                    pair = %format!("{}-{}", it.tp.token_a, it.tp.token_b),
+                    dex = %it.tp.dex_name,
+                    error = %e,
+                    "fail-open: TVL e8 conversion failed"
+                );
+                kept.push(it.tp);
+                continue;
+            }
+        };
+        let Ok(min_e8) = fixed_usd::usd_f64_to_e8_ceil(min_usd.max(0.0)) else {
+            kept.push(it.tp);
+            continue;
+        };
+        let tvl = tvl_e8.display_f64();
+        if passes_liquidity_gate_e8(tvl_e8, min_e8) {
             kept.push(it.tp);
         } else {
             discarded += 1;
@@ -630,6 +674,36 @@ mod tests {
         assert!(passes_liquidity_gate(5000.0, 5000.0));
         assert!(passes_liquidity_gate(50_000.0, 5000.0));
         assert!(!passes_liquidity_gate(f64::NAN, 5000.0));
+    }
+
+    #[test]
+    fn liquidity_gate_uses_e8_not_display_saturation() {
+        let bal_usdc = U256::from(1_000_000_000u64);
+        let bal_weth = U256::from(2u64) * U256::exp10(18);
+        let tvl_e8 =
+            pool_tvl_usd_e8_from_balances(bal_usdc, 6, 1.0, bal_weth, 18, 2000.0).unwrap();
+        let min = crate::core::fixed_usd::usd_f64_to_e8_ceil(5000.0).unwrap();
+        assert!(passes_liquidity_gate_e8(tvl_e8, min));
+    }
+
+    #[test]
+    fn execution_modules_must_not_call_display_raw_to_usd() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for rel in [
+            "src/core/flashloan.rs",
+            "src/core/economics.rs",
+            "src/core/fixed_usd.rs",
+        ] {
+            let src = std::fs::read_to_string(root.join(rel)).unwrap();
+            assert!(
+                !src.contains("raw_to_usd_display_f64"),
+                "{rel} must not call display liquidity helper"
+            );
+            assert!(
+                !src.contains("liquidity::raw_to_usd("),
+                "{rel} must not call legacy raw_to_usd"
+            );
+        }
     }
 
     #[test]

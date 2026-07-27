@@ -35,3 +35,4 @@ ignition/deployments/chain-31337
 /src/contracts/*.json
 .mimocode/
 commit_msg.txt
+rpc_healthcheck.local.cjs

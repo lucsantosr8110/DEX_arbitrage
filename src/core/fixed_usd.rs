@@ -259,4 +259,112 @@ mod tests {
         let fee = flashloan_fee_usd_e8(principal, 5).unwrap(); // 5 bps
         assert_eq!(fee.0, USD_E8_SCALE / 20); // $0.05
     }
+
+    /// Reference ceil using only U256 (no f64): same formula as production.
+    fn ref_usd_e8_to_token_raw_ceil(usd_e8: u128, price_e8: u128, decimals: u32) -> Option<U256> {
+        if price_e8 == 0 || decimals > 36 {
+            return None;
+        }
+        if usd_e8 == 0 {
+            return Some(U256::zero());
+        }
+        let scale = U256::exp10(decimals as usize);
+        let num = U256::from(usd_e8).checked_mul(scale)?;
+        let price = U256::from(price_e8);
+        Some((num + price - U256::one()) / price)
+    }
+
+    fn covers_hurdle(raw: U256, price_e8: u128, hurdle_e8: u128, decimals: u32) -> bool {
+        let scale = U256::exp10(decimals as usize);
+        let lhs = raw.saturating_mul(U256::from(price_e8));
+        let rhs = U256::from(hurdle_e8).saturating_mul(scale);
+        lhs >= rhs
+    }
+
+    /// Deterministic grid seed: `phase3-fixed-usd-grid-v1`
+    #[test]
+    fn property_grid_ceil_matches_reference_and_covers_hurdle() {
+        let decimals_list = [0u32, 6, 8, 18, 24];
+        let prices: &[u128] = &[
+            1,
+            USD_E8_SCALE / 100,
+            USD_E8_SCALE,
+            USD_E8_SCALE * 1_000,
+            USD_E8_SCALE * 100_000,
+            9_876_543_210,
+        ];
+        let hurdles: &[u128] = &[
+            0,
+            1,
+            50,
+            USD_E8_SCALE / 10,
+            USD_E8_SCALE,
+            USD_E8_SCALE * 10,
+            999_999_999,
+        ];
+
+        for &decimals in &decimals_list {
+            for &price in prices {
+                for &hurdle in hurdles {
+                    let got =
+                        usd_e8_to_token_raw_ceil(UsdE8(hurdle), UsdE8(price), decimals).unwrap();
+                    let expect = ref_usd_e8_to_token_raw_ceil(hurdle, price, decimals).unwrap();
+                    assert_eq!(got, expect, "dec={decimals} price={price} hurdle={hurdle}");
+                    if hurdle > 0 {
+                        assert!(
+                            covers_hurdle(got, price, hurdle, decimals),
+                            "coverage fail dec={decimals} price={price} hurdle={hurdle} raw={got}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn property_monotonic_in_hurdle_and_inverse_in_price() {
+        let decimals = 18u32;
+        let price = UsdE8(USD_E8_SCALE * 2);
+        let mut prev = U256::zero();
+        for hurdle in [0u128, 1, 100, 10_000, USD_E8_SCALE, USD_E8_SCALE * 3] {
+            let raw = usd_e8_to_token_raw_ceil(UsdE8(hurdle), price, decimals).unwrap();
+            assert!(raw >= prev, "hurdle increase must not shrink raw");
+            prev = raw;
+        }
+        let hurdle = UsdE8(USD_E8_SCALE);
+        let mut prev = U256::MAX;
+        for price in [
+            USD_E8_SCALE / 10,
+            USD_E8_SCALE,
+            USD_E8_SCALE * 10,
+            USD_E8_SCALE * 1000,
+        ] {
+            let raw = usd_e8_to_token_raw_ceil(hurdle, UsdE8(price), decimals).unwrap();
+            assert!(raw <= prev, "price increase must not grow raw");
+            prev = raw;
+        }
+    }
+
+    #[test]
+    fn property_token_raw_to_usd_e8_monotonic_and_no_silent_clip() {
+        let price = UsdE8(USD_E8_SCALE);
+        let mut prev = 0u128;
+        for exp in 0u32..40 {
+            let raw = U256::from(10u64).pow(U256::from(exp));
+            match token_raw_to_usd_e8(raw, price, 18) {
+                Ok(usd) => {
+                    assert!(usd.0 >= prev, "monotonicity broken at exp={exp}");
+                    prev = usd.0;
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("overflow") || msg.contains("exceeds"),
+                        "unexpected err={e}"
+                    );
+                    break;
+                }
+            }
+        }
+    }
 }

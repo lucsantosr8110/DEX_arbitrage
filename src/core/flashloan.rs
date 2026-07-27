@@ -19,7 +19,7 @@ use crate::{
     AppMiddleware,
 };
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use ethers::{
     abi::{encode, Detokenize, Token},
     prelude::*,
@@ -1003,6 +1003,21 @@ impl ArbitrageClient {
         ))
     }
 
+    /// `abi.encode(profitRecipient, steps, minProfit)` — layout `CallbackData`
+    /// (campo renomeado de `executor`; ordem/tipos inalterados).
+    pub(crate) fn encode_callback_data(
+        profit_recipient: Address,
+        steps: &[AbiSwapStep],
+        min_profit: U256,
+    ) -> Bytes {
+        use ethers::abi::Tokenizable;
+        Bytes::from(ethers::abi::encode(&[
+            profit_recipient.into_token(),
+            steps.to_vec().into_token(),
+            min_profit.into_token(),
+        ]))
+    }
+
     /// `abi.encode(initiator, steps, minProfit)` — callback do executor.
     fn encode_flashloan_callback_params(
         &self,
@@ -1010,12 +1025,33 @@ impl ArbitrageClient {
         steps: &[AbiSwapStep],
         min_profit: U256,
     ) -> Bytes {
-        use ethers::abi::Tokenizable;
-        Bytes::from(ethers::abi::encode(&[
-            initiator.into_token(),
-            steps.to_vec().into_token(),
-            min_profit.into_token(),
-        ]))
+        Self::encode_callback_data(initiator, steps, min_profit)
+    }
+
+    /// Fail-closed: `profitRecipient` resolvido deve == `owner()` on-chain.
+    async fn assert_profit_recipient_matches_owner(
+        &self,
+        profit_recipient: Address,
+    ) -> Result<()> {
+        let onchain_owner: Address = self.executor.owner().call().await.map_err(|e| {
+            anyhow!("ProfitRecipientPreflight: failed to read owner(): {e}")
+        })?;
+        Self::ensure_profit_recipient_matches_owner(profit_recipient, onchain_owner)
+    }
+
+    /// Pure gate used by preflight + unit tests (no RPC).
+    fn ensure_profit_recipient_matches_owner(
+        profit_recipient: Address,
+        onchain_owner: Address,
+    ) -> Result<()> {
+        if profit_recipient != onchain_owner {
+            metrics::inc_counter("profit_recipient_owner_mismatch");
+            bail!(
+                "ProfitRecipientMismatch: resolved={profit_recipient:?} \
+                 onchain_owner={onchain_owner:?} — abort before broadcast"
+            );
+        }
+        Ok(())
     }
 
     /// Piso on-chain em raw units do ativo de entrada.
@@ -1295,12 +1331,15 @@ impl ArbitrageClient {
 
         // CallbackData.profitRecipient — must equal on-chain owner (Q1).
         // Never encode the executor contract address as recipient.
-        let recipient_token = Token::Address(profit_recipient);
-        let steps_token = Token::Array(
-            steps.iter().map(|x| x.clone().into_token()).collect()
-        );
+        if let Err(e) = self
+            .assert_profit_recipient_matches_owner(profit_recipient)
+            .await
+        {
+            warn!(error = %e, "wrapper abort: recipient != owner");
+            return Ok(BundleResult::skipped().with_execution_mode("profit_recipient_mismatch"));
+        }
 
-        let params = Bytes::from(encode(&[recipient_token, steps_token, Token::Uint(min_profit_raw)]));
+        let params = Self::encode_callback_data(profit_recipient, &steps, min_profit_raw);
 
         let contract = FlashloanCaller::new(wrapper_addr, self.middleware.clone());
         let call = contract.trigger_flashloan(asset, amount, params);
@@ -2536,6 +2575,175 @@ mod tests {
             ArbitrageClient::gas_strategy_kind(&ExecutionStrategy::Flashloan),
             crate::core::gas::GasStrategyKind::WithFlashloan
         );
+    }
+
+    // ------------------------------------------------------------------------
+    // V1 — CallbackData ABI encode round-trip (ethers decode = Solidity layout)
+    // ------------------------------------------------------------------------
+    #[test]
+    fn callback_data_abi_roundtrip_preserves_fields() {
+        use ethers::abi::{decode, ParamType, Token as AbiToken};
+
+        let owner = Address::from_low_u64_be(0xA11);
+        let other = Address::from_low_u64_be(0xB0B);
+        let token_in = Address::from_low_u64_be(0xc1);
+        let token_out = Address::from_low_u64_be(0xc2);
+        let fee500 = ArbitrageClient::encode_v3_fee_extra_data(500);
+        let step = AbiSwapStep {
+            dex_type: 2, // UNISWAP_V3
+            token_in,
+            token_out,
+            amount_out_min: U256::from(12_345u64),
+            extra_data: fee500.clone(),
+        };
+
+        let cases: Vec<(Address, U256, &str)> = vec![
+            (owner, U256::zero(), "owner_min0"),
+            (other, U256::zero(), "other_recipient"),
+            (owner, U256::from(2).pow(U256::from(130)), "min_gt_u128"),
+        ];
+
+        let step_tuple = ParamType::Tuple(vec![
+            ParamType::Uint(8),
+            ParamType::Address,
+            ParamType::Address,
+            ParamType::Uint(256),
+            ParamType::Bytes,
+        ]);
+        let params = [
+            ParamType::Address,
+            ParamType::Array(Box::new(step_tuple)),
+            ParamType::Uint(256),
+        ];
+
+        for (recipient, min_profit, name) in cases {
+            let encoded = ArbitrageClient::encode_callback_data(recipient, &[step.clone()], min_profit);
+            let decoded = decode(&params, encoded.as_ref()).expect(name);
+            assert_eq!(decoded.len(), 3, "{name}");
+            match &decoded[0] {
+                AbiToken::Address(a) => assert_eq!(*a, recipient, "{name}"),
+                o => panic!("{name}: expected Address, got {o:?}"),
+            }
+            match &decoded[2] {
+                AbiToken::Uint(v) => assert_eq!(*v, min_profit, "{name}"),
+                o => panic!("{name}: expected Uint, got {o:?}"),
+            }
+            let steps = match &decoded[1] {
+                AbiToken::Array(a) => a,
+                o => panic!("{name}: expected Array, got {o:?}"),
+            };
+            assert_eq!(steps.len(), 1, "{name}");
+            let fields = match &steps[0] {
+                AbiToken::Tuple(t) => t,
+                o => panic!("{name}: expected Tuple, got {o:?}"),
+            };
+            assert_eq!(fields[0], AbiToken::Uint(U256::from(2u64)), "{name} dex");
+            assert_eq!(fields[1], AbiToken::Address(token_in), "{name} in");
+            assert_eq!(fields[2], AbiToken::Address(token_out), "{name} out");
+            match &fields[4] {
+                AbiToken::Bytes(b) => {
+                    assert_eq!(b.as_slice(), fee500.as_ref(), "{name} extraData");
+                    let fee = ArbitrageClient::decode_v3_fee_extra_data(&Bytes::from(b.clone()))
+                        .expect(name);
+                    assert_eq!(fee, 500, "{name} fee");
+                }
+                o => panic!("{name}: expected Bytes, got {o:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_profit_recipient_prefers_wrapper_owner() {
+        let client = make_client();
+        let mut cfg = Config::default();
+        cfg.wrapper.owner_address = Some("0x0000000000000000000000000000000000000A11".into());
+        let got = client.resolve_profit_recipient(&cfg).unwrap();
+        assert_eq!(got, Address::from_low_u64_be(0xA11));
+    }
+
+    #[test]
+    fn resolve_profit_recipient_falls_back_to_wallet() {
+        let client = make_client();
+        let mut cfg = Config::default();
+        cfg.wrapper.owner_address = None;
+        let got = client.resolve_profit_recipient(&cfg).unwrap();
+        assert_eq!(got, client.get_wallet_address().unwrap());
+    }
+
+    #[test]
+    fn profit_recipient_mismatch_aborts_before_broadcast() {
+        let owner = Address::from_low_u64_be(0xA11);
+        let wallet = Address::from_low_u64_be(0xB0B);
+        assert!(ArbitrageClient::ensure_profit_recipient_matches_owner(owner, owner).is_ok());
+        let err = ArbitrageClient::ensure_profit_recipient_matches_owner(wallet, owner)
+            .expect_err("wallet != owner must abort");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("ProfitRecipientMismatch"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("abort before broadcast"), "got: {msg}");
+    }
+
+    #[test]
+    fn resolve_then_mismatch_when_cfg_owner_differs_from_onchain() {
+        let client = make_client();
+        let mut cfg = Config::default();
+        // Config points at A11, but on-chain owner is wallet (simulated).
+        cfg.wrapper.owner_address = Some("0x0000000000000000000000000000000000000A11".into());
+        let resolved = client.resolve_profit_recipient(&cfg).unwrap();
+        let onchain = client.get_wallet_address().unwrap();
+        assert_ne!(resolved, onchain);
+        assert!(ArbitrageClient::ensure_profit_recipient_matches_owner(resolved, onchain).is_err());
+    }
+
+    /// Export hex fixtures for Hardhat CallbackDataDecoder (ignored by default).
+    #[test]
+    #[ignore]
+    fn export_callback_abi_fixtures() {
+        use std::fs;
+        use std::path::PathBuf;
+
+        let owner = Address::from_low_u64_be(0xA11);
+        let other = Address::from_low_u64_be(0xB0B);
+        let step = AbiSwapStep {
+            dex_type: 2,
+            token_in: Address::from_low_u64_be(0xc1),
+            token_out: Address::from_low_u64_be(0xc2),
+            amount_out_min: U256::from(12_345u64),
+            extra_data: ArbitrageClient::encode_v3_fee_extra_data(500),
+        };
+        let cases = vec![
+            ("owner_recipient_fee500", owner, U256::zero()),
+            ("other_recipient_min0", other, U256::zero()),
+            (
+                "high_minprofit_gt_u128",
+                owner,
+                U256::from(2).pow(U256::from(130)),
+            ),
+        ];
+        let mut out = serde_json::json!({ "cases": [] });
+        let arr = out["cases"].as_array_mut().unwrap();
+        for (name, recipient, min_profit) in cases {
+            let hex = format!(
+                "0x{}",
+                ethers::utils::hex::encode(
+                    ArbitrageClient::encode_callback_data(recipient, &[step.clone()], min_profit)
+                        .as_ref()
+                )
+            );
+            arr.push(serde_json::json!({
+                "name": name,
+                "hex": hex,
+                "expectRecipient": format!("{recipient:#x}"),
+                "expectMinProfit": min_profit.to_string(),
+                "expectFee": 500,
+            }));
+        }
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test/fixtures");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("callback_abi_hex.json"), serde_json::to_string_pretty(&out).unwrap())
+            .unwrap();
     }
 }
 
