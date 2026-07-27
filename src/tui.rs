@@ -19,15 +19,14 @@ use ratatui::{
 };
 use std::{
     io,
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, RwLock,
+    },
+    thread,
     time::{Duration, Instant},
 };
 use tokio::sync::broadcast;
-
-/// Timeout máximo para `event::read()` — se estourar, o poll retorna sem evento
-/// em vez de travar para sempre. Antes não havia timeout, e um estado inconsistente
-/// do terminal (ex: resize durante poll + read) podia travar a TUI eternamente.
-const READ_EVENT_TIMEOUT: Duration = Duration::from_millis(200);
 
 // ============================================================
 // TUI State
@@ -119,14 +118,55 @@ impl Default for TuiState {
 pub struct TuiApp {
     state: Arc<RwLock<TuiState>>,
     shutdown_tx: broadcast::Sender<()>,
+    event_rx: mpsc::Receiver<Event>,
+    _reader_shutdown: Arc<AtomicBool>,
+    _reader_handle: thread::JoinHandle<()>,
 }
 
 impl TuiApp {
     pub fn new(state: Arc<RwLock<TuiState>>, shutdown_tx: broadcast::Sender<()>) -> Self {
-        Self { state, shutdown_tx }
+        let (event_tx, event_rx) = mpsc::channel::<Event>();
+        let reader_shutdown = Arc::new(AtomicBool::new(false));
+        let sd = reader_shutdown.clone();
+
+        let _reader_handle = thread::spawn(move || {
+            // Thread dedicada: lê eventos do crossterm e encaminha via canal.
+            // A TUI principal nunca bloqueia em event::read() — se esta thread
+            // travar (poll true + read blocks), a TUI continua atualizando os
+            // dados e só perde input de teclado.
+            loop {
+                if sd.load(Ordering::Relaxed) {
+                    break;
+                }
+                // poll com 100ms: granularidade suficiente para responder
+                // a input sem delay perceptível, mas sem travar pra sempre.
+                match crossterm::event::poll(Duration::from_millis(100)) {
+                    Ok(true) => {
+                        match crossterm::event::read() {
+                            Ok(ev) => {
+                                if event_tx.send(ev).is_err() {
+                                    break; // receiver dropped
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    Ok(false) => {} // timeout, loop de novo
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self {
+            state,
+            shutdown_tx,
+            event_rx,
+            _reader_shutdown: reader_shutdown,
+            _reader_handle,
+        }
     }
 
-    pub async fn run(&self, shutdown_rx: &mut broadcast::Receiver<()>) -> io::Result<()> {
+    pub fn run(&self, shutdown_rx: &mut broadcast::Receiver<()>) -> io::Result<()> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -136,7 +176,7 @@ impl TuiApp {
         let last_tick = Instant::now();
         let tick_rate = Duration::from_millis(250);
 
-        let result = self.run_inner(&mut terminal, shutdown_rx, last_tick, tick_rate).await;
+        let result = self.run_inner(&mut terminal, shutdown_rx, last_tick, tick_rate);
 
         // Restaura o terminal EM QUALQUER CASO (erro ou saída normal).
         // Antes o terminal só era restaurado no Ok(()); se terminal.draw()
@@ -160,7 +200,7 @@ impl TuiApp {
         result
     }
 
-    async fn run_inner(
+    fn run_inner(
         &self,
         terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
         shutdown_rx: &mut broadcast::Receiver<()>,
@@ -168,70 +208,68 @@ impl TuiApp {
         tick_rate: Duration,
     ) -> io::Result<()> {
         loop {
-            // Shutdown check: try_recv é síncrono. Ok | Closed → sair e
-            // restaurar o terminal. Antes a thread do TUI era std::thread
-            // detached sem sinal — no Ctrl-C o runtime principal morria mas
-            // a thread continuava em raw mode, deixando o terminal quebrado
-            // até matar o processo. Agora o broadcast do main quebra o loop
-            // e executa o cleanup (disable_raw_mode / LeaveAlternateScreen).
+            // Shutdown check via broadcast (sinal do Ctrl+C no main).
             match shutdown_rx.try_recv() {
                 Ok(_) | Err(broadcast::error::TryRecvError::Closed) => return Ok(()),
                 Err(broadcast::error::TryRecvError::Lagged(_)) | Err(broadcast::error::TryRecvError::Empty) => {}
             }
 
-            // Heartbeat + uptime: atualiza a cada render, na thread do TUI
-            // (runtime próprio). Independente do bot_task — se o executor
-            // travar em process_prices().await, o uptime mesmo assim avança.
+            // Heartbeat + uptime: computado na thread da TUI, independente
+            // do bot_task. Antes o uptime só atualizava em update_tui_state,
+            // que só é chamado pelo bot_task — se process_prices() travasse,
+            // o uptime congelava junto.
             if let Ok(mut s) = self.state.write() {
                 s.render_tick = s.render_tick.wrapping_add(1);
                 s.uptime = s.start.elapsed();
             }
 
-            // terminal.draw() pode falhar se o terminal for redimensionado
-            // para um tamanho muito pequeno. Ignoramos o erro em vez de
-            // propagar com ? — draw falho não deve matar a TUI.
+            // Draw: ignoramos erro de resize (terminal muito pequeno).
             let _ = terminal.draw(|f| self.draw(f));
 
-            let timeout = tick_rate
-                .checked_sub(last_tick.elapsed())
-                .unwrap_or(Duration::ZERO);
-
-            // event::poll(timeout) com timeout garante que o loop não trava
-            // mesmo se não houver input. O timeout é o tempo restante até
-            // o próximo tick de render.
-            if crossterm::event::poll(timeout)? {
-                // event::read() é bloqueante — usamos READ_EVENT_TIMEOUT
-                // para garantir que não trava se o terminal ficar inconsistente
-                // (ex: resize durante poll, ou stdin em estado estranho).
-                let ev = wait_event_with_timeout(READ_EVENT_TIMEOUT)?;
-                if let Some(Event::Key(key)) = ev {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => {
-                            // Envia sinal de shutdown para o processo principal.
-                            // Antes a TUI só saía do loop, mas o bot_task e radar_task
-                            // continuavam rodando — e como raw mode desliga ISIG,
-                            // o tokio::signal::ctrl_c() nunca disparava, então o
-                            // processo nunca morria sem um segundo Ctrl+C.
-                            let _ = self.shutdown_tx.send(());
-                            return Ok(());
+            // Leitura NÃO-BLOQUEANTE de eventos via canal mpsc.
+            // A thread dedicada (spawnada em TuiApp::new) lê do crossterm
+            // e coloca no canal. A TUI principal apenas try_recv — nunca
+            // bloqueia em event::read().
+            loop {
+                match self.event_rx.try_recv() {
+                    Ok(Event::Key(key)) => {
+                        match key.code {
+                            KeyCode::Char('q') | KeyCode::Esc => {
+                                let _ = self.shutdown_tx.send(());
+                                return Ok(());
+                            }
+                            KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                                let _ = self.shutdown_tx.send(());
+                                return Ok(());
+                            }
+                            _ => {} // ignora outras teclas
                         }
-                        KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
-                            let _ = self.shutdown_tx.send(());
-                            return Ok(());
-                        }
-                        _ => {}
+                    }
+                    Ok(_) => {
+                        // Evento não-tecla (Resize, Mouse, FocusGained, FocusLost):
+                        // apenas descarta e continua.
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break, // sem eventos por agora
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        // Reader thread morreu. Log via eprint (único safe
+                        // em raw mode) e continua — a TUI ainda desenha.
+                        // O shutdown eventual vem pelo broadcast.
+                        eprintln!("[tui] event reader thread died");
+                        break;
                     }
                 }
             }
 
-            // Trata resize: se o terminal foi redimensionado, crossterm gera
-            // Event::Resize. Esse evento é lido por poll/read normalmente,
-            // então não precisa de tratamento especial — só garantir que o
-            // draw roda de novo.
-
-            if last_tick.elapsed() >= tick_rate {
-                last_tick = Instant::now();
+            // Dorme o restante do tick. Usamos thread::sleep (bloqueante)
+            // em vez de tokio::time::sleep porque a TUI não precisa de
+            // async — todo I/O é síncrono. O event reader thread roda em
+            // paralelo e acumula eventos no canal mpsc; nenhum se perde
+            // durante o sono.
+            let elapsed = last_tick.elapsed();
+            if elapsed < tick_rate {
+                thread::sleep(tick_rate - elapsed);
             }
+            last_tick = Instant::now();
         }
     }
 
@@ -513,23 +551,6 @@ fn fmt_opt_net(v: Option<f64>) -> String {
     }
 }
 
-/// Lê um evento do terminal com timeout máximo. Se `event::read()` não
-/// responder dentro de `READ_EVENT_TIMEOUT`, retorna None em vez de travar.
-/// Previne que a TUI congele se o stdin ficar em estado inconsistente.
-fn wait_event_with_timeout(timeout: Duration) -> io::Result<Option<Event>> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        // poll com 50ms: granularidade fina o bastante para responder
-        // a Ctrl+C / 'q' sem delay perceptível, mas sem travar.
-        if crossterm::event::poll(Duration::from_millis(50))? {
-            return Ok(Some(event::read()?));
-        }
-        if Instant::now() >= deadline {
-            return Ok(None);
-        }
-    }
-}
-
 /// Chave canônica de par (tokens sorted, direção-agnóstica): "WETH-USDC" ==
 /// "USDC-WETH" == "usdc-weth". Usado p/ casar adj_cycles (canonical) com
 /// PriceRow (direcional) sem depender da direção do label.
@@ -551,17 +572,18 @@ pub fn norm_pair(pair: &str) -> String {
 // TUI Spawner
 // ============================================================
 
-/// Spawn the TUI in a background thread
+/// Spawn the TUI in a background thread. A TUI roda 100% síncrona
+/// (crossterm + ratatui + thread::sleep) — não precisa de runtime tokio.
+/// O event reader thread roda em paralelo e acumula eventos no canal mpsc.
 pub fn spawn_tui(state: Arc<RwLock<TuiState>>, shutdown_tx: broadcast::Sender<()>) {
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let mut sd_rx = shutdown_tx.subscribe();
-            let app = TuiApp::new(state, shutdown_tx);
-            if let Err(e) = app.run(&mut sd_rx).await {
-                eprintln!("TUI error: {:?}", e);
-            }
-        });
+        let mut sd_rx = shutdown_tx.subscribe();
+        let app = TuiApp::new(state, shutdown_tx);
+        if let Err(e) = app.run(&mut sd_rx) {
+            // Não usar eprintln! durante raw mode (terminal alternate screen).
+            // O erro é logado no arquivo via tracing; aqui só ignoramos.
+            let _ = e;
+        }
     });
 }
 
