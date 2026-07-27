@@ -447,33 +447,81 @@ async fn main() -> Result<()> {
     }
 
     let radar_task = {
-        let client_ws = client_ws.clone();
+        let mut client_ws = client_ws.clone();
         let dex_manager = dex_manager.clone();
         let config = config.clone();
         let adj_cost = adj_cost.clone();
         let price_tx = price_tx.clone();
         let circuit_breaker = circuit_breaker.clone();
-        let sd_rx = shutdown_tx.subscribe();
+        let shutdown_tx = shutdown_tx.clone();
         let telegram = telegram.clone();
 
         tokio::spawn(async move {
-            info!("📡 High Hit Rate Radar iniciado.");
-            if let Err(e) = start_high_hit_rate_radar(
-                client_ws,
-                dex_manager,
-                config,
-                adj_cost,
-                circuit_breaker,
-                price_tx,
-                sd_rx,
-            )
-            .await
-            {
-                error!("❌ Radar erro: {:?}", e);
-                let _ = telegram
-                    .send_error_alert("Radar", &format!("{:?}", e))
-                    .await;
+            // start_high_hit_rate_radar só retorna Err quando a conexão WS
+            // morre de vez (ex.: reconnect interno do ethers-rs esgotado —
+            // ver logs/deployments do incidente 2026-07-27). Sem este loop,
+            // uma única queda de WS matava o radar pro resto do processo:
+            // o price_tx parava de receber, e a TUI (que roda em thread e
+            // runtime próprios, ver src/tui.rs) continuava desenhando o
+            // último estado congelado pra sempre, parecendo viva mas nunca
+            // mais atualizando.
+            const INITIAL_BACKOFF: Duration = Duration::from_secs(2);
+            const MAX_BACKOFF: Duration = Duration::from_secs(60);
+            let mut backoff = INITIAL_BACKOFF;
+
+            loop {
+                info!("📡 High Hit Rate Radar iniciado.");
+                let sd_rx = shutdown_tx.subscribe();
+                let result = start_high_hit_rate_radar(
+                    client_ws.clone(),
+                    dex_manager.clone(),
+                    config.clone(),
+                    adj_cost.clone(),
+                    circuit_breaker.clone(),
+                    price_tx.clone(),
+                    sd_rx,
+                )
+                .await;
+
+                match result {
+                    // Encerramento limpo: o próprio radar já tratou o sinal
+                    // de shutdown internamente e retornou Ok(()).
+                    Ok(()) => break,
+                    Err(e) => {
+                        error!("❌ Radar erro: {:?}", e);
+                        let _ = telegram
+                            .send_error_alert("Radar", &format!("{:?}", e))
+                            .await;
+
+                        let mut sd_rx_wait = shutdown_tx.subscribe();
+                        tokio::select! {
+                            _ = sd_rx_wait.recv() => {
+                                info!("📡 Radar: shutdown durante backoff — não reconecta.");
+                                break;
+                            }
+                            _ = tokio::time::sleep(backoff) => {}
+                        }
+                        backoff = (backoff * 2).min(MAX_BACKOFF);
+
+                        // A conexão antiga provavelmente está morta (reconnect
+                        // interno já esgotado) — reconecta do zero, com o
+                        // fallback já existente entre ws_endpoints, antes de
+                        // tentar o radar de novo.
+                        let net_cfg = { config.lock().await.network.clone() };
+                        match RpcProvider::connect_ws(&net_cfg).await {
+                            Ok(fresh) => {
+                                info!("📡 Radar: WS reconectado, retomando.");
+                                client_ws = fresh;
+                                backoff = INITIAL_BACKOFF;
+                            }
+                            Err(e) => {
+                                error!("❌ Radar: falha ao reconectar WS: {:?}", e);
+                            }
+                        }
+                    }
+                }
             }
+            info!("📡 Radar: task encerrada.");
         })
     };
 
