@@ -91,6 +91,15 @@ contract FlashloanExecutor is ReentrancyGuard, IFlashLoanSimpleReceiver {
     using Math for uint256;
 
     // =============================================================
+    // CUSTOM ERRORS (fail-closed, structured)
+    // =============================================================
+    /// @notice `CallbackData.profitRecipient` must be the immutable owner.
+    error UnauthorizedProfitRecipient(address recipient);
+    /// @notice V3 hop requires abi.encode(uint24) fee (exactly 32 bytes); no silent 3000 fallback.
+    error InvalidV3Fee(uint24 fee);
+    error InvalidV3FeeExtraDataLength(uint256 length);
+
+    // =============================================================
     // ENUMS & STRUCTS
     // =============================================================
     enum DexType { QUICKSWAP, SUSHISWAP, UNISWAP_V3 }
@@ -109,8 +118,11 @@ contract FlashloanExecutor is ReentrancyGuard, IFlashLoanSimpleReceiver {
         bool   enabled;
     }
 
+    /// @dev ABI tuple layout: (address, SwapStep[], uint256).
+    /// Field renamed from `executor` → `profitRecipient` (encoding unchanged).
+    /// This is the economic owner of flashloan profit — NOT msg.sender / relayer.
     struct CallbackData {
-        address executor;
+        address profitRecipient;
         SwapStep[] steps;
         uint256 minProfit;
     }
@@ -161,7 +173,7 @@ contract FlashloanExecutor is ReentrancyGuard, IFlashLoanSimpleReceiver {
     // =============================================================
     // EVENTS
     // =============================================================
-    event FlashLoanSuccess(address indexed asset, uint256 amount, uint256 premium, uint256 profit, address indexed executor);
+    event FlashLoanSuccess(address indexed asset, uint256 amount, uint256 premium, uint256 profit, address indexed profitRecipient);
     event FlashLoanFailure(address indexed asset, uint256 amount, string reason, address indexed executor);
     event SwapExecuted(uint256 indexed stepIndex, DexType dexType, address tokenIn, address tokenOut, uint256 amountIn, uint256 amountOut);
     event ExecutorUpdated(address indexed executor, bool allowed);
@@ -237,7 +249,9 @@ contract FlashloanExecutor is ReentrancyGuard, IFlashLoanSimpleReceiver {
         require(amount >= _minAmount(asset), "Amount too low");
         _validateSteps(steps, asset);
 
-        bytes memory params = abi.encode(msg.sender, steps, minProfit);
+        // Profit always settles to immutable `owner`, never msg.sender.
+        // Relayer/allowedExecutor may call; economic recipient stays the owner.
+        bytes memory params = abi.encode(owner, steps, minProfit);
 
         try IAavePool(AAVE_POOL).flashLoanSimple(address(this), asset, amount, params, 0) {
             return true;
@@ -352,6 +366,7 @@ contract FlashloanExecutor is ReentrancyGuard, IFlashLoanSimpleReceiver {
         require(isValidInitiator, "Invalid initiator");
 
         CallbackData memory data = abi.decode(params, (CallbackData));
+        _requireAuthorizedProfitRecipient(data.profitRecipient);
 
         // AUDIT fix #2: validar steps vindos via callback (FlashloanCaller passa params cru).
         // Defesa em profundidade — alinha com executeFlashloan/executeDirect.
@@ -379,9 +394,9 @@ contract FlashloanExecutor is ReentrancyGuard, IFlashLoanSimpleReceiver {
         uint256 profit = finalAmount - totalOwed;
         if (profit > 0) {
             totalProfit += profit;
-            IERC20(asset).safeTransfer(data.executor, profit);
+            IERC20(asset).safeTransfer(data.profitRecipient, profit);
         }
-        emit FlashLoanSuccess(asset, amount, premium, profit, data.executor);
+        emit FlashLoanSuccess(asset, amount, premium, profit, data.profitRecipient);
 
         emit MetricsUpdated(totalFlashloans, totalProfit, totalPremiumPaid, failedFlashloans);
         return true;
@@ -461,8 +476,7 @@ contract FlashloanExecutor is ReentrancyGuard, IFlashLoanSimpleReceiver {
         internal
         returns (uint256)
     {
-        uint24 fee = step.extraData.length > 0 ? abi.decode(step.extraData, (uint24)) : 3000;
-        require(fee == 500 || fee == 3000 || fee == 10000, "Invalid V3 fee");
+        uint24 fee = _decodeV3Fee(step.extraData);
 
         _ensureAllowance(step.tokenIn, UNISWAP_V3_ROUTER, amount);
 
@@ -478,6 +492,18 @@ contract FlashloanExecutor is ReentrancyGuard, IFlashLoanSimpleReceiver {
                 sqrtPriceLimitX96: 0
             })
         );
+    }
+
+    /// @dev Rust encodes `abi.encode(uint24)` → 32 bytes. Empty/short payload must not
+    /// silently fall back to fee 3000 (wrong pool / economics).
+    function _decodeV3Fee(bytes memory extraData) internal pure returns (uint24 fee) {
+        if (extraData.length != 32) revert InvalidV3FeeExtraDataLength(extraData.length);
+        fee = abi.decode(extraData, (uint24));
+        if (fee != 500 && fee != 3000 && fee != 10000) revert InvalidV3Fee(fee);
+    }
+
+    function _requireAuthorizedProfitRecipient(address recipient) internal view {
+        if (recipient != owner) revert UnauthorizedProfitRecipient(recipient);
     }
 
     // =============================================================

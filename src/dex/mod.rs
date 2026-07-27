@@ -299,14 +299,10 @@ pub trait DexContract: Send + Sync {
     // ðŸ”„ ImplementaÃ§Ã£o padrÃ£o usando Config (AGORA VAI ENCONTRAR O CAMPO `addresses`)
     /// Notional em USD usado para dimensionar as cotacoes de preco.
     ///
-    /// Ancorado em `arbitrage.default_trade_amount` para que o spread medido seja o
-    /// spread no tamanho que o bot de fato executaria. Ver `quote_amount_for_usd`.
+    /// Delega a `Config::executable_trade_notional_usd` (flashloan capital ou
+    /// `default_trade_amount`) — mesmo tamanho da execução. Ver `quote_amount_for_usd`.
     fn quote_notional_usd(&self) -> f64 {
-        self.config()
-            .arbitrage
-            .default_trade_amount
-            .parse::<f64>()
-            .unwrap_or(100.0)
+        self.config().executable_trade_notional_usd()
     }
 
     fn get_wmatic_address(&self) -> Option<Address> {
@@ -670,11 +666,22 @@ mod fee_tier_cache_tests {
     }
 
     #[test]
-    fn cache_fee_tier_rejects_100() {
-        cache_fee_tier("UniswapV3", "AAA_REJ100", "BBB_REJ100", 100);
+    fn quote_notional_default_uses_executable_not_default_trade_amount() {
+        // Trait default delegates to executable_trade_notional_usd (flashloan capital),
+        // not arbitrage.default_trade_amount — prevents silent undersize for new adapters.
+        let mut cfg = crate::config::Config::default();
+        cfg.flashloan.enabled = true;
+        cfg.flashloan.capital_usd = 250.0;
+        cfg.arbitrage.default_trade_amount = "42".into();
+        assert_eq!(cfg.executable_trade_notional_usd(), 250.0);
         assert_eq!(
-            cached_fee_tier("UniswapV3", "AAA_REJ100", "BBB_REJ100"),
-            None
+            cfg.arbitrage.default_trade_amount.parse::<f64>().unwrap(),
+            42.0
+        );
+        // Documented default body: `self.config().executable_trade_notional_usd()`
+        assert_ne!(
+            cfg.arbitrage.default_trade_amount.parse::<f64>().unwrap(),
+            cfg.executable_trade_notional_usd()
         );
     }
 }

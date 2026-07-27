@@ -57,9 +57,14 @@ static OPP_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Ciclos triangulares descartados porque alguma perna não está no price_map
 /// do venue (já filtrado pelo B2 liquidity gate no radar).
 static TRIANGULAR_LEG_LOW_LIQUIDITY_DISCARDED: AtomicU64 = AtomicU64::new(0);
+static UNSUPPORTED_DIRECT_NON_STABLE: AtomicU64 = AtomicU64::new(0);
 
 pub fn triangular_leg_low_liquidity_discarded_count() -> u64 {
     TRIANGULAR_LEG_LOW_LIQUIDITY_DISCARDED.load(Ordering::Relaxed)
+}
+
+pub fn unsupported_direct_non_stable_count() -> u64 {
+    UNSUPPORTED_DIRECT_NON_STABLE.load(Ordering::Relaxed)
 }
 
 pub fn reset_triangular_leg_low_liquidity_discarded_count() {
@@ -70,6 +75,11 @@ fn note_triangular_leg_low_liquidity_discarded(n: u64) {
     if n > 0 {
         TRIANGULAR_LEG_LOW_LIQUIDITY_DISCARDED.fetch_add(n, Ordering::Relaxed);
     }
+}
+
+fn metrics_inc_unsupported_direct_non_stable() {
+    UNSUPPORTED_DIRECT_NON_STABLE.fetch_add(1, Ordering::Relaxed);
+    crate::infra::metrics::inc_counter("unsupported_direct_non_stable_cycle");
 }
 
 /// Resultado da montagem de um ciclo 3-hop intra-DEX.
@@ -771,7 +781,7 @@ impl ArbitrageEngine {
         &self,
         path: &[String],
         steps: &[ArbitrageStep],
-        price_map: &HashMap<String, HashMap<String, f64>>,
+        _price_map: &HashMap<String, HashMap<String, f64>>,
         app_config: &Config,
     ) -> Option<ArbitrageOpportunity> {
         if path.len() != 3 || steps.len() != 2 {
@@ -780,35 +790,42 @@ impl ArbitrageEngine {
 
         let token_a = &path[0];
         let token_b = &path[1];
+        let token_end = &path[2];
 
-        // M9: preserva stable de entrada (USDC ou USDT), em vez de fabricar USDT
-        // num ciclo iniciado em USDC. Para ciclo non-stable, USDT segue base padrão.
-        let base_token = if Self::is_usd_stable_symbol(token_a) {
-            token_a.as_str()
-        } else {
-            TARGET_BASE_TOKEN
-        };
+        // Direct só se rota materializada ≡ cotada e fecha no mesmo ativo.
+        if !token_a.eq_ignore_ascii_case(token_end) {
+            warn!(
+                target: "arbitrage",
+                path = ?path,
+                "UnsupportedDirectNonStableCycle: start_token != end_token"
+            );
+            metrics_inc_unsupported_direct_non_stable();
+            return None;
+        }
 
-        // C5: se não há step stable↔token na rota original (direct A→B→A non-stable),
-        // consultar o price_map global p/ melhor taxa cross-DEX. Antes retornava
-        // 0.0 e toda direct non-stable era descartada silenciosamente.
-        let stable_to_a = self.estimate_stable_step(base_token, token_a, steps, true, price_map)?;
-        let b_to_stable = self.estimate_stable_step(base_token, token_b, steps, false, price_map)?;
+        // Rotação pura: A→stable→A → stable→A→stable (mesmas pernas, ordem cíclica).
+        // Não inventa USDT↔legs via estimate_stable_step.
+        if !Self::is_usd_stable_symbol(token_a) && Self::is_usd_stable_symbol(token_b) {
+            let rotated_path = vec![token_b.clone(), token_a.clone(), token_b.clone()];
+            let rotated_steps = vec![steps[1].clone(), steps[0].clone()];
+            debug!(
+                target: "arbitrage",
+                from = ?path,
+                to = ?rotated_path,
+                "Direct cycle rotated onto stable start (same legs)"
+            );
+            return self
+                .build_usdt_opportunity(rotated_path, rotated_steps, app_config)
+                .await;
+        }
 
-        let stable_steps = vec![
-            stable_to_a,
-            steps[0].clone(), // Hop original A->B
-            b_to_stable,
-        ];
-
-        let stable_path = vec![
-            base_token.into(),
-            token_a.clone(),
-            token_b.clone(),
-            base_token.into(),
-        ];
-
-        self.build_usdt_opportunity(stable_path, stable_steps, app_config).await
+        warn!(
+            target: "arbitrage",
+            path = ?path,
+            "UnsupportedDirectNonStableCycle: discard A→B→A without inventing base legs"
+        );
+        metrics_inc_unsupported_direct_non_stable();
+        None
     }
 
     async fn build_usdt_opportunity(

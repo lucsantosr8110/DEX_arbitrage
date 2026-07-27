@@ -102,11 +102,31 @@ pub fn wei_to_gwei(wei: u128) -> f64 {
     (wei as f64) / 1e9
 }
 
-/// Converte U256 para f64 considerando decimais, cap em u128
+/// Converte U256 para f64 considerando decimais — **somente telemetria/UI**.
+///
+/// Pré-escala no domínio U256. Ainda aplica teto `u128::MAX` pós-escala para o
+/// cast f64; gates econômicos devem usar `core::fixed_usd` (erro explícito).
 pub fn u256_to_f64(value: U256, decimals: u32) -> f64 {
-    let scale = 10u128.saturating_pow(decimals.min(38)) as f64;
-    let capped = value.min(U256::from(u128::MAX)).as_u128() as f64;
-    capped / scale
+    let dec = decimals.min(36) as usize;
+    let amount_18: U256 = if dec >= 18 {
+        value / U256::exp10(dec - 18)
+    } else {
+        value.saturating_mul(U256::exp10(18 - dec))
+    };
+    if amount_18 > U256::from(u128::MAX) {
+        // Display path: escalate via string rather than silent economic clip.
+        let as_tokens = amount_18 / U256::exp10(18);
+        return as_tokens
+            .to_string()
+            .parse::<f64>()
+            .unwrap_or(f64::MAX);
+    }
+    let amt = amount_18.as_u128() as f64 / 1e18;
+    if amt.is_finite() {
+        amt
+    } else {
+        0.0
+    }
 }
 
 /// Converte f64 para U256 considerando decimais, truncando negativos
@@ -318,23 +338,9 @@ pub fn univ3_price_base_quote(
     }
 }
 
-/// Conversão precisa de U256 para f64
+/// Conversão precisa de U256 para f64 — delega à pré-escala U256 compartilhada.
 pub fn u256_to_f64_precise(value: U256, decimals: u8) -> f64 {
-    if decimals == 0 {
-        return value.as_u128() as f64;
-    }
-    let ten = U256::from(10u64);
-    let scale = ten.pow(decimals.into());
-    let int = value / scale;
-    let frac = value % scale;
-    let int_f = int.as_u128() as f64;
-    let frac_s = frac.to_string();
-    if frac_s == "0" {
-        int_f
-    } else {
-        let denom = 10f64.powi(decimals as i32);
-        int_f + frac_s.parse::<f64>().unwrap_or(0.0) / denom
-    }
+    u256_to_f64(value, decimals as u32)
 }
 
 /// Filtra outliers removendo desvios > pct

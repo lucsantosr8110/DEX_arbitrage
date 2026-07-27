@@ -9,12 +9,13 @@ use crate::{
     core::{
         arbitrage::ArbitrageEngine,
         economics,
-        gas::GasEstimator,
+        fixed_usd::{self, UsdE8},
+        gas::{GasEstimator, GasStrategyKind},
         paper_validation::{self, PaperValidationHub},
         types::{ArbitrageOpportunity, BundleResult},
     },
     infra::metrics,
-    utils::{f64_to_u256, u256_to_f64},
+    utils::{u256_to_f64},
     AppMiddleware,
 };
 
@@ -279,15 +280,65 @@ impl ArbitrageClient {
         Ok(())
     }
 
-    fn token_amount_to_usd(&self, amount: U256, price_usd: f64, decimals: u32) -> f64 {
+    /// Integer gate: net = gross - gas - flashloan_fee - adverse (`UsdE8`).
+    fn validate_profit_after_fees_e8(
+        &self,
+        gross: UsdE8,
+        gas: UsdE8,
+        flashloan_fee: UsdE8,
+        adverse: UsdE8,
+    ) -> Result<(), FlashloanError> {
+        let net = fixed_usd::net_profit_usd_e8(gross, gas, flashloan_fee, adverse);
+        if net.0 == 0 {
+            return Err(FlashloanError::InsufficientProfit(format!(
+                "Net profit ${:.4} <= 0 (gross: ${:.4}, gas: ${:.4}, flashloan_fee: ${:.4}, adverse: ${:.4})",
+                net.display_f64(),
+                gross.display_f64(),
+                gas.display_f64(),
+                flashloan_fee.display_f64(),
+                adverse.display_f64()
+            )));
+        }
+        info!(
+            "💰 Profit validation: ${:.4} net (${:.4} gross - ${:.4} gas - ${:.4} flashloan - ${:.4} adverse)",
+            net.display_f64(),
+            gross.display_f64(),
+            gas.display_f64(),
+            flashloan_fee.display_f64(),
+            adverse.display_f64()
+        );
+        Ok(())
+    }
+
+    /// Telemetry/UI only — converts raw→USD via f64 display helper.
+    /// Economic gates must use `fixed_usd::token_raw_to_usd_e8`.
+    fn token_amount_to_usd_display_f64(&self, amount: U256, price_usd: f64, decimals: u32) -> f64 {
         if !price_usd.is_finite() || price_usd <= 0.0 {
             return 0.0;
         }
-        // `as_u128()` pegava somente os 128 bits baixos de U256. Para valores
-        // grandes isso podia transformar principal/profit em número menor e
-        // aprovar uma rota sobreestimada. Conversão compartilhada preserva a
-        // ordem de grandeza antes de entrar no domínio f64.
-        u256_to_f64(amount, decimals) * price_usd
+        fixed_usd::token_raw_display_f64(amount, decimals) * price_usd
+    }
+
+    fn gas_strategy_kind(strategy: &ExecutionStrategy) -> GasStrategyKind {
+        match strategy {
+            ExecutionStrategy::Direct => GasStrategyKind::Direct,
+            ExecutionStrategy::Flashloan
+            | ExecutionStrategy::WrapperFlashloan
+            | ExecutionStrategy::Skip => GasStrategyKind::WithFlashloan,
+        }
+    }
+
+    /// Economic profit recipient: must match on-chain `owner` (Q1).
+    /// Prefer `[wrapper].owner_address`, else signing wallet.
+    fn resolve_profit_recipient(&self, cfg: &Config) -> Result<Address> {
+        if let Some(ref owner) = cfg.wrapper.owner_address {
+            let trimmed = owner.trim();
+            if !trimmed.is_empty() {
+                return Address::from_str(trimmed)
+                    .with_context(|| format!("invalid wrapper.owner_address={owner}"));
+            }
+        }
+        self.get_wallet_address()
     }
 
     /// ABI-encode `uint24` fee tier — layout compatível com
@@ -512,8 +563,9 @@ impl ArbitrageClient {
 )
         };
 
+        // Direct = capital próprio: sem premium Aave.
         let fee_pct = if matches!(strategy, ExecutionStrategy::Direct) {
-            configured_fee_pct
+            0.0
         } else {
             self.current_flashloan_fee_pct(pool_address.as_deref(), configured_fee_pct)
                 .await
@@ -532,23 +584,32 @@ impl ArbitrageClient {
             );
         }
 
-        let configured_premium_bps = (fee_pct * 10_000.0).round();
-        if !configured_premium_bps.is_finite()
-            || configured_premium_bps < 0.0
-            || max_premium_bps
-                .map(|limit| configured_premium_bps > limit as f64)
-                .unwrap_or(false)
+        let fee_bps = match fixed_usd::fee_pct_to_bps(fee_pct) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("Flashloan skip: invalid fee_pct: {e}");
+                return Ok(BundleResult::skipped().with_execution_mode("premium_cap"));
+            }
+        };
+        if max_premium_bps
+            .map(|limit| fee_bps > u64::from(limit))
+            .unwrap_or(false)
         {
             warn!(
-                "Flashloan skip: fee_pct={} exceeds max_premium_bps={:?}",
-                fee_pct, max_premium_bps
+                "Flashloan skip: fee_bps={} exceeds max_premium_bps={:?}",
+                fee_bps, max_premium_bps
             );
             return Ok(BundleResult::skipped().with_execution_mode("premium_cap"));
         }
 
-        // GAS - Estimativa atualizada (escalada por hops reais da rota, M4).
+        // GAS — overhead Aave tipado por estratégia.
         let n_hops = opp.steps.0.len().max(1);
-        let gas_cost = match self.gas_estimator.estimate_gas_usd_for_hops(n_hops).await {
+        let gas_kind = Self::gas_strategy_kind(&strategy);
+        let gas_cost = match self
+            .gas_estimator
+            .estimate_gas_usd_for_hops(n_hops, gas_kind)
+            .await
+        {
             Ok(v) => {
                 opp.gas_cost_usd = v;
                 metrics::set_last_gas_usd(v);
@@ -557,40 +618,80 @@ impl ArbitrageClient {
             Err(_) => opp.gas_cost_usd,
         };
 
-        // A5: valida a partir do GROSS (uma dedução de gas + Aave fee_pct).
-        let token_price = opp.token_price_usd.unwrap_or(1.0);
-        let principal_usd = self.token_amount_to_usd(opp.amount_in, token_price, flashloan_decimals);
-        let flashloan_fee_usd = economics::flashloan_fee_usd(principal_usd, fee_pct);
-        // A16: adverse_move era ignorado aqui (engine inclui). Repassar p/ o
-        // gate p/ ficar consistente com `recalculate_profitability`.
-        let trade_amount_usd = opp.estimated_volume_usd.max(0.0);
-        let adverse_usd = economics::adverse_move_usd(trade_amount_usd, adverse_move_bps);
+        // Integer economic gate (no f64 approve/reject).
+        let price_e8 = match fixed_usd::price_usd_e8_from_option(opp.token_price_usd) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(error = %e, "MissingProfitTokenPrice — abort exec");
+                metrics::inc_counter("missing_profit_token_price");
+                return Ok(BundleResult::skipped().with_execution_mode("missing_token_price"));
+            }
+        };
+        let principal_e8 =
+            match fixed_usd::token_raw_to_usd_e8(opp.amount_in, price_e8, flashloan_decimals) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("principal usd_e8 failed: {e}");
+                    return Ok(BundleResult::skipped().with_execution_mode("principal_usd_overflow"));
+                }
+            };
+        let flashloan_fee_e8 = match fixed_usd::flashloan_fee_usd_e8(principal_e8, fee_bps) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("flashloan fee usd_e8 failed: {e}");
+                return Ok(BundleResult::skipped().with_execution_mode("fee_usd_overflow"));
+            }
+        };
+        let gas_e8 = match fixed_usd::usd_f64_to_e8_ceil(gas_cost) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("gas usd_e8 failed: {e}");
+                return Ok(BundleResult::skipped().with_execution_mode("gas_usd_invalid"));
+            }
+        };
+        let gross_e8 = match fixed_usd::usd_f64_to_e8_ceil(opp.estimated_profit_usd) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("gross profit usd_e8 failed: {e}");
+                return Ok(BundleResult::skipped().with_execution_mode("gross_usd_invalid"));
+            }
+        };
+        let adverse_e8 = {
+            let adverse_f =
+                economics::adverse_move_usd(opp.estimated_volume_usd.max(0.0), adverse_move_bps);
+            match fixed_usd::usd_f64_to_e8_ceil(adverse_f) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("adverse usd_e8 failed: {e}");
+                    return Ok(BundleResult::skipped().with_execution_mode("adverse_usd_invalid"));
+                }
+            }
+        };
 
-        if let Err(e) = self.validate_profit_after_fees(
-            opp.estimated_profit_usd, // GROSS
-            gas_cost,
-            flashloan_fee_usd,
-            adverse_usd,
-        ) {
+        if let Err(e) =
+            self.validate_profit_after_fees_e8(gross_e8, gas_e8, flashloan_fee_e8, adverse_e8)
+        {
             warn!("{}", e);
             return Ok(BundleResult::skipped().with_execution_mode("insufficient_profit"));
         }
 
-        // A6: net_profit NÃO era recalculado após gas fresca — gate `:489`
-        // usava net antigo (computado pelo engine com gas anterior). Se gas
-        // fresco < gas do engine, opps lucrativas eram descartadas. Recalcular
-        // com a mesma fórmula única do economics.
-        opp.net_profit_usd = economics::net_profit_usd(
-            opp.estimated_profit_usd,
-            &economics::TradeCosts {
-                gas_usd: gas_cost,
-                flashloan_fee_usd,
-                adverse_move_usd: adverse_usd,
-            },
-        );
+        let flashloan_fee_usd = flashloan_fee_e8.display_f64();
+        let net_e8 =
+            fixed_usd::net_profit_usd_e8(gross_e8, gas_e8, flashloan_fee_e8, adverse_e8);
+        opp.net_profit_usd = net_e8.display_f64();
 
-        if opp.net_profit_usd < min_profit {
-            info!("💰 Profit skip: ${:.4} < ${:.4}", opp.net_profit_usd, min_profit);
+        let min_profit_e8 = match fixed_usd::usd_f64_to_e8_ceil(min_profit) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("min_profit usd_e8 failed: {e}");
+                return Ok(BundleResult::skipped().with_execution_mode("min_profit_invalid"));
+            }
+        };
+        if net_e8.0 < min_profit_e8.0 {
+            info!(
+                "💰 Profit skip: ${:.4} < ${:.4}",
+                opp.net_profit_usd, min_profit
+            );
             return Ok(BundleResult::skipped().with_execution_mode("profit_skip"));
         }
 
@@ -670,10 +771,13 @@ impl ArbitrageClient {
             .current_flashloan_fee_pct(pool_address.as_deref(), configured_fee_pct)
             .await;
 
-        // A6: igual ao path de exec real — recalcular net após gas fresca
-        // (escalada por hops reais da rota, M4).
+        // A6: paper valida flashloan → overhead WithFlashloan.
         let n_hops = opp.steps.0.len().max(1);
-        let gas_cost = match self.gas_estimator.estimate_gas_usd_for_hops(n_hops).await {
+        let gas_cost = match self
+            .gas_estimator
+            .estimate_gas_usd_for_hops(n_hops, GasStrategyKind::WithFlashloan)
+            .await
+        {
             Ok(v) => {
                 opp.gas_cost_usd = v;
                 v
@@ -681,19 +785,32 @@ impl ArbitrageClient {
             Err(_) => opp.gas_cost_usd,
         };
 
-        let token_price = opp.token_price_usd.unwrap_or(1.0);
-        let principal_usd = self.token_amount_to_usd(opp.amount_in, token_price, flashloan_decimals);
-        let flashloan_fee_usd = economics::flashloan_fee_usd(principal_usd, fee_pct);
-        let adverse_usd =
-            economics::adverse_move_usd(opp.estimated_volume_usd.max(0.0), adverse_move_bps);
-        opp.net_profit_usd = economics::net_profit_usd(
-            opp.estimated_profit_usd,
-            &economics::TradeCosts {
-                gas_usd: gas_cost,
-                flashloan_fee_usd,
-                adverse_move_usd: adverse_usd,
-            },
-        );
+        let price_e8 = match fixed_usd::price_usd_e8_from_option(opp.token_price_usd) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(error = %e, "MissingProfitTokenPrice — abort paper");
+                metrics::inc_counter("missing_profit_token_price");
+                return Ok(BundleResult::skipped().with_execution_mode("missing_token_price"));
+            }
+        };
+        let fee_bps = fixed_usd::fee_pct_to_bps(fee_pct).unwrap_or(0);
+        let principal_e8 =
+            fixed_usd::token_raw_to_usd_e8(opp.amount_in, price_e8, flashloan_decimals)
+                .unwrap_or(UsdE8::zero());
+        let flashloan_fee_e8 =
+            fixed_usd::flashloan_fee_usd_e8(principal_e8, fee_bps).unwrap_or(UsdE8::zero());
+        let gas_e8 = fixed_usd::usd_f64_to_e8_ceil(gas_cost).unwrap_or(UsdE8::zero());
+        let gross_e8 =
+            fixed_usd::usd_f64_to_e8_ceil(opp.estimated_profit_usd).unwrap_or(UsdE8::zero());
+        let adverse_e8 = fixed_usd::usd_f64_to_e8_ceil(economics::adverse_move_usd(
+            opp.estimated_volume_usd.max(0.0),
+            adverse_move_bps,
+        ))
+        .unwrap_or(UsdE8::zero());
+        let flashloan_fee_usd = flashloan_fee_e8.display_f64();
+        opp.net_profit_usd =
+            fixed_usd::net_profit_usd_e8(gross_e8, gas_e8, flashloan_fee_e8, adverse_e8)
+                .display_f64();
 
         match self
             .run_paper_validation(opp, slippage_bps, flashloan_fee_usd, would_execute)
@@ -901,21 +1018,24 @@ impl ArbitrageClient {
         ]))
     }
 
-    /// Piso on-chain em unidades do ativo de entrada. O contrato só libera a
-    /// transação se o lucro, depois do prêmio Aave, também cobrir o gás atual
-    /// e o lucro absoluto configurado.
-    fn minimum_profit_raw(&self, opp: &ArbitrageOpportunity, decimals: u32, cfg: &Config) -> U256 {
-        let configured = cfg
-            .arbitrage
-            .min_profit_absolute
-            .parse::<f64>()
-            .unwrap_or(0.0)
-            .max(0.0);
-        let required = (opp.gas_cost_usd + configured).max(0.0);
-        // f64_to_u256 trunca; arredonda um raw unit para cima para o piso nunca
-        // ficar abaixo do custo calculado.
-        let raw = f64_to_u256(required, decimals);
-        if required > 0.0 { raw.saturating_add(U256::one()) } else { raw }
+    /// Piso on-chain em raw units do ativo de entrada.
+    ///
+    /// `ceil((gas_usd_e8 + min_profit_usd_e8) * 10^decimals / price_e8)`.
+    /// Fail-closed se `token_price_usd` ausente/≤0 (`MissingProfitTokenPrice`).
+    fn minimum_profit_raw(
+        &self,
+        opp: &ArbitrageOpportunity,
+        decimals: u32,
+        cfg: &Config,
+    ) -> Result<U256> {
+        let price_e8 = fixed_usd::price_usd_e8_from_option(opp.token_price_usd).map_err(|e| {
+            metrics::inc_counter("missing_profit_token_price");
+            e
+        })?;
+        let gas_e8 = fixed_usd::usd_f64_to_e8_ceil(opp.gas_cost_usd)?;
+        let min_e8 = fixed_usd::usd_str_to_e8_ceil(&cfg.arbitrage.min_profit_absolute)?;
+        let required = gas_e8.checked_add(min_e8)?;
+        fixed_usd::usd_e8_to_token_raw_ceil(required, price_e8, decimals)
     }
 
     // ========================================================================
@@ -1005,6 +1125,15 @@ impl ArbitrageClient {
                 return Ok(BundleResult::skipped().with_execution_mode("complexity_reject"));
             }
 
+            let decimals = cfg.flashloan.flashloan_decimals.unwrap_or(6) as u32;
+            let min_profit_raw = match self.minimum_profit_raw(opp, decimals, &cfg) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(error = %e, "MissingProfitTokenPrice — abort Direct");
+                    return Ok(BundleResult::skipped().with_execution_mode("missing_token_price"));
+                }
+            };
+
             (
                 cfg.execution.dry_run,
                 // Quote de cada hop é por notional; rota completa precisa eth_call
@@ -1013,8 +1142,8 @@ impl ArbitrageClient {
                 asset,
                 amount,
                 steps,
-                cfg.flashloan.flashloan_decimals.unwrap_or(6) as u32,
-                self.minimum_profit_raw(opp, cfg.flashloan.flashloan_decimals.unwrap_or(6) as u32, &cfg),
+                decimals,
+                min_profit_raw,
             )
         };
 
@@ -1069,6 +1198,15 @@ impl ArbitrageClient {
                 return Ok(BundleResult::skipped().with_execution_mode("complexity_reject"));
             }
 
+            let decimals = cfg.flashloan.flashloan_decimals.unwrap_or(6) as u32;
+            let min_profit_raw = match self.minimum_profit_raw(opp, decimals, &cfg) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(error = %e, "MissingProfitTokenPrice — abort Flashloan");
+                    return Ok(BundleResult::skipped().with_execution_mode("missing_token_price"));
+                }
+            };
+
             (
                 cfg.execution.dry_run,
                 // Valida output real encadeado da rota antes de broadcast.
@@ -1076,8 +1214,8 @@ impl ArbitrageClient {
                 asset,
                 amount,
                 steps,
-                cfg.flashloan.flashloan_decimals.unwrap_or(6) as u32,
-                self.minimum_profit_raw(opp, cfg.flashloan.flashloan_decimals.unwrap_or(6) as u32, &cfg),
+                decimals,
+                min_profit_raw,
             )
         };
 
@@ -1115,7 +1253,7 @@ impl ArbitrageClient {
             return Ok(BundleResult::skipped().with_execution_mode("same_block"));
         }
 
-        let (dry, simulate, wrapper_addr, asset, amount, steps, flashloan_decimals, min_profit_raw) = {
+        let (dry, simulate, wrapper_addr, asset, amount, steps, flashloan_decimals, min_profit_raw, profit_recipient) = {
             let cfg = self.config.lock().await;
 
             let wrapper_addr = Address::from_str(&cfg.wrapper.address)?;
@@ -1131,6 +1269,16 @@ impl ArbitrageClient {
                 return Ok(BundleResult::skipped().with_execution_mode("complexity_reject"));
             }
 
+            let decimals = cfg.flashloan.flashloan_decimals.unwrap_or(6) as u32;
+            let min_profit_raw = match self.minimum_profit_raw(opp, decimals, &cfg) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(error = %e, "MissingProfitTokenPrice — abort Wrapper");
+                    return Ok(BundleResult::skipped().with_execution_mode("missing_token_price"));
+                }
+            };
+            let profit_recipient = self.resolve_profit_recipient(&cfg)?;
+
             (
                 cfg.execution.dry_run,
                 // Wrapper também executa hops encadeados; nunca pular preflight.
@@ -1139,17 +1287,20 @@ impl ArbitrageClient {
                 asset,
                 amount,
                 steps,
-                cfg.flashloan.flashloan_decimals.unwrap_or(6) as u32,
-                self.minimum_profit_raw(opp, cfg.flashloan.flashloan_decimals.unwrap_or(6) as u32, &cfg),
+                decimals,
+                min_profit_raw,
+                profit_recipient,
             )
         };
 
-        let executor_token = Token::Address(self.executor.address());
+        // CallbackData.profitRecipient — must equal on-chain owner (Q1).
+        // Never encode the executor contract address as recipient.
+        let recipient_token = Token::Address(profit_recipient);
         let steps_token = Token::Array(
             steps.iter().map(|x| x.clone().into_token()).collect()
         );
 
-        let params = Bytes::from(encode(&[executor_token, steps_token, Token::Uint(min_profit_raw)]));
+        let params = Bytes::from(encode(&[recipient_token, steps_token, Token::Uint(min_profit_raw)]));
 
         let contract = FlashloanCaller::new(wrapper_addr, self.middleware.clone());
         let call = contract.trigger_flashloan(asset, amount, params);
@@ -1354,8 +1505,17 @@ impl ArbitrageClient {
                                 self.update_execution_block().await;
 
                                 if let Some(gas_used) = receipt.gas_used {
+                                    let gas_kind = if mode == "direct" {
+                                        GasStrategyKind::Direct
+                                    } else {
+                                        GasStrategyKind::WithFlashloan
+                                    };
                                     self.gas_estimator
-                                        .observe_gas_used(opp.steps.0.len().max(1), gas_used)
+                                        .observe_gas_used(
+                                            opp.steps.0.len().max(1),
+                                            gas_used,
+                                            gas_kind,
+                                        )
                                         .await;
                                 }
 
@@ -1466,8 +1626,9 @@ impl ArbitrageClient {
                 Some(Token::Uint(v)) => v,
                 _ => continue,
             };
-            let token_price = opp.token_price_usd.unwrap_or(1.0);
-            let profit_usd = self.token_amount_to_usd(profit_raw, token_price, flashloan_decimals);
+            let token_price = opp.token_price_usd.unwrap_or(0.0);
+            let profit_usd =
+                self.token_amount_to_usd_display_f64(profit_raw, token_price, flashloan_decimals);
             info!(
                 "💰 Profit real do receipt: {} raw ({} dec) → ${:.6} (price=${:.4})",
                 profit_raw, flashloan_decimals, profit_usd, token_price
@@ -1774,13 +1935,13 @@ mod tests {
     }
 
     // ------------------------------------------------------------------------
-    // token_amount_to_usd
+    // token_amount_to_usd_display_f64 (telemetry)
     // ------------------------------------------------------------------------
     #[test]
     fn token_amount_to_usd_6_decimals() {
         let client = make_client();
         // 1_000_000 units @ 6 decimals, price $1 => $1.00
-        let usd = client.token_amount_to_usd(U256::from(1_000_000), 1.0, 6);
+        let usd = client.token_amount_to_usd_display_f64(U256::from(1_000_000), 1.0, 6);
         assert!((usd - 1.0).abs() < 1e-9, "usd={usd}");
     }
 
@@ -1789,7 +1950,7 @@ mod tests {
         let client = make_client();
         // 1e18 units @ 18 decimals, price $2 => $2.00
         let amount = U256::from(10).pow(U256::from(18));
-        let usd = client.token_amount_to_usd(amount, 2.0, 18);
+        let usd = client.token_amount_to_usd_display_f64(amount, 2.0, 18);
         assert!((usd - 2.0).abs() < 1e-9, "usd={usd}");
     }
 
@@ -1836,7 +1997,7 @@ mod tests {
         let client = make_client();
         let amount = U256::from(100_000_000u64); // 100 USDC 6dec
         let fee_tok = client.calculate_flashloan_fee(amount, 0.0005);
-        let fee_usd = client.token_amount_to_usd(fee_tok, 1.0, 6);
+        let fee_usd = client.token_amount_to_usd_display_f64(fee_tok, 1.0, 6);
         assert!((fee_usd - 0.05).abs() < 1e-9, "fee_usd={fee_usd}");
         assert!(client.validate_profit_after_fees(2.0, 0.1, fee_usd, 0.0).is_ok());
     }
@@ -2315,6 +2476,66 @@ mod tests {
         cfg.execution.max_slippage_bps = 50;
         cfg.execution.hop_slippage_increase_bps = 0;
         assert!(client.apply_complexity_filters(&two_hops, &cfg).is_err());
+    }
+
+    // ------------------------------------------------------------------------
+    // minimum_profit_raw — integer USD→token, fail-closed price
+    // ------------------------------------------------------------------------
+    fn sample_opp(price: Option<f64>, gas_usd: f64) -> ArbitrageOpportunity {
+        let mut opp = ArbitrageOpportunity::default();
+        opp.id = "t".into();
+        opp.amount_in = U256::from(1_000_000u64);
+        opp.gas_cost_usd = gas_usd;
+        opp.token_price_usd = price;
+        opp
+    }
+
+    #[test]
+    fn minimum_profit_raw_stable_6dec() {
+        let client = make_client();
+        let mut cfg = Config::default();
+        cfg.arbitrage.min_profit_absolute = "1.0".into();
+        let opp = sample_opp(Some(1.0), 0.0);
+        let raw = client.minimum_profit_raw(&opp, 6, &cfg).unwrap();
+        assert_eq!(raw, U256::from(1_000_000u64));
+    }
+
+    #[test]
+    fn minimum_profit_raw_rejects_missing_price() {
+        let client = make_client();
+        let cfg = Config::default();
+        let opp = sample_opp(None, 0.1);
+        let err = client.minimum_profit_raw(&opp, 6, &cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("MissingProfitTokenPrice"),
+            "err={err}"
+        );
+    }
+
+    #[test]
+    fn minimum_profit_raw_weth_price_2000() {
+        let client = make_client();
+        let mut cfg = Config::default();
+        cfg.arbitrage.min_profit_absolute = "10.0".into();
+        let opp = sample_opp(Some(2000.0), 0.0);
+        let raw = client.minimum_profit_raw(&opp, 18, &cfg).unwrap();
+        // $10 / $2000 = 0.005 ETH = 5e15 wei
+        assert_eq!(raw, U256::from(5u64) * U256::exp10(15));
+    }
+
+    #[test]
+    fn direct_fee_pct_is_zero_flashloan_nonzero() {
+        // Document invariant at strategy layer: Direct maps fee to 0 bps.
+        assert_eq!(fixed_usd::fee_pct_to_bps(0.0).unwrap(), 0);
+        assert_eq!(fixed_usd::fee_pct_to_bps(0.0005).unwrap(), 5);
+        assert_eq!(
+            ArbitrageClient::gas_strategy_kind(&ExecutionStrategy::Direct),
+            crate::core::gas::GasStrategyKind::Direct
+        );
+        assert_eq!(
+            ArbitrageClient::gas_strategy_kind(&ExecutionStrategy::Flashloan),
+            crate::core::gas::GasStrategyKind::WithFlashloan
+        );
     }
 }
 

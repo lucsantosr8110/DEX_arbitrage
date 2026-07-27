@@ -5,6 +5,7 @@
 pub mod arbitrage;
 pub mod bot;
 pub mod economics;
+pub mod fixed_usd;
 pub mod flashloan;
 pub mod gas;
 pub mod paper_validation;

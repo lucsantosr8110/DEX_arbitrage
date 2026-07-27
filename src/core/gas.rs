@@ -23,6 +23,22 @@ use tracing::{info, warn};
 
 use crate::config::Config;
 
+/// Separates Direct vs Flashloan gas components (no loose bool at call sites).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GasStrategyKind {
+    /// Own capital: no Aave callback / borrow / repay overhead.
+    Direct,
+    /// Flashloan or wrapper: includes `flashloan.gas_overhead`.
+    WithFlashloan,
+}
+
+impl GasStrategyKind {
+    #[inline]
+    pub fn include_flashloan_overhead(self) -> bool {
+        matches!(self, Self::WithFlashloan)
+    }
+}
+
 // ============================================================
 // 🧩 Estrutura de Cache Interno
 // ============================================================
@@ -257,7 +273,11 @@ where
     /// executa opps que dão prejuízo. Agora escala: `base_per_hop × n_hops +
     /// flashloan_overhead`, derivando `base_per_hop` de `estimated_gas_units`
     /// (interpretado como rota de 3 hops) menos `flashloan.gas_overhead`.
-    pub async fn estimate_gas_usd_for_hops(&self, n_hops: usize) -> Result<f64> {
+    pub async fn estimate_gas_usd_for_hops(
+        &self,
+        n_hops: usize,
+        strategy: GasStrategyKind,
+    ) -> Result<f64> {
         let cfg = self.config.lock().await.clone();
         let gas_cfg = &cfg.gas;
 
@@ -277,7 +297,7 @@ where
         let priority_gwei = u256_to_f64(priority_fee, 9);
         let eff = base_fee_gwei * 1.05 + priority_gwei;
 
-        let baseline_units = Self::gas_units_for_hops(gas_cfg, &cfg, n_hops);
+        let baseline_units = Self::gas_units_for_hops(gas_cfg, &cfg, n_hops, strategy);
         let multiplier = *self.gas_unit_multiplier.read().await;
         let gas_units = baseline_units * multiplier;
 
@@ -302,16 +322,23 @@ where
         Ok(cost)
     }
 
-    /// Backward-compat: custo para rota de 3 hops (referência do
+    /// Backward-compat: custo para rota de 3 hops flashloan (referência do
     /// `estimated_gas_units`). Callers sem `n_hops` explícito caem aqui.
     pub async fn estimate_arbitrage_gas_usd(&self) -> Result<f64> {
-        self.estimate_gas_usd_for_hops(3).await
+        self.estimate_gas_usd_for_hops(3, GasStrategyKind::WithFlashloan)
+            .await
     }
 
     /// `gas_units` escalado por hops (M4). Deriva `base_per_hop` de
-    /// `estimated_gas_units` (rota de 3 hops) e `flashloan.gas_overhead`. Sem
-    /// `estimated_gas_units`, cai em `default_gas_limit`/`max_gas_limit` (teto).
-    fn gas_units_for_hops(gas_cfg: &crate::config::GasConfig, cfg: &Config, n_hops: usize) -> f64 {
+    /// `estimated_gas_units` (rota de 3 hops) e `flashloan.gas_overhead`.
+    /// `GasStrategyKind::Direct` omite overhead Aave. Sem `estimated_gas_units`,
+    /// cai em `default_gas_limit`/`max_gas_limit` (teto).
+    fn gas_units_for_hops(
+        gas_cfg: &crate::config::GasConfig,
+        cfg: &Config,
+        n_hops: usize,
+        strategy: GasStrategyKind,
+    ) -> f64 {
         let hops = n_hops.max(1) as f64;
         if gas_cfg.estimated_gas_units > 0 {
             let overhead = cfg
@@ -320,7 +347,12 @@ where
                 .unwrap_or(100_000)
                 .min(gas_cfg.estimated_gas_units);
             let base_per_hop = (gas_cfg.estimated_gas_units - overhead) as f64 / 3.0;
-            return base_per_hop * hops + overhead as f64;
+            let applied_overhead = if strategy.include_flashloan_overhead() {
+                overhead as f64
+            } else {
+                0.0
+            };
+            return base_per_hop * hops + applied_overhead;
         }
         if gas_cfg.default_gas_limit == 0 {
             gas_cfg.max_gas_limit as f64
@@ -330,11 +362,16 @@ where
     }
 
     /// Aprende do receipt sem deixar uma tx atípica distorcer a estimativa.
-    pub async fn observe_gas_used(&self, n_hops: usize, actual_units: U256) {
+    pub async fn observe_gas_used(
+        &self,
+        n_hops: usize,
+        actual_units: U256,
+        strategy: GasStrategyKind,
+    ) {
         let actual = actual_units.as_u64() as f64;
         if actual <= 0.0 { return; }
         let cfg = self.config.lock().await.clone();
-        let estimated = Self::gas_units_for_hops(&cfg.gas, &cfg, n_hops);
+        let estimated = Self::gas_units_for_hops(&cfg.gas, &cfg, n_hops, strategy);
         if estimated <= 0.0 { return; }
         let mut multiplier = self.gas_unit_multiplier.write().await;
         // EWMA 20% observação / 80% histórico, limitado para segurança.
@@ -495,16 +532,19 @@ mod tests {
     fn gas_units_scale_with_hops() {
         let gas_cfg = crate::config::GasConfig::default();
         let cfg = crate::config::Config::default();
-        let u3 = GasEstimator::<ethers::providers::Provider<ethers::providers::Http>>::gas_units_for_hops(&gas_cfg, &cfg, 3);
-        let u2 = GasEstimator::<ethers::providers::Provider<ethers::providers::Http>>::gas_units_for_hops(&gas_cfg, &cfg, 2);
-        let u4 = GasEstimator::<ethers::providers::Provider<ethers::providers::Http>>::gas_units_for_hops(&gas_cfg, &cfg, 4);
-        // 3 hops deve reproduzir o estimated_gas_units de referência.
+        let u3 = GasEstimator::<ethers::providers::Provider<ethers::providers::Http>>::gas_units_for_hops(&gas_cfg, &cfg, 3, GasStrategyKind::WithFlashloan);
+        let u2 = GasEstimator::<ethers::providers::Provider<ethers::providers::Http>>::gas_units_for_hops(&gas_cfg, &cfg, 2, GasStrategyKind::WithFlashloan);
+        let u4 = GasEstimator::<ethers::providers::Provider<ethers::providers::Http>>::gas_units_for_hops(&gas_cfg, &cfg, 4, GasStrategyKind::WithFlashloan);
+        // 3 hops flashloan deve reproduzir o estimated_gas_units de referência.
         assert!((u3 - gas_cfg.estimated_gas_units as f64).abs() < 1e-6, "3 hops={u3} ref={}", gas_cfg.estimated_gas_units);
         assert!(u4 > u3, "4 hops ({u4}) deve custar mais que 3 ({u3})");
         assert!(u2 < u3, "2 hops ({u2}) deve custar menos que 3 ({u3})");
         // 0 hops (degen) não divide por zero — clamp em 1.
-        let u0 = GasEstimator::<ethers::providers::Provider<ethers::providers::Http>>::gas_units_for_hops(&gas_cfg, &cfg, 0);
+        let u0 = GasEstimator::<ethers::providers::Provider<ethers::providers::Http>>::gas_units_for_hops(&gas_cfg, &cfg, 0, GasStrategyKind::WithFlashloan);
         assert!(u0.is_finite() && u0 > 0.0);
+        // Direct: sem overhead Aave — 3 hops < referência flashloan.
+        let u3_direct = GasEstimator::<ethers::providers::Provider<ethers::providers::Http>>::gas_units_for_hops(&gas_cfg, &cfg, 3, GasStrategyKind::Direct);
+        assert!(u3_direct < u3, "Direct 3 hops ({u3_direct}) < flashloan 3 hops ({u3})");
     }
 
     #[test]
