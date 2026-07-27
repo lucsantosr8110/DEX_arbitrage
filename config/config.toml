@@ -199,10 +199,10 @@ chain_id = 137
 # Segredos vêm do .env via expansão ${VAR} (ver Config::from_file).
 # Se ALCHEMY_RPC_URL/ALCHEMY_WS_URL não estiverem definidos, o literal "${...}"
 # permanece e o fallback público abaixo assume. Nunca versione chaves aqui.
-rpc_url = "${QUICKNODE_RPC_URL}"
+rpc_url = "${ALCHEMY_RPC_URL}"
 rpc_endpoints = [
-    "${QUICKNODE_RPC_URL}",
     "${ALCHEMY_RPC_URL}",
+    "${QUICKNODE_RPC_URL}",
     "${INFURA_RPC_URL}",
     "https://polygon-bor-rpc.publicnode.com",
     "https://1rpc.io/matic",
@@ -210,13 +210,15 @@ rpc_endpoints = [
     "https://polygon.llamarpc.com",
 ]
 ws_endpoints = [
-    # Público primeiro: WS privado (QuickNode/Alchemy) cai/rate-limita → radar
-    # morre → TUI congela (auto-restart reconecta no mesmo WS morto). Público
-    # sem auth mantém radar vivo mesmo se chaves pagas falharem.
-    "wss://polygon-bor-rpc.publicnode.com",
-    "${QUICKNODE_WS_URL}",
+    # Ordem: Alchemy → QuickNode → Infura → públicos.
+    # connect_ws_with_fallback tenta na ordem exata da lista — sem round-robin.
+    # Se Alchemy falha, QuickNode assume; se ambos falham, Infura; por último
+    # os públicos sem auth mantêm o radar vivo mesmo que todas as chaves pagas
+    # estejam rate-limitadas ou fora do ar.
     "${ALCHEMY_WS_URL}",
+    "${QUICKNODE_WS_URL}",
     "${INFURA_WS_URL}",
+    "wss://polygon-bor-rpc.publicnode.com",
     "wss://polygon.drpc.org",
     "wss://polygon-rpc.com",
     "wss://polygon.llamarpc.com",

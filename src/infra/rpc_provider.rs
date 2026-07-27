@@ -17,10 +17,7 @@ use ethers::{
     signers::{LocalWallet, Signer},
 };
 use std::{
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
+    sync::Arc,
     time::Duration,
 };
 use tokio::time::{sleep, Instant};
@@ -30,11 +27,6 @@ use tracing::{info, warn};
 use crate::{config::NetworkConfig, infra::metrics, AppMiddleware};
 
 pub struct RpcProvider;
-
-/// Índice rotativo p/ round-robin do `connect_ws_with_fallback`. Cada
-/// reconexão começa no próximo endpoint da lista — "caiu um → passa ao
-/// próximo" — em vez de martelar sempre o índice 0 (possivelmente morto).
-static WS_START_IDX: AtomicUsize = AtomicUsize::new(0);
 
 /// Um endpoint é inutilizável se estiver vazio ou se ainda for um placeholder
 /// `${VAR}` — o expansor de `Config::from_file` mantém o literal quando a variável
@@ -215,20 +207,17 @@ impl RpcProvider {
         _cfg: &NetworkConfig, // ⚠️ 'cfg' não estava sendo usado, adicionado '_'
         endpoints: &[String],
     ) -> Result<Arc<Provider<Ws>>> {
-        let n = endpoints.len();
-        if n == 0 {
+        if endpoints.is_empty() {
             return Err(anyhow!("❌ Nenhum WebSocket disponível após fallback."));
         }
 
-        // Round-robin: cada chamada começa do próximo índice. Evita martelar
-        // sempre o endpoint 0 quando ele cai — dispersa reconexões entre
-        // todos os configurados ("caiu um → passa ao próximo, sucessivamente").
-        // Primeira chamada (boot) retorna 0 = endpoint primário definido no config.
-        let start = WS_START_IDX.fetch_add(1, Ordering::Relaxed) % n;
-
-        for k in 0..n {
-            let i = (start + k) % n;
-            let url = &endpoints[i];
+        // Tentativa linear na ordem exata da lista. Sem round-robin —
+        // o primeiro endpoint que funcionar vence. Se o topo da lista
+        // (ex: Alchemy) cair, o failover tenta o próximo (QuickNode) e
+        // assim sucessivamente. Na reconexão, a ordem é a mesma — se o
+        // primeiro recuperou, ele vence de novo; se ainda estiver fora,
+        // o failover avança na fila novamente.
+        for (i, url) in endpoints.iter().enumerate() {
             if !is_usable_endpoint(url) {
                 continue;
             }
