@@ -172,6 +172,11 @@ impl UniswapV3Dex {
             .ok_or_else(|| anyhow!("Token não suportado: {}", symbol_or_address))
     }
 
+    #[inline]
+    fn quote_notional_usd(&self) -> f64 {
+        self.config.executable_trade_notional_usd()
+    }
+
     async fn prepare_call_data(&self, pairs: &[(&str, &str)]) -> Result<Vec<CallInfo>> {
         let mut data = Vec::new();
 

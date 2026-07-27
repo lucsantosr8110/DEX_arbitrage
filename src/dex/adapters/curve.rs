@@ -125,11 +125,7 @@ impl CurveDex {
     }
 
     fn quote_notional_usd(&self) -> f64 {
-        self.config
-            .arbitrage
-            .default_trade_amount
-            .parse::<f64>()
-            .unwrap_or(100.0)
+        self.config.executable_trade_notional_usd()
     }
 
     async fn resolve_am_to_symbol(&self, addr: &Address) -> Option<String> {

@@ -1938,6 +1938,28 @@ pub struct Config {
 
 /// Impl config
 impl Config {
+    /// Notional único do ciclo executável, em USD.
+    ///
+    /// Quotes AMM incluem impacto de preço, portanto precisam usar exatamente o
+    /// mesmo tamanho que será emprestado/executado. Em modo flashloan o capital
+    /// é a fonte de verdade; sem flashloan usa-se o tamanho da ordem direta.
+    /// Nunca retorne zero/NaN: adapters usam este valor para montar calldata.
+    pub fn executable_trade_notional_usd(&self) -> f64 {
+        let configured = if self.flashloan.enabled {
+            self.flashloan.capital_usd
+        } else {
+            self.arbitrage
+                .default_trade_amount
+                .parse::<f64>()
+                .unwrap_or(0.0)
+        };
+        if configured.is_finite() && configured > 0.0 {
+            configured
+        } else {
+            100.0
+        }
+    }
+
     fn apply_fallbacks(&mut self) {
         if !self.monitoring.enabled { self.monitoring.enabled = true; }
         if self.monitoring.interval_sec == 0 { self.monitoring.interval_sec = 30; }
@@ -1960,33 +1982,8 @@ impl Config {
             self.flashloan.max_amount_wmatic = Some(10.0);
         }
 
-        // Notional de COTAÇÃO vs notional de LUCRO.
-        //
-        // Os quotes são cotados em `arbitrage.default_trade_amount` (ver
-        // dex::quote_amount_for_usd), mas o lucro escala por `flashloan.capital_usd`
-        // quando o flashloan está ligado. Se divergirem, o gross é extrapolado com
-        // um rate medido em outro tamanho — price impact do tamanho real fica de
-        // fora e o lucro sai superestimado. Nada no código força a igualdade, então
-        // avisar alto.
-        if self.flashloan.enabled {
-            let quote_notional = self
-                .arbitrage
-                .default_trade_amount
-                .parse::<f64>()
-                .unwrap_or(0.0);
-            let profit_notional = self.flashloan.capital_usd;
-            if quote_notional > 0.0
-                && profit_notional > 0.0
-                && (quote_notional - profit_notional).abs() / quote_notional > 0.01
-            {
-                warn!(
-                    "⚠️ Notional divergente: quotes cotados a ${:.2} (arbitrage.default_trade_amount) \
-                     mas lucro escalado a ${:.2} (flashloan.capital_usd). O rate medido não vale \
-                     nesse tamanho — gross fica superestimado. Iguale os dois.",
-                    quote_notional, profit_notional
-                );
-            }
-        }
+        // Quotes e execução usam `executable_trade_notional_usd`: em flashloan,
+        // `capital_usd` vence; sem flashloan, `default_trade_amount` vence.
 
         if self.min_profit_usd_threshold == 0.0 {
             self.min_profit_usd_threshold = self.flashloan.min_profit_usd.unwrap_or(0.000005);
@@ -2411,5 +2408,22 @@ mod config_parser_tests {
             let ignored = Config::ignored_toml_keys(raw, &cfg);
             assert!(ignored.is_empty(), "{name} has ignored keys: {ignored:?}");
         }
+    }
+
+    #[test]
+    fn executable_notional_uses_flashloan_capital_when_enabled() {
+        let mut cfg = Config::default();
+        cfg.flashloan.enabled = true;
+        cfg.flashloan.capital_usd = 250.0;
+        cfg.arbitrage.default_trade_amount = "10.0".into();
+        assert_eq!(cfg.executable_trade_notional_usd(), 250.0);
+    }
+
+    #[test]
+    fn executable_notional_uses_direct_size_without_flashloan() {
+        let mut cfg = Config::default();
+        cfg.flashloan.enabled = false;
+        cfg.arbitrage.default_trade_amount = "42.5".into();
+        assert_eq!(cfg.executable_trade_notional_usd(), 42.5);
     }
 }

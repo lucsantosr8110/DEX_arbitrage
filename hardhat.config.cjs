@@ -13,6 +13,10 @@ const PRIVATE_KEY = process.env.PRIVATE_KEY;
 const ALCHEMY_KEY = process.env.ALCHEMY_KEY || "";
 const INFURA_KEY = process.env.INFURA_KEY || "";
 const POLYGONSCAN_API_KEY = process.env.POLYGONSCAN_API_KEY;
+// Forks são úteis para integrações, mas não devem tornar compile/test local
+// dependentes do RPC presente no .env. Ative explicitamente quando necessário:
+// HARDHAT_FORK_POLYGON=1 npm test
+const FORK_POLYGON = process.env.HARDHAT_FORK_POLYGON === "1";
 
 if (!PRIVATE_KEY) {
   console.warn("⚠️  PRIVATE_KEY não definido no .env — deploy/verify podem falhar.");
@@ -97,7 +101,7 @@ module.exports = {
     // --------------------------
     hardhat: {
       chainId: 31337,
-      forking: process.env.RPC_POLYGON_URL
+      forking: FORK_POLYGON && process.env.RPC_POLYGON_URL
         ? {
             url: process.env.RPC_POLYGON_URL,
           }

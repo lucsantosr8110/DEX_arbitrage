@@ -14,7 +14,7 @@ use crate::{
         types::{ArbitrageOpportunity, BundleResult},
     },
     infra::metrics,
-    utils::f64_to_u256,
+    utils::{f64_to_u256, u256_to_f64},
     AppMiddleware,
 };
 
@@ -280,9 +280,14 @@ impl ArbitrageClient {
     }
 
     fn token_amount_to_usd(&self, amount: U256, price_usd: f64, decimals: u32) -> f64 {
-        let raw_u128 = amount.as_u128();
-        let denom = 10_f64.powi(decimals as i32);
-        (raw_u128 as f64 / denom) * price_usd
+        if !price_usd.is_finite() || price_usd <= 0.0 {
+            return 0.0;
+        }
+        // `as_u128()` pegava somente os 128 bits baixos de U256. Para valores
+        // grandes isso podia transformar principal/profit em número menor e
+        // aprovar uma rota sobreestimada. Conversão compartilhada preserva a
+        // ordem de grandeza antes de entrar no domínio f64.
+        u256_to_f64(amount, decimals) * price_usd
     }
 
     /// ABI-encode `uint24` fee tier — layout compatível com
@@ -1242,7 +1247,11 @@ impl ArbitrageClient {
         &self, 
         call: &ContractCall<AppMiddleware, T>
     ) -> Result<()> {
-        match timeout(Duration::from_secs(10), call.call()).await {
+        // Simular em `pending` inclui swaps concorrentes que o RPC já viu.
+        // Se o nó não puder dar esta garantia, falhar fechado evita broadcast
+        // otimista de uma rota que provavelmente reverteria.
+        let pending = call.clone().block(BlockNumber::Pending);
+        match timeout(Duration::from_secs(10), pending.call()).await {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(e)) => {
                 let error_msg = self.decode_revert_reason(&e.to_string());
@@ -1270,7 +1279,8 @@ impl ArbitrageClient {
         &self,
         call: &ContractCall<AppMiddleware, bool>,
     ) -> Result<()> {
-        match timeout(Duration::from_secs(10), call.call()).await {
+        let pending = call.clone().block(BlockNumber::Pending);
+        match timeout(Duration::from_secs(10), pending.call()).await {
             Ok(Ok(true)) => Ok(()),
             Ok(Ok(false)) => Err(anyhow!(
                 "Simulation failed: contract returned false (flashloan initiation failed)"
@@ -1349,9 +1359,22 @@ impl ArbitrageClient {
                                         .await;
                                 }
 
-                                let real_profit = self
+                                let contract_profit = self
                                     .extract_real_profit_from_receipt(&receipt, opp, flashloan_decimals)
-                                    .unwrap_or(opp.estimated_profit_usd);
+                                    .unwrap_or_else(|| {
+                                        // Projeção nunca é PnL realizado. Sem evento
+                                        // confiável, registrar limite inferior (zero
+                                        // antes do gás) evita contaminar calibração.
+                                        warn!("receipt sem evento de lucro; PnL será limite inferior");
+                                        0.0
+                                    });
+                                // Evento do executor mede lucro do ativo após o premium,
+                                // mas gás sai da wallet em POL. Métrica/PnL sem esta
+                                // subtração superestima exatamente o tipo de edge de cents
+                                // que este bot tenta capturar.
+                                let real_profit = self
+                                    .realized_net_profit_after_gas_usd(&receipt, contract_profit)
+                                    .await;
                                 metrics::inc_arbitrage_executions();
                                 metrics::inc_exec_ok();
                                 metrics::set_last_profit(real_profit);
@@ -1404,14 +1427,19 @@ impl ArbitrageClient {
     ) -> Option<f64> {
         use ethers::abi::ParamType;
 
-        // topic0 = keccak256("FlashLoanSuccess(address,uint256,uint256,uint256,address)")
-        let topic0 = H256::from(ethers::utils::keccak256(
+        // Ambos eventos carregam `profit` como terceiro uint256 não-indexado.
+        let flashloan_topic = H256::from(ethers::utils::keccak256(
             b"FlashLoanSuccess(address,uint256,uint256,uint256,address)",
+        ));
+        let direct_topic = H256::from(ethers::utils::keccak256(
+            b"DirectExecution(address,uint256,uint256,address,uint256)",
         ));
 
         for log in receipt.logs.iter() {
             let Some(t0) = log.topics.first() else { continue };
-            if *t0 != topic0 {
+            if (*t0 != flashloan_topic && *t0 != direct_topic)
+                || log.address != self.executor.address()
+            {
                 continue;
             }
             // Dados não-indexados: amount, premium, profit (3 × 32 bytes).
@@ -1449,6 +1477,39 @@ impl ArbitrageClient {
         // Sem evento FlashLoanSuccess (ex.: wrapper path emite evento diferente
         // ou TX revertedida em depth) — caller cai p/ estimated_profit_usd.
         None
+    }
+
+    /// PnL realizado da wallet = lucro transferido pelo executor menos gás de
+    /// inclusão efetivamente pago. `effective_gas_price` vem do receipt, não do
+    /// teto EIP-1559 nem da estimativa pré-envio.
+    async fn realized_net_profit_after_gas_usd(
+        &self,
+        receipt: &TransactionReceipt,
+        contract_profit_usd: f64,
+    ) -> f64 {
+        let (Some(gas_used), Some(effective_gas_price)) =
+            (receipt.gas_used, receipt.effective_gas_price)
+        else {
+            warn!(
+                "receipt sem gas_used/effective_gas_price; PnL mantém lucro do contrato=${:.6}",
+                contract_profit_usd
+            );
+            return contract_profit_usd;
+        };
+
+        let gas_wei = gas_used.saturating_mul(effective_gas_price);
+        let gas_pol = u256_to_f64(gas_wei, 18);
+        let pol_usd = crate::infra::price_feed::PRICE_FEED
+            .get_price("WMATIC")
+            .await
+            .unwrap_or_else(|_| crate::infra::price_feed::CachedPriceFeed::fallback_price("WMATIC"));
+        let gas_usd = gas_pol * pol_usd;
+        let net = contract_profit_usd - gas_usd;
+        info!(
+            "💵 PnL realizado: lucro_contrato=${:.6} - gas={} wei (${:.6}) = net=${:.6}",
+            contract_profit_usd, gas_wei, gas_usd, net
+        );
+        net
     }
 
     // ========================================================================
@@ -1631,6 +1692,24 @@ mod tests {
         }
     }
 
+    fn direct_execution_log(profit_raw: U256) -> ethers::types::Log {
+        use ethers::types::{Bytes, H256, Log};
+        let topic0 = H256::from(ethers::utils::keccak256(
+            b"DirectExecution(address,uint256,uint256,address,uint256)",
+        ));
+        let data = ethers::abi::encode(&[
+            Token::Uint(U256::from(1_000_000)),
+            Token::Uint(U256::from(1_100_000)),
+            Token::Uint(profit_raw),
+        ]);
+        Log {
+            address: Address::zero(),
+            topics: vec![topic0],
+            data: Bytes::from(data),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn extract_real_profit_decodes_flashloan_success_event() {
         let client = make_client();
@@ -1655,6 +1734,21 @@ mod tests {
         let receipt = TransactionReceipt::default();
         let opp = ArbitrageOpportunity::default();
         assert!(client.extract_real_profit_from_receipt(&receipt, &opp, 6).is_none());
+    }
+
+    #[test]
+    fn extract_real_profit_decodes_direct_execution_event() {
+        let client = make_client();
+        let receipt = TransactionReceipt {
+            logs: vec![direct_execution_log(U256::from(250_000u64))],
+            ..Default::default()
+        };
+        let mut opp = ArbitrageOpportunity::default();
+        opp.token_price_usd = Some(1.0);
+        assert_eq!(
+            client.extract_real_profit_from_receipt(&receipt, &opp, 6),
+            Some(0.25)
+        );
     }
 
     #[test]

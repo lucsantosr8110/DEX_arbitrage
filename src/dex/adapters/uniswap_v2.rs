@@ -130,6 +130,11 @@ impl V2Dex {
         }
         Ok(call_data_list)
     }
+
+    #[inline]
+    fn quote_notional_usd(&self) -> f64 {
+        self.config.executable_trade_notional_usd()
+    }
 }
 
 #[async_trait]
