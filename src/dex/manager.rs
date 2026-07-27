@@ -321,9 +321,38 @@ impl DexManager {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(HEALTH_CHECK_INTERVAL).await;
+                // Auto-recovery: DEXs marcados unhealthy não são mais consultados
+                // pelo radar (get_healthy_adapters filtra health=false), então nunca
+                // recebem um multicall de sucesso que chamaria mark_healthy —
+                // deadlock permanente (ex.: SushiSwap após rate-limit Infura, TUI
+                // fica com coluna em branco até restart). A cada ciclo, damos uma
+                // nova chance: resetamos error_count/health para que o próximo scan
+                // tente de novo. Se a falha persistir, record_error re-tripa o
+                // breaker no mesmo ciclo.
+                let unhealthy: Vec<String> = {
+                    let h = mgr.health.read().await;
+                    let adapters = mgr.active_adapters.read().await;
+                    adapters
+                        .iter()
+                        .map(|a| a.name())
+                        .filter(|n| matches!(h.get(n), Some(false)))
+                        .map(|n| n.to_string())
+                        .collect()
+                };
+                for name in &unhealthy {
+                    info!(
+                        "♻️ Health-check: resetando {} (auto-recovery — estava unhealthy, nova tentativa no próximo scan)",
+                        name
+                    );
+                    mgr.reset_circuit_breaker(name).await;
+                }
                 let adapters = mgr.active_adapters.read().await;
                 for a in adapters.iter() {
                     let name = a.name().to_string();
+                    if unhealthy.iter().any(|u| u == &name) {
+                        // já tratado acima
+                        continue;
+                    }
                     if mgr.should_circuit_break(&name).await {
                         debug!("🩺 Health-check: {} (circuit-breaker ativo)", name);
                     } else {
