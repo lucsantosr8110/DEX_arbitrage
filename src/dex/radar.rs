@@ -24,7 +24,7 @@ use crate::{
 use chrono::Utc;
 use ethers::providers::{Middleware, Provider, Ws};
 use futures_util::StreamExt;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use std::{
     collections::HashMap,
     fs::{self, OpenOptions},
@@ -1557,6 +1557,15 @@ pub async fn start_high_hit_rate_radar(
     let mut adj_tracker = AdjTracker::new();
     let mut cycle = 0u64;
 
+    // WS morre silenciosamente: stream.next() dá None (fechou) ou trava
+    // (half-open). Sem tratamento, o select! bloqueava pra sempre — o radar
+    // nunca retornava Err, o auto-restart (main.rs) nunca disparava, e a TUI
+    // congelava: heartbeat piscando mas scan_age crescendo, parecia viva mas
+    // nunca atualizava. Agora: None ou ausência de bloco > BLOCK_TIMEOUT
+    // → Err → auto-restart → connect_ws itera próximos endpoints.
+    // Polygon ~2s/block; 20s sem bloco = WS morto/half-open.
+    const BLOCK_TIMEOUT: Duration = Duration::from_secs(20);
+
     loop {
         tokio::select! {
             _ = shutdown_rx.recv() => {
@@ -1564,22 +1573,35 @@ pub async fn start_high_hit_rate_radar(
                 break;
             }
 
-            Some(_) = stream.next() => {
-                cycle += 1;
+            block = stream.next() => {
+                match block {
+                    Some(_) => {
+                        cycle += 1;
 
-                ALCHEMY_RATE_LIMITER.cleanup().await;
-                DEX_RATE_LIMITER.cleanup().await;
+                        ALCHEMY_RATE_LIMITER.cleanup().await;
+                        DEX_RATE_LIMITER.cleanup().await;
 
-                match execute_radar_cycle(
-                    &dm, &cfg, &adj_cost, &price_tx,
-                    &mut previous, &mut adj_tracker, cb.clone(),
-                    &retry, cycle
-                ).await {
-                    Ok((total, edges)) =>
-                        debug!("Ciclo {} — {} preços, {} sinais-spread, {} edges logados", cycle, total, edges.len(), edges.len()),
-                    Err(e) =>
-                        error!("Erro no ciclo {}: {:?}", cycle, e),
+                        match execute_radar_cycle(
+                            &dm, &cfg, &adj_cost, &price_tx,
+                            &mut previous, &mut adj_tracker, cb.clone(),
+                            &retry, cycle
+                        ).await {
+                            Ok((total, edges)) =>
+                                debug!("Ciclo {} — {} preços, {} sinais-spread, {} edges logados", cycle, total, edges.len(), edges.len()),
+                            Err(e) =>
+                                error!("Erro no ciclo {}: {:?}", cycle, e),
+                        }
+                    }
+                    None => {
+                        error!("📡 Radar: stream WS fechou (provider morto) — disparando failover.");
+                        return Err(anyhow!("WS stream closed — failing over to next endpoint"));
+                    }
                 }
+            }
+
+            _ = tokio::time::sleep(BLOCK_TIMEOUT) => {
+                error!("📡 Radar: sem bloco há {}s — WS morto/half-open, disparando failover.", BLOCK_TIMEOUT.as_secs());
+                return Err(anyhow!("no block within {}s — WS dead, failing over", BLOCK_TIMEOUT.as_secs()));
             }
         }
     }

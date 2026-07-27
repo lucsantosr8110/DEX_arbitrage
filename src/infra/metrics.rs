@@ -9,17 +9,14 @@
 // ✅ Integração total com RiskManager e Config (v4.4.4)
 // ============================================================
 
-use crate::config::Config;
-use anyhow::Result;
 use once_cell::sync::Lazy;
 use prometheus::{
     register, register_counter, register_gauge, register_histogram, register_int_counter,
     register_int_counter_vec, register_int_gauge, Counter, Gauge, Histogram, IntCounter,
     HistogramVec, IntCounterVec, IntGauge, Opts,
 };
-use std::{collections::HashMap, net::SocketAddr, sync::Mutex};
-use tracing::{debug, info, warn};
-use warp::Filter;
+use std::{collections::HashMap, sync::Mutex};
+use tracing::{debug, warn};
 
 // ============================================================
 // 🔧 REGISTROS PROMETHEUS GLOBAIS
@@ -276,31 +273,10 @@ pub fn record_flashloan_execution(mode: &str, profit: f64, premium: f64, gas_use
 // ============================================================
 // 📊 Servidor Prometheus
 // ============================================================
-
-pub async fn serve_metrics(cfg: &Config) -> Result<()> {
-    let port: u16 = cfg.metrics.port;
-    let addr: SocketAddr = ([0, 0, 0, 0], port).into();
-
-    tokio::spawn(async move {
-        info!("📈 Servidor Prometheus ativo em http://0.0.0.0:{}/metrics", port);
-
-        let metrics_route = warp::path("metrics").map(|| {
-            let body = prometheus::TextEncoder::new()
-                .encode_to_string(&prometheus::gather())
-                .unwrap_or_else(|_| "# erro ao gerar métricas".to_string());
-
-            warp::reply::with_header(
-                body,
-                "content-type",
-                "text/plain; version=0.0.4; charset=utf-8",
-            )
-        });
-
-        warp::serve(metrics_route).run(addr).await;
-    });
-
-    Ok(())
-}
+// serve_metrics() removido: era dead code (nenhum caller — main.rs usa
+// try_serve_metrics_with_fallback -> start_metrics_server, que agora tem
+// graceful shutdown via broadcast). Esta versão antiga fazia
+// warp::serve().run(addr) pelado, task leaked sem sinal de shutdown.
 
 // ============================================================
 // 📊 Resumo e Exportação

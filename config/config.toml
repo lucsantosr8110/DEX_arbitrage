@@ -210,10 +210,13 @@ rpc_endpoints = [
     "https://polygon.llamarpc.com",
 ]
 ws_endpoints = [
+    # Público primeiro: WS privado (QuickNode/Alchemy) cai/rate-limita → radar
+    # morre → TUI congela (auto-restart reconecta no mesmo WS morto). Público
+    # sem auth mantém radar vivo mesmo se chaves pagas falharem.
+    "wss://polygon-bor-rpc.publicnode.com",
     "${QUICKNODE_WS_URL}",
     "${ALCHEMY_WS_URL}",
     "${INFURA_WS_URL}",
-    "wss://polygon-bor-rpc.publicnode.com",
     "wss://polygon.drpc.org",
     "wss://polygon-rpc.com",
     "wss://polygon.llamarpc.com",

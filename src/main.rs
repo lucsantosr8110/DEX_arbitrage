@@ -11,7 +11,7 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tracing::{debug, error, info, warn, Level};
@@ -71,7 +71,6 @@ fn update_tui_state(
     prices: &HashMap<String, HashMap<String, f64>>,
     top_n: usize,
     cycle_count: u64,
-    uptime: Duration,
 ) {
     let (_, _, economics, adj_cycles) = extract_edges(prices, adj_cost);
 
@@ -129,7 +128,6 @@ fn update_tui_state(
 
     if let Ok(mut state) = tui_state.write() {
         state.running = true;
-        state.uptime = uptime;
         state.cycle_count = cycle_count;
         state.dex_count = prices.len();
         state.pairs_count = last_prices.len();
@@ -139,6 +137,7 @@ fn update_tui_state(
         state.net_usd_total = net_usd_total;
         state.top_spreads = top_spreads;
         state.last_prices = last_prices;
+        state.last_update = Some(std::time::Instant::now());
     }
 }
 
@@ -283,8 +282,12 @@ async fn main() -> Result<()> {
     // Antes o servidor de métricas nunca era iniciado — Infrastructure::initialize()
     // não era chamado do main.rs, e toda a camada de observabilidade era decorativa.
     // Agora chamamos diretamente: inicia warp em [prometheus].port (fallback 9101).
+    //
+    // shutdown_tx criado aqui (antes de metrics/health-check/TUI) para que
+    // todos os subsistemas spawned possam subscribe() e sair limpo no Ctrl-C.
+    let (shutdown_tx, _) = broadcast::channel::<()>(4);
     if cfg_unlocked.prometheus.enabled || cfg_unlocked.metrics.enabled {
-        if let Err(e) = try_serve_metrics_with_fallback(&cfg_unlocked).await {
+        if let Err(e) = try_serve_metrics_with_fallback(&cfg_unlocked, shutdown_tx.clone()).await {
             warn!("⚠️ Falha ao iniciar servidor Prometheus: {}", e);
         }
     } else {
@@ -362,6 +365,10 @@ async fn main() -> Result<()> {
         .context("❌ Falha ao inicializar DexManager")?,
     );
     info!("🧩 DexManager inicializado com sucesso.");
+    // Health-checker como task sinalizada: antes era tokio::spawn detached
+    // sem shutdown_rx (leaked até o processo morrer). Agora recebe broadcast
+    // e sai limpo no shutdown.
+    dex_manager.start_health_checker(shutdown_tx.subscribe()).await;
 
     // ============================================================
     // 6️⃣ ExecutionEngine removido (codigo morto)
@@ -435,13 +442,12 @@ async fn main() -> Result<()> {
     // ============================================================
     let (price_tx, price_rx) = mpsc::channel::<HashMap<String, HashMap<String, f64>>>(256);
     let price_rx = Arc::new(Mutex::new(price_rx));
-    let (shutdown_tx, _) = broadcast::channel::<()>(4);
 
     let tui_state = Arc::new(std::sync::RwLock::new(tui::TuiState::default()));
     // Paper/headless: TUI precisa de TTY; skip quando PAPER_VALIDATION=1.
     let tui_enabled = !flashloan_bot::core::paper_validation::env_paper_flag();
     if tui_enabled {
-        tui::spawn_tui(tui_state.clone());
+        tui::spawn_tui(tui_state.clone(), shutdown_tx.clone());
     } else {
         info!("📄 PAPER mode: TUI desabilitado (headless)");
     }
@@ -536,7 +542,16 @@ async fn main() -> Result<()> {
         let tui_state = tui_state.clone();
         let adj_cost = adj_cost.clone();
         let top_n = cfg_unlocked.log.top_spreads_n;
-        let start_time = Instant::now();
+
+        // Guarda-forte contra travamento do executor: process_prices()
+        // encadeia execute_opportunity → send_atomic_flashloan + bundle_sender
+        // + telegram, nenhum com timeout próprio (ver execution_engine.rs:337,
+        // bundle_sender.rs:97). Se qualquer um desses .await hung (RPC morto,
+        // builder de bundle pendurado), o bot_task bloqueava pra sempre
+        // segurando bot.lock — sem novos preços, TUI congelava, shutdown
+        // pendurava no try_join_all. Timeout aqui cancela o future (libera o
+        // lock), loga + alerta, e o ciclo seguinte retoma.
+        const EXEC_TIMEOUT: Duration = Duration::from_secs(60);
 
         tokio::spawn(async move {
             info!("🤖 Bot executor iniciado.");
@@ -545,7 +560,10 @@ async fn main() -> Result<()> {
                 tokio::select! {
                     _ = sd_rx.recv() => {
                         info!("🔌 Desligando bot...");
-                        let _ = telegram.send_alert("Shutdown", "Bot sendo desligado").await;
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            telegram.send_alert("Shutdown", "Bot sendo desligado"),
+                        ).await;
                         break;
                     },
                     result = async {
@@ -558,12 +576,33 @@ async fn main() -> Result<()> {
                                 debug!("📊 Ciclo #{} — {} DEXs", cycle_count, prices.len());
                             }
 
-                            update_tui_state(&tui_state, &adj_cost, &prices, top_n, cycle_count, start_time.elapsed());
+                            update_tui_state(&tui_state, &adj_cost, &prices, top_n, cycle_count);
 
-                            let mut bot_guard = bot.lock().await;
-                            if let Err(e) = bot_guard.process_prices(prices).await {
-                                error!("❌ Erro ao processar preços: {:?}", e);
-                                let _ = telegram.send_error_alert("Processamento", &format!("{:?}", e)).await;
+                            // Execução envolvida em timeout: se hung, o future
+                            // é droppado (bot_guard liberado no drop) e o loop
+                            // continua em vez de travar o bot_task pra sempre.
+                            let exec = async {
+                                let mut bot_guard = bot.lock().await;
+                                bot_guard.process_prices(prices).await
+                            };
+                            match tokio::time::timeout(EXEC_TIMEOUT, exec).await {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => {
+                                    error!("❌ Erro ao processar preços: {:?}", e);
+                                    let _ = telegram.send_error_alert("Processamento", &format!("{:?}", e)).await;
+                                }
+                                Err(_) => {
+                                    error!(
+                                        "⏰ Executor travou >{}s no ciclo #{} — abortando future (lock liberado), próximo ciclo retoma.",
+                                        EXEC_TIMEOUT.as_secs(), cycle_count
+                                    );
+                                    let _ = telegram
+                                        .send_error_alert(
+                                            "Executor Timeout",
+                                            &format!("Ciclo #{} travou >{}s — abortado, retomando.", cycle_count, EXEC_TIMEOUT.as_secs()),
+                                        )
+                                        .await;
+                                }
                             }
                         } else {
                             warn!("⚠️ Canal de preços fechado.");
@@ -585,9 +624,15 @@ async fn main() -> Result<()> {
         tokio::spawn(async move {
             if tokio::signal::ctrl_c().await.is_ok() {
                 warn!("🛑 Ctrl-C recebido — encerrando...");
-                let _ = telegram
-                    .send_alert("Shutdown", "Ctrl-C recebido - encerrando bot")
-                    .await;
+                // Alerta de telegram envolvido em timeout: send_alert faz HTTP
+                // sem timeout próprio (telegram.rs:157). Se a rede/Telegram
+                // estiver pendurado, o ctrl_c nunca disparava shutdown_tx — o
+                // bot continuava vivo. Timeout aqui garante que o sinal sai
+                // mesmo se o alerta falhar.
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    telegram.send_alert("Shutdown", "Ctrl-C recebido - encerrando bot"),
+                ).await;
                 let _ = shutdown_tx.send(());
             }
         })
@@ -606,6 +651,16 @@ async fn main() -> Result<()> {
     // Configura a lista de tasks principais
     let tasks = vec![radar_task, bot_task, shutdown_task];
 
+    // Abort handles: se o shutdown ordenado estourar o timeout, forçamos o
+    // abort das tasks que não retornaram. Antes try_join_all era sem timeout
+    // — se o bot_task hung (execução sem timeout, ou radar preso em WS),
+    // o ctrl_c mandava shutdown mas o join esperava pra sempre e o processo
+    // nunca saía (tinha que kill -9). shutdown_timeout (config)liga esse
+    // guarda; default 300s, mas abort garante saída mesmo se uma task ignorar
+    // o sinal.
+    let aborts: Vec<tokio::task::AbortHandle> = tasks.iter().map(|t| t.abort_handle()).collect();
+    let shutdown_timeout = Duration::from_secs(cfg_unlocked.general.shutdown_timeout.max(10) as u64);
+
     info!("🎯 Sistema pronto (modo hot-reload).");
 
     if telegram.is_enabled() {
@@ -614,9 +669,16 @@ async fn main() -> Result<()> {
             .await;
     }
 
-    match future::try_join_all(tasks).await {
-        Ok(_) => info!("✅ Todas as tasks finalizadas."),
-        Err(e) => error!("❌ Erro nas tasks: {:?}", e),
+    match tokio::time::timeout(shutdown_timeout, future::try_join_all(tasks)).await {
+        Ok(Ok(_)) => info!("✅ Todas as tasks finalizadas."),
+        Ok(Err(e)) => error!("❌ Erro nas tasks: {:?}", e),
+        Err(_) => {
+            error!(
+                "⏰ Shutdown excedeu {}s — abortando tasks restantes (kill -9 não mais necessário).",
+                shutdown_timeout.as_secs()
+            );
+            for a in &aborts { a.abort(); }
+        }
     }
 
     metrics::set_bot_status(0);

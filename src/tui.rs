@@ -22,6 +22,12 @@ use std::{
     sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
+use tokio::sync::broadcast;
+
+/// Timeout máximo para `event::read()` — se estourar, o poll retorna sem evento
+/// em vez de travar para sempre. Antes não havia timeout, e um estado inconsistente
+/// do terminal (ex: resize durante poll + read) podia travar a TUI eternamente.
+const READ_EVENT_TIMEOUT: Duration = Duration::from_millis(200);
 
 // ============================================================
 // TUI State
@@ -43,6 +49,20 @@ pub struct TuiState {
     /// Top-N spreads por Spread% desc (espelha log `[TOPSPREAD]`, sem TVL).
     pub top_spreads: Vec<TopSpreadRow>,
     pub recent_opps: Vec<String>,
+    /// Instant do último scan de preços recebido (set em update_tui_state).
+    /// None = nenhum scan chegou ainda. Usado p/ mostrar "último scan: Ns atrás"
+    /// e detectar radar morto (WS caiu, sem novos blocos).
+    pub last_update: Option<Instant>,
+    /// Contador de render ticks (incrementado no loop do TUI a cada 250ms).
+    /// Indicador de heartbeat: se parar de piscar, o próprio TUI travou.
+    pub render_tick: u64,
+    /// Instant em que o processo subiu. Setado uma vez no spawn do TUI;
+    /// o loop de render computa `uptime = start.elapsed()` a cada tick,
+    /// então o uptime avança mesmo se o bot_task travar (preço parar de
+    /// chegar). Antes o uptime só era atualizado em update_tui_state, na
+    /// thread do bot_task — se ela bloqueava em process_prices().await,
+    /// o uptime congelava junto.
+    pub start: Instant,
 }
 
 #[derive(Clone, Debug)]
@@ -85,6 +105,9 @@ impl Default for TuiState {
             last_prices: Vec::new(),
             top_spreads: Vec::new(),
             recent_opps: Vec::new(),
+            last_update: None,
+            render_tick: 0,
+            start: Instant::now(),
         }
     }
 }
@@ -95,53 +118,121 @@ impl Default for TuiState {
 
 pub struct TuiApp {
     state: Arc<RwLock<TuiState>>,
+    shutdown_tx: broadcast::Sender<()>,
 }
 
 impl TuiApp {
-    pub fn new(state: Arc<RwLock<TuiState>>) -> Self {
-        Self { state }
+    pub fn new(state: Arc<RwLock<TuiState>>, shutdown_tx: broadcast::Sender<()>) -> Self {
+        Self { state, shutdown_tx }
     }
 
-    pub async fn run(&self) -> io::Result<()> {
+    pub async fn run(&self, shutdown_rx: &mut broadcast::Receiver<()>) -> io::Result<()> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
-        let mut last_tick = Instant::now();
+        let last_tick = Instant::now();
         let tick_rate = Duration::from_millis(250);
 
+        let result = self.run_inner(&mut terminal, shutdown_rx, last_tick, tick_rate).await;
+
+        // Restaura o terminal EM QUALQUER CASO (erro ou saída normal).
+        // Antes o terminal só era restaurado no Ok(()); se terminal.draw()
+        // falhava, o raw mode ficava ligado pra sempre e o usuário tinha
+        // que resetar o terminal manualmente.
+        let mut cleanup = || -> io::Result<()> {
+            disable_raw_mode()?;
+            execute!(
+                terminal.backend_mut(),
+                LeaveAlternateScreen,
+                DisableMouseCapture
+            )?;
+            terminal.show_cursor()?;
+            Ok(())
+        };
+
+        // cleanup ignorando erro do result — queremos restaurar o terminal
+        // mesmo se o loop principal já tiver falhado.
+        let _ = cleanup();
+
+        result
+    }
+
+    async fn run_inner(
+        &self,
+        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+        shutdown_rx: &mut broadcast::Receiver<()>,
+        mut last_tick: Instant,
+        tick_rate: Duration,
+    ) -> io::Result<()> {
         loop {
-            terminal.draw(|f| self.draw(f))?;
+            // Shutdown check: try_recv é síncrono. Ok | Closed → sair e
+            // restaurar o terminal. Antes a thread do TUI era std::thread
+            // detached sem sinal — no Ctrl-C o runtime principal morria mas
+            // a thread continuava em raw mode, deixando o terminal quebrado
+            // até matar o processo. Agora o broadcast do main quebra o loop
+            // e executa o cleanup (disable_raw_mode / LeaveAlternateScreen).
+            match shutdown_rx.try_recv() {
+                Ok(_) | Err(broadcast::error::TryRecvError::Closed) => return Ok(()),
+                Err(broadcast::error::TryRecvError::Lagged(_)) | Err(broadcast::error::TryRecvError::Empty) => {}
+            }
+
+            // Heartbeat + uptime: atualiza a cada render, na thread do TUI
+            // (runtime próprio). Independente do bot_task — se o executor
+            // travar em process_prices().await, o uptime mesmo assim avança.
+            if let Ok(mut s) = self.state.write() {
+                s.render_tick = s.render_tick.wrapping_add(1);
+                s.uptime = s.start.elapsed();
+            }
+
+            // terminal.draw() pode falhar se o terminal for redimensionado
+            // para um tamanho muito pequeno. Ignoramos o erro em vez de
+            // propagar com ? — draw falho não deve matar a TUI.
+            let _ = terminal.draw(|f| self.draw(f));
 
             let timeout = tick_rate
                 .checked_sub(last_tick.elapsed())
                 .unwrap_or(Duration::ZERO);
 
+            // event::poll(timeout) com timeout garante que o loop não trava
+            // mesmo se não houver input. O timeout é o tempo restante até
+            // o próximo tick de render.
             if crossterm::event::poll(timeout)? {
-                if let Event::Key(key) = event::read()? {
+                // event::read() é bloqueante — usamos READ_EVENT_TIMEOUT
+                // para garantir que não trava se o terminal ficar inconsistente
+                // (ex: resize durante poll, ou stdin em estado estranho).
+                let ev = wait_event_with_timeout(READ_EVENT_TIMEOUT)?;
+                if let Some(Event::Key(key)) = ev {
                     match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => break,
-                        KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => break,
+                        KeyCode::Char('q') | KeyCode::Esc => {
+                            // Envia sinal de shutdown para o processo principal.
+                            // Antes a TUI só saía do loop, mas o bot_task e radar_task
+                            // continuavam rodando — e como raw mode desliga ISIG,
+                            // o tokio::signal::ctrl_c() nunca disparava, então o
+                            // processo nunca morria sem um segundo Ctrl+C.
+                            let _ = self.shutdown_tx.send(());
+                            return Ok(());
+                        }
+                        KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                            let _ = self.shutdown_tx.send(());
+                            return Ok(());
+                        }
                         _ => {}
                     }
                 }
             }
 
+            // Trata resize: se o terminal foi redimensionado, crossterm gera
+            // Event::Resize. Esse evento é lido por poll/read normalmente,
+            // então não precisa de tratamento especial — só garantir que o
+            // draw roda de novo.
+
             if last_tick.elapsed() >= tick_rate {
                 last_tick = Instant::now();
             }
         }
-
-        disable_raw_mode()?;
-        execute!(
-            terminal.backend_mut(),
-            LeaveAlternateScreen,
-            DisableMouseCapture
-        )?;
-        terminal.show_cursor()?;
-        Ok(())
     }
 
     fn draw(&self, f: &mut Frame) {
@@ -198,12 +289,41 @@ impl TuiApp {
             state.uptime.as_secs() % 60
         );
 
+        // Heartbeat: pisca a cada render tick (4 ticks/s). Parado = TUI travou.
+        let beat = if state.render_tick % 2 == 0 { "●" } else { "○" };
+        let beat_color = if state.render_tick % 2 == 0 { Color::Green } else { Color::DarkGray };
+
+        // Idade do último scan: quanto faz que o radar entregou preços. Se crescer
+        // além de ~normal (segundos), radar stallou (WS morto / RPC rate-limit).
+        let scan_age = match state.last_update {
+            Some(t) => {
+                let secs = t.elapsed().as_secs();
+                if secs < 60 {
+                    format!("{}s", secs)
+                } else {
+                    format!("{}m{}s", secs / 60, secs % 60)
+                }
+            }
+            None => "--".to_string(),
+        };
+        // >15s sem scan = suspeito (block time Polygon ~2s); pinta de vermelho.
+        let scan_age_color = match state.last_update {
+            Some(t) if t.elapsed().as_secs() > 15 => Color::Red,
+            Some(_) => Color::Green,
+            None => Color::Yellow,
+        };
+
         let status_items = vec![
             ListItem::new(Line::from(vec![
-                Span::styled("  Status: ", Style::default().fg(Color::Gray)),
+                Span::styled("  ", Style::default()),
+                Span::styled(beat, Style::default().fg(beat_color).add_modifier(Modifier::BOLD)),
+                Span::styled(" Status: ", Style::default().fg(Color::Gray)),
                 Span::styled("RUNNING", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
                 Span::raw(" | "),
                 Span::raw(format!("Uptime: {}", uptime_str)),
+                Span::raw(" | "),
+                Span::styled("scan: ", Style::default().fg(Color::Gray)),
+                Span::styled(scan_age, Style::default().fg(scan_age_color)),
             ])),
             ListItem::new(Line::from(vec![
                 Span::styled("  DEXes: ", Style::default().fg(Color::Gray)),
@@ -393,6 +513,23 @@ fn fmt_opt_net(v: Option<f64>) -> String {
     }
 }
 
+/// Lê um evento do terminal com timeout máximo. Se `event::read()` não
+/// responder dentro de `READ_EVENT_TIMEOUT`, retorna None em vez de travar.
+/// Previne que a TUI congele se o stdin ficar em estado inconsistente.
+fn wait_event_with_timeout(timeout: Duration) -> io::Result<Option<Event>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        // poll com 50ms: granularidade fina o bastante para responder
+        // a Ctrl+C / 'q' sem delay perceptível, mas sem travar.
+        if crossterm::event::poll(Duration::from_millis(50))? {
+            return Ok(Some(event::read()?));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+    }
+}
+
 /// Chave canônica de par (tokens sorted, direção-agnóstica): "WETH-USDC" ==
 /// "USDC-WETH" == "usdc-weth". Usado p/ casar adj_cycles (canonical) com
 /// PriceRow (direcional) sem depender da direção do label.
@@ -415,12 +552,13 @@ pub fn norm_pair(pair: &str) -> String {
 // ============================================================
 
 /// Spawn the TUI in a background thread
-pub fn spawn_tui(state: Arc<RwLock<TuiState>>) {
+pub fn spawn_tui(state: Arc<RwLock<TuiState>>, shutdown_tx: broadcast::Sender<()>) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let app = TuiApp::new(state);
-            if let Err(e) = app.run().await {
+            let mut sd_rx = shutdown_tx.subscribe();
+            let app = TuiApp::new(state, shutdown_tx);
+            if let Err(e) = app.run(&mut sd_rx).await {
                 eprintln!("TUI error: {:?}", e);
             }
         });

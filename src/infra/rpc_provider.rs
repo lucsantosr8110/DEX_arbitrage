@@ -16,7 +16,13 @@ use ethers::{
     providers::{Http, Provider, Ws},
     signers::{LocalWallet, Signer},
 };
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use tokio::time::{sleep, Instant};
 // ⚠️ 'error' removido pois não estava sendo usado
 use tracing::{info, warn}; 
@@ -24,6 +30,11 @@ use tracing::{info, warn};
 use crate::{config::NetworkConfig, infra::metrics, AppMiddleware};
 
 pub struct RpcProvider;
+
+/// Índice rotativo p/ round-robin do `connect_ws_with_fallback`. Cada
+/// reconexão começa no próximo endpoint da lista — "caiu um → passa ao
+/// próximo" — em vez de martelar sempre o índice 0 (possivelmente morto).
+static WS_START_IDX: AtomicUsize = AtomicUsize::new(0);
 
 /// Um endpoint é inutilizável se estiver vazio ou se ainda for um placeholder
 /// `${VAR}` — o expansor de `Config::from_file` mantém o literal quando a variável
@@ -204,12 +215,25 @@ impl RpcProvider {
         _cfg: &NetworkConfig, // ⚠️ 'cfg' não estava sendo usado, adicionado '_'
         endpoints: &[String],
     ) -> Result<Arc<Provider<Ws>>> {
-        for (i, url) in endpoints.iter().enumerate() {
+        let n = endpoints.len();
+        if n == 0 {
+            return Err(anyhow!("❌ Nenhum WebSocket disponível após fallback."));
+        }
+
+        // Round-robin: cada chamada começa do próximo índice. Evita martelar
+        // sempre o endpoint 0 quando ele cai — dispersa reconexões entre
+        // todos os configurados ("caiu um → passa ao próximo, sucessivamente").
+        // Primeira chamada (boot) retorna 0 = endpoint primário definido no config.
+        let start = WS_START_IDX.fetch_add(1, Ordering::Relaxed) % n;
+
+        for k in 0..n {
+            let i = (start + k) % n;
+            let url = &endpoints[i];
             if !is_usable_endpoint(url) {
                 continue;
             }
 
-            let start = Instant::now();
+            let start_t = Instant::now();
             info!(
                 target: "rpc_provider",
                 "{} | 🔁 Tentando WS[{}]: {}",
@@ -221,7 +245,7 @@ impl RpcProvider {
             match Provider::<Ws>::connect(url.clone()).await {
                 Ok(provider) => {
                     let chain_id = provider.get_chainid().await.unwrap_or_default();
-                    let elapsed = start.elapsed().as_millis();
+                    let elapsed = start_t.elapsed().as_millis();
                     info!(
                         target: "rpc_provider",
                         "{} | 📡 WS conectado (chain_id={}, {}ms)",
@@ -235,7 +259,7 @@ impl RpcProvider {
                 Err(e) => {
                     warn!("⚠️ Falha ao conectar WS em {}: {:?}", url, e);
                     metrics::observe_exec_latency_ms(
-                        start.elapsed().as_millis() as f64,
+                        start_t.elapsed().as_millis() as f64,
                         "rpc_ws_fallback_fail",
                     );
                     sleep(Duration::from_millis(300)).await;

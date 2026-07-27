@@ -32,7 +32,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, error, info, instrument, warn};
 
 /// Intervalo entre verificações de saúde
@@ -135,7 +135,9 @@ impl DexManager {
         );
 
         manager.start_metadata_warm().await;
-        manager.start_health_checker().await;
+        // start_health_checker() é chamado de main.rs com shutdown_rx, para
+        // que o loop de health-check saia limpo no shutdown (antes era
+        // tokio::spawn detached sem sinal — leaked até o processo morrer).
         Ok(manager)
     }
 
@@ -316,11 +318,19 @@ impl DexManager {
             .collect()
     }
 
-    pub async fn start_health_checker(&self) {
+    pub async fn start_health_checker(&self, mut shutdown_rx: broadcast::Receiver<()>) {
         let mgr = self.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(HEALTH_CHECK_INTERVAL).await;
+                // Sleep com select em shutdown: antes era sleep pelado, loop
+                // nunca saía no shutdown — task leaked. Agora broadcast quebra.
+                tokio::select! {
+                    _ = shutdown_rx.recv() => {
+                        info!("🩺 Health-check: shutdown recebido, encerrando.");
+                        break;
+                    }
+                    _ = tokio::time::sleep(HEALTH_CHECK_INTERVAL) => {}
+                }
                 // Auto-recovery: DEXs marcados unhealthy não são mais consultados
                 // pelo radar (get_healthy_adapters filtra health=false), então nunca
                 // recebem um multicall de sucesso que chamaria mark_healthy —

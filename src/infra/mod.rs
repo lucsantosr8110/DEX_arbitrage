@@ -79,9 +79,13 @@ impl Infrastructure {
             Err(e) => warn!("Falha ao conectar WebSocket: {e}"),
         }
 
-        // Métricas Prometheus (com fallback)
+        // Métricas Prometheus (com fallback). Infrastructure::initialize é
+        // camada legada (main.rs usa try_serve_metrics_with_fallback direto
+        // com o shutdown_tx do processo); criamos um canal local só p/ satisfazer
+        // a assinatura — o servidor aqui spawned sem sinal real de shutdown.
         if cfg.metrics.enabled {
-            if let Err(e) = try_serve_metrics_with_fallback(&cfg).await {
+            let (local_tx, _) = tokio::sync::broadcast::channel::<()>(4);
+            if let Err(e) = try_serve_metrics_with_fallback(&cfg, local_tx).await {
                 warn!("Falha ao iniciar métricas Prometheus: {e}");
             }
         } else {
@@ -127,7 +131,7 @@ impl Infrastructure {
 // Servidor Prometheus com fallback automático
 // ============================================================
 
-pub async fn try_serve_metrics_with_fallback(cfg: &Config) -> Result<()> {
+pub async fn try_serve_metrics_with_fallback(cfg: &Config, shutdown_tx: tokio::sync::broadcast::Sender<()>) -> Result<()> {
     use crate::infra::metrics::{inc_bot_start_total, set_bot_status};
 
     // Preferir [prometheus].port (alinhado com prometheus.yml) quando ativo;
@@ -146,7 +150,7 @@ pub async fn try_serve_metrics_with_fallback(cfg: &Config) -> Result<()> {
     for attempt in 0..3 {
         let addr: SocketAddr = ([0, 0, 0, 0], port).into();
 
-        match start_metrics_server(addr).await {
+        match start_metrics_server(addr, shutdown_tx.clone()).await {
             Ok(_) => {
                 info!(
                     "{} | Prometheus ativo em http://0.0.0.0:{}/metrics",
@@ -178,7 +182,7 @@ pub async fn try_serve_metrics_with_fallback(cfg: &Config) -> Result<()> {
 // Inicializador real do servidor Prometheus
 // ============================================================
 
-async fn start_metrics_server(addr: SocketAddr) -> Result<()> {
+async fn start_metrics_server(addr: SocketAddr, shutdown_tx: tokio::sync::broadcast::Sender<()>) -> Result<()> {
     use prometheus::{Encoder, TextEncoder};
     use warp::Filter;
 
@@ -203,14 +207,25 @@ async fn start_metrics_server(addr: SocketAddr) -> Result<()> {
         warp::reply::with_header(body, "content-type", "text/plain; version=0.0.4")
     });
 
-    // Rodar servidor em thread assíncrona
+    // Rodar servidor em thread assíncrona com graceful shutdown: antes
+    // warp::serve().run(addr) nunca retornava — task leaked, porta ficava
+    // presa até o processo morrer (reinício pegava EADDRINUSE às vezes).
+    // Agora select! entre run() e o broadcast de shutdown: quando o sinal
+    // chega, o future run() é droppado e o listener fecha.
     tokio::spawn(async move {
         info!(
             "{} | Servidor Prometheus aguardando conexões em {}",
             chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"),
             addr
         );
-        warp::serve(routes).run(addr).await;
+        let mut rx = shutdown_tx.subscribe();
+        let server = warp::serve(routes).run(addr);
+        tokio::select! {
+            _ = server => {}
+            _ = rx.recv() => {
+                info!("📈 Servidor Prometheus: shutdown recebido, fechando listener {}.", addr);
+            }
+        }
     });
 
     // Pequeno atraso para garantir binding da porta

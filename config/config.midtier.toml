@@ -209,9 +209,11 @@ rpc_endpoints = [
     "https://1rpc.io/matic",
 ]
 ws_endpoints = [
+    # Público primeiro: WS privado cai → radar morre → TUI congela. Sem auth
+    # mantém radar vivo mesmo se chaves pagas falharem.
+    "wss://polygon-bor-rpc.publicnode.com",
     "${ALCHEMY_WS_URL}",
     "${INFURA_WS_URL}",
-    "wss://polygon-bor-rpc.publicnode.com",
     "wss://polygon.drpc.org",
 ]
 timeout_ms = 5000
