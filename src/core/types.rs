@@ -43,6 +43,15 @@ pub enum ExecutionOutcome {
     Dropped {
         nonce: U256,
     },
+    /// B4: tx broadcast mas o re-bump de gas (RBF underpriced) ultrapassou o teto
+    /// `gas_ceiling_gwei` ou esgotou `max_replace_attempts`. A tx pendente foi
+    /// abandonada (não substituída por gas maior) — nonce ainda pode estar na
+    /// rede; o nonce reaper (B8) cuida da recuperação. Não conta como executada.
+    Expired {
+        nonce: U256,
+        latest_tx_hash: Option<H256>,
+        reason: String,
+    },
     AbortedPreBroadcast {
         reason: String,
     },

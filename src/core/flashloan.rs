@@ -78,6 +78,42 @@ pub enum FlashloanError {
 }
 
 // ============================================================================
+// B4 — RBF re-bump de gas (underpriced / replacement)
+// ============================================================================
+/// Motivo de abort do re-bump acumulado.
+pub(super) enum RbfBumpAbort {
+    /// `max_replace_attempts` excedido — para de spamar replacement.
+    MaxAttempts,
+    /// `gas_ceiling_gwei` excedido — nunca paga gas acima do teto do operador.
+    CeilingExceeded,
+}
+
+/// B4 — re-bump acumulado (×`multiplier_bps`/100) de `max_fee` E `max_priority`,
+/// mesmo nonce. Saturating p/ não overflow. Retorna `Err` se exceder
+/// `max_replace_attempts` ou `gas_ceiling_wei`. Item fn pura (testável sem RPC).
+pub(super) fn rbf_bump_gas(
+    max_fee: &mut U256,
+    max_priority: &mut U256,
+    replacement_count: &mut u32,
+    multiplier_bps: U256,
+    max_replace_attempts: u32,
+    gas_ceiling_wei: Option<U256>,
+) -> Result<(), RbfBumpAbort> {
+    if *replacement_count >= max_replace_attempts {
+        return Err(RbfBumpAbort::MaxAttempts);
+    }
+    *max_fee = max_fee.saturating_mul(multiplier_bps) / U256::from(100u64);
+    *max_priority = max_priority.saturating_mul(multiplier_bps) / U256::from(100u64);
+    *replacement_count += 1;
+    if let Some(ceil) = gas_ceiling_wei {
+        if *max_fee > ceil {
+            return Err(RbfBumpAbort::CeilingExceeded);
+        }
+    }
+    Ok(())
+}
+
+// ============================================================================
 // Main Client
 // ============================================================================
 #[derive(Clone)]
@@ -1754,12 +1790,23 @@ impl ArbitrageClient {
         // Política de retry/RBF. Uma tentativa lógica = um nonce. Retry = replacement
         // (mesmo nonce + gas maior), nunca nonce novo. Evita double execution: duas
         // txs com nonces distintos que ambas incluem e ambas executam a arbitragem.
-        let (max_retries, replace_multiplier, confirm_timeout) = {
+        let (max_retries, replace_multiplier, confirm_timeout, max_replace_attempts, gas_ceiling_wei) = {
             let cfg = self.config.lock().await;
-            let m = cfg.execution.replace_multiplier.unwrap_or(1.12).max(1.0);
+            // B4: default 1.15 (bump max_fee E max_priority). 1.12 era insuficiente
+            // p/ substituir tx underpriced em congestionamento na Polygon.
+            // SAFETY-EV: 1.12 falhava em re-bump (underpriced persistente); 1.15
+            // cobre o spread típico de priority fee entre blocos congestionados.
+            let m = cfg.execution.replace_multiplier.unwrap_or(1.15).max(1.0);
             // max_retries limitado a 4 p/ não virar spam de replacement.
             let retries = cfg.execution.max_retries.clamp(1, 4) as usize;
-            (retries, m, Duration::from_secs(30))
+            let max_replace = cfg.execution.max_replace_attempts.max(0);
+            // Teto de gwei → wei para comparar com max_fee (U256). None/0 = sem teto.
+            let ceiling_wei = cfg
+                .execution
+                .gas_ceiling_gwei
+                .filter(|g| *g > 0.0)
+                .map(|g| crate::core::gas::gwei_f64(g));
+            (retries, m, Duration::from_secs(30), max_replace, ceiling_wei)
         };
         let send_timeout = Duration::from_secs(10);
         let multiplier_bps = U256::from((replace_multiplier * 100.0).round() as u64);
@@ -1793,18 +1840,51 @@ impl ArbitrageClient {
         let mut latest_tx_hash: Option<H256> = None;
         let mut replacement_count: u32 = 0;
 
+        // B4 — helper de re-bump acumulado (×replace_multiplier) com teto e cap.
+        // Retorna o motivo do abort se exceder max_replace_attempts ou gas_ceiling.
+        // Bump é inteiro (×100 → /100) p/ evitar drift de f64. Mesmo nonce sempre.
+        // Item fn (não closure) → não captura, evita borrow conflict no loop.
+
+        let mut skip_next_bump = false;
         for attempt in 0..max_retries {
-            if attempt > 0 {
+            if attempt > 0 && !skip_next_bump {
                 // Bump integer (x100 → /100) p/ evitar drift de f64. Mesmo nonce.
-                max_fee = max_fee.saturating_mul(multiplier_bps) / U256::from(100u64);
-                max_priority = max_priority.saturating_mul(multiplier_bps) / U256::from(100u64);
-                replacement_count += 1;
+                if let Err(abort) = rbf_bump_gas(
+                    &mut max_fee,
+                    &mut max_priority,
+                    &mut replacement_count,
+                    multiplier_bps,
+                    max_replace_attempts,
+                    gas_ceiling_wei,
+                ) {
+                    let reason = match abort {
+                        RbfBumpAbort::MaxAttempts => {
+                            format!("max_replace_attempts ({}) excedido", max_replace_attempts)
+                        }
+                        RbfBumpAbort::CeilingExceeded => {
+                            "gas_ceiling_gwei excedido no re-bump".to_string()
+                        }
+                    };
+                    warn!(
+                        opp_id = %opp_id, nonce = ?nonce, replacement_count,
+                        max_fee = ?max_fee, "⏹️ RBF expirada: {} — tx pendente abandonada", reason
+                    );
+                    return Ok(BundleResult::skipped()
+                        .with_execution_mode("rbf_expired")
+                        .with_tx_hash(latest_tx_hash.map(|h| format!("{:?}", h)))
+                        .with_outcome(ExecutionOutcome::Expired {
+                            nonce,
+                            latest_tx_hash,
+                            reason,
+                        }));
+                }
                 info!(
                     opp_id = %opp_id, mode, attempt, replacement_count,
                     nonce = ?nonce, max_fee = ?max_fee, max_priority = ?max_priority,
                     "🔄 RBF replacement: mesmo nonce, gas bumped"
                 );
             }
+            skip_next_bump = false;
 
             // Fixa nonce + gas no TypedTransaction do ContractCall. ethers skipa
             // o fetch de nonce em send() quando o campo já está setado.
@@ -1987,6 +2067,53 @@ impl ArbitrageClient {
                 }
                 Ok(Err(e)) => {
                     let s = e.to_string().to_lowercase();
+                    // B4: "replacement transaction underpriced" / "transaction
+                    // underpriced" → re-bump acumulado ×replace_multiplier no mesmo
+                    // nonce, até max_replace_attempts ou gas_ceiling_gwei. Não cria
+                    // nonce novo (evita double execution). skip_next_bump evita
+                    // double-bump no próximo iteration do loop.
+                    let underpriced = s.contains("underpriced");
+                    if underpriced {
+                        if let Err(abort) = rbf_bump_gas(
+                            &mut max_fee,
+                            &mut max_priority,
+                            &mut replacement_count,
+                            multiplier_bps,
+                            max_replace_attempts,
+                            gas_ceiling_wei,
+                        ) {
+                            let reason = match abort {
+                                RbfBumpAbort::MaxAttempts => format!(
+                                    "max_replace_attempts ({}) excedido em re-bump underpriced",
+                                    max_replace_attempts
+                                ),
+                                RbfBumpAbort::CeilingExceeded => {
+                                    "gas_ceiling_gwei excedido em re-bump underpriced".to_string()
+                                }
+                            };
+                            warn!(
+                                opp_id = %opp_id, nonce = ?nonce, replacement_count,
+                                max_fee = ?max_fee,
+                                "⏹️ RBF expirada (underpriced): {} — tx pendente abandonada",
+                                reason
+                            );
+                            return Ok(BundleResult::skipped()
+                                .with_execution_mode("rbf_expired")
+                                .with_tx_hash(latest_tx_hash.map(|h| format!("{:?}", h)))
+                                .with_outcome(ExecutionOutcome::Expired {
+                                    nonce,
+                                    latest_tx_hash,
+                                    reason,
+                                }));
+                        }
+                        info!(
+                            opp_id = %opp_id, nonce = ?nonce, replacement_count,
+                            max_fee = ?max_fee, max_priority = ?max_priority,
+                            "🔁 underpriced — re-bump acumulado, mesmo nonce (RBF)"
+                        );
+                        skip_next_bump = true;
+                        continue;
+                    }
                     // A11: "nonce too low" significa tx com esse nonce JÁ foi
                     // incluída na chain — não está pendente. Classifica Dropped
                     // (nonce consumido) em vez de TimeoutStuck (que prenderia o
@@ -3284,5 +3411,51 @@ mod tests {
             serde_json::to_string_pretty(&out).unwrap(),
         )
         .unwrap();
+    }
+
+    /// B4 — re-bump acumulado ×1.15 (115 bps) de max_fee E max_priority.
+    /// Cenário underpriced: 1º bump habilitado (cap=3), gas cresce, 2º send
+    /// teria gas maior (sucesso). 4º bump → MaxAttempts. Ceiling → abort.
+    #[test]
+    fn b4_rbf_bump_gas_accumulates_and_caps() {
+        let multiplier_bps = U256::from(115u64); // 1.15
+        let mut max_fee = U256::from(100_000_000_000u64); // 100 gwei
+        let mut max_priority = U256::from(10_000_000_000u64); // 10 gwei
+        let mut count: u32 = 0;
+
+        // 1º bump (underpriced no attempt 1) → ok, gas ×1.15.
+        assert!(rbb_bump_ok(&mut max_fee, &mut max_priority, &mut count, multiplier_bps, 3, None));
+        assert_eq!(max_fee, U256::from(115_000_000_000u64)); // 115 gwei
+        assert_eq!(max_priority, U256::from(11_500_000_000u64));
+        assert_eq!(count, 1);
+
+        // 2º e 3º bumps → ok (cap=3 permite 3 bumps).
+        assert!(rbf_bump_gas(&mut max_fee, &mut max_priority, &mut count, multiplier_bps, 3, None).is_ok());
+        assert!(rbf_bump_gas(&mut max_fee, &mut max_priority, &mut count, multiplier_bps, 3, None).is_ok());
+        assert_eq!(count, 3);
+
+        // 4º bump → MaxAttempts.
+        let err = rbf_bump_gas(&mut max_fee, &mut max_priority, &mut count, multiplier_bps, 3, None).unwrap_err();
+        assert!(matches!(err, RbfBumpAbort::MaxAttempts));
+
+        // Ceiling: teto 120 gwei. 1 bump de 100→115 ok; 2º 115→132.25 > 120 → abort.
+        let mut mf = U256::from(100_000_000_000u64);
+        let mut mp = U256::from(1_000_000_000u64);
+        let mut c: u32 = 0;
+        let ceil = Some(U256::from(120_000_000_000u64));
+        assert!(rbf_bump_gas(&mut mf, &mut mp, &mut c, multiplier_bps, 10, ceil).is_ok()); // 115
+        let err2 = rbf_bump_gas(&mut mf, &mut mp, &mut c, multiplier_bps, 10, ceil).unwrap_err();
+        assert!(matches!(err2, RbfBumpAbort::CeilingExceeded));
+    }
+
+    fn rbb_bump_ok(
+        max_fee: &mut U256,
+        max_priority: &mut U256,
+        count: &mut u32,
+        multiplier_bps: U256,
+        max_attempts: u32,
+        ceil: Option<U256>,
+    ) -> bool {
+        rbf_bump_gas(max_fee, max_priority, count, multiplier_bps, max_attempts, ceil).is_ok()
     }
 }

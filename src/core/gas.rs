@@ -512,7 +512,7 @@ fn next_gas_multiplier(previous: f64, actual_units: f64, estimated_units: f64) -
 ///
 /// `gwei(x as u64)` descartava a fração: um oracle devolvendo 30.7 gwei virava
 /// 30, e uma priority de 0.6 gwei virava **0** (tx que nunca entra em bloco).
-fn gwei_f64(n: f64) -> U256 {
+pub(crate) fn gwei_f64(n: f64) -> U256 {
     if !n.is_finite() || n <= 0.0 {
         return U256::zero();
     }

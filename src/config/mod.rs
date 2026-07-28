@@ -1244,6 +1244,11 @@ fn default_top_n_opportunities() -> u32 {
     1
 }
 
+/// B4: número máximo de re-bumps acumulados ao receber "underpriced".
+fn default_max_replace_attempts() -> u32 {
+    3
+}
+
 impl Default for RouteValidationConfig {
     fn default() -> Self {
         Self {
@@ -1575,6 +1580,21 @@ pub struct ExecutionConfig {
     pub replace_multiplier: Option<f64>,
     #[serde(default)]
     pub replace_max_retries: Option<u8>,
+
+    /// B4: número máximo de re-bumps acumulados (×1.15) ao receber erro
+    /// "replacement transaction underpriced" / "transaction underpriced".
+    /// Default 3. Cada re-bump multiplica max_fee E max_priority por
+    /// `replace_multiplier`. Excedido → abort (tx expirada, não spam de RBF).
+    #[serde(default = "default_max_replace_attempts")]
+    pub max_replace_attempts: u32,
+
+    /// B4: teto absoluto de gwei para max_fee. Se um re-bump ultrapassar,
+    /// aborta (Expired) — nunca paga gas acima do teto do operador. Default
+    /// 500 gwei (Polygon raramente passa de ~3k gwei em spikes; 500 é
+    /// conservador para evitar sangria em congestionamento extremo).
+    /// `None`/0 = sem teto explícito (não recomendado).
+    #[serde(default)]
+    pub gas_ceiling_gwei: Option<f64>,
     #[serde(default)]
     pub force_flashloan: bool,
     #[serde(default)]
@@ -1641,8 +1661,10 @@ impl Default for ExecutionConfig {
             priority: Some(ExecutionPriorityConfig::default()),
             logging: Some(ExecutionLoggingConfig::default()),
             auto_replace_tx: true,
-            replace_multiplier: Some(1.12),
+            replace_multiplier: Some(1.15),
             replace_max_retries: Some(5),
+            max_replace_attempts: default_max_replace_attempts(),
+            gas_ceiling_gwei: Some(500.0),
             force_flashloan: false,
             enabled: true,
             execution_mode: Some("direct".to_string()),
