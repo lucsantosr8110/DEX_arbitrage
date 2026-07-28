@@ -433,6 +433,15 @@ impl ArbitrageClient {
         }
 
         for (i, step) in steps.iter().enumerate() {
+            // A13: hop no-op (token_in == token_out) — `force_usdt` às vezes anexa
+            // `USDT→USDT`, que reverte on-chain como V2 IDENTICAL_ADDRESSES e
+            // queima gás. Rejeitar antes do broadcast.
+            if step.token_in == step.token_out {
+                return Err(FlashloanError::InvalidRoute(format!(
+                    "Step {}: no-op hop (token_in == token_out)",
+                    i
+                )));
+            }
             if step.amount_out_min.is_zero() {
                 return Err(FlashloanError::InvalidRoute(format!(
                     "Step {}: amount_out_min is zero",
@@ -2703,6 +2712,21 @@ mod tests {
             .validate_steps_critical(&steps)
             .expect_err("amount_out_min zero");
         assert!(err.to_string().contains("amount_out_min is zero"));
+    }
+
+    #[test]
+    fn steps_critical_rejects_noop_hop() {
+        // A13: force_usdt às vezes anexa USDT→USDT — reverte on-chain como
+        // IDENTICAL_ADDRESSES e queima gás. Deve ser rejeitado pré-broadcast.
+        let client = make_client();
+        let a = Address::from_low_u64_be(1);
+        let steps = vec![
+            step(0, a, a, U256::from(100)), // no-op: token_in == token_out
+        ];
+        let err = client
+            .validate_steps_critical(&steps)
+            .expect_err("no-op hop");
+        assert!(err.to_string().contains("no-op hop"));
     }
 
     #[test]
