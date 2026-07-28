@@ -200,7 +200,9 @@ impl ArbitrageClient {
     }
 
     /// B7: acesso ao ledger (para watcher / telemetria externa).
-    pub fn profit_ledger(&self) -> Arc<tokio::sync::Mutex<crate::core::profit_ledger::ProfitLedger>> {
+    pub fn profit_ledger(
+        &self,
+    ) -> Arc<tokio::sync::Mutex<crate::core::profit_ledger::ProfitLedger>> {
         self.profit_ledger.clone()
     }
 
@@ -239,7 +241,8 @@ impl ArbitrageClient {
                 return false;
             }
         };
-        self.reap_decide(sender, on_chain_pending, nonce_stall_secs).await
+        self.reap_decide(sender, on_chain_pending, nonce_stall_secs)
+            .await
     }
 
     async fn reap_decide(&self, sender: Address, on_chain_pending: u64, stall: u64) -> bool {
@@ -247,7 +250,10 @@ impl ArbitrageClient {
         let (verdict, pending_local) = {
             let reaper = self.nonce_reaper.lock().await;
             let pending_local = on_chain_pending + reaper.in_flight_count() as u64;
-            (reaper.verdict(pending_local, on_chain_pending, now, stall), pending_local)
+            (
+                reaper.verdict(pending_local, on_chain_pending, now, stall),
+                pending_local,
+            )
         };
         match verdict {
             crate::core::nonce_reaper::ReapVerdict::NoGap => {
@@ -255,7 +261,10 @@ impl ArbitrageClient {
                 false
             }
             crate::core::nonce_reaper::ReapVerdict::GapStalling { lowest, .. } => {
-                debug!(lowest, pending_local, "B8 reaper: gap stalling, sem cancel ainda");
+                debug!(
+                    lowest,
+                    pending_local, "B8 reaper: gap stalling, sem cancel ainda"
+                );
                 false
             }
             crate::core::nonce_reaper::ReapVerdict::Reap { lowest } => {
@@ -1354,7 +1363,10 @@ impl ArbitrageClient {
                      consecutivas ≥ threshold — kill switch deve atuar"
                 );
             }
-            debug!("📦 Bloco atualizado: {} (provisory=${:.4} final=${:.4})", block, provisory, final_);
+            debug!(
+                "📦 Bloco atualizado: {} (provisory=${:.4} final=${:.4})",
+                block, provisory, final_
+            );
         }
     }
 
@@ -1954,7 +1966,13 @@ impl ArbitrageClient {
         // Política de retry/RBF. Uma tentativa lógica = um nonce. Retry = replacement
         // (mesmo nonce + gas maior), nunca nonce novo. Evita double execution: duas
         // txs com nonces distintos que ambas incluem e ambas executam a arbitragem.
-        let (max_retries, replace_multiplier, confirm_timeout, max_replace_attempts, gas_ceiling_wei) = {
+        let (
+            max_retries,
+            replace_multiplier,
+            confirm_timeout,
+            max_replace_attempts,
+            gas_ceiling_wei,
+        ) = {
             let cfg = self.config.lock().await;
             // B4: default 1.15 (bump max_fee E max_priority). 1.12 era insuficiente
             // p/ substituir tx underpriced em congestionamento na Polygon.
@@ -1970,7 +1988,13 @@ impl ArbitrageClient {
                 .gas_ceiling_gwei
                 .filter(|g| *g > 0.0)
                 .map(|g| crate::core::gas::gwei_f64(g));
-            (retries, m, Duration::from_secs(30), max_replace, ceiling_wei)
+            (
+                retries,
+                m,
+                Duration::from_secs(30),
+                max_replace,
+                ceiling_wei,
+            )
         };
         let send_timeout = Duration::from_secs(10);
         let multiplier_bps = U256::from((replace_multiplier * 100.0).round() as u64);
@@ -1999,7 +2023,10 @@ impl ArbitrageClient {
         };
         // B8: registra nonce como in-flight p/ o reaper rastrear stall.
         let nonce_u64 = nonce.as_u64();
-        self.nonce_reaper.lock().await.note_broadcast(nonce_u64, std::time::Instant::now());
+        self.nonce_reaper
+            .lock()
+            .await
+            .note_broadcast(nonce_u64, std::time::Instant::now());
 
         let (mut max_fee, mut max_priority) = {
             let mut tx_req = Eip1559TransactionRequest::new();
@@ -2147,18 +2174,23 @@ impl ArbitrageClient {
                                 // veio do receipt (evento decodificado); Estimated se caiu
                                 // no fallback do gross do finder (A1). Estimated NÃO alimenta
                                 // o circuit breaker de perda.
-                                let inclusion_block = receipt
-                                    .block_number
-                                    .map(|b| b.as_u64())
-                                    .unwrap_or(0);
+                                let inclusion_block =
+                                    receipt.block_number.map(|b| b.as_u64()).unwrap_or(0);
                                 let source = if profit_measured {
-                                    crate::core::profit_ledger::ProfitSource::Realized { final_: false }
+                                    crate::core::profit_ledger::ProfitSource::Realized {
+                                        final_: false,
+                                    }
                                 } else {
                                     crate::core::profit_ledger::ProfitSource::Estimated
                                 };
                                 {
                                     let mut led = self.profit_ledger.lock().await;
-                                    led.record_included(r_hash, inclusion_block, real_profit, source);
+                                    led.record_included(
+                                        r_hash,
+                                        inclusion_block,
+                                        real_profit,
+                                        source,
+                                    );
                                 }
                                 let outcome = if real_profit >= 0.0 {
                                     ExecutionOutcome::ConfirmedProfit {
@@ -3612,18 +3644,49 @@ mod tests {
         let mut count: u32 = 0;
 
         // 1º bump (underpriced no attempt 1) → ok, gas ×1.15.
-        assert!(rbb_bump_ok(&mut max_fee, &mut max_priority, &mut count, multiplier_bps, 3, None));
+        assert!(rbb_bump_ok(
+            &mut max_fee,
+            &mut max_priority,
+            &mut count,
+            multiplier_bps,
+            3,
+            None
+        ));
         assert_eq!(max_fee, U256::from(115_000_000_000u64)); // 115 gwei
         assert_eq!(max_priority, U256::from(11_500_000_000u64));
         assert_eq!(count, 1);
 
         // 2º e 3º bumps → ok (cap=3 permite 3 bumps).
-        assert!(rbf_bump_gas(&mut max_fee, &mut max_priority, &mut count, multiplier_bps, 3, None).is_ok());
-        assert!(rbf_bump_gas(&mut max_fee, &mut max_priority, &mut count, multiplier_bps, 3, None).is_ok());
+        assert!(rbf_bump_gas(
+            &mut max_fee,
+            &mut max_priority,
+            &mut count,
+            multiplier_bps,
+            3,
+            None
+        )
+        .is_ok());
+        assert!(rbf_bump_gas(
+            &mut max_fee,
+            &mut max_priority,
+            &mut count,
+            multiplier_bps,
+            3,
+            None
+        )
+        .is_ok());
         assert_eq!(count, 3);
 
         // 4º bump → MaxAttempts.
-        let err = rbf_bump_gas(&mut max_fee, &mut max_priority, &mut count, multiplier_bps, 3, None).unwrap_err();
+        let err = rbf_bump_gas(
+            &mut max_fee,
+            &mut max_priority,
+            &mut count,
+            multiplier_bps,
+            3,
+            None,
+        )
+        .unwrap_err();
         assert!(matches!(err, RbfBumpAbort::MaxAttempts));
 
         // Ceiling: teto 120 gwei. 1 bump de 100→115 ok; 2º 115→132.25 > 120 → abort.
@@ -3644,6 +3707,145 @@ mod tests {
         max_attempts: u32,
         ceil: Option<U256>,
     ) -> bool {
-        rbf_bump_gas(max_fee, max_priority, count, multiplier_bps, max_attempts, ceil).is_ok()
+        rbf_bump_gas(
+            max_fee,
+            max_priority,
+            count,
+            multiplier_bps,
+            max_attempts,
+            ceil,
+        )
+        .is_ok()
+    }
+
+    /// B10: cenário mock-RPC "underpriced" — re-bump compõe exatamente 1.15^k
+    /// por tentativa. b4 checa o 1º bump exato e os 2º/3º só is_ok; aqui
+    /// verificamos o valor composto do 2º (132.25 gwei) p/ travar a fórmula.
+    #[test]
+    fn b10_rbf_underpriced_compounds_exact_15pct() {
+        let multiplier_bps = U256::from(115u64); // 1.15
+        let mut max_fee = U256::from(100_000_000_000u64); // 100 gwei
+        let mut max_priority = U256::from(10_000_000_000u64); // 10 gwei
+        let mut count: u32 = 0;
+        let ceil: Option<U256> = None;
+
+        // 1º bump: 100 → 115 gwei (×1.15 exato).
+        assert!(rbf_bump_gas(
+            &mut max_fee,
+            &mut max_priority,
+            &mut count,
+            multiplier_bps,
+            5,
+            ceil
+        )
+        .is_ok());
+        assert_eq!(max_fee, U256::from(115_000_000_000u64));
+        assert_eq!(max_priority, U256::from(11_500_000_000u64));
+        assert_eq!(count, 1);
+
+        // 2º bump: 115 → 132.25 gwei. 115e9 * 115 / 100 = 132.25e9.
+        assert!(rbf_bump_gas(
+            &mut max_fee,
+            &mut max_priority,
+            &mut count,
+            multiplier_bps,
+            5,
+            ceil
+        )
+        .is_ok());
+        assert_eq!(max_fee, U256::from(132_250_000_000u64));
+        assert_eq!(max_priority, U256::from(13_225_000_000u64));
+        assert_eq!(count, 2);
+    }
+
+    // ------------------------------------------------------------------------
+    // B10: proptest — validate_steps_critical como oráculo de rejeição de rota
+    // ------------------------------------------------------------------------
+    // Random routes (1-5 hops, venues variados, tokens repetidos/no-op) devem
+    // ser classificadas corretamente: Ok só se a rota for bem-formada; Err com
+    // a razão certa senão. Caracteriza as 4 guardas em ordem de prioridade:
+    //   1. no-op hop (token_in == token_out)
+    //   2. amount_out_min == 0
+    //   3. path desconexo (token_out[i] != token_in[i+1])
+    //   4. não retorna ao token inicial (ciclo aberto)
+    // Decimals (6/8/18) não aparecem em AbiSwapStep — validação é agnóstica a
+    // decimals; o gerador ignora esse eixo aqui (documentado, não inventado).
+    mod proptest_routes {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Prediz a primeira guarda que dispara, espelhando a ordem exata de
+        /// `validate_steps_critical` + `validate_route_consistency`. Retorna
+        /// `None` ⇒ espera-se `Ok(())`.
+        fn predict(steps: &[AbiSwapStep]) -> Option<&'static str> {
+            if steps.is_empty() {
+                return Some("Empty steps");
+            }
+            // Mesma ordem do loop em validate_steps_critical: por step, no-op
+            // checado antes de zero, e step i inteiro antes de step i+1.
+            for s in steps {
+                if s.token_in == s.token_out {
+                    return Some("no-op hop");
+                }
+                if s.amount_out_min.is_zero() {
+                    return Some("amount_out_min is zero");
+                }
+            }
+            // Chain
+            for i in 0..steps.len() - 1 {
+                if steps[i].token_out != steps[i + 1].token_in {
+                    return Some("token_out");
+                }
+            }
+            // Cycle
+            if steps[0].token_in != steps[steps.len() - 1].token_out {
+                return Some("return to initial token");
+            }
+            None
+        }
+
+        fn any_step() -> impl Strategy<Value = AbiSwapStep> {
+            (
+                0u8..6u8, // dex_type (venue variado)
+                0u8..4u8, // token_in idx
+                0u8..4u8, // token_out idx
+                0u8..4u8, // amount_out_min: 0 ⇒ zero
+            )
+                .prop_map(|(dex, ti, to, amt)| AbiSwapStep {
+                    dex_type: dex,
+                    token_in: Address::from_low_u64_be(ti as u64 + 1),
+                    token_out: Address::from_low_u64_be(to as u64 + 1),
+                    amount_out_min: if amt == 0 {
+                        U256::zero()
+                    } else {
+                        U256::from(amt as u64)
+                    },
+                    extra_data: Bytes::new(),
+                })
+        }
+
+        proptest! {
+            #[test]
+            fn b10_validate_steps_critical_classifies_random_routes(
+                n_hops in 1u32..=5,
+                steps in proptest::collection::vec(any_step(), 1..=5),
+            ) {
+                let _ = n_hops; // tamanho real = steps.len()
+                let client = make_client();
+                let got = client.validate_steps_critical(&steps);
+                match predict(&steps) {
+                    None => {
+                        prop_assert!(got.is_ok(), "esperava Ok, got Err: {:?} steps={:?}", got, steps);
+                    }
+                    Some(needle) => {
+                        let err = got.expect_err(&format!("esperava Err({needle}) steps={steps:?}"));
+                        prop_assert!(
+                            err.to_string().contains(needle),
+                            "needle={needle} err={err} steps={steps:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
