@@ -40,6 +40,13 @@ pub const AAVE_V3_PREMIUM_PCT: f64 = 0.0005;
 /// usava um estático de config, o risk manager saturava num teto fixo de $0.10).
 static LAST_LIVE_GAS_USD_MICROS: AtomicU64 = AtomicU64::new(0);
 
+/// A6: estimativa viva POR número de hops (micro-dólares). Antes só se
+/// publicava em rotas de 3 hops — rotas de 2/4 hops caiam no fallback estático
+/// no finder, drift de ~33%. Agora cada contagem de hops tem seu próprio live.
+static LAST_LIVE_GAS_BY_HOPS: once_cell::sync::Lazy<
+    std::sync::RwLock<std::collections::HashMap<u32, u64>>,
+> = once_cell::sync::Lazy::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+
 /// Publica a estimativa viva de gás. Valores não-finitos/negativos são ignorados.
 pub fn publish_live_gas_usd(usd: f64) {
     if !usd.is_finite() || usd < 0.0 {
@@ -52,6 +59,21 @@ pub fn publish_live_gas_usd(usd: f64) {
     LAST_LIVE_GAS_USD_MICROS.store(micros as u64, Ordering::Relaxed);
 }
 
+/// Publica a estimativa viva de gás para uma contagem de hops específica
+/// (A6). Rotas de 2/4 hops agora alimentam seu próprio slot em vez de cair no
+/// fallback estático no finder.
+pub fn publish_live_gas_usd_for_hops(usd: f64, n_hops: usize) {
+    if !usd.is_finite() || usd < 0.0 {
+        return;
+    }
+    let micros = (usd * 1e6).round();
+    if micros < 1.0 || micros >= u64::MAX as f64 || n_hops == 0 {
+        return;
+    }
+    let mut map = LAST_LIVE_GAS_BY_HOPS.write().unwrap();
+    map.insert(n_hops as u32, micros as u64);
+}
+
 /// Estimativa viva de gás, se já houve alguma.
 pub fn live_gas_usd() -> Option<f64> {
     match LAST_LIVE_GAS_USD_MICROS.load(Ordering::Relaxed) {
@@ -60,9 +82,22 @@ pub fn live_gas_usd() -> Option<f64> {
     }
 }
 
+/// Estimativa viva de gás para `n_hops`, se publicada (A6).
+pub fn live_gas_usd_for_hops(n_hops: usize) -> Option<f64> {
+    let map = LAST_LIVE_GAS_BY_HOPS.read().unwrap();
+    map.get(&(n_hops as u32)).map(|&m| m as f64 / 1e6)
+}
+
 /// Gás a usar num gate de lucro: preferir a medição viva, cair no estático.
 pub fn gas_usd_or_fallback(fallback_usd: f64) -> f64 {
     live_gas_usd().unwrap_or_else(|| sane(fallback_usd))
+}
+
+/// Gás a usar num gate de lucro para `n_hops`: prefere a medição viva DAQUELA
+/// contagem de hops (A6); se não houver, cai no `fallback_usd` (estático, já
+/// referência 3 hops — caller escala via `gas_cost_for_hops` se precisar).
+pub fn gas_usd_or_fallback_for_hops(fallback_usd: f64, n_hops: usize) -> f64 {
+    live_gas_usd_for_hops(n_hops).unwrap_or_else(|| sane(fallback_usd))
 }
 
 /// Custos de uma rota, em USD. Cada campo aparece **uma** vez no net.

@@ -295,7 +295,7 @@ where
 
         // M7: populate_dynamic_gas pode popular base_fee_cache via oracle, evitando
         // a segunda RPC `get_cached_base_fee` que antes sempre rodava.
-        let (_, priority_fee) = self
+        let (max_fee, priority_fee) = self
             .populate_dynamic_gas(&mut Eip1559TransactionRequest::default())
             .await?;
         let base_fee = self
@@ -305,7 +305,14 @@ where
 
         let base_fee_gwei = u256_to_f64(base_fee, 9);
         let priority_gwei = u256_to_f64(priority_fee, 9);
-        let eff = base_fee_gwei * 1.05 + priority_gwei;
+        let max_fee_gwei = u256_to_f64(max_fee, 9);
+        // A7: buffer de 5% sobre base_fee não cobre saltos de base_fee entre
+        // blocos na Polygon (pode passar de 5% em congestionamento). EIP-1559
+        // garante que o gas real pago = min(base_fee + priority, max_fee). Usar
+        // o max_fee como teto (pior caso) é conservador: superestima gás no gate
+        // → rejeita mais opps do que aprova perdedoras (fail-closed).
+        let eff_from_base = base_fee_gwei * 1.05 + priority_gwei;
+        let eff = eff_from_base.max(max_fee_gwei);
 
         let baseline_units = Self::gas_units_for_hops(gas_cfg, &cfg, n_hops, strategy);
         let multiplier = *self.gas_unit_multiplier.read().await;
@@ -340,6 +347,10 @@ where
 
         // Finder guarda referência canônica de 3 hops; publicar uma rota de
         // 2/4 hops e depois escalá-la de novo distorce custo por 33%.
+        // A6: agora publicamos por n_hops — cada contagem de hops tem seu live,
+        // o finder pega o da rota certa sem escalar.
+        crate::core::economics::publish_live_gas_usd_for_hops(cost, n_hops);
+        // Mantém legado (default 3) p/ risk.rs e callers sem n_hops.
         if n_hops == 3 {
             crate::core::economics::publish_live_gas_usd(cost);
         }

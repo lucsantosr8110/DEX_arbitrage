@@ -2161,6 +2161,13 @@ impl ArbitrageEngine {
     /// → hurdle baixo → executa opps que dão prejuízo. O live publicado pelo
     /// executor é referência de 3 hops, então aplicamos o mesmo scale aqui.
     async fn estimate_gas_cost(&self, app_config: &Config, n_hops: usize) -> f64 {
+        // A6: prefere a medição viva DA contagem de hops da rota (publicada pelo
+        // GasEstimator). Se houver, NÃO escala (já é do hops certo). Se não houver,
+        // cai no fallback estático (referência 3 hops) e escala via
+        // gas_cost_for_hops — preservando o comportamento M4 original.
+        if let Some(live) = economics::live_gas_usd_for_hops(n_hops) {
+            return live;
+        }
         gas_cost_for_hops(
             economics::gas_usd_or_fallback(app_config.execution.estimate_base_gas_usd),
             n_hops,
