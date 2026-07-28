@@ -141,6 +141,56 @@ impl RotatingHttpClient {
             || m.contains("request limit")
     }
 
+    /// Erro do PROVEDOR (auth/capacidade/tenant) — recuperável rotacionando
+    /// para o próximo endpoint. Diferente de rate-limit puro: cobre chaves
+    /// desativadas, tenant desabilitado, 403/401, erros JSON-RPC de provider
+    /// (-32051 etc.). Antes só 429/rate-limit rotacionavam; um endpoint paid
+    /// com "API key disabled, tenant disabled, -32051, 403" devolvia um body
+    /// `{"error":"string"}` (shape não-padrão) que falhava a desserialização
+    /// como struct → Serde error NÃO-recuperável → retorno imediato sem
+    /// rotacionar → `current` travava naquele endpoint e TODA chamada seguinte
+    /// morria no mesmo lugar (loop de ciclos falhando pra sempre, radar nunca
+    /// recuperava). Tratar como recuperável aqui faz o cliente avançar.
+    fn is_provider_error(msg: &str) -> bool {
+        let m = msg.to_lowercase();
+        m.contains("api key")
+            || m.contains("api-key")
+            || m.contains("disabled")
+            || m.contains("tenant")
+            || m.contains("unauthorized")
+            || m.contains("forbidden")
+            || m.contains("not allowed")
+            || m.contains("invalid api")
+            || m.contains("access denied")
+            || m.contains("-32051")
+            || m.contains("-32000")
+            || m.contains("-32001")
+            || m.contains("-32002")
+            || m.contains("-32003")
+            || m.contains("-32004")
+            || m.contains("-32005")
+            || m.contains("-32042")
+            || m.contains("-32043")
+            || m.contains("rate limit")
+            || m.contains("429")
+            || m.contains("too many requests")
+            || m.contains("capacity")
+            || m.contains("exceeded")
+    }
+
+    /// Status HTTP que indica problema do provedor (rotacionar, não hard-fail).
+    fn is_recoverable_status(status: StatusCode) -> bool {
+        matches!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS
+                | StatusCode::UNAUTHORIZED
+                | StatusCode::FORBIDDEN
+                | StatusCode::BAD_GATEWAY
+                | StatusCode::SERVICE_UNAVAILABLE
+                | StatusCode::GATEWAY_TIMEOUT
+        )
+    }
+
     fn is_recoverable_transport(err: &ReqwestError) -> bool {
         err.is_timeout()
             || err.is_connect()
@@ -226,10 +276,15 @@ impl JsonRpcClient for RotatingHttpClient {
                 }
             };
 
-            if status == StatusCode::TOO_MANY_REQUESTS {
-                warn!("RPC[{}] HTTP 429 — rotacionando...", idx);
+            // Status de provedor (429/401/403/5xx de gateway) → rotaciona.
+            // Antes só 429 rotacionava; 403 "API key disabled" ficava preso.
+            if Self::is_recoverable_status(status) {
+                warn!(
+                    "RPC[{}] HTTP {} — erro de provedor, rotacionando...",
+                    idx, status.as_u16()
+                );
                 self.current.store((idx + 1) % n, Ordering::Relaxed);
-                last_err = Some("HTTP 429".into());
+                last_err = Some(format!("HTTP {}", status.as_u16()));
                 continue;
             }
 
@@ -237,17 +292,34 @@ impl JsonRpcClient for RotatingHttpClient {
             let parsed: JsonRpcResponse<Value> = match serde_json::from_slice(&body) {
                 Ok(r) => r,
                 Err(err) => {
+                    // Body não desserializa como struct JsonRpcResponse. Dois
+                    // casos: (a) provedor devolveu erro em shape não-padrão
+                    // (ex.: `{"error":"API key disabled, tenant disabled,
+                    // -32051, 403"}` — error como STRING) → recuperável,
+                    // rotaciona; (b) bug real de protocolo → hard-fail.
+                    if Self::is_provider_error(&text) {
+                        warn!(
+                            "RPC[{}] resposta de erro não-padrão ({} bytes) — rotacionando...",
+                            idx, body.len()
+                        );
+                        self.current.store((idx + 1) % n, Ordering::Relaxed);
+                        last_err = Some(text.chars().take(200).collect());
+                        continue;
+                    }
                     return Err(RotatingClientError::Serde {
                         err,
                         text: text.into_owned(),
-                    })
+                    });
                 }
             };
 
             if let Some(err) = parsed.error {
                 let msg = format!("{:?}", err);
-                if Self::is_rate_limit(&msg) {
-                    warn!("RPC[{}] rate-limit JSON-RPC ({}) — rotacionando...", idx, msg);
+                // Rate-limit OU erro de provedor (auth/tenant/capacidade) →
+                // rotaciona. Erro de método (revert, insufficient funds, etc.)
+                // é genuíno e falha igual em todos os endpoints → hard-fail.
+                if Self::is_rate_limit(&msg) || Self::is_provider_error(&msg) {
+                    warn!("RPC[{}] erro JSON-RPC de provedor ({}) — rotacionando...", idx, msg);
                     self.current.store((idx + 1) % n, Ordering::Relaxed);
                     last_err = Some(msg);
                     continue;
