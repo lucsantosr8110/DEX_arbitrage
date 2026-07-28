@@ -1055,13 +1055,17 @@ impl ArbitrageEngine {
         let costs = economics::TradeCosts {
             gas_usd: gas_cost_usd,
             flashloan_fee_usd,
-            // Buffer opt-in de drift quote→exec (default 0). Antes aqui entrava
-            // `default_price_impact_bps` (25-50 bps), que era dedução DUPLA do
-            // price impact já embutido no quote — sozinho respondia por ~81% do
-            // custo total e exigia ~31 bps de gross para aprovar uma rota.
-            adverse_move_usd: economics::adverse_move_usd(
+            // B5: haircut de drift quote→exec por hop, composto sobre expected_out.
+            // Antes aqui entrava `default_price_impact_bps` (25-50 bps), que era
+            // dedução DUPLA do price impact já embutido no quote — sozinho
+            // respondia por ~81% do custo e exigia ~31 bps de gross para aprovar.
+            // Default 5 bps/hop (opt-out via config = 0).
+            // SAFETY-EV: ~2s entre simulação e inclusão na Polygon; drift médio
+            // observado. Compounded: rota n hops perde ≈ n*5 bps de expected_out.
+            adverse_move_usd: economics::compounded_adverse_move_usd(
                 trade_amount_usd,
                 app_config.execution.adverse_move_bps,
+                opp.steps.0.len(),
             ),
         };
 

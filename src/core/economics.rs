@@ -147,8 +147,33 @@ pub fn flashloan_fee_usd_from_amount(
 }
 
 /// Buffer opcional de drift quote→execução. **Não** é price impact.
+/// Single-hop (legado); prefira `compounded_adverse_move_usd` (B5).
 pub fn adverse_move_usd(trade_amount_usd: f64, adverse_move_bps: u32) -> f64 {
     sane(trade_amount_usd) * (adverse_move_bps as f64 / 10_000.0)
+}
+
+/// B5 — haircut de adverse_move_bps por hop, **composto** sobre o expected_out.
+/// Reduz o output acumulado da rota por um fator `(1 − b/10_000)^n_hops`. O
+/// custo equivalente em USD = `trade_amount * (1 − (1 − b/10_000)^n_hops)`.
+///
+/// Para 1 hop ≡ `adverse_move_usd` (b bps do notional). Para n hops é
+/// levemente menor que `n * b` bps (juros compostos), sempre conservador.
+/// `adverse_move_bps = 0` ⇒ 0 (opt-out explícito via config).
+// SAFETY-EV: ~2s entre simulação e inclusão na Polygon; drift médio observado.
+pub fn compounded_adverse_move_usd(
+    trade_amount_usd: f64,
+    adverse_move_bps: u32,
+    n_hops: usize,
+) -> f64 {
+    let amt = sane(trade_amount_usd);
+    if adverse_move_bps == 0 || n_hops == 0 {
+        return 0.0;
+    }
+    let per_hop = 1.0 - (adverse_move_bps as f64 / 10_000.0);
+    let compounded = per_hop.powi(n_hops as i32);
+    // haircut fraction = 1 - compounded; jamais negativo (per_hop ≤ 1).
+    let haircut_frac = (1.0 - compounded).max(0.0);
+    amt * haircut_frac
 }
 
 /// Net = gross − custos. Única fórmula de net do projeto.
@@ -360,6 +385,46 @@ mod tests {
     fn adverse_move_is_opt_in() {
         assert_eq!(adverse_move_usd(100.0, 0), 0.0);
         assert!((adverse_move_usd(100.0, 25) - 0.25).abs() < 1e-12);
+    }
+
+    /// B5: haircut composto por hop. 1 hop ≡ legado; n hops > n*b (juros
+    /// compostos, levemente menor); 0 bps ⇒ 0 (opt-out).
+    #[test]
+    fn b5_compounded_adverse_move_usd() {
+        // 0 bps → 0 mesmo com hops
+        assert_eq!(compounded_adverse_move_usd(100.0, 0, 3), 0.0);
+        // 1 hop, 5 bps → 5 bps do notional = 0.05 (≡ adverse_move_usd)
+        let one = compounded_adverse_move_usd(100.0, 5, 1);
+        assert!((one - 0.05).abs() < 1e-12, "1 hop: {}", one);
+        // 2 hops, 5 bps → (1 - 0.9995^2)*100 = 0.099975... > 0.05, < 0.10
+        let two = compounded_adverse_move_usd(100.0, 5, 2);
+        assert!(two > 0.05 && two < 0.10, "2 hops composto: {}", two);
+        assert!((two - (1.0 - (0.9995f64).powi(2)) * 100.0).abs() < 1e-12);
+        // 0 hops → 0
+        assert_eq!(compounded_adverse_move_usd(100.0, 5, 0), 0.0);
+    }
+
+    /// B5 spec: edge 6 bps rejeitado com default 5 bps, aceito com 0.
+    /// Cenário: gross edge 6 bps = $0.06 em $100, gas/flashloan = 0.
+    /// adverse 5 (1 hop) = $0.05 → net $0.01 = 1 bps ≤ margin 1 → None (rejeita).
+    /// adverse 0 → net $0.06 = 6 bps → Some (aceita).
+    #[test]
+    fn b5_edge_6bps_rejected_with_default_adverse_accepted_with_zero() {
+        let trade = 100.0;
+        let gross_edge_bps = 6u32;
+        let gross_usd = trade * (gross_edge_bps as f64 / 10_000.0); // 0.06
+
+        // default 5 bps, 1 hop
+        let adverse5 = compounded_adverse_move_usd(trade, 5, 1); // 0.05
+        let net5 = gross_usd - adverse5; // 0.01 = 1 bps
+        let gate5 = slippage_allowed_total_bps(net5, trade, 1, 50, 200);
+        assert!(gate5.is_none(), "edge 6 bps c/ adverse 5 deve rejeitar: net={} gate={:?}", net5, gate5);
+
+        // opt-out 0
+        let adverse0 = compounded_adverse_move_usd(trade, 0, 1); // 0
+        let net0 = gross_usd - adverse0; // 0.06 = 6 bps
+        let gate0 = slippage_allowed_total_bps(net0, trade, 1, 50, 200);
+        assert!(gate0.is_some(), "edge 6 bps c/ adverse 0 deve aceitar: net={} gate={:?}", net0, gate0);
     }
 
     #[test]

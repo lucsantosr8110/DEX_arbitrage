@@ -1249,6 +1249,11 @@ fn default_max_replace_attempts() -> u32 {
     3
 }
 
+/// B5: haircut de drift quote→exec por hop (default 5 bps).
+fn default_adverse_move_bps() -> u32 {
+    5
+}
+
 impl Default for RouteValidationConfig {
     fn default() -> Self {
         Self {
@@ -1630,11 +1635,14 @@ pub struct ExecutionConfig {
     #[serde(default = "default_edge_safety_margin_bps")]
     pub edge_safety_margin_bps: u32,
 
-    /// Buffer de drift quote→execução, em bps do notional. **Default 0.**
+    /// Buffer de drift quote→execução, em bps do notional **por hop**, aplicado
+    /// como haircut composto sobre o expected_out (B5). Default 5.
     ///
     /// NÃO é price impact: quotes já são impact-inclusive (ver `core::economics`).
-    /// Só ligue isto se quiser pagar explicitamente por risco de latência.
-    #[serde(default)]
+    /// 0 = opt-out explícito (sem haircut de latência).
+    // SAFETY-EV: ~2s entre simulação e inclusão na Polygon; drift médio
+    /// observado. 5 bps/hop cobre a latência típica sem rejeitar edge real.
+    #[serde(default = "default_adverse_move_bps")]
     pub adverse_move_bps: u32,
 
     /// Top-N oportunidades a tentar por ciclo, em ordem descrescente de net profit.
@@ -1677,7 +1685,7 @@ impl Default for ExecutionConfig {
             // Ver core::economics. Mantidos só para overrides de simulação legada.
             default_dex_fee_bps: 30,      // 0.30%
             default_price_impact_bps: 50, // 0.50%
-            adverse_move_bps: 0,          // opt-in; ver core::economics
+            adverse_move_bps: default_adverse_move_bps(), // B5: 5 bps/hop compounded
             dex_fee_bps_map: HashMap::new(),
             dex_price_impact_bps_map: HashMap::new(),
             hop_slippage_increase_bps: 5, // 5 bps = 0.05% por hop adicional
