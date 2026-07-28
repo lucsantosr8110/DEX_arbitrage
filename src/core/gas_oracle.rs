@@ -1,5 +1,12 @@
 //! GasOracle EWMA por venue (B2).
 //!
+//! B9: money/gas — aritmética checked/saturating, casts sem truncation.
+#![deny(
+    clippy::arithmetic_side_effects,
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss
+)]
+//!
 //! Calibra o perfil estático (`gas_profile::swap_gas_units`) com `gas_used`
 //! real dos receipts. Cada venue mantém um EWMA (alpha 0.15). A estimativa
 //! calibrada usa `max(estático, ewma_p75)` — nunca abaixo do estático até ter
@@ -14,8 +21,8 @@
 //! Polygon sem subestimar. Documentado para não passar silencioso.
 
 use crate::core::gas_profile::{
-    classify_step, flashloan_overhead_gas, swap_gas_units, CALLDATA_GAS_PER_HOP,
-    FlashloanProvider, TX_BASE_GAS, VenueKind,
+    classify_step, flashloan_overhead_gas, swap_gas_units, FlashloanProvider, VenueKind,
+    CALLDATA_GAS_PER_HOP, TX_BASE_GAS,
 };
 use crate::core::types::ArbitrageStep;
 use serde::{Deserialize, Serialize};
@@ -58,7 +65,7 @@ impl VenueEwma {
 
     /// p75 aproximado (mean * 1.15). `None` se < MIN_SAMPLES amostras.
     fn p75(&self) -> Option<f64> {
-        if (self.n_samples as usize) < MIN_SAMPLES {
+        if self.n_samples < MIN_SAMPLES as u64 {
             return None;
         }
         if !self.mean.is_finite() || self.mean <= 0.0 {
@@ -106,7 +113,9 @@ impl GasOracle {
     /// Carrega do path se configurado; se ausente/inválido, começa vazio
     /// (fail-safe: perfil estático continua válido). Nunca panic.
     pub fn load(path: Option<PathBuf>) -> Self {
-        let Some(p) = path else { return Self::default() };
+        let Some(p) = path else {
+            return Self::default();
+        };
         match std::fs::read_to_string(&p) {
             Ok(s) => match serde_json::from_str::<GasOracle>(&s) {
                 Ok(o) => {
@@ -141,6 +150,10 @@ impl GasOracle {
     /// Atribui `actual_total_gas` da tx proporcionalmente ao perfil estático de
     /// cada hop, e atualiza o EWMA por venue. `venues` = venues dos hops (sem
     /// overhead/base, que são compartilhados — só swaps são calibrados por venue).
+    //
+    // SAFETY-EV: casts u64→f64 aqui são de gas units (≤ ~1.5M, bem dentro da
+    // mantissa f64 de 52 bits) — sem perda de precisão prática. f64→não há.
+    #[allow(clippy::cast_precision_loss)]
     pub fn record_route(&mut self, venues: &[VenueKind], actual_total_gas: u64) {
         if venues.is_empty() || actual_total_gas == 0 {
             return;
@@ -166,12 +179,22 @@ impl GasOracle {
 
     /// Estimativa de gas de um swap: `max(estático, ewma_p75)` se p75 disponível,
     /// senão só estático. Nunca abaixo do estático (fail-safe até ≥20 amostras).
+    //
+    // SAFETY-EV: p75 é gas units (positivo, finito, ≤ ~1.5M). f64→u64: p75 já
+    // validado is_finite && > 0; truncação de fração é segura (gas é inteiro).
+    // u64::MAX as f64: só p/ clamp de teto — perda de precisão no limite é OK.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
     pub fn swap_gas_estimate(&self, v: VenueKind) -> u64 {
         let static_units = swap_gas_units(v);
         match self.p75(v) {
             Some(p75) if p75.is_finite() && p75 > 0.0 => {
-                // max(estático, ewma_p75) — conservador.
-                static_units.max(p75 as u64)
+                // max(estático, ewma_p75) — conservador. clamp em u64::MAX p/ failsafe.
+                let p75_u = if p75 >= u64::MAX as f64 {
+                    u64::MAX
+                } else {
+                    p75 as u64
+                };
+                static_units.max(p75_u)
             }
             _ => static_units,
         }

@@ -1,5 +1,11 @@
 //! Fixed-point USD helpers for economic gates (no f64 on approve/reject paths).
 //!
+//! B9 (pricing/money): aritmética inteira deny(arithmetic_side_effects); casts
+//! f64↔int warn (conversões de preço na fronteira, valores < 2^52). Falha de
+//! checked_* em gate de approve/reject aborta a opp (never silent saturate).
+#![deny(clippy::arithmetic_side_effects)]
+#![warn(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+//!
 //! # Scale
 //! - `UsdE8`: USD × 10^8. `$1.00` = `100_000_000`.
 //! - Token amounts stay in raw `U256` (`10^decimals` units).
@@ -96,10 +102,12 @@ pub fn usd_e8_to_token_raw_ceil(usd: UsdE8, price: UsdE8, decimals: u32) -> Resu
         .checked_mul(scale)
         .ok_or_else(|| anyhow!("usd_e8_to_token_raw_ceil: usd*10^dec overflow"))?;
     // ceil_div(num, price) = (num + price - 1) / price
+    // SAFETY-EV: price_u > 0 garantido (guard price.0==0 acima); saturating_sub
+    // é correto (price_u≥1 → price_u-1). checked_div: price_u>0 → sempre Some.
     let numer = num
-        .checked_add(price_u - U256::one())
+        .checked_add(price_u.saturating_sub(U256::one()))
         .ok_or_else(|| anyhow!("usd_e8_to_token_raw_ceil: ceil add overflow"))?;
-    Ok(numer / price_u)
+    Ok(numer.checked_div(price_u).expect("price_u > 0 guardado"))
 }
 
 /// `(amount_raw * price_e8) / 10^decimals` → UsdE8 (floor; used for principal/fee).
@@ -120,15 +128,17 @@ pub fn token_raw_to_usd_e8(amount: U256, price: UsdE8, decimals: u32) -> Result<
     // (amount * price) / scale — split to reduce overflow pressure:
     // q = amount / scale; r = amount % scale;
     // usd = q * price + (r * price) / scale
-    let q = amount / scale;
-    let r = amount % scale;
+    // SAFETY-EV: scale = exp10(decimals), decimals≤36 → scale≥1 (never 0).
+    // checked_div/checked_rem: scale>0 → sempre Some; unwrap seguro.
+    let q = amount.checked_div(scale).expect("scale >= 1");
+    let r = amount.checked_rem(scale).expect("scale >= 1");
     let hi = q
         .checked_mul(price_u)
         .ok_or_else(|| anyhow!("token_raw_to_usd_e8: q*price overflow"))?;
     let lo_num = r
         .checked_mul(price_u)
         .ok_or_else(|| anyhow!("token_raw_to_usd_e8: r*price overflow"))?;
-    let lo = lo_num / scale;
+    let lo = lo_num.checked_div(scale).expect("scale >= 1");
     let sum = hi
         .checked_add(lo)
         .ok_or_else(|| anyhow!("token_raw_to_usd_e8: usd sum overflow"))?;
@@ -166,13 +176,11 @@ pub fn fee_pct_to_bps(fee_pct: f64) -> Result<u64> {
 }
 
 /// Net = gross - gas - fl_fee - adverse. Underflow → 0 (not profitable).
-pub fn net_profit_usd_e8(
-    gross: UsdE8,
-    gas: UsdE8,
-    flashloan_fee: UsdE8,
-    adverse: UsdE8,
-) -> UsdE8 {
-    let costs = gas.0.saturating_add(flashloan_fee.0).saturating_add(adverse.0);
+pub fn net_profit_usd_e8(gross: UsdE8, gas: UsdE8, flashloan_fee: UsdE8, adverse: UsdE8) -> UsdE8 {
+    let costs = gas
+        .0
+        .saturating_add(flashloan_fee.0)
+        .saturating_add(adverse.0);
     UsdE8(gross.0.saturating_sub(costs))
 }
 
@@ -199,7 +207,10 @@ mod tests {
         let price = usd_f64_to_e8_ceil(2000.0).unwrap();
         let hurdle = usd_f64_to_e8_ceil(10.0).unwrap();
         let raw = usd_e8_to_token_raw_ceil(hurdle, price, 18).unwrap();
-        assert_eq!(raw, U256::from(10u64).pow(U256::from(15)) * U256::from(5u64));
+        assert_eq!(
+            raw,
+            U256::from(10u64).pow(U256::from(15)) * U256::from(5u64)
+        );
     }
 
     #[test]
@@ -235,7 +246,7 @@ mod tests {
         let b = a + U256::one();
         let ua = token_raw_to_usd_e8(a, price, 6).unwrap();
         let ub = token_raw_to_usd_e8(b, price, 6).unwrap();
-        // 1 raw unit @ 6dec @ $1 = 1e8/1e6 = 100 e8-units? 
+        // 1 raw unit @ 6dec @ $1 = 1e8/1e6 = 100 e8-units?
         // (1e6 * 1e8) / 1e6 = 1e8 for 1 token; for +1 raw: floor may equal
         // Use larger gap:
         let b2 = a + U256::from(1_000_000u64);

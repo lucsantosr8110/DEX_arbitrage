@@ -1,5 +1,12 @@
 //! Nonce reaper (B8).
 //!
+//! B9: exec/money — aritmética checked/saturating, casts sem truncation.
+#![deny(
+    clippy::arithmetic_side_effects,
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss
+)]
+//!
 //! Detecta nonces presos: reservamos `pending_local` mas a chain só viu
 //! `on_chain_pending` (eth_getTransactionCount pending). Se o gap persiste por
 //! `nonce_stall_secs` (default 45) sem inclusão, o nonce mais baixo preso é
@@ -185,7 +192,10 @@ mod tests {
         let early = base + Duration::from_secs(10);
         assert_eq!(
             r.verdict(3, 0, early, 45),
-            ReapVerdict::GapStalling { lowest: 0, elapsed_secs: 10 }
+            ReapVerdict::GapStalling {
+                lowest: 0,
+                elapsed_secs: 10
+            }
         );
     }
 

@@ -1,5 +1,12 @@
 //! Ledger de finalidade de lucro (B7).
 //!
+//! B9: money — aritmética checked/saturating, casts sem truncation.
+#![deny(
+    clippy::arithmetic_side_effects,
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss
+)]
+//!
 //! Um tx confirmado com 1 confirmação NÃO é lucro final: a Polygon reorga
 //! (raramente, mas reorga). Contabilização separada:
 //!   - **provisory**: lucro/prejuízo de txs incluídas mas ainda não final
@@ -145,8 +152,8 @@ impl ProfitLedger {
                 }
                 TradeFinality::Final => TradeFinality::Final,
             };
-            let became_final =
-                matches!(new_state, TradeFinality::Final) && !matches!(entry.state, TradeFinality::Final);
+            let became_final = matches!(new_state, TradeFinality::Final)
+                && !matches!(entry.state, TradeFinality::Final);
             entry.state = new_state;
             if became_final {
                 // Move PnL provisory → final.
@@ -233,7 +240,11 @@ pub enum ReorgVerdict {
     TxDisappeared,
 }
 
-pub fn detect_reorg(prev_block_hash: Option<H256>, cur_block_hash: H256, tx_present: bool) -> ReorgVerdict {
+pub fn detect_reorg(
+    prev_block_hash: Option<H256>,
+    cur_block_hash: H256,
+    tx_present: bool,
+) -> ReorgVerdict {
     if !tx_present {
         return ReorgVerdict::TxDisappeared;
     }
@@ -255,7 +266,10 @@ mod tests {
     fn b7_finality_promotion_to_final_after_confirmations() {
         let mut led = ProfitLedger::new(3);
         led.record_included(h(1), 100, 5.0, ProfitSource::Realized { final_: false });
-        assert_eq!(led.state_of(h(1)), Some(TradeFinality::Included { block: 100 }));
+        assert_eq!(
+            led.state_of(h(1)),
+            Some(TradeFinality::Included { block: 100 })
+        );
         assert!((led.provisory_profit_usd() - 5.0).abs() < 1e-12);
         assert!(led.final_profit_usd().abs() < 1e-12);
 
@@ -304,10 +318,18 @@ mod tests {
         // 2 perdas Realized finalizadas → breaker tripa
         for i in 0..2u8 {
             let bh = h(20 + i);
-            led.record_included(bh, 2000 + i as u64, -3.0, ProfitSource::Realized { final_: false });
+            led.record_included(
+                bh,
+                2000 + i as u64,
+                -3.0,
+                ProfitSource::Realized { final_: false },
+            );
             led.promote(2000 + i as u64 + 24, 24);
         }
-        assert!(led.breaker_tripped(), "Realized final consecutivo tripa breaker");
+        assert!(
+            led.breaker_tripped(),
+            "Realized final consecutivo tripa breaker"
+        );
     }
 
     #[test]
@@ -317,7 +339,10 @@ mod tests {
         // tx ausente → TxDisappeared (precede hash)
         assert_eq!(detect_reorg(Some(a), a, false), ReorgVerdict::TxDisappeared);
         // hash mudou → BlockHashChanged
-        assert_eq!(detect_reorg(Some(a), b, true), ReorgVerdict::BlockHashChanged);
+        assert_eq!(
+            detect_reorg(Some(a), b, true),
+            ReorgVerdict::BlockHashChanged
+        );
         // sem prev hash, tx presente → NoReorg (primeira observação)
         assert_eq!(detect_reorg(None, a, true), ReorgVerdict::NoReorg);
         // hash igual, tx presente → NoReorg
@@ -337,6 +362,9 @@ mod tests {
         // agora 2 perdas seguidas precisam de novo → não tripa com 1
         led.record_included(h(3), 80, -5.0, ProfitSource::Realized { final_: false });
         led.promote(80 + 24, 24);
-        assert!(!led.breaker_tripped(), "lucro resetou série; 1 perda não tripa (threshold 3)");
+        assert!(
+            !led.breaker_tripped(),
+            "lucro resetou série; 1 perda não tripa (threshold 3)"
+        );
     }
 }

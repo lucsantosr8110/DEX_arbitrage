@@ -1,5 +1,13 @@
 //! Perfil de gas por venue (B1).
 //!
+//! B9: módulo de money/gas — aritmética inteira deve ser checked/saturating;
+//! casts não podem truncar silenciosamente. `deny` mantém regressões fora.
+#![deny(
+    clippy::arithmetic_side_effects,
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss
+)]
+//!
 //! Substitui o modelo linear antigo (`n_hops * GAS_PER_HOP`) por uma estimativa
 //! somada por hop, onde cada venue contribui com seu gas base medido em Polygon
 //! mainnet. Os números são conservadores (p75) — quando o EWMA (B2) tiver ≥20
@@ -51,7 +59,10 @@ pub const fn swap_gas_units(v: VenueKind) -> u64 {
     match v {
         VenueKind::UniV2 | VenueKind::QuickSwapV2 | VenueKind::SushiV2 => 105_000,
         VenueKind::UniV3 | VenueKind::QuickSwapV3 => 165_000,
-        VenueKind::CurveStable { n_coins } => 220_000 + 60_000 * n_coins as u64,
+        VenueKind::CurveStable { n_coins } => {
+            // n_coins: u8 → u64 widen (sem truncation). saturating p/ fail-safe.
+            220_000_u64.saturating_add(60_000_u64.saturating_mul(n_coins as u64))
+        }
         VenueKind::BalancerWeighted => 195_000,
         VenueKind::Unknown => 250_000, // fail-safe: superestima
     }

@@ -5,6 +5,11 @@
 // ✅ Log "GasOracleSync" detalhado
 // ✅ Mantém hot-reload e microprofit tuning
 // ============================================================
+// B9 (gas/money): aritmética inteira deny(arithmetic_side_effects); casts
+// f64↔int em gwei/gas warn (valores < 2^52). Falha de checked_* em caminho de
+// execução aborta a opp (nunca silent saturate).
+#![deny(clippy::arithmetic_side_effects)]
+#![warn(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
 use anyhow::Result;
 use ethers::{
@@ -347,8 +352,7 @@ where
         // ≥20 amostras do venue (max(estático, ewma_p75); nunca abaixo do estático).
         let oracle = self.gas_oracle.read().await;
         let baseline_units =
-            crate::core::gas_oracle::estimate_gas_units_calibrated(steps, provider, &oracle)
-                as f64;
+            crate::core::gas_oracle::estimate_gas_units_calibrated(steps, provider, &oracle) as f64;
         drop(oracle);
         let multiplier = *self.gas_unit_multiplier.read().await;
         let gas_units = baseline_units * multiplier;
@@ -428,8 +432,10 @@ where
 
         // B2: alimenta oráculo EWMA por venue com gas real atribuído
         // proporcionalmente ao perfil estático de cada hop.
-        let venues: Vec<crate::core::gas_profile::VenueKind> =
-            steps.iter().map(crate::core::gas_profile::classify_step).collect();
+        let venues: Vec<crate::core::gas_profile::VenueKind> = steps
+            .iter()
+            .map(crate::core::gas_profile::classify_step)
+            .collect();
         {
             let mut oracle = self.gas_oracle.write().await;
             oracle.record_route(&venues, actual_units.as_u64());
@@ -496,7 +502,11 @@ where
 // ============================================================
 
 fn gwei(n: u64) -> U256 {
-    U256::from(n) * U256::exp10(9)
+    // SAFETY-EV: n em gwei (≤ ~500 na prática); *1e9 não estoura U256, mas
+    // saturating p/ fail-safe em vez de overflow silencioso.
+    U256::from(n)
+        .checked_mul(U256::exp10(9))
+        .unwrap_or(U256::MAX)
 }
 
 fn next_gas_multiplier(previous: f64, actual_units: f64, estimated_units: f64) -> f64 {
@@ -527,9 +537,11 @@ pub(crate) fn gwei_f64(n: f64) -> U256 {
 }
 
 pub fn u256_to_f64(value: U256, decimals: u32) -> f64 {
+    // SAFETY-EV: divisor = exp10(decimals), decimals≥0 → divisor≥1 (never 0).
+    // checked_div/checked_rem: divisor>0 → Some; unwrap seguro.
     let divisor = U256::exp10(decimals as usize);
-    let integer = value / divisor;
-    let fractional = value % divisor;
+    let integer = value.checked_div(divisor).expect("divisor >= 1");
+    let fractional = value.checked_rem(divisor).expect("divisor >= 1");
     integer.as_u64() as f64 + (fractional.as_u64() as f64 / 10f64.powi(decimals as i32))
 }
 

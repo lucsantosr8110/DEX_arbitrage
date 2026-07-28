@@ -1,5 +1,12 @@
 //! Fonte única do modelo de custo de uma rota de arbitragem.
 //!
+//! B9 (money/profit): aritmética inteira `deny(arithmetic_side_effects)` —
+//! overflow wrap em money = bug silencioso. Casts f64↔int em math de bps são
+//! `warn` (valores < 2^52, perda de precisão negligenciável); locais sensíveis
+//! usam `checked_*` e abortam a opp em falha (never silent saturate in profit).
+#![deny(clippy::arithmetic_side_effects)]
+#![warn(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+//!
 //! # O que já está no `total_rate` (e portanto NÃO é custo separado)
 //!
 //! Os rates de cada perna vêm de `getAmountsOut` (V2), `quoteExactInputSingle`
@@ -351,7 +358,15 @@ pub fn slippage_allowed_total_bps(
     if budget_bps <= margin {
         return None;
     }
-    let edge_total = (budget_bps - margin) as u32;
+    // SAFETY-EV: budget_bps > margin garantido acima; checked_sub nunca falha
+    // aqui. checked_int_to u32: edge_total cabe em u32 (bps ≤ ~10000); se não
+    // couber, fail-closed None (abort opp) — nunca saturate silencioso.
+    let edge_total = budget_bps
+        .checked_sub(margin)
+        .expect("budget_bps > margin guardado acima")
+        .try_into()
+        .ok()
+        .filter(|v: &u32| *v <= 100_000)?;
     Some(configured_slippage_bps.min(edge_total).min(route_limit_bps))
 }
 
@@ -440,13 +455,23 @@ mod tests {
         let adverse5 = compounded_adverse_move_usd(trade, 5, 1); // 0.05
         let net5 = gross_usd - adverse5; // 0.01 = 1 bps
         let gate5 = slippage_allowed_total_bps(net5, trade, 1, 50, 200);
-        assert!(gate5.is_none(), "edge 6 bps c/ adverse 5 deve rejeitar: net={} gate={:?}", net5, gate5);
+        assert!(
+            gate5.is_none(),
+            "edge 6 bps c/ adverse 5 deve rejeitar: net={} gate={:?}",
+            net5,
+            gate5
+        );
 
         // opt-out 0
         let adverse0 = compounded_adverse_move_usd(trade, 0, 1); // 0
         let net0 = gross_usd - adverse0; // 0.06 = 6 bps
         let gate0 = slippage_allowed_total_bps(net0, trade, 1, 50, 200);
-        assert!(gate0.is_some(), "edge 6 bps c/ adverse 0 deve aceitar: net={} gate={:?}", net0, gate0);
+        assert!(
+            gate0.is_some(),
+            "edge 6 bps c/ adverse 0 deve aceitar: net={} gate={:?}",
+            net0,
+            gate0
+        );
     }
 
     #[test]
