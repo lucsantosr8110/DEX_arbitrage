@@ -130,6 +130,13 @@ impl ArbitrageClient {
         }
     }
 
+    /// B2: carrega o oráculo EWMA de gas do path configurado (`gas.gas_oracle_path`).
+    /// Chamar uma vez na inicialização (em contexto async). Idempotente: reload
+    /// sobrescreve o oráculo em memória — não chamar a cada execução.
+    pub async fn init_gas_oracle(&self) {
+        self.gas_estimator.load_gas_oracle().await;
+    }
+
     async fn current_flashloan_fee_pct(
         &self,
         pool_address: Option<&str>,

@@ -1412,6 +1412,12 @@ pub struct GasConfig {
     /// stale. 0 = sem limite de idade extra (só o TTL normal do cache valem).
     #[serde(default)]
     pub native_price_max_stale_secs: u64,
+
+    /// B2: path do arquivo JSON do oráculo EWMA de gas por venue. Se `None`,
+    /// o oráculo opera só em memória (sem persistência entre restarts). Sem
+    /// default inventado — persistência exige opt-in do operador.
+    #[serde(default)]
+    pub gas_oracle_path: Option<String>,
 }
 impl Default for GasConfig {
     fn default() -> Self {
@@ -1441,6 +1447,7 @@ impl Default for GasConfig {
             estimated_gas_units: 400_000,
             require_fresh_native_price: false,
             native_price_max_stale_secs: 0,
+            gas_oracle_path: None,
         }
     }
 }

@@ -91,6 +91,8 @@ impl Bot {
         // ✅ ArbitrageClient sem execution_engine
         let arbitrage_client =
             ArbitrageClient::new(executor_address, client.clone(), config.clone(), None);
+        // B2: carrega oráculo EWMA de gas do path configurado (se houver).
+        arbitrage_client.init_gas_oracle().await;
 
         let execution_mode = if cfg_guard.flashloan.enabled {
             if cfg_guard

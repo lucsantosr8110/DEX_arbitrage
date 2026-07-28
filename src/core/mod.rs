@@ -8,6 +8,7 @@ pub mod economics;
 pub mod fixed_usd;
 pub mod flashloan;
 pub mod gas;
+pub mod gas_oracle;
 pub mod gas_profile;
 pub mod paper_validation;
 pub mod replay_cross_model;

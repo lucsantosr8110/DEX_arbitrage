@@ -83,6 +83,9 @@ pub struct GasEstimator<M> {
     oracle_cache: Arc<RwLock<Option<(PolygonGasOracle, Instant)>>>,
     /// EWMA de gas real/estimado, aprendido de receipts confirmados.
     gas_unit_multiplier: Arc<RwLock<f64>>,
+    /// B2: oráculo EWMA por venue, persistido em disco.
+    gas_oracle: Arc<RwLock<crate::core::gas_oracle::GasOracle>>,
+    gas_oracle_path: Arc<RwLock<Option<std::path::PathBuf>>>,
     http: Client,
 }
 
@@ -98,10 +101,30 @@ where
             base_fee_cache: Arc::new(RwLock::new(None)),
             oracle_cache: Arc::new(RwLock::new(None)),
             gas_unit_multiplier: Arc::new(RwLock::new(1.0)),
+            gas_oracle: Arc::new(RwLock::new(crate::core::gas_oracle::GasOracle::default())),
+            gas_oracle_path: Arc::new(RwLock::new(None)),
             http: Client::builder()
                 .timeout(Duration::from_secs(3))
                 .build()
                 .unwrap(),
+        }
+    }
+
+    /// B2: carrega o oráculo EWMA do path configurado (`gas.gas_oracle_path`).
+    /// Deve ser chamado após `new` (em init, antes do loop de execução). Se o
+    /// path for `None`, opera só em memória (sem persistência).
+    pub async fn load_gas_oracle(&self) {
+        let path = {
+            let cfg = self.config.lock().await;
+            cfg.gas
+                .gas_oracle_path
+                .as_ref()
+                .map(|p| std::path::PathBuf::from(p))
+        };
+        if let Some(p) = &path {
+            let oracle = crate::core::gas_oracle::GasOracle::load(Some(p.clone()));
+            *self.gas_oracle.write().await = oracle;
+            *self.gas_oracle_path.write().await = Some(p.clone());
         }
     }
 
@@ -317,8 +340,13 @@ where
         let eff_from_base = base_fee_gwei * 1.05 + priority_gwei;
         let eff = eff_from_base.max(max_fee_gwei);
 
-        // B1: gas units por venue (soma), não linear por hop.
-        let baseline_units = crate::core::gas_profile::estimate_gas_units(steps, provider) as f64;
+        // B1/B2: gas units por venue, calibrado pelo oráculo EWMA quando houver
+        // ≥20 amostras do venue (max(estático, ewma_p75); nunca abaixo do estático).
+        let oracle = self.gas_oracle.read().await;
+        let baseline_units =
+            crate::core::gas_oracle::estimate_gas_units_calibrated(steps, provider, &oracle)
+                as f64;
+        drop(oracle);
         let multiplier = *self.gas_unit_multiplier.read().await;
         let gas_units = baseline_units * multiplier;
 
@@ -367,7 +395,7 @@ where
     }
 
     /// Aprende do receipt sem deixar uma tx atípica distorcer a estimativa.
-    /// B1: estima via perfil por venue (soma), não linear por hop.
+    /// B1/B2: estima via perfil por venue e alimenta o oráculo EWMA por venue.
     pub async fn observe_gas_used(
         &self,
         steps: &[crate::core::types::ArbitrageStep],
@@ -393,6 +421,25 @@ where
             actual,
             *multiplier
         );
+        drop(multiplier);
+
+        // B2: alimenta oráculo EWMA por venue com gas real atribuído
+        // proporcionalmente ao perfil estático de cada hop.
+        let venues: Vec<crate::core::gas_profile::VenueKind> =
+            steps.iter().map(crate::core::gas_profile::classify_step).collect();
+        {
+            let mut oracle = self.gas_oracle.write().await;
+            oracle.record_route(&venues, actual_units.as_u64());
+            let path = self.gas_oracle_path.read().await.clone();
+            oracle.save(path.as_ref());
+        }
+        // Métrica de erro de estimativa por venue (bps).
+        let err_bps = if estimated > 0.0 {
+            ((estimated - actual) / estimated).abs() * 10_000.0
+        } else {
+            0.0
+        };
+        crate::infra::metrics::observe_gas_estimate_error_bps(err_bps);
     }
 
     // ============================================================
@@ -524,6 +571,8 @@ impl<M> Clone for GasEstimator<M> {
             oracle_cache: self.oracle_cache.clone(),
             gas_unit_multiplier: self.gas_unit_multiplier.clone(),
             http: self.http.clone(),
+            gas_oracle: self.gas_oracle.clone(),
+            gas_oracle_path: self.gas_oracle_path.clone(),
         }
     }
 }

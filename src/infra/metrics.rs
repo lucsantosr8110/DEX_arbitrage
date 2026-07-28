@@ -110,6 +110,16 @@ pub static GAS_USED_OBSERVED: Lazy<Histogram> = Lazy::new(||
     register_histogram!("gas_used_observed", "Gas usado confirmado", vec![100_000.0, 250_000.0, 400_000.0, 600_000.0, 900_000.0, 1_500_000.0]).unwrap()
 );
 
+/// B2: erro absoluto da estimativa de gas em bps (|estimado − real| / estimado * 10_000).
+/// Por rota (não por venue); permite detectar drift sistemático da modelagem.
+pub static GAS_ESTIMATE_ERROR_BPS: Lazy<Histogram> = Lazy::new(||
+    register_histogram!(
+        "gas_estimate_error_bps",
+        "Erro absoluto |est−real|/est em bps por rota",
+        vec![0.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0]
+    ).unwrap()
+);
+
 // ============================================================
 // ⚡️ MÉTRICAS FLASHLOAN
 // ============================================================
@@ -246,6 +256,14 @@ pub fn record_gas_calibration(estimated_units: f64, actual_units: f64) {
     }
     GAS_CALIBRATION_RATIO.set(actual_units / estimated_units);
     GAS_USED_OBSERVED.observe(actual_units);
+}
+
+/// B2: observa erro absoluto da estimativa de gas em bps por rota.
+/// `err_bps` = |estimado − real| / estimado * 10_000. NaN/inf descartados.
+pub fn observe_gas_estimate_error_bps(err_bps: f64) {
+    if err_bps.is_finite() && err_bps >= 0.0 {
+        GAS_ESTIMATE_ERROR_BPS.observe(err_bps);
+    }
 }
 
 // ============================================================
