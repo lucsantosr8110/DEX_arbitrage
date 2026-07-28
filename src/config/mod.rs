@@ -997,6 +997,9 @@ fn default_route_max_cumulative_slippage() -> f64 { 2.0 }
 /// Margem padrão de 1 bps reservada do edge antes de autorizar slippage.
 fn default_edge_safety_margin_bps() -> u32 { 1 }
 
+/// Default top-N: 1 (executa só a melhor; >1 habilita fallback pré-broadcast).
+fn default_top_n_opportunities() -> u32 { 1 }
+
 impl Default for RouteValidationConfig {
     fn default() -> Self {
         Self {
@@ -1309,6 +1312,12 @@ pub struct ExecutionConfig {
     /// NÃO é price impact: quotes já são impact-inclusive (ver `core::economics`).
     /// Só ligue isto se quiser pagar explicitamente por risco de latência.
     #[serde(default)] pub adverse_move_bps: u32,
+
+    /// Top-N oportunidades a tentar por ciclo, em ordem descrescente de net profit.
+    /// Se a primeira falhar em validação pré-broadcast/simulação, tenta a próxima.
+    /// Após uma oportunidade ser ENVIADA (outcome não-Aborted), o loop para.
+    #[serde(default = "default_top_n_opportunities")]
+    pub top_n_opportunities: u32,
 }
 
 impl Default for ExecutionConfig {
@@ -1349,6 +1358,7 @@ impl Default for ExecutionConfig {
             safety_margin_bps: 9800,            // 98% safety (BPS-like)
             estimate_base_gas_usd: 0.02,
             edge_safety_margin_bps: default_edge_safety_margin_bps(),
+            top_n_opportunities: default_top_n_opportunities(),
         }
     }
 }

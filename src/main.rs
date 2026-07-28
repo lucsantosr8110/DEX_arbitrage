@@ -25,7 +25,8 @@ use tracing_subscriber::{
 
 use flashloan_bot::{
     config::Config,
-    core::bot::Bot,
+    core::bot::{execute_opportunity_standalone, should_try_next_opp, Bot},
+    core::flashloan::ArbitrageClient,
     dex::{
         circuit_breaker::DexCircuitBreaker, manager::DexManager,
         radar::{compute_top_spreads, extract_edges, start_high_hit_rate_radar, AdjCostParams, TopSpreadInfo},
@@ -606,12 +607,46 @@ async fn main() -> Result<()> {
 
                             update_tui_state(&tui_state, &adj_cost, &prices, top_n, cycle_count);
 
-                            // Execução envolvida em timeout: se hung, o future
-                            // é droppado (bot_guard liberado no drop) e o loop
-                            // continua em vez de travar o bot_task pra sempre.
+                            // FASE 7: detecção (descoberta + seleção top-N) sob lock;
+                            // envio/confirmação de tx FORA do lock. O bot não segura
+                            // MutexGuard através de awaits longos de broadcast.
                             let exec = async {
-                                let mut bot_guard = bot.lock().await;
-                                bot_guard.process_prices(prices).await
+                                // (1) Descoberta + seleção sob lock (sem envio).
+                                let selected = {
+                                    let mut bot_guard = bot.lock().await;
+                                    bot_guard.select_opportunities(prices).await
+                                };
+
+                                match selected {
+                                    Ok(opps) if !opps.is_empty() => {
+                                        // (2) Clona client + telegram sob lock brevemente,
+                                        // libera, e executa fora do lock.
+                                        let (client, tg): (ArbitrageClient, Arc<TelegramNotifier>) = {
+                                            let bot_guard = bot.lock().await;
+                                            (bot_guard.arbitrage_client.clone(), bot_guard.telegram.clone())
+                                        };
+
+                                        // FASE 8: top-N. Tenta próxima só se pré-broadcast
+                                        // abort (sim/complexidade/rota). Broadcast/terminal para.
+                                        for opp in opps {
+                                            let res = execute_opportunity_standalone(&client, &tg, opp).await;
+                                            match res {
+                                                Ok(r) => {
+                                                    if !should_try_next_opp(&r) {
+                                                        break;
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    error!("❌ Erro ao executar oportunidade: {:?}", e);
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        Ok(())
+                                    }
+                                    Ok(_) => Ok(()),
+                                    Err(e) => Err(e),
+                                }
                             };
                             match tokio::time::timeout(EXEC_TIMEOUT, exec).await {
                                 Ok(Ok(())) => {}

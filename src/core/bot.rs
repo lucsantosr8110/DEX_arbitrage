@@ -10,7 +10,7 @@ use crate::{
         gas::GasEstimator,
         paper_validation,
         risk::RiskManager,
-        types::{ArbitrageOpportunity, BundleResult},
+        types::{ArbitrageOpportunity, BundleResult, ExecutionOutcome},
     },
     infra::metrics,
     utils::telegram::TelegramNotifier,
@@ -221,10 +221,30 @@ impl Bot {
     // ============================================================
     // 🧾 Processamento e auditoria de preços
     // ============================================================
+    //
+    // FASE 7: a detecção (descoberta + seleção) roda sob o lock do bot; o envio/
+    // confirmação de tx NÃO. `select_opportunities` devolve as top-N opps sem
+    // executá-las; `main.rs` executa fora do lock (clonando ArbitrageClient, que
+    // é Clone, + telegram Arc). Isso evita segurar MutexGuard através de awaits
+    // longos de broadcast/confirmação, que travava TUI/preços por 30-60s.
     pub async fn process_prices(
         &mut self,
         prices: HashMap<String, HashMap<String, f64>>,
     ) -> Result<(), anyhow::Error> {
+        let selected = self.select_opportunities(prices).await?;
+        for opp in selected {
+            let _ = self.handle_opportunity(opp).await;
+        }
+        Ok(())
+    }
+
+    /// Descoberta + seleção top-N sob lock. Sem envio de tx. Paper path observa
+    /// inline e devolve `Vec::new()`. Non-paper devolve até `top_n_opportunities`
+    /// opps ordenadas por net profit descrescente.
+    pub async fn select_opportunities(
+        &mut self,
+        prices: HashMap<String, HashMap<String, f64>>,
+    ) -> Result<Vec<ArbitrageOpportunity>, anyhow::Error> {
         debug!("🧠 Processando {} conjuntos de preços", prices.len());
 
         if std::env::var("BOT_AUDIT_PRICES")
@@ -266,7 +286,7 @@ impl Bot {
             cfg_snapshot.clone()
         };
 
-        let opportunities = self
+        let mut opportunities = self
             .arbitrage_engine
             .find_arbitrage_opportunities(&prices, &discovery_cfg)
             .await;
@@ -316,28 +336,39 @@ impl Bot {
                     );
                 }
             }
-        } else if opportunities.is_empty() {
-            info!("📭 Ciclo sem oportunidades acima do threshold");
-        } else {
-            let best = &opportunities[0];
-            let all_pairs: Vec<String> = opportunities
-                .iter()
-                .map(|o| format!("{}@{:.2}%", o.pair, o.spread_percent))
-                .collect();
-            info!(
-                "🎯 {} oportunidades | melhor: {} spread={:.4}% net=${:.6} | [{}]",
-                opportunities.len(),
-                best.pair,
-                best.spread_percent,
-                best.net_profit_usd,
-                all_pairs.join(", ")
-            );
-            let _ = self
-                .handle_opportunity(opportunities.into_iter().next().unwrap())
-                .await;
+            return Ok(Vec::new());
         }
 
-        Ok(())
+        if opportunities.is_empty() {
+            info!("📭 Ciclo sem oportunidades acima do threshold");
+            return Ok(Vec::new());
+        }
+
+        // Top-N configurável, ordenado por net profit descrescente. main.rs
+        // executa fora do lock; falhas pré-broadcast (AbortedPreBroadcast) tentam
+        // a próxima; qualquer outcome de broadcast/terminal encerra o ciclo.
+        let top_n = cfg_snapshot.execution.top_n_opportunities.max(1) as usize;
+        opportunities.sort_by(|a, b| {
+            b.net_profit_usd
+                .partial_cmp(&a.net_profit_usd)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let best = &opportunities[0];
+        let all_pairs: Vec<String> = opportunities
+            .iter()
+            .take(top_n)
+            .map(|o| format!("{}@{:.2}%", o.pair, o.spread_percent))
+            .collect();
+        info!(
+            "🎯 {} oportunidades | melhor: {} spread={:.4}% net=${:.6} | top{}=[{}]",
+            opportunities.len(),
+            best.pair,
+            best.spread_percent,
+            best.net_profit_usd,
+            top_n,
+            all_pairs.join(", ")
+        );
+        Ok(opportunities.into_iter().take(top_n).collect())
     }
 
     // ============================================================
@@ -370,4 +401,60 @@ impl Bot {
     pub fn telegram(&self) -> &Arc<TelegramNotifier> {
         &self.telegram
     }
+}
+
+// =====================================================================
+// FASE 7: execução fora do lock do bot
+// =====================================================================
+//
+// `select_opportunities` roda sob lock (descoberta). A execução (envio/
+// confirmação de tx) roda aqui, sem segurar o MutexGuard do bot. O
+// `ArbitrageClient` é Clone e `TelegramNotifier` é Arc — clonados sob lock
+// e usados fora dele.
+
+/// Executa uma oportunidade sem segurar o lock do bot. Contém o mesmo gate
+/// de rota suportada + notificação telegram de `handle_opportunity`, mas
+/// opera sobre um `ArbitrageClient` clonado.
+pub async fn execute_opportunity_standalone(
+    client: &ArbitrageClient,
+    telegram: &TelegramNotifier,
+    mut opportunity: ArbitrageOpportunity,
+) -> Result<BundleResult> {
+    if !paper_validation::route_executor_supported(&opportunity) {
+        info!(
+            "🚫 Skip exec: rota não-suportada pelo executor ({}): {}",
+            opportunity.buy_dex, opportunity.pair
+        );
+        return Ok(BundleResult::skipped()
+            .with_execution_mode("route_unsupported")
+            .with_outcome(ExecutionOutcome::AbortedPreBroadcast {
+                reason: "route unsupported by executor".into(),
+            }));
+    }
+
+    if telegram.is_enabled() {
+        let _ = telegram
+            .notify_opportunity(
+                opportunity.spread_percent,
+                opportunity.estimated_profit_usd,
+                &opportunity.pair,
+                &[&opportunity.buy_dex, &opportunity.sell_dex],
+            )
+            .await;
+    }
+
+    client.execute_opportunity(&mut opportunity).await
+}
+
+/// Decide se o ciclo deve tentar a próxima oportunidade do top-N.
+///
+/// Tenta a próxima **só** em abort pré-broadcast (simulação/complexidade/
+/// approve/rota não-suportada/falta de preço). Qualquer outcome de broadcast
+/// (Confirmed, Reverted, TimeoutStuck, Dropped) ou SameBlockRejected encerra
+/// o ciclo — não há concorrência segura de nonce/liquidez para paralelo.
+pub fn should_try_next_opp(res: &BundleResult) -> bool {
+    matches!(
+        res.outcome,
+        Some(ExecutionOutcome::AbortedPreBroadcast { .. })
+    )
 }
