@@ -31,6 +31,7 @@ pub struct BundleSender<S: Signer + 'static> {
     http_client: reqwest::Client,
     signer: Arc<S>,
     pub signer_addr: Address,
+    #[allow(dead_code)] // TODO: usar no cálculo de tip mínimo do bundle
     min_tip_matic_wei: U256,
 }
 

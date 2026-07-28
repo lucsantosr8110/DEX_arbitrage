@@ -12,6 +12,7 @@
 pub mod metrics;
 pub mod network;
 pub mod rpc_provider;
+pub mod rotating_http_client;
 pub mod price_feed;
 
 use anyhow::Result;

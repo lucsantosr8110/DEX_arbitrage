@@ -183,14 +183,15 @@ network = "warn"
 risk = "info"
 
 [log]
-show_opportunities = true
-show_best_paths = true
-show_rejections = true
-show_profit_estimates = true
-show_gas_details = true
+show_opportunities = false
+show_best_paths = false
+show_rejections = false
+show_profit_estimates = false
+show_gas_details = false
 show_dex_responses = false
-export_trades_csv = true
+export_trades_csv = false
 export_prices_csv = false
+# Top-N spreads no painel TUI (sem RPC/TVL — ranking sync local).
 top_spreads_n = 5
 
 # ======================================================================
@@ -199,29 +200,34 @@ top_spreads_n = 5
 [network]
 name = "polygon"
 chain_id = 137
-# Segredos vêm do .env via expansão ${VAR} (ver Config::from_file).
-# Se ALCHEMY_RPC_URL/ALCHEMY_WS_URL não estiverem definidos, o literal "${...}"
-# permanece e o fallback público abaixo assume. Nunca versione chaves aqui.
-rpc_url = "${ALCHEMY_RPC_URL}"
+# RPC PÚBLICO primário + paid como fallback. Provedores pagos (Alchemy/QuickNode/
+# Infura) bateram rate-limit/capacidade mensal em 2026-07-27 e como primários
+# derrubavam o bot em ~20 ciclos. Públicos primeiro; connect_ws_with_fallback e
+# RotatingHttpClient só avançam para o paid quando os públicos falham/429.
+# Endpoints paid vêm do .env (gitignored) via expansão ${VAR}; se a variável
+# não estiver definida, o literal "${...}" é pulado por is_usable_endpoint.
+# Nunca versionar chaves aqui. O main.rs usa BOT_RPC_ENDPOINTS do .env quando
+# presente (HTTP); este bloco é o fallback seguro e a fonte de ws_endpoints.
+rpc_url = "https://polygon-bor-rpc.publicnode.com"
 rpc_endpoints = [
-    "${ALCHEMY_RPC_URL}",
-    "${QUICKNODE_RPC_URL}",
-    "${INFURA_RPC_URL}",
     "https://polygon-bor-rpc.publicnode.com",
     "https://1rpc.io/matic",
     "https://polygon-rpc.com",
     "https://polygon.llamarpc.com",
+    "${QUICKNODE_RPC_URL}",
+    "${ALCHEMY_RPC_URL}",
+    "${INFURA_RPC_URL}",
 ]
 ws_endpoints = [
-    "${ALCHEMY_WS_URL}",
-    "${QUICKNODE_WS_URL}",
-    "${INFURA_WS_URL}",
     "wss://polygon-bor-rpc.publicnode.com",
     "wss://polygon.drpc.org",
     "wss://polygon-rpc.com",
     "wss://polygon.llamarpc.com",
+    "${QUICKNODE_WS_URL}",
+    "${ALCHEMY_WS_URL}",
+    "${INFURA_WS_URL}",
 ]
-timeout_ms = 5000
+timeout_ms = 3000
 max_reorg_depth = 64
 block_delay_max = 2
 chain_monitoring = true
@@ -531,15 +537,14 @@ fee_tier = 25
 [pairs]
 enabled = true
 liquidity_allowlist = [
-    "USDC", "USDT", "DAI", "WMATIC", "WETH", "WBTC",
-    "LINK", "UNI", "LDO",
+    "USDC", "USDT", "DAI", "WMATIC", "WETH",
 ]
 monitor = [
     # Stable ↔ Stable (Curve am3CRV — única cobertura Curve)
     "USDC-USDT",
     "DAI-USDC",
     "DAI-USDT",
-    # Stable + bluechip + WBTC
+    # Stable + bluechip
     "USDC-WMATIC",
     "USDC-WETH",
     "USDT-WMATIC",
@@ -547,17 +552,6 @@ monitor = [
     "DAI-WMATIC",
     "DAI-WETH",
     "WMATIC-WETH",
-    "WBTC-USDC",
-    "WBTC-WMATIC",
-    # Mid-caps triangulares (UniswapV3); GHST/CRV/SAND/SUSHI fora
-    "LINK-WETH",
-    "LINK-USDC",
-    "LINK-WMATIC",
-    "UNI-WETH",
-    "UNI-USDC",
-    "LDO-WETH",
-    "LDO-USDC",
-    "LDO-WMATIC",
 ]
 
 auto_discovery = false

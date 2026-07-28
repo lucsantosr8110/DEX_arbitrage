@@ -14,6 +14,8 @@ use std::{
     time::Duration,
 };
 use tokio::sync::{broadcast, mpsc, Mutex};
+#[cfg(unix)]
+use tokio::signal::unix::{signal, SignalKind};
 use tracing::{debug, error, info, warn, Level};
 use tracing_subscriber::{
     filter::LevelFilter,
@@ -28,6 +30,7 @@ use flashloan_bot::{
         circuit_breaker::DexCircuitBreaker, manager::DexManager,
         radar::{compute_top_spreads, extract_edges, start_high_hit_rate_radar, AdjCostParams, TopSpreadInfo},
     },
+    emergency_shutdown::{self, EMERGENCY_SHUTDOWN},
     // execution:: imports removidos: ExecutionEngine/MevConfig/gwei eram codigo morto
     infra::{
         metrics,
@@ -39,7 +42,7 @@ use flashloan_bot::{
 };
 
 // ============================================================
-// 0️⃣ FUNÇÃO AUXILIAR PARA LOG DE CONFIGURAÇÃO
+// 0️⃣.5 FUNÇÃO AUXILIAR PARA LOG DE CONFIGURAÇÃO
 // ============================================================
 fn log_config_snapshot(config: &Config) {
     info!("═══════════════════════════════════════════════════════════════════");
@@ -276,15 +279,38 @@ async fn main() -> Result<()> {
     log_config_snapshot(&cfg_unlocked);
 
     // ============================================================
-    // 3️⃣.5 Servidor Prometheus (métricas)
+    // 3️⃣.5 Canal de shutdown + watchdog de emergência
+    // ============================================================
+    // Criado o mais cedo possível para que TUI, metrics, health-checker e
+    // listener Ctrl+C independente possam se inscrever.
+    let (shutdown_tx, _) = broadcast::channel::<()>(4);
+    emergency_shutdown::spawn_emergency_watchdog();
+
+    // Listener Ctrl+C em runtime separado: se o runtime principal travar em RPC,
+    // este thread ainda consegue receber o sinal e forçar a saída.
+    {
+        let shutdown_tx = shutdown_tx.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            if let Ok(rt) = rt {
+                rt.block_on(async {
+                    let _ = tokio::signal::ctrl_c().await;
+                    EMERGENCY_SHUTDOWN.store(true, std::sync::atomic::Ordering::Relaxed);
+                    let _ = shutdown_tx.send(());
+                });
+            }
+            // watchdog cuida do exit forçado
+        });
+    }
+
+    // ============================================================
+    // 3️⃣.6 Servidor Prometheus (métricas)
     // ============================================================
     // Antes o servidor de métricas nunca era iniciado — Infrastructure::initialize()
     // não era chamado do main.rs, e toda a camada de observabilidade era decorativa.
     // Agora chamamos diretamente: inicia warp em [prometheus].port (fallback 9101).
-    //
-    // shutdown_tx criado aqui (antes de metrics/health-check/TUI) para que
-    // todos os subsistemas spawned possam subscribe() e sair limpo no Ctrl-C.
-    let (shutdown_tx, _) = broadcast::channel::<()>(4);
     if cfg_unlocked.prometheus.enabled || cfg_unlocked.metrics.enabled {
         if let Err(e) = try_serve_metrics_with_fallback(&cfg_unlocked, shutdown_tx.clone()).await {
             warn!("⚠️ Falha ao iniciar servidor Prometheus: {}", e);
@@ -445,11 +471,14 @@ async fn main() -> Result<()> {
     let tui_state = Arc::new(std::sync::RwLock::new(tui::TuiState::default()));
     // Paper/headless: TUI precisa de TTY; skip quando PAPER_VALIDATION=1.
     let tui_enabled = !flashloan_bot::core::paper_validation::env_paper_flag();
-    if tui_enabled {
-        tui::spawn_tui(tui_state.clone(), shutdown_tx.clone());
+    // JoinHandle da thread da TUI — guardado para o main() fazer join no
+    // shutdown e garantir restauração do terminal (ver spawn_tui doc).
+    let tui_handle: Option<std::thread::JoinHandle<()>> = if tui_enabled {
+        Some(tui::spawn_tui(tui_state.clone(), shutdown_tx.clone()))
     } else {
         info!("📄 PAPER mode: TUI desabilitado (headless)");
-    }
+        None
+    };
 
     let radar_task = {
         let mut client_ws = client_ws.clone();
@@ -617,23 +646,51 @@ async fn main() -> Result<()> {
     // ============================================================
     // 1️⃣1️⃣ Shutdown ordenado
     // ============================================================
+    // Escuta SIGINT/SIGTERM (kill, Ctrl+C fora do raw mode da TUI) UMA vez,
+    // dispara o broadcast de shutdown, e RETORNA. Antes isto era um loop
+    // infinito: a task nunca completava, então future::try_join_all(tasks)
+    // no final do main nunca terminava sozinho e o tokio::time::timeout
+    // (shutdown_timeout, ...) — que conta desde o STARTUP, não desde o
+    // sinal — always disparava em 180s, abortando radar/bot/TUI no ar.
+    // O usuário via o bot morrer em ~180s ≈ 20 ciclos lentos e o terminal
+    // ficar preso no alternate screen da TUI (sem cleanup). Agora a task
+    // completa no shutdown e o timeout só passa a contar DEPOIS do sinal.
     let shutdown_task = {
         let shutdown_tx = shutdown_tx.clone();
         let telegram = telegram.clone();
         tokio::spawn(async move {
-            if tokio::signal::ctrl_c().await.is_ok() {
-                warn!("🛑 Ctrl-C recebido — encerrando...");
-                // Alerta de telegram envolvido em timeout: send_alert faz HTTP
-                // sem timeout próprio (telegram.rs:157). Se a rede/Telegram
-                // estiver pendurado, o ctrl_c nunca disparava shutdown_tx — o
-                // bot continuava vivo. Timeout aqui garante que o sinal sai
-                // mesmo se o alerta falhar.
-                let _ = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    telegram.send_alert("Shutdown", "Ctrl-C recebido - encerrando bot"),
-                ).await;
-                let _ = shutdown_tx.send(());
+            // ── Espera UM sinal de encerramento ──
+            #[cfg(unix)]
+            {
+                let mut sigint = signal(SignalKind::interrupt())
+                    .expect("falha ao registrar handler SIGINT");
+                let mut sigterm = signal(SignalKind::terminate())
+                    .expect("falha ao registrar handler SIGTERM");
+
+                tokio::select! {
+                    _ = sigint.recv() => warn!("🛑 SIGINT recebido — encerrando..."),
+                    _ = sigterm.recv() => warn!("🛑 SIGTERM recebido — encerrando..."),
+                }
             }
+
+            #[cfg(not(unix))]
+            {
+                tokio::signal::ctrl_c().await.expect("falha ao registrar Ctrl+C handler");
+                warn!("🛑 Ctrl-C recebido — encerrando...");
+            }
+
+            // Alerta Telegram com timeout: send_alert faz HTTP sem timeout
+            // próprio. Se rede/Telegram pendurado, timeout garante que o
+            // shutdown broadcast sai mesmo assim.
+            let _ = tokio::time::timeout(
+                Duration::from_secs(5),
+                telegram.send_alert("Shutdown", "Sinal recebido - encerrando bot"),
+            ).await;
+            let _ = shutdown_tx.send(());
+            // NÃO faz process::exit nem loop: o watchdog de emergência
+            // (emergency_shutdown.rs) cuida da saída forçada se o runtime
+            // não drenar em tempo. Retornar deixa a task completar e o
+            // try_join_all do main terminar sem depender do timeout global.
         })
     };
 
@@ -651,13 +708,14 @@ async fn main() -> Result<()> {
     let tasks = vec![radar_task, bot_task, shutdown_task];
 
     // Abort handles: se o shutdown ordenado estourar o timeout, forçamos o
-    // abort das tasks que não retornaram. Antes try_join_all era sem timeout
-    // — se o bot_task hung (execução sem timeout, ou radar preso em WS),
-    // o ctrl_c mandava shutdown mas o join esperava pra sempre e o processo
-    // nunca saía (tinha que kill -9). shutdown_timeout (config)liga esse
-    // guarda; default 300s, mas abort garante saída mesmo se uma task ignorar
-    // o sinal.
+    // abort das tasks que não retornaram.
     let aborts: Vec<tokio::task::AbortHandle> = tasks.iter().map(|t| t.abort_handle()).collect();
+    // shutdown_timeout agora é o teto da FASE de shutdown (depois do sinal),
+    // não mais um countdown desde o startup. Antes, como as tasks eram loops
+    // infinitos, o try_join_all nunca terminava sozinho e este timeout —
+    // contando desde "Sistema pronto" — matava o bot em 180s mesmo sem ninguém
+    // pedir shutdown. Agora o bloqueio abaixo só acontece APÓS o sinal, então
+    // este valor só é gasto drenando tasks na saída.
     let shutdown_timeout = Duration::from_secs(cfg_unlocked.general.shutdown_timeout.max(10) as u64);
 
     info!("🎯 Sistema pronto (modo hot-reload).");
@@ -668,16 +726,43 @@ async fn main() -> Result<()> {
             .await;
     }
 
+    // ── Bloqueia até ALGUÉM pedir shutdown ──
+    // Fontes de shutdown: 'q'/Esc/Ctrl+C na TUI (raw mode), SIGINT/SIGTERM
+    // (shutdown_task), Ctrl+C headless (thread early ctrl_c), e o watchdog
+    // de emergência (process::exit) como último recurso. Sem este bloqueio,
+    // o main avançava direto pro try_join_all com timeout e o processo morria
+    // em 180s desde o startup. Agora o bot roda indefinidamente até um sinal.
+    let mut main_shutdown_rx = shutdown_tx.subscribe();
+    let _ = main_shutdown_rx.recv().await;
+    info!("🛑 Shutdown solicitado — drenando tasks (teto {}s)...", shutdown_timeout.as_secs());
+
+    // ── Drena as tasks com teto de tempo ──
+    // Cada task responde ao broadcast: radar/bot quebram o loop no
+    // shutdown_rx; shutdown_task retorna após enviar o broadcast. Se uma
+    // task ignorar o sinal (ex.: radar preso em subscribe_blocks sem
+    // timeout), o abort garante saída mesmo assim.
     match tokio::time::timeout(shutdown_timeout, future::try_join_all(tasks)).await {
         Ok(Ok(_)) => info!("✅ Todas as tasks finalizadas."),
         Ok(Err(e)) => error!("❌ Erro nas tasks: {:?}", e),
         Err(_) => {
             error!(
-                "⏰ Shutdown excedeu {}s — abortando tasks restantes (kill -9 não mais necessário).",
+                "⏰ Drenagem excedeu {}s — abortando tasks restantes (kill -9 não mais necessário).",
                 shutdown_timeout.as_secs()
             );
             for a in &aborts { a.abort(); }
         }
+    }
+
+    // ── Restaura o terminal ──
+    // Join na thread da TUI: ela saiu do run_inner ao receber o broadcast de
+    // shutdown, momento em que run() já rodou o cleanup (disable_raw_mode +
+    // LeaveAlternateScreen). Sem este join, o processo podia sair com a TUI
+    // ainda em raw mode e o terminal do usuário ficava preso no alternate
+    // screen — nenhum comando respondia, precisava `reset`. Teto de 5s: se a
+    // TUI não sair (ex.: travou em draw), não penduramos o shutdown; o
+    // watchdog de emergência cuida do caso patológico.
+    if let Some(handle) = tui_handle {
+        let _ = handle.join();
     }
 
     metrics::set_bot_status(0);

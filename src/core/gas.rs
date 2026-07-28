@@ -65,7 +65,8 @@ struct PolygonGasTier {
 
 #[derive(Deserialize, Debug, Clone)]
 struct PolygonGasOracle {
-    safeLow: PolygonGasTier,
+    #[serde(rename = "safeLow")]
+    safe_low: PolygonGasTier,
     standard: PolygonGasTier,
     fast: PolygonGasTier,
 }
@@ -199,8 +200,8 @@ where
             let cfg = self.config.lock().await;
             cfg.gas.stations.polygon_oracle_url.clone()
         };
-        match self.http.get(&url).send().await {
-            Ok(resp) => {
+        match tokio::time::timeout(Duration::from_secs(5), self.http.get(&url).send()).await {
+            Ok(Ok(resp)) => {
                 if resp.status().is_success() {
                     let oracle: PolygonGasOracle = resp.json().await?;
                     let s = &oracle.standard;
@@ -212,8 +213,13 @@ where
                     Ok(None)
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!("⚠️ Erro ao acessar Polygon Gas Oracle: {}", e);
+                Ok(None)
+            }
+            Err(_) => {
+                warn!("⏱️ Timeout ao acessar Polygon Gas Oracle (>5s)");
+                crate::infra::metrics::inc_counter("rpc_call_timeout");
                 Ok(None)
             }
         }
@@ -393,7 +399,9 @@ where
             }
         }
 
-        let base_fee = latest_base_fee(&self.client).await?;
+        // Timeout defensivo: evita que RPC lenta/rate-limitada congele o ciclo.
+        let call_timeout = ttl.min(Duration::from_secs(5)).max(Duration::from_secs(1));
+        let base_fee = latest_base_fee(&self.client, call_timeout).await?;
         let mut cache = self.base_fee_cache.write().await;
         if let Some(bf) = base_fee {
             *cache = Some((bf, Instant::now()));
@@ -462,15 +470,28 @@ pub fn u256_to_f64(value: U256, decimals: u32) -> f64 {
     integer.as_u64() as f64 + (fractional.as_u64() as f64 / 10f64.powi(decimals as i32))
 }
 
-async fn latest_base_fee<M: Middleware>(client: &Arc<M>) -> Result<Option<U256>> {
-    match client.get_block(BlockId::Number(BlockNumber::Latest)).await {
-        Ok(Some(block)) => Ok(block.base_fee_per_gas),
-        Ok(None) => {
+async fn latest_base_fee<M: Middleware>(
+    client: &Arc<M>,
+    call_timeout: Duration,
+) -> Result<Option<U256>> {
+    match tokio::time::timeout(
+        call_timeout,
+        client.get_block(BlockId::Number(BlockNumber::Latest)),
+    )
+    .await
+    {
+        Ok(Ok(Some(block))) => Ok(block.base_fee_per_gas),
+        Ok(Ok(None)) => {
             warn!("⚠️ Nenhum bloco recente encontrado");
             Ok(None)
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             warn!("❌ Falha ao obter base fee: {}", e);
+            Ok(None)
+        }
+        Err(_) => {
+            warn!("⏱️ Timeout ao obter base fee (>{:?})", call_timeout);
+            crate::infra::metrics::inc_counter("rpc_call_timeout");
             Ok(None)
         }
     }

@@ -236,10 +236,12 @@ impl TuiApp {
                     Ok(Event::Key(key)) => {
                         match key.code {
                             KeyCode::Char('q') | KeyCode::Esc => {
+                                crate::emergency_shutdown::request_emergency_shutdown();
                                 let _ = self.shutdown_tx.send(());
                                 return Ok(());
                             }
                             KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                                crate::emergency_shutdown::request_emergency_shutdown();
                                 let _ = self.shutdown_tx.send(());
                                 return Ok(());
                             }
@@ -577,7 +579,16 @@ pub fn norm_pair(pair: &str) -> String {
 /// Spawn the TUI in a background thread. A TUI roda 100% síncrona
 /// (crossterm + ratatui + thread::sleep) — não precisa de runtime tokio.
 /// O event reader thread roda em paralelo e acumula eventos no canal mpsc.
-pub fn spawn_tui(state: Arc<RwLock<TuiState>>, shutdown_tx: broadcast::Sender<()>) {
+///
+/// Retorna o JoinHandle da thread da TUI. O main() faz join nele no shutdown
+/// para garantir que o terminal seja restaurado (disable_raw_mode +
+/// LeaveAlternateScreen) ANTES do processo sair. Sem este join, se o processo
+/// morresse (ou o runtime abortasse as tasks) com a TUI ainda em raw mode, o
+/// terminal do usuário ficava preso no alternate screen — parecia travado,
+/// nenhum comando respondia, precisava `reset`. O join espera a TUI sair do
+/// run_inner (que ela faz ao receber o broadcast de shutdown), momento em
+/// que o cleanup já rodou.
+pub fn spawn_tui(state: Arc<RwLock<TuiState>>, shutdown_tx: broadcast::Sender<()>) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut sd_rx = shutdown_tx.subscribe();
         let app = TuiApp::new(state, shutdown_tx);
@@ -586,7 +597,7 @@ pub fn spawn_tui(state: Arc<RwLock<TuiState>>, shutdown_tx: broadcast::Sender<()
             // O erro é logado no arquivo via tracing; aqui só ignoramos.
             let _ = e;
         }
-    });
+    })
 }
 
 #[cfg(test)]

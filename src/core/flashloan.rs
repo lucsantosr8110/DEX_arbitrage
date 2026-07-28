@@ -157,15 +157,29 @@ impl ArbitrageClient {
         };
         let pool = Contract::new(address, abi, self.middleware.clone());
         match pool.method::<_, U256>("FLASHLOAN_PREMIUM_TOTAL", ()) {
-            Ok(call) => match call.call().await {
-                Ok(bps) if bps <= U256::from(10_000u64) => {
-                    let pct = bps.as_u64() as f64 / 10_000.0;
-                    *self.flashloan_fee_cache.lock().await = Some((StdInstant::now(), pct));
-                    info!("Aave premium on-chain: {:.2} bps", pct * 10_000.0);
-                    pct
+            Ok(call) => {
+                match tokio::time::timeout(Duration::from_secs(10), call.call()).await {
+                    Ok(Ok(bps)) if bps <= U256::from(10_000u64) => {
+                        let pct = bps.as_u64() as f64 / 10_000.0;
+                        *self.flashloan_fee_cache.lock().await = Some((StdInstant::now(), pct));
+                        info!("Aave premium on-chain: {:.2} bps", pct * 10_000.0);
+                        pct
+                    }
+                    Ok(Ok(_)) => {
+                        warn!("⚠️ FLASHLOAN_PREMIUM_TOTAL fora do range; usando fallback");
+                        fallback_pct
+                    }
+                    Ok(Err(e)) => {
+                        warn!("⚠️ Falha ao ler FLASHLOAN_PREMIUM_TOTAL: {}; usando fallback", e);
+                        fallback_pct
+                    }
+                    Err(_) => {
+                        warn!("⏱️ Timeout ao ler FLASHLOAN_PREMIUM_TOTAL (>10s); usando fallback");
+                        crate::infra::metrics::inc_counter("rpc_call_timeout");
+                        fallback_pct
+                    }
                 }
-                _ => fallback_pct,
-            },
+            }
             Err(_) => fallback_pct,
         }
     }
@@ -1806,18 +1820,26 @@ impl ArbitrageClient {
 mod tests {
     use super::*;
 
-    use ethers::providers::{Http, Provider};
+    use ethers::providers::Provider;
     use ethers::signers::LocalWallet;
     use std::str::FromStr;
+    use crate::infra::rotating_http_client::RotatingHttpClient;
 
     // Chave de teste hardhat account #0 — bem conhecida, sem valor.
     const TEST_PK: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 
     /// Constrói um ArbitrageClient com middleware dummy (RPC localhost).
-    /// Nenhum método testado abaixo realiza chamadas de rede.
+    /// Nenhum método testado abaixo realiza chamadas de rede. Usa
+    /// RotatingHttpClient (mesmo tipo de transporte do AppMiddleware em
+    /// produção) — antes usava Provider<Http>, que não casa com o tipo
+    /// atual de AppMiddleware e quebrava a compilação dos testes.
     fn make_client() -> ArbitrageClient {
-        let provider = Provider::<Http>::try_from("http://127.0.0.1:8545")
-            .expect("URL dummy válida");
+        let transport = RotatingHttpClient::from_strings(
+            &["http://127.0.0.1:8545".to_string()],
+            std::time::Duration::from_secs(5),
+        )
+        .expect("transporte dummy válido");
+        let provider = Provider::new(transport);
         let provider = Arc::new(provider);
         let wallet = LocalWallet::from_str(TEST_PK).expect("PK teste válida");
         let middleware = Arc::new(AppMiddleware::new(provider, wallet));

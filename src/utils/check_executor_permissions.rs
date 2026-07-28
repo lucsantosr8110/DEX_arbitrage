@@ -9,8 +9,9 @@ use ethers::prelude::*;
 use std::sync::Arc;
 use tracing::{info, warn};
 
-// Endereço do contrato Executor
-const EXECUTOR_ADDRESS: &str = "0xc9bF35C5fF835aF08d1cc48dF114Af0e0D6b6B33"; // Coloque o endereço do seu executor aqui (se necessário)
+// Endereço do contrato Executor — mantido como referência; a função recebe o endereço via parâmetro.
+#[allow(dead_code)]
+const EXECUTOR_ADDRESS: &str = "0xc9bF35C5fF835aF08d1cc48dF114Af0e0D6b6B33";
 
 pub async fn check_permissions(middleware: Arc<AppMiddleware>, executor_address: Address) -> Result<()> {
     

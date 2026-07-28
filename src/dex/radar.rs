@@ -1565,6 +1565,9 @@ pub async fn start_high_hit_rate_radar(
     // → Err → auto-restart → connect_ws itera próximos endpoints.
     // Polygon ~2s/block; 20s sem bloco = WS morto/half-open.
     const BLOCK_TIMEOUT: Duration = Duration::from_secs(20);
+    // Timeout defensivo para o ciclo inteiro: se execute_radar_cycle travar
+    // em RPC rate-limitada, abortamos e forçamos reconexão/failover.
+    const CYCLE_TIMEOUT: Duration = Duration::from_secs(15);
 
     loop {
         tokio::select! {
@@ -1581,16 +1584,26 @@ pub async fn start_high_hit_rate_radar(
                         ALCHEMY_RATE_LIMITER.cleanup().await;
                         DEX_RATE_LIMITER.cleanup().await;
 
-                        match execute_radar_cycle(
+                        let cycle_result = tokio::time::timeout(
+                        CYCLE_TIMEOUT,
+                        execute_radar_cycle(
                             &dm, &cfg, &adj_cost, &price_tx,
                             &mut previous, &mut adj_tracker, cb.clone(),
                             &retry, cycle
-                        ).await {
-                            Ok((total, edges)) =>
-                                debug!("Ciclo {} — {} preços, {} sinais-spread, {} edges logados", cycle, total, edges.len(), edges.len()),
-                            Err(e) =>
-                                error!("Erro no ciclo {}: {:?}", cycle, e),
+                        )
+                    ).await;
+
+                    match cycle_result {
+                        Ok(Ok((total, edges))) =>
+                            debug!("Ciclo {} — {} preços, {} sinais-spread, {} edges logados", cycle, total, edges.len(), edges.len()),
+                        Ok(Err(e)) =>
+                            error!("Erro no ciclo {}: {:?}", cycle, e),
+                        Err(_) => {
+                            error!("⏱️ Radar: ciclo {} travou >{}s — disparando failover/reconexão.", cycle, CYCLE_TIMEOUT.as_secs());
+                            crate::infra::metrics::inc_counter("radar_cycle_timeout");
+                            return Err(anyhow!("radar cycle {} excedeu {:?}", cycle, CYCLE_TIMEOUT));
                         }
+                    }
                     }
                     None => {
                         error!("📡 Radar: stream WS fechou (provider morto) — disparando failover.");
