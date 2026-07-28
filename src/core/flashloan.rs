@@ -1885,10 +1885,36 @@ impl ArbitrageClient {
                             }
                         }
                         Ok(Ok(None)) => {
-                            // Receipt None: tx pode estar pending. Próximo attempt =
-                            // replacement mesmo nonce. Último attempt → TimeoutStuck.
+                            // Receipt None: tx pode estar pending OU já minerada (nó
+                            // sem receipt ainda). Próximo attempt = replacement mesmo
+                            // nonce. Último attempt → distinguir stuck vs dropped via
+                            // pending nonce da rede.
                             warn!(opp_id = %opp_id, nonce = ?nonce, "⏰ receipt None — tx possivelmente pending");
                             if attempt + 1 >= max_retries {
+                                // A12: se pending nonce da rede já passou do nosso,
+                                // tx foi incluída — não está stuck, está sem receipt no
+                                // nosso nó. Classifica Dropped (nonce consumido) e deixa
+                                // o caller resyncar, em vez de prender o nonce como stuck.
+                                let net_nonce = self
+                                    .middleware
+                                    .get_transaction_count(
+                                        sender,
+                                        Some(BlockId::Number(BlockNumber::Pending)),
+                                    )
+                                    .await
+                                    .unwrap_or(nonce);
+                                if net_nonce > nonce {
+                                    warn!(
+                                        opp_id = %opp_id, our_nonce = ?nonce,
+                                        net_nonce = ?net_nonce,
+                                        "tx incluída mas sem receipt local — nonce consumido, \
+                                         classifica Dropped (não stuck)"
+                                    );
+                                    return Ok(BundleResult::skipped()
+                                        .with_execution_mode("no_receipt_nonce_consumed")
+                                        .with_tx_hash(latest_tx_hash.map(|h| format!("{:?}", h)))
+                                        .with_outcome(ExecutionOutcome::Dropped { nonce }));
+                                }
                                 return Ok(self.timeout_stuck_result(
                                     &opp_id,
                                     nonce,
@@ -1923,16 +1949,23 @@ impl ArbitrageClient {
                 }
                 Ok(Err(e)) => {
                     let s = e.to_string().to_lowercase();
-                    // Sinais de que a tx já está na rede (nonce low, already known,
-                    // replacement underpriced, known transaction): não recriar com nonce
-                    // novo. Último attempt → TimeoutStuck (assume pendente). Caso
-                    // contrário → Dropped (nonce liberado p/ reuso futuro).
-                    let already_known = s.contains("nonce")
-                        || s.contains("already known")
-                        || s.contains("replacement")
-                        || s.contains("known transaction");
+                    // A11: "nonce too low" significa tx com esse nonce JÁ foi
+                    // incluída na chain — não está pendente. Classifica Dropped
+                    // (nonce consumido) em vez de TimeoutStuck (que prenderia o
+                    // nonce e conflitaria com a próxima opp).
+                    let nonce_too_low = s.contains("nonce too low");
+                    // Sinais de que a tx já está na rede (already known,
+                    // replacement underpriced, known transaction): não recriar com
+                    // nonce novo. Último attempt → TimeoutStuck (assume pendente).
+                    let already_known = !nonce_too_low
+                        && (s.contains("already known")
+                            || s.contains("replacement")
+                            || s.contains("known transaction")
+                            || s.contains("nonce"));
                     if attempt + 1 >= max_retries {
-                        let (mode_str, outcome) = if already_known {
+                        let (mode_str, outcome) = if nonce_too_low {
+                            ("dropped_nonce_consumed", ExecutionOutcome::Dropped { nonce })
+                        } else if already_known {
                             (
                                 "timeout_stuck",
                                 ExecutionOutcome::TimeoutStuck {
