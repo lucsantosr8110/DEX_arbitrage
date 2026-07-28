@@ -1799,21 +1799,37 @@ impl ArbitrageClient {
                                         )
                                         .await;
                                 }
-                                let contract_profit = self
+                                // A1: sem evento de lucro decodificável (wrapper path
+                                // emite evento distinto, ou token_price ausente), usa
+                                // gross teórico do finder como fallback — NUNCA 0.0.
+                                // 0.0 viria `real_profit = 0 - gas` = ConfirmedLoss
+                                // falso sistemático. Marca PnL como estimado, não medido.
+                                let (contract_profit, profit_measured) = match self
                                     .extract_real_profit_from_receipt(
                                         &receipt,
                                         opp,
                                         flashloan_decimals,
-                                    )
-                                    .unwrap_or_else(|| {
+                                    ) {
+                                    Some(p) => (p, true),
+                                    None => {
                                         warn!(
-                                            "receipt sem evento de lucro; PnL será limite inferior"
+                                            "receipt sem evento de lucro decodificável \
+                                             (wrapper path ou token_price ausente); PnL usará \
+                                             gross teórico do finder — NÃO é medição real"
                                         );
-                                        0.0
-                                    });
+                                        (opp.estimated_profit_usd, false)
+                                    }
+                                };
                                 let real_profit = self
                                     .realized_net_profit_after_gas_usd(&receipt, contract_profit)
                                     .await;
+                                if !profit_measured {
+                                    warn!(
+                                        opp_id = %opp_id, tx_hash = ?r_hash,
+                                        real_profit = real_profit,
+                                        "PnL NÃO medido do receipt — estimativa teórica (gross finder - gas real)"
+                                    );
+                                }
                                 metrics::inc_arbitrage_executions();
                                 metrics::inc_exec_ok();
                                 metrics::set_last_profit(real_profit);
@@ -2017,7 +2033,19 @@ impl ArbitrageClient {
                 Some(Token::Uint(v)) => v,
                 _ => continue,
             };
-            let token_price = opp.token_price_usd.unwrap_or(0.0);
+            // A2: sem preço do token no opp, não dá p/ converter raw→USD.
+            // Retornar None (caller usa gross teórico) — NUNCA Some(0.0), que
+            // vira falso ConfirmedLoss sistemático.
+            let token_price = match opp.token_price_usd {
+                Some(p) if p.is_finite() && p > 0.0 => p,
+                _ => {
+                    warn!(
+                        "FlashLoanSuccess decodificado mas opp.token_price_usd ausente/inválido \
+                         — profit real não medido, PnL será estimativa teórica"
+                    );
+                    return None;
+                }
+            };
             let profit_usd =
                 self.token_amount_to_usd_display_f64(profit_raw, token_price, flashloan_decimals);
             info!(
@@ -2051,12 +2079,24 @@ impl ArbitrageClient {
 
         let gas_wei = gas_used.saturating_mul(effective_gas_price);
         let gas_pol = u256_to_f64(gas_wei, 18);
-        let pol_usd = crate::infra::price_feed::PRICE_FEED
-            .get_price("WMATIC")
+        // A3: PnL realizado (que calibra gas estimator + métricas) não pode usar
+        // fallback heurístico de POL silenciosamente — preço de gas errado distorce
+        // o net de forma não detectável. Tenta strict (qualquer entrada não-fallback
+        // do cache); só cai no fallback se não houver NADA, e loga warn explícito.
+        let pol_usd = match crate::infra::price_feed::PRICE_FEED
+            .get_price_strict("WMATIC", std::time::Duration::ZERO)
             .await
-            .unwrap_or_else(|_| {
+        {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "PnL realizado: preço POL não-strict indisponível — usando fallback heurístico \
+                     (gas_usd PODE estar errado, métrica de calibração afetada)"
+                );
                 crate::infra::price_feed::CachedPriceFeed::fallback_price("WMATIC")
-            });
+            }
+        };
         let gas_usd = gas_pol * pol_usd;
         let net = contract_profit_usd - gas_usd;
         info!(
