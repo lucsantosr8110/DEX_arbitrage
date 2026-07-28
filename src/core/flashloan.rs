@@ -1727,9 +1727,25 @@ impl ArbitrageClient {
                 }
             }
             if !cfg.mev.enabled {
+                // B3 — fail-closed no ponto de broadcast: sem relay privado e sem
+                // opt-in explícito ao mempool público → aborta. Nunca transmite ao
+                // mempool público por default (custo de backrun/sandwich na Polygon ~0).
+                if !cfg.mev.allow_public_mempool {
+                    warn!(
+                        "🚫 ABORT pre-broadcast: NoPrivateRoute — relay privado off e \
+                         allow_public_mempool=false (fail-closed, zero broadcast)"
+                    );
+                    return Ok(BundleResult::skipped()
+                        .with_execution_mode("no_private_route")
+                        .with_outcome(ExecutionOutcome::AbortedPreBroadcast {
+                            reason: "NoPrivateRoute: relay privado indisponível e \
+                                 allow_public_mempool=false (fail-closed)"
+                                .into(),
+                        }));
+                }
                 info!(
-                    "⚠️ PublicMempoolDegraded: enviando via mempool público (relay privado off). \
-                     private_relay_required={}",
+                    "⚠️ PublicMempoolDegraded: enviando via mempool público (relay privado off, \
+                     allow_public_mempool=true). private_relay_required={}",
                     cfg.mev.private_relay_required
                 );
             }

@@ -20,6 +20,49 @@ use std::{
 use tokio::sync::RwLock;
 use tracing::{debug, info, instrument, warn};
 
+/// B3: timestamp (ms desde UNIX epoch) do último warn NoPrivateRoute. Rate-limit
+/// 1/min para não floodar logs quando muitas opps chegam sem relay privado.
+static LAST_NOPRIVATE_WARN_MS: AtomicU64 = AtomicU64::new(0);
+const NOPRIVATE_WARN_INTERVAL_MS: u64 = 60_000;
+
+/// B3: emite warn NoPrivateRoute no máximo 1×/min. Retorna true se emitiu.
+fn maybe_warn_no_private_route() -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let last = LAST_NOPRIVATE_WARN_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < NOPRIVATE_WARN_INTERVAL_MS {
+        return false;
+    }
+    // compare_exchange para não emitir 2× na mesma janela sob concorrência.
+    let _ = LAST_NOPRIVATE_WARN_MS.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed);
+    true
+}
+
+/// B3 — fail-closed puro: sem relay privado (`mev_enabled=false`) e operador não
+/// optou em mempool público (`allow_public_mempool=false`) → `Err` NoPrivateRoute.
+/// Zero broadcast. Extraído para teste sem instanciar `ArbitrageEngine` (que
+/// requer middleware/RPC). Emite warn rate-limited (1/min) no caminho de erro.
+pub(crate) fn enforce_no_public_mempool_fail_closed(
+    mev_enabled: bool,
+    allow_public_mempool: bool,
+) -> Result<()> {
+    if !mev_enabled && !allow_public_mempool {
+        if maybe_warn_no_private_route() {
+            warn!(
+                "🚫 NoPrivateRoute: relay privado indisponível (mev.enabled=false) e \
+                 allow_public_mempool=false — abort fail-closed (zero broadcast, MEV exposure)"
+            );
+        }
+        bail!(
+            "NoPrivateRoute: relay privado indisponível e allow_public_mempool=false \
+             (fail-closed, zero broadcast)"
+        );
+    }
+    Ok(())
+}
+
 // ------------------------------------------------------------
 // ⚙️ CONSTANTES DERIVADAS (removemos hardcodes sempre que possível)
 // ------------------------------------------------------------
@@ -1124,6 +1167,13 @@ impl ArbitrageEngine {
         let public_degraded = !mev_enabled;
         let degraded_slippage_cap = app_config.mev.public_mempool_degraded_slippage_bps;
         let public_min_edge_bps = app_config.mev.public_mempool_min_edge_bps as i64;
+
+        // B3 — fail-closed: sem relay privado (mev.enabled=false) e operador não
+        // optou em mempool público (allow_public_mempool=false) → aborta PRÉ-broadcast.
+        // Zero transmissão ao mempool público; custo do atacante em backrun na
+        // Polygon é ~0, então nunca degradar sem opt-in explícito.
+        enforce_no_public_mempool_fail_closed(mev_enabled, app_config.mev.allow_public_mempool)?;
+
         let effective_configured_bps = if public_degraded {
             configured_slippage_bps.min(degraded_slippage_cap)
         } else {
@@ -3160,5 +3210,24 @@ mod tests {
     fn realistic_price_rejects_unknown_token_fallback() {
         assert!(!ArbitrageEngine::is_realistic_price(1.0, "UNKNOWN", "USDC"));
         assert!(ArbitrageEngine::is_realistic_price(1.0, "USDC.E", "USDT"));
+    }
+
+    /// B3: degradado (mev.enabled=false) + allow_public_mempool=false → Err
+    /// NoPrivateRoute, zero broadcast (fail-closed).
+    #[test]
+    fn b3_no_private_route_fail_closed_when_degraded_and_not_allowed() {
+        // degradado, sem opt-in → aborta
+        let err = enforce_no_public_mempool_fail_closed(false, false).unwrap_err();
+        assert!(
+            err.to_string().contains("NoPrivateRoute"),
+            "deve ser NoPrivateRoute: {}",
+            err
+        );
+
+        // relay privado ativo → ok (não degrada)
+        assert!(enforce_no_public_mempool_fail_closed(true, false).is_ok());
+
+        // degradado mas operador optou em mempool público → ok (degrada explícito)
+        assert!(enforce_no_public_mempool_fail_closed(false, true).is_ok());
     }
 }

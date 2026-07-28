@@ -372,9 +372,19 @@ pub struct MevConfig {
     pub public_mempool_degraded_slippage_bps: u32,
 
     /// No modo degradado, edge mínimo (em bps) abaixo do qual a opp é rejeitada
-    /// — mempool público exige edge maior p/ compensar exposição a MEV. Default 10.
+    /// — mempool público exige edge maior p/ compensar exposição a MEV.
+    // SAFETY-EV: 10 bps em mempool público na Polygon é backrun garantido;
+    // custo do atacante ~0. Default 45 bps exige edge real antes de se expor.
     #[serde(default = "default_public_mempool_min_edge_bps")]
     pub public_mempool_min_edge_bps: u32,
+
+    /// Se false (default), o bot NÃO transmite ao mempool público quando o relay
+    /// privado está indisponível — aborta fail-closed (NoPrivateRoute) em vez de
+    /// se expor a MEV. Flip explícito para true libera o modo degradado.
+    // SAFETY-EV: default false — mempool público na Polygon é observado em tempo
+    /// real por sandwichers; nunca degradar sem opt-in do operador.
+    #[serde(default)]
+    pub allow_public_mempool: bool,
 }
 impl Default for MevConfig {
     fn default() -> Self {
@@ -388,6 +398,7 @@ impl Default for MevConfig {
             private_relay_required: false,
             public_mempool_degraded_slippage_bps: default_public_mempool_degraded_slippage_bps(),
             public_mempool_min_edge_bps: default_public_mempool_min_edge_bps(),
+            allow_public_mempool: false,
         }
     }
 }
@@ -396,7 +407,7 @@ fn default_public_mempool_degraded_slippage_bps() -> u32 {
     20
 }
 fn default_public_mempool_min_edge_bps() -> u32 {
-    10
+    45
 }
 
 // ===============================
