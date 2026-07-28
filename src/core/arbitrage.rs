@@ -36,7 +36,8 @@ fn maybe_warn_no_private_route() -> bool {
         return false;
     }
     // compare_exchange para não emitir 2× na mesma janela sob concorrência.
-    let _ = LAST_NOPRIVATE_WARN_MS.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed);
+    let _ =
+        LAST_NOPRIVATE_WARN_MS.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed);
     true
 }
 

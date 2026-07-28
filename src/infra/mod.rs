@@ -11,9 +11,9 @@
 
 pub mod metrics;
 pub mod network;
-pub mod rpc_provider;
-pub mod rotating_http_client;
 pub mod price_feed;
+pub mod rotating_http_client;
+pub mod rpc_provider;
 
 use anyhow::Result;
 use std::{net::SocketAddr, sync::Arc};
@@ -132,7 +132,10 @@ impl Infrastructure {
 // Servidor Prometheus com fallback automático
 // ============================================================
 
-pub async fn try_serve_metrics_with_fallback(cfg: &Config, shutdown_tx: tokio::sync::broadcast::Sender<()>) -> Result<()> {
+pub async fn try_serve_metrics_with_fallback(
+    cfg: &Config,
+    shutdown_tx: tokio::sync::broadcast::Sender<()>,
+) -> Result<()> {
     use crate::infra::metrics::{inc_bot_start_total, set_bot_status};
 
     // Preferir [prometheus].port (alinhado com prometheus.yml) quando ativo;
@@ -183,7 +186,10 @@ pub async fn try_serve_metrics_with_fallback(cfg: &Config, shutdown_tx: tokio::s
 // Inicializador real do servidor Prometheus
 // ============================================================
 
-async fn start_metrics_server(addr: SocketAddr, shutdown_tx: tokio::sync::broadcast::Sender<()>) -> Result<()> {
+async fn start_metrics_server(
+    addr: SocketAddr,
+    shutdown_tx: tokio::sync::broadcast::Sender<()>,
+) -> Result<()> {
     use prometheus::{Encoder, TextEncoder};
     use warp::Filter;
 

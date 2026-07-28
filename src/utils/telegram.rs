@@ -24,7 +24,8 @@ pub struct TelegramNotifier {
 impl TelegramNotifier {
     pub async fn init_from_config(cfg: &Config) -> Result<Self> {
         // 🔍 Verifica se a seção telegram existe
-        let telegram_config = if let Some(tg_cfg) = &cfg.telegram { // ✅ Remove .as_ref()
+        let telegram_config = if let Some(tg_cfg) = &cfg.telegram {
+            // ✅ Remove .as_ref()
             tg_cfg
         } else {
             warn!("📵 Seção [telegram] não encontrada no config - desativando notificações");
@@ -56,7 +57,8 @@ impl TelegramNotifier {
             return Err(anyhow!("❌ TELEGRAM_CHAT_ID não encontrado (env: TELEGRAM_CHAT_ID ou config.telegram.chat_id)"));
         }
 
-        if token == "${TELEGRAM_TOKEN}" || token == "${TELEGRAM_BOT_TOKEN}"
+        if token == "${TELEGRAM_TOKEN}"
+            || token == "${TELEGRAM_BOT_TOKEN}"
             || chat_id == "${TELEGRAM_CHAT_ID}"
         {
             return Err(anyhow!("❌ Variáveis Telegram não substituídas - verifique .env (TELEGRAM_TOKEN e TELEGRAM_CHAT_ID)"));
@@ -80,8 +82,9 @@ impl TelegramNotifier {
             chat_id,
             cooldown: Duration::from_secs(cooldown_secs),
             last_sent: Arc::new(Mutex::new(
-                Instant::now().checked_sub(Duration::from_secs(cooldown_secs))
-                    .unwrap_or(Instant::now())
+                Instant::now()
+                    .checked_sub(Duration::from_secs(cooldown_secs))
+                    .unwrap_or(Instant::now()),
             )),
             client: Client::new(),
         })
@@ -136,17 +139,19 @@ impl TelegramNotifier {
         if self.cooldown.as_secs() > 0 {
             let now = Instant::now();
             let mut last_sent = self.last_sent.lock().await;
-            
+
             if now.duration_since(*last_sent) < self.cooldown {
-                debug!("⏳ Cooldown ativo ({:?} restante) - ignorando envio Telegram", 
-                       self.cooldown - now.duration_since(*last_sent));
+                debug!(
+                    "⏳ Cooldown ativo ({:?} restante) - ignorando envio Telegram",
+                    self.cooldown - now.duration_since(*last_sent)
+                );
                 return Ok(());
             }
             *last_sent = now;
         }
 
         let url = format!("https://api.telegram.org/bot{}/sendMessage", self.bot_token);
-        
+
         let payload = TelegramMessage {
             chat_id: self.chat_id.clone(),
             text: text.to_string(),
@@ -180,7 +185,7 @@ impl TelegramNotifier {
         }
 
         let url = format!("https://api.telegram.org/bot{}/sendMessage", self.bot_token);
-        
+
         let payload = TelegramMessage {
             chat_id: self.chat_id.clone(),
             text: text.to_string(),
@@ -222,11 +227,11 @@ struct TelegramMessage {
 // 📦 Implementações auxiliares para uso fácil
 impl TelegramNotifier {
     pub async fn notify_opportunity(
-        &self, 
-        spread: f64, 
+        &self,
+        spread: f64,
         profit_estimate: f64,
         pair: &str,
-        dexes: &[&str]
+        dexes: &[&str],
     ) -> Result<()> {
         if !self.enabled {
             return Ok(());
@@ -254,7 +259,7 @@ impl TelegramNotifier {
         success: bool,
         profit_usd: f64,
         tx_hash: Option<&str>,
-        gas_cost: f64
+        gas_cost: f64,
     ) -> Result<()> {
         if !self.enabled {
             return Ok(());
@@ -262,7 +267,7 @@ impl TelegramNotifier {
 
         let emoji = if success { "✅" } else { "❌" };
         let status = if success { "Sucesso" } else { "Falha" };
-        
+
         let tx_info = if let Some(hash) = tx_hash {
             format!("[Ver TX](https://polygonscan.com/tx/{})", hash)
         } else {

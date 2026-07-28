@@ -7,12 +7,8 @@
 use crate::{
     config::{token_cache::TokenCache, Config},
     dex::{
-        calculate_price_from_decimals,
-        normalize_price,
-        quote_amount_for_usd,
-        rate_limiter::ALCHEMY_RATE_LIMITER,
-        DexContract,
-        TokenPairPrice,
+        calculate_price_from_decimals, normalize_price, quote_amount_for_usd,
+        rate_limiter::ALCHEMY_RATE_LIMITER, DexContract, TokenPairPrice,
     },
     AppMiddleware,
 };
@@ -22,7 +18,7 @@ use async_trait::async_trait;
 use ethers::{
     abi::{Abi, Token},
     contract::{Contract, Multicall},
-    types::{Address, U64, U256},
+    types::{Address, U256, U64},
 };
 use std::{str::FromStr, sync::Arc};
 use tracing::{debug, info, warn};
@@ -34,7 +30,7 @@ const DEX_NAME: &str = "Curve";
 // amTokens (amDAI/amUSDC/amUSDT). Sem este mapa, `resolve_am_to_symbol` nunca
 // casava → fallback Curve sempre retornava None, mesmo p/ stable-stable.
 const RAW_STABLE_TO_SYMBOL: &[(&str, &str)] = &[
-    ("0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063", "DAI"),  // DAI  raw
+    ("0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063", "DAI"), // DAI  raw
     // amUSDC no pool é o USDC.e bridged, não o USDC nativo Circle (0x3c49...).
     ("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174", "USDC.e"),
     ("0xc2132D05D31c914a87C6611C10748AEb04B58e8F", "USDT"), // USDT raw
@@ -102,11 +98,17 @@ impl CurveDex {
         let pool_tokens = discover_pool_tokens(client.clone(), pool_addr)
             .await
             .unwrap_or_else(|| {
-                warn!("[{}] coins(i) indisponível; usando ordem Curve conhecida", DEX_NAME);
+                warn!(
+                    "[{}] coins(i) indisponível; usando ordem Curve conhecida",
+                    DEX_NAME
+                );
                 default_stable_pool_tokens()
             });
 
-        info!("✅ {}Dex inicializado | pool={} | 3 stables (0.04% fee)", DEX_NAME, pool_addr);
+        info!(
+            "✅ {}Dex inicializado | pool={} | 3 stables (0.04% fee)",
+            DEX_NAME, pool_addr
+        );
         Self {
             client,
             pool_address: pool_addr,
@@ -222,10 +224,8 @@ impl DexContract for CurveDex {
 
         for (token_a, token_b) in pairs {
             // Só processa pares de stables
-            let (Some(idx_a), Some(idx_b)) = (
-                self.pool_index(token_a),
-                self.pool_index(token_b),
-            ) else {
+            let (Some(idx_a), Some(idx_b)) = (self.pool_index(token_a), self.pool_index(token_b))
+            else {
                 // AUDIT 2026-07-25: par fora do pool stable (ex.: DAI-WETH). Curve
                 // não serve este par — `–` é honesto. Log em debug p/ não spammar
                 // (o resumo de exclusão da DEX é barulhento no radar).
@@ -242,27 +242,41 @@ impl DexContract for CurveDex {
             let decimals_a = self.pool_tokens[idx_a].1;
             let decimals_b = self.pool_tokens[idx_b].1;
 
-            let amount_in = match quote_amount_for_usd(token_a, decimals_a, self.quote_notional_usd()).await {
-                Ok(amount) => amount,
-                Err(e) => {
-                    debug!("[{}] pulando {}-{}: notional indisponível: {}", DEX_NAME, token_a, token_b, e);
-                    continue;
-                }
-            };
+            let amount_in =
+                match quote_amount_for_usd(token_a, decimals_a, self.quote_notional_usd()).await {
+                    Ok(amount) => amount,
+                    Err(e) => {
+                        debug!(
+                            "[{}] pulando {}-{}: notional indisponível: {}",
+                            DEX_NAME, token_a, token_b, e
+                        );
+                        continue;
+                    }
+                };
 
             calls.push(CurveQuoteCall {
-                token_a: token_a.clone(), token_b: token_b.clone(), idx_a, idx_b,
-                decimals_a, decimals_b, amount_in,
+                token_a: token_a.clone(),
+                token_b: token_b.clone(),
+                idx_a,
+                idx_b,
+                decimals_a,
+                decimals_b,
+                amount_in,
             });
         }
 
-        if calls.is_empty() { return Ok(Vec::new()); }
+        if calls.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut multicall = Multicall::new(self.client.clone(), None).await?;
         if let Some(block) = quote_block {
             multicall = multicall.block(block);
         }
         for info in &calls {
-            let call = pool.method::<_, U256>("get_dy", (info.idx_a as i128, info.idx_b as i128, info.amount_in))?;
+            let call = pool.method::<_, U256>(
+                "get_dy",
+                (info.idx_a as i128, info.idx_b as i128, info.amount_in),
+            )?;
             // I1: uma falha de par não invalida todo lote Curve.
             multicall.add_call(call, true);
         }
@@ -271,13 +285,28 @@ impl DexContract for CurveDex {
         let mut results = Vec::new();
         for (info, result) in calls.iter().zip(raw) {
             let Ok(Token::Uint(dy)) = result else {
-                debug!("[{}] get_dy({}→{}) falhou no multicall", DEX_NAME, info.token_a, info.token_b);
+                debug!(
+                    "[{}] get_dy({}→{}) falhou no multicall",
+                    DEX_NAME, info.token_a, info.token_b
+                );
                 continue;
             };
-            if dy.is_zero() { continue; }
-            if let Ok(price) = calculate_price_from_decimals(info.amount_in, dy, info.decimals_a, info.decimals_b) {
+            if dy.is_zero() {
+                continue;
+            }
+            if let Ok(price) =
+                calculate_price_from_decimals(info.amount_in, dy, info.decimals_a, info.decimals_b)
+            {
                 if let Some(normalized) = normalize_price(price) {
-                    results.push(TokenPairPrice::new(info.token_a.clone(), info.token_b.clone(), normalized, DEX_NAME.into()).with_fee_tier(4));
+                    results.push(
+                        TokenPairPrice::new(
+                            info.token_a.clone(),
+                            info.token_b.clone(),
+                            normalized,
+                            DEX_NAME.into(),
+                        )
+                        .with_fee_tier(4),
+                    );
                 }
             }
         }
@@ -285,7 +314,12 @@ impl DexContract for CurveDex {
         Ok(results)
     }
 
-    async fn swap(&self, _token_in: Address, _token_out: Address, _amount_in: U256) -> Result<U256> {
+    async fn swap(
+        &self,
+        _token_in: Address,
+        _token_out: Address,
+        _amount_in: U256,
+    ) -> Result<U256> {
         Err(anyhow!("Curve swap not implemented (read-only adapter)"))
     }
 
@@ -390,7 +424,9 @@ async fn discover_pool_tokens(
     let raw: Vec<Result<Token, _>> = multicall.call_raw().await.ok()?;
     let mut tokens = Vec::with_capacity(3);
     for result in raw {
-        let Ok(Token::Address(address)) = result else { return None; };
+        let Ok(Token::Address(address)) = result else {
+            return None;
+        };
         let (decimals, symbol) = stable_metadata_for_am_token(address)?;
         tokens.push((address, decimals, symbol.to_string()));
     }
@@ -446,7 +482,11 @@ mod tests {
         let pt = pool_tokens();
         assert_eq!(stable_pool_index(&pt, "DAI"), Some(0));
         assert_eq!(stable_pool_index(&pt, "USDC.e"), Some(1));
-        assert_eq!(stable_pool_index(&pt, "USDC"), None, "USDC nativo não é amUSDC");
+        assert_eq!(
+            stable_pool_index(&pt, "USDC"),
+            None,
+            "USDC nativo não é amUSDC"
+        );
         assert_eq!(stable_pool_index(&pt, "USDT"), Some(2));
         assert_eq!(stable_pool_index(&pt, "dai"), Some(0)); // case-insensitive
     }
@@ -464,7 +504,11 @@ mod tests {
     fn stable_pool_index_rejects_non_stables() {
         let pt = pool_tokens();
         for sym in ["WETH", "WMATIC", "WBTC", "LINK", "UNI", "LDO", "AAVE"] {
-            assert_eq!(stable_pool_index(&pt, sym), None, "{sym} não deveria ter pool");
+            assert_eq!(
+                stable_pool_index(&pt, sym),
+                None,
+                "{sym} não deveria ter pool"
+            );
         }
     }
 

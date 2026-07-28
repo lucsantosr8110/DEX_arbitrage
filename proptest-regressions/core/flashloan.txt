@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f99baed3e3bb9fdb9dedede5b9bfc9b90ad36596d1b4672301e8bb8dbaa1f340 # shrinks to n_hops = 1, steps = [SwapStep { dex_type: 0, token_in: 0x0000000000000000000000000000000000000001, token_out: 0x0000000000000000000000000000000000000002, amount_out_min: 0, extra_data: Bytes(0x) }, SwapStep { dex_type: 0, token_in: 0x0000000000000000000000000000000000000001, token_out: 0x0000000000000000000000000000000000000001, amount_out_min: 0, extra_data: Bytes(0x) }]

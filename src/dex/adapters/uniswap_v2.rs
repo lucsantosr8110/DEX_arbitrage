@@ -7,14 +7,10 @@
 // ============================================================
 
 use crate::{
-    config::{Config, token_cache::TokenCache},
+    config::{token_cache::TokenCache, Config},
     dex::{
-        calculate_price_from_decimals,
-        get_token_decimals::get_token_decimals,
-        normalize_price,
-        quote_amount_for_usd,
-        rate_limiter::ALCHEMY_RATE_LIMITER,
-        DexContract, TokenPairPrice,
+        calculate_price_from_decimals, get_token_decimals::get_token_decimals, normalize_price,
+        quote_amount_for_usd, rate_limiter::ALCHEMY_RATE_LIMITER, DexContract, TokenPairPrice,
     },
     AppMiddleware,
 };
@@ -22,8 +18,8 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use ethers::{
     abi::{Abi, Token},
-    contract::{Contract, Multicall}, 
-    types::{Address, U64, U256},
+    contract::{Contract, Multicall},
+    types::{Address, U256, U64},
 };
 use std::{collections::HashSet, str::FromStr, sync::Arc};
 use tracing::{debug, info, warn};
@@ -83,7 +79,7 @@ impl V2Dex {
             token_cache,
         }
     }
-    
+
     async fn resolve_token(&self, symbol_or_address: &str) -> Result<Address> {
         if symbol_or_address.starts_with("0x") {
             return Ok(Address::from_str(symbol_or_address)?);
@@ -93,16 +89,20 @@ impl V2Dex {
             .await
             .ok_or_else(|| anyhow!("Token não suportado: {}", symbol_or_address))
     }
-    
+
     async fn prepare_call_data(&self, pairs: &[(String, String)]) -> Result<Vec<CallInfo>> {
         let mut call_data_list = Vec::new();
         for (token_a, token_b) in pairs {
-            
             let (Ok(addr_a), Ok(addr_b)) = (
                 self.resolve_token(token_a).await,
                 self.resolve_token(token_b).await,
             ) else {
-                warn!("⚠️ [{}] Falha ao resolver par {}/{} (endereços)", self.name(), token_a, token_b);
+                warn!(
+                    "⚠️ [{}] Falha ao resolver par {}/{} (endereços)",
+                    self.name(),
+                    token_a,
+                    token_b
+                );
                 continue;
             };
 
@@ -110,10 +110,15 @@ impl V2Dex {
                 get_token_decimals(self.client.clone(), addr_a).await,
                 get_token_decimals(self.client.clone(), addr_b).await,
             ) else {
-                warn!("⚠️ [{}] Falha ao resolver par {}/{} (decimais)", self.name(), token_a, token_b);
+                warn!(
+                    "⚠️ [{}] Falha ao resolver par {}/{} (decimais)",
+                    self.name(),
+                    token_a,
+                    token_b
+                );
                 continue;
             };
-            
+
             // Cotacao dimensionada pelo notional configurado, nao por "1 unidade
             // do token de entrada" (ver dex::quote_amount_for_usd).
             let amount_in =
@@ -153,15 +158,24 @@ impl DexContract for V2Dex {
             .dex
             .iter()
             .find(|d| d.name == self.name())
-            .ok_or_else(|| anyhow!("Configuração DEX não encontrada em config.toml para {}", self.name()))?
-            .factory_address 
+            .ok_or_else(|| {
+                anyhow!(
+                    "Configuração DEX não encontrada em config.toml para {}",
+                    self.name()
+                )
+            })?
+            .factory_address
             .clone();
 
-        let factory_address_str = factory_address_option
-            .ok_or_else(|| anyhow!("Factory address ausente na config.toml para {}", self.name()))?;
+        let factory_address_str = factory_address_option.ok_or_else(|| {
+            anyhow!(
+                "Factory address ausente na config.toml para {}",
+                self.name()
+            )
+        })?;
 
         let factory_address = factory_address_str.parse::<Address>()?;
-        
+
         let abi: Abi = serde_json::from_str(V2_FACTORY_ABI)?;
         let factory = Contract::new(factory_address, abi, self.client.clone());
 
@@ -177,7 +191,7 @@ impl DexContract for V2Dex {
             }
             Err(e) => {
                 warn!("[{}] Factory check falhou (getPair): {}", self.name(), e);
-                Ok(None) 
+                Ok(None)
             }
         }
     }
@@ -204,16 +218,21 @@ impl DexContract for V2Dex {
             .map(|i| i.symbol)
             .unwrap_or_default();
         if symbol_a.is_empty() {
-            debug!("[{}] get_price: symbol não resolvido p/ {:?}", self.name(), token_a);
+            debug!(
+                "[{}] get_price: symbol não resolvido p/ {:?}",
+                self.name(),
+                token_a
+            );
             return Ok(None);
         }
-        let amount_in = match quote_amount_for_usd(&symbol_a, decimals_a, self.quote_notional_usd()).await {
-            Ok(amount) => amount,
-            Err(e) => {
-                debug!("[{}] get_price: notional indisponível: {}", self.name(), e);
-                return Ok(None);
-            }
-        };
+        let amount_in =
+            match quote_amount_for_usd(&symbol_a, decimals_a, self.quote_notional_usd()).await {
+                Ok(amount) => amount,
+                Err(e) => {
+                    debug!("[{}] get_price: notional indisponível: {}", self.name(), e);
+                    return Ok(None);
+                }
+            };
         let path = vec![*token_a, *token_b];
         let call = contract.method::<_, Vec<U256>>("getAmountsOut", (amount_in, path))?;
 
@@ -223,7 +242,10 @@ impl DexContract for V2Dex {
                 if let Some(amount_out) = amounts.last() {
                     if !amount_out.is_zero() {
                         let price = calculate_price_from_decimals(
-                            amount_in, *amount_out, decimals_a, decimals_b
+                            amount_in,
+                            *amount_out,
+                            decimals_a,
+                            decimals_b,
                         )?;
                         return Ok(normalize_price(price));
                     }
@@ -242,9 +264,8 @@ impl DexContract for V2Dex {
         pairs: &[(String, String)],
         quote_block: Option<U64>,
     ) -> Result<Vec<TokenPairPrice>> {
-        
         let mut prices = Vec::new();
-        let mut failed_pairs = HashSet::new(); 
+        let mut failed_pairs = HashSet::new();
 
         let abi: Abi = serde_json::from_str(UNISWAP_V2_ROUTER_ABI)?;
         let contract = Contract::new(self.router, abi.clone(), self.client.clone());
@@ -258,7 +279,7 @@ impl DexContract for V2Dex {
         if let Some(block) = quote_block {
             multicall_direct = multicall_direct.block(block);
         }
-        
+
         for info in &call_data_list {
             let path = vec![info.addr_a, info.addr_b];
             let call = contract.method::<_, Vec<U256>>("getAmountsOut", (info.amount_in, path))?;
@@ -266,8 +287,12 @@ impl DexContract for V2Dex {
             multicall_direct.add_call(call, true);
         }
 
-        debug!("⚡ [{}] Multicall Pass 1 (Direct) - {} chamadas", self.name(), call_data_list.len());
-        ALCHEMY_RATE_LIMITER.acquire().await?; 
+        debug!(
+            "⚡ [{}] Multicall Pass 1 (Direct) - {} chamadas",
+            self.name(),
+            call_data_list.len()
+        );
+        ALCHEMY_RATE_LIMITER.acquire().await?;
         let results_direct: Vec<Result<Token, _>> = multicall_direct.call_raw().await?;
 
         for (i, result) in results_direct.into_iter().enumerate() {
@@ -277,22 +302,42 @@ impl DexContract for V2Dex {
             match result {
                 Ok(Token::Array(tokens)) => {
                     if let Some(Token::Uint(amount_out)) = tokens.last() {
-                         if !amount_out.is_zero() {
+                        if !amount_out.is_zero() {
                             let price = calculate_price_from_decimals(
-                                info.amount_in, *amount_out, info.decimals_a, info.decimals_b
+                                info.amount_in,
+                                *amount_out,
+                                info.decimals_a,
+                                info.decimals_b,
                             )?;
                             if let Some(p) = normalize_price(price) {
-                                prices.push(TokenPairPrice::new(info.token_a.clone(), info.token_b.clone(), p, self.name()));
-                                continue; 
+                                prices.push(TokenPairPrice::new(
+                                    info.token_a.clone(),
+                                    info.token_b.clone(),
+                                    p,
+                                    self.name(),
+                                ));
+                                continue;
                             }
                         }
                     }
                 }
                 Ok(other) => {
-                    debug!("- [{}] Path direto {}/{} retornou Token inesperado: {:?}", self.name(), info.token_a, info.token_b, other);
+                    debug!(
+                        "- [{}] Path direto {}/{} retornou Token inesperado: {:?}",
+                        self.name(),
+                        info.token_a,
+                        info.token_b,
+                        other
+                    );
                 }
                 Err(e) => {
-                     debug!("- [{}] Path direto falhou para {}/{}: {}", self.name(), info.token_a, info.token_b, e.to_string());
+                    debug!(
+                        "- [{}] Path direto falhou para {}/{}: {}",
+                        self.name(),
+                        info.token_a,
+                        info.token_b,
+                        e.to_string()
+                    );
                 }
             }
             failed_pairs.insert(pair_id);
@@ -332,17 +377,31 @@ impl DexContract for V2Dex {
         let deadline = U256::from(chrono::Utc::now().timestamp().saturating_add(600) as u64);
         let call = router.method::<_, Vec<U256>>(
             "swapExactTokensForTokens",
-            (amount_in, U256::zero(), vec![token_in, token_out], self.client.address(), deadline),
+            (
+                amount_in,
+                U256::zero(),
+                vec![token_in, token_out],
+                self.client.address(),
+                deadline,
+            ),
         )?;
         ALCHEMY_RATE_LIMITER.acquire().await?;
         let pending = call.send().await?;
         if let Some(receipt) = pending.await? {
-            info!("✅ [{}] Swap confirmado: {:?}", self.name(), receipt.transaction_hash);
+            info!(
+                "✅ [{}] Swap confirmado: {:?}",
+                self.name(),
+                receipt.transaction_hash
+            );
         }
         Ok(amount_in)
     }
-    fn client(&self) -> &Arc<AppMiddleware> { &self.client }
-    fn config(&self) -> &Arc<Config> { &self.config }
+    fn client(&self) -> &Arc<AppMiddleware> {
+        &self.client
+    }
+    fn config(&self) -> &Arc<Config> {
+        &self.config
+    }
 }
 
 /// Compatibilidade de API para callers que ainda importam o nome antigo.

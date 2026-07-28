@@ -32,7 +32,10 @@ pub enum RotatingClientError {
     JsonRpc(JsonRpcError),
 
     #[error("deserialization error: {err}. response: {text}")]
-    Serde { err: serde_json::Error, text: String },
+    Serde {
+        err: serde_json::Error,
+        text: String,
+    },
 
     #[error("all endpoints exhausted. last: {0}")]
     Exhausted(String),
@@ -233,11 +236,7 @@ impl JsonRpcClient for RotatingHttpClient {
             let idx = (start_idx + offset) % n;
             let url = &self.endpoints[idx];
 
-            let fut = self
-                .client
-                .post(url.as_ref())
-                .json(&payload)
-                .send();
+            let fut = self.client.post(url.as_ref()).json(&payload).send();
 
             let res = match timeout(self.request_timeout, fut).await {
                 Ok(Ok(r)) => r,
@@ -255,7 +254,11 @@ impl JsonRpcClient for RotatingHttpClient {
                     return Err(RotatingClientError::Reqwest(e));
                 }
                 Err(_) => {
-                    warn!("RPC[{}] timeout externo (>{}ms) — rotacionando...", idx, self.request_timeout.as_millis());
+                    warn!(
+                        "RPC[{}] timeout externo (>{}ms) — rotacionando...",
+                        idx,
+                        self.request_timeout.as_millis()
+                    );
                     self.current.store((idx + 1) % n, Ordering::Relaxed);
                     last_err = Some(format!("timeout externo em {}", url));
                     continue;
@@ -267,7 +270,10 @@ impl JsonRpcClient for RotatingHttpClient {
                 Ok(b) => b,
                 Err(e) => {
                     if Self::is_recoverable_transport(&e) || status.is_server_error() {
-                        warn!("RPC[{}] erro ao ler resposta ({}) — rotacionando...", idx, e);
+                        warn!(
+                            "RPC[{}] erro ao ler resposta ({}) — rotacionando...",
+                            idx, e
+                        );
                         self.current.store((idx + 1) % n, Ordering::Relaxed);
                         last_err = Some(e.to_string());
                         continue;
@@ -281,7 +287,8 @@ impl JsonRpcClient for RotatingHttpClient {
             if Self::is_recoverable_status(status) {
                 warn!(
                     "RPC[{}] HTTP {} — erro de provedor, rotacionando...",
-                    idx, status.as_u16()
+                    idx,
+                    status.as_u16()
                 );
                 self.current.store((idx + 1) % n, Ordering::Relaxed);
                 last_err = Some(format!("HTTP {}", status.as_u16()));
@@ -300,7 +307,8 @@ impl JsonRpcClient for RotatingHttpClient {
                     if Self::is_provider_error(&text) {
                         warn!(
                             "RPC[{}] resposta de erro não-padrão ({} bytes) — rotacionando...",
-                            idx, body.len()
+                            idx,
+                            body.len()
                         );
                         self.current.store((idx + 1) % n, Ordering::Relaxed);
                         last_err = Some(text.chars().take(200).collect());
@@ -319,7 +327,10 @@ impl JsonRpcClient for RotatingHttpClient {
                 // rotaciona. Erro de método (revert, insufficient funds, etc.)
                 // é genuíno e falha igual em todos os endpoints → hard-fail.
                 if Self::is_rate_limit(&msg) || Self::is_provider_error(&msg) {
-                    warn!("RPC[{}] erro JSON-RPC de provedor ({}) — rotacionando...", idx, msg);
+                    warn!(
+                        "RPC[{}] erro JSON-RPC de provedor ({}) — rotacionando...",
+                        idx, msg
+                    );
                     self.current.store((idx + 1) % n, Ordering::Relaxed);
                     last_err = Some(msg);
                     continue;
@@ -328,12 +339,11 @@ impl JsonRpcClient for RotatingHttpClient {
             }
 
             if let Some(result) = parsed.result {
-                let r = serde_json::from_value(result).map_err(|err| {
-                    RotatingClientError::Serde {
+                let r =
+                    serde_json::from_value(result).map_err(|err| RotatingClientError::Serde {
                         err,
                         text: text.into_owned(),
-                    }
-                })?;
+                    })?;
                 return Ok(r);
             }
 

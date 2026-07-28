@@ -2,7 +2,7 @@
 // src/dex/adapters/uniswap_v3.rs — V5 (FIXED: Validação de Preço Multi-Amount)
 // ============================================================
 //
-// 🚀 CORREÇÃO CRÍTICA: Implementação de validação de preço com 
+// 🚀 CORREÇÃO CRÍTICA: Implementação de validação de preço com
 //    múltiplos amounts_in (e.g., $10, $100, $500) para mitigar slippage/liquidez concentrada.
 // ✅ Substitui a chamada de preço baseada em 1 token.
 //
@@ -11,17 +11,17 @@
 use crate::{
     config::{token_cache::TokenCache, Config},
     dex::{
+        addresses, // Importando endereços de Factory/Quoter
+        cache_fee_tier,
         calculate_price_from_decimals,
         get_token_decimals::get_token_decimals,
+        is_executable_v3_fee_tier,
         normalize_price,
         quote_amount_for_usd,
         rate_limiter::ALCHEMY_RATE_LIMITER,
+        select_executable_v3_best_out,
         DexContract,
         TokenPairPrice,
-        addresses, // Importando endereços de Factory/Quoter
-        cache_fee_tier,
-        select_executable_v3_best_out,
-        is_executable_v3_fee_tier,
         EXECUTABLE_V3_FEE_TIERS,
         QUOTE_V3_FEE_TIERS,
     },
@@ -33,7 +33,7 @@ use async_trait::async_trait;
 use ethers::{
     abi::{Abi, Token},
     contract::{Contract, Multicall},
-    types::{Address, U64, U256},
+    types::{Address, U256, U64},
 };
 use std::{str::FromStr, sync::Arc};
 use tracing::{debug, info, warn};
@@ -50,7 +50,10 @@ const STABLE_PRICE_DEVIATION_LIMIT: f64 = 0.02; // stable-stable: 2%
 
 #[inline]
 fn is_usd_stable(symbol: &str) -> bool {
-    matches!(symbol.to_ascii_uppercase().as_str(), "USDC" | "USDC.E" | "USDT" | "DAI")
+    matches!(
+        symbol.to_ascii_uppercase().as_str(),
+        "USDC" | "USDC.E" | "USDT" | "DAI"
+    )
 }
 
 #[inline]
@@ -66,7 +69,7 @@ fn price_deviation_limit(token_a: &str, token_b: &str) -> f64 {
 const DEFAULT_QUOTER_V1: &str = addresses::UNISWAP_V3_QUOTER;
 const FACTORY_ADDR: &str = addresses::UNISWAP_V3_FACTORY;
 // Fallback Quoter V2 (mantido como constante interna, se não estiver no mod.rs)
-const FALLBACK_QUOTER_V2: &str = "0x61fFE014bA17989E743c5F6cB21bF9697530B21e"; 
+const FALLBACK_QUOTER_V2: &str = "0x61fFE014bA17989E743c5F6cB21bF9697530B21e";
 
 // 🚀 NOVO: ABI MÍNIMA PARA A FACTORY V3 (getPool)
 const UNISWAP_V3_FACTORY_ABI: &str = r#"[
@@ -116,9 +119,11 @@ impl UniswapV3Dex {
             .expect("Router inválido no config.toml");
 
         // Endereços dos quoters
-        let quoter_v1 = Address::from_str(DEFAULT_QUOTER_V1).unwrap_or_else(|_| panic!("Endereço Quoter V1 inválido"));
-        let quoter_v2 = Address::from_str(FALLBACK_QUOTER_V2).unwrap_or_else(|_| panic!("Endereço Quoter V2 inválido"));
-        
+        let quoter_v1 = Address::from_str(DEFAULT_QUOTER_V1)
+            .unwrap_or_else(|_| panic!("Endereço Quoter V1 inválido"));
+        let quoter_v2 = Address::from_str(FALLBACK_QUOTER_V2)
+            .unwrap_or_else(|_| panic!("Endereço Quoter V2 inválido"));
+
         // 1. OBTENDO O ENDEREÇO DA FACTORY
         let factory = dex_cfg
             .extra
@@ -127,7 +132,6 @@ impl UniswapV3Dex {
             .unwrap_or(FACTORY_ADDR)
             .parse::<Address>()
             .expect("Endereço de Factory UniswapV3 inválido");
-
 
         // Flags de modo
         let debug_mode = dex_cfg
@@ -183,7 +187,9 @@ impl UniswapV3Dex {
         // NOTE: prepare_call_data AINDA USA 1 UNIDADE COMO BASE para o Multicall fallback,
         // mas a lógica principal (get_price) irá usar a validação de múltiplos amounts.
         for (a, b) in pairs {
-            let (Ok(addr_a), Ok(addr_b)) = (self.resolve_token(a).await, self.resolve_token(b).await) else {
+            let (Ok(addr_a), Ok(addr_b)) =
+                (self.resolve_token(a).await, self.resolve_token(b).await)
+            else {
                 warn!("[{}] Falha ao resolver {}/{}", DEX_NAME, a, b);
                 continue;
             };
@@ -211,8 +217,8 @@ impl UniswapV3Dex {
     }
 
     fn load_abi_from_wrapper(abi_content: &str) -> Result<Abi> {
-        let wrapper: serde_json::Value =
-            serde_json::from_str(abi_content).map_err(|e| anyhow!("Erro parse ABI wrapper: {e}"))?;
+        let wrapper: serde_json::Value = serde_json::from_str(abi_content)
+            .map_err(|e| anyhow!("Erro parse ABI wrapper: {e}"))?;
         let array = wrapper
             .get("abi")
             .ok_or_else(|| anyhow!("Campo 'abi' ausente"))?
@@ -237,7 +243,8 @@ impl UniswapV3Dex {
         amount_in: U256,
     ) -> Result<U256> {
         // Tenta V1
-        let abi_v1 = Self::load_abi_from_wrapper(include_str!("../../../abi/uniswap_v3_quoter.json"))?;
+        let abi_v1 =
+            Self::load_abi_from_wrapper(include_str!("../../../abi/uniswap_v3_quoter.json"))?;
         let quoter_v1 = Contract::new(self.quoter_v1, abi_v1.clone(), self.client.clone());
 
         ALCHEMY_RATE_LIMITER.acquire().await?;
@@ -255,7 +262,8 @@ impl UniswapV3Dex {
         }
 
         // Fallback V2 (caso V1 reverta)
-        let abi_v2 = Self::load_abi_from_wrapper(include_str!("../../../abi/uniswap_v3_quoter_v2.json"))?;
+        let abi_v2 =
+            Self::load_abi_from_wrapper(include_str!("../../../abi/uniswap_v3_quoter_v2.json"))?;
         let quoter_v2 = Contract::new(self.quoter_v2, abi_v2, self.client.clone());
 
         ALCHEMY_RATE_LIMITER.acquire().await?;
@@ -265,14 +273,17 @@ impl UniswapV3Dex {
         )?;
 
         match call_v2.call().await {
-            Ok((out, _, _, _)) if out > U256::zero() => {
-                Ok(out)
-            }
-            Err(e) => Err(anyhow!("Ambos quoters falharam para (in: {:?}, fee: {}): {}", amount_in, fee, e)),
+            Ok((out, _, _, _)) if out > U256::zero() => Ok(out),
+            Err(e) => Err(anyhow!(
+                "Ambos quoters falharam para (in: {:?}, fee: {}): {}",
+                amount_in,
+                fee,
+                e
+            )),
             _ => Err(anyhow!("quoteExactInputSingle retornou zero")),
         }
     }
-    
+
     // ============================================================
     // NOVO: Função para obter cotação e preço
     // ============================================================
@@ -291,14 +302,20 @@ impl UniswapV3Dex {
             return Ok(None);
         }
 
-        match self.get_quote_with_fallback(token_a, token_b, fee, amount_in).await {
+        match self
+            .get_quote_with_fallback(token_a, token_b, fee, amount_in)
+            .await
+        {
             Ok(amount_out) => {
                 let price = calculate_price_from_decimals(amount_in, amount_out, dec_a, dec_b)?;
                 Ok(normalize_price(price))
             }
             Err(e) => {
                 if self.debug_mode {
-                    debug!("[{}] Falha ao cotar fee {} (in:{:?}): {}", DEX_NAME, fee, amount_in, e);
+                    debug!(
+                        "[{}] Falha ao cotar fee {} (in:{:?}): {}",
+                        DEX_NAME, fee, amount_in, e
+                    );
                 }
                 Err(e)
             }
@@ -333,28 +350,43 @@ impl UniswapV3Dex {
             .unwrap_or_default();
         let notional = self.quote_notional_usd();
         if symbol_a.is_empty() {
-            debug!("[{}] impacto: symbol não resolvido p/ {:?}", DEX_NAME, token_a);
+            debug!(
+                "[{}] impacto: symbol não resolvido p/ {:?}",
+                DEX_NAME, token_a
+            );
             return Ok(None);
         }
         // ~10%, 100%, 200% do notional configurado (default $100 → $10/$100/$200).
         let a_small = match quote_amount_for_usd(&symbol_a, dec_a, notional * 0.1).await {
             Ok(amount) => amount,
-            Err(e) => { debug!("[{}] impacto sem notional: {}", DEX_NAME, e); return Ok(None); }
+            Err(e) => {
+                debug!("[{}] impacto sem notional: {}", DEX_NAME, e);
+                return Ok(None);
+            }
         };
         let a_mid = match quote_amount_for_usd(&symbol_a, dec_a, notional).await {
             Ok(amount) => amount,
-            Err(e) => { debug!("[{}] impacto sem notional: {}", DEX_NAME, e); return Ok(None); }
+            Err(e) => {
+                debug!("[{}] impacto sem notional: {}", DEX_NAME, e);
+                return Ok(None);
+            }
         };
         let a_big = match quote_amount_for_usd(&symbol_a, dec_a, notional * 2.0).await {
             Ok(amount) => amount,
-            Err(e) => { debug!("[{}] impacto sem notional: {}", DEX_NAME, e); return Ok(None); }
+            Err(e) => {
+                debug!("[{}] impacto sem notional: {}", DEX_NAME, e);
+                return Ok(None);
+            }
         };
         let amounts_to_test: [U256; 3] = [a_small, a_mid, a_big];
 
         let mut prices = Vec::new();
 
         for amount_in in amounts_to_test.iter() {
-            if let Ok(Some(price)) = self.get_quote_price_for_amount(token_a, token_b, best_fee, *amount_in, dec_a, dec_b).await {
+            if let Ok(Some(price)) = self
+                .get_quote_price_for_amount(token_a, token_b, best_fee, *amount_in, dec_a, dec_b)
+                .await
+            {
                 prices.push(price);
             }
         }
@@ -374,22 +406,27 @@ impl UniswapV3Dex {
         let median_price = prices[prices.len() / 2];
 
         // 5. Verifica a divergência (slippage/concentração de liquidez)
-        let max_deviation = prices.iter().map(|&price| {
-            ((price - median_price) / median_price).abs()
-        }).fold(0.0, f64::max);
+        let max_deviation = prices
+            .iter()
+            .map(|&price| ((price - median_price) / median_price).abs())
+            .fold(0.0, f64::max);
 
         let deviation_limit = price_deviation_limit(&symbol_a, &symbol_b);
         if max_deviation > deviation_limit {
             warn!(
-                 "[{}] Pool {}/{} (fee {}) divergência ALTA ({:.2}% > {:.2}%) — Preço rejeitado.",
-                 DEX_NAME, token_a, token_b, best_fee, max_deviation * 100.0, deviation_limit * 100.0
+                "[{}] Pool {}/{} (fee {}) divergência ALTA ({:.2}% > {:.2}%) — Preço rejeitado.",
+                DEX_NAME,
+                token_a,
+                token_b,
+                best_fee,
+                max_deviation * 100.0,
+                deviation_limit * 100.0
             );
             return Ok(None);
         }
 
         Ok(Some(median_price))
     }
-
 }
 
 // ============================================================
@@ -414,17 +451,23 @@ impl DexContract for UniswapV3Dex {
         for &fee in &FEE_TIERS {
             ALCHEMY_RATE_LIMITER.acquire().await?;
             let call = factory_contract.method::<_, Address>("getPool", (token_a, token_b, fee))?;
-            
+
             match call.call().await {
                 Ok(pool_addr) if !pool_addr.is_zero() => {
-                    debug!("- [{}] Pool encontrado com fee {}: {}", DEX_NAME, fee, pool_addr);
+                    debug!(
+                        "- [{}] Pool encontrado com fee {}: {}",
+                        DEX_NAME, fee, pool_addr
+                    );
                     return Ok(Some(pool_addr));
-                },
+                }
                 _ => {}
             }
         }
 
-        debug!("- [{}] Nenhum Pool encontrado na Factory V3 para {:?} / {:?}", DEX_NAME, token_a, token_b);
+        debug!(
+            "- [{}] Nenhum Pool encontrado na Factory V3 para {:?} / {:?}",
+            DEX_NAME, token_a, token_b
+        );
         Ok(None)
     }
 
@@ -473,8 +516,15 @@ impl DexContract for UniswapV3Dex {
     // ========================================================
     async fn get_price(&self, token_a: &Address, token_b: &Address) -> Result<Option<f64>> {
         // 1. CRÍTICO: Checar se existe algum pool para este par
-        if self.get_pair_or_pool_address(*token_a, *token_b).await?.is_none() {
-            debug!("- [{}] Nenhum Pool V3 encontrado para o par, pulando cotação.", DEX_NAME);
+        if self
+            .get_pair_or_pool_address(*token_a, *token_b)
+            .await?
+            .is_none()
+        {
+            debug!(
+                "- [{}] Nenhum Pool V3 encontrado para o par, pulando cotação.",
+                DEX_NAME
+            );
             return Ok(None);
         }
 
@@ -499,13 +549,14 @@ impl DexContract for UniswapV3Dex {
             debug!("[{}] symbol não resolvido p/ {:?}", DEX_NAME, token_a);
             return Ok(None);
         }
-        let amount_in_test = match quote_amount_for_usd(&symbol_a_test, dec_a, self.quote_notional_usd()).await {
-            Ok(amount) => amount,
-            Err(e) => {
-                debug!("[{}] notional indisponível: {}", DEX_NAME, e);
-                return Ok(None);
-            }
-        };
+        let amount_in_test =
+            match quote_amount_for_usd(&symbol_a_test, dec_a, self.quote_notional_usd()).await {
+                Ok(amount) => amount,
+                Err(e) => {
+                    debug!("[{}] notional indisponível: {}", DEX_NAME, e);
+                    return Ok(None);
+                }
+            };
         let mut quotes: Vec<(u32, U256)> = Vec::with_capacity(FEE_TIERS.len());
 
         for &fee in &FEE_TIERS {
@@ -528,13 +579,9 @@ impl DexContract for UniswapV3Dex {
         };
 
         // 2. NOVO: Valida o preço usando múltiplos amounts e a melhor fee encontrada
-        let validated_price = self.validate_price_with_multiple_amounts(
-            *token_a, 
-            *token_b, 
-            best_fee, 
-            dec_a, 
-            dec_b
-        ).await?;
+        let validated_price = self
+            .validate_price_with_multiple_amounts(*token_a, *token_b, best_fee, dec_a, dec_b)
+            .await?;
 
         // 📊 LOG DE COTAÇÃO (fim do cálculo)
         if let Some(price) = validated_price {
@@ -549,7 +596,12 @@ impl DexContract for UniswapV3Dex {
             if self.debug_mode {
                 tracing::info!(
                     "[{}] {}→{} fee={} price={:.8} (validated, cached fee_tier={})",
-                    DEX_NAME, token_a, token_b, best_fee, price, best_fee
+                    DEX_NAME,
+                    token_a,
+                    token_b,
+                    best_fee,
+                    price,
+                    best_fee
                 );
             }
             Ok(Some(price))
@@ -562,7 +614,7 @@ impl DexContract for UniswapV3Dex {
     // ========================================================
     // ⚡ Consulta múltipla (Multicall opcional)
     // ========================================================
-    // O Multicall é mantido inalterado, pois é otimizado para velocidade 
+    // O Multicall é mantido inalterado, pois é otimizado para velocidade
     // e confia no revert do Quoter. A lógica de preço principal (get_price)
     // agora é mais robusta para fallback.
     async fn get_prices_multicall(
@@ -571,15 +623,22 @@ impl DexContract for UniswapV3Dex {
         quote_block: Option<U64>,
     ) -> Result<Vec<TokenPairPrice>> {
         if self.disable_multicall {
-            warn!("[{}] Multicall desativado — fallback para chamadas diretas", DEX_NAME);
+            warn!(
+                "[{}] Multicall desativado — fallback para chamadas diretas",
+                DEX_NAME
+            );
             let mut results = Vec::new();
             for (a, b) in pairs {
-                if let (Ok(addr_a), Ok(addr_b)) = (
-                    self.resolve_token(a).await,
-                    self.resolve_token(b).await,
-                ) {
+                if let (Ok(addr_a), Ok(addr_b)) =
+                    (self.resolve_token(a).await, self.resolve_token(b).await)
+                {
                     if let Ok(Some(p)) = self.get_price(&addr_a, &addr_b).await {
-                        results.push(TokenPairPrice::new(a.clone(), b.clone(), p, DEX_NAME.into()));
+                        results.push(TokenPairPrice::new(
+                            a.clone(),
+                            b.clone(),
+                            p,
+                            DEX_NAME.into(),
+                        ));
                     }
                 }
             }
@@ -590,7 +649,12 @@ impl DexContract for UniswapV3Dex {
         let abi = Self::load_abi_from_wrapper(include_str!("../../../abi/uniswap_v3_quoter.json"))?;
         let quoter = Contract::new(self.quoter_v1, abi, self.client.clone());
         let call_data = self
-            .prepare_call_data(&pairs.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect::<Vec<_>>())
+            .prepare_call_data(
+                &pairs
+                    .iter()
+                    .map(|(a, b)| (a.as_str(), b.as_str()))
+                    .collect::<Vec<_>>(),
+            )
             .await?;
 
         // Chunk em batches de 10 pares para caber no gas limit da Alchemy
@@ -619,7 +683,12 @@ impl DexContract for UniswapV3Dex {
             let raw: Vec<Result<Token, _>> = match multicall.call_raw().await {
                 Ok(r) => r,
                 Err(e) => {
-                    warn!("[{}] Multicall batch falhou ({} pares): {:?}", DEX_NAME, batch.len(), e);
+                    warn!(
+                        "[{}] Multicall batch falhou ({} pares): {:?}",
+                        DEX_NAME,
+                        batch.len(),
+                        e
+                    );
                     continue;
                 }
             };
@@ -650,16 +719,20 @@ impl DexContract for UniswapV3Dex {
                     if !is_executable_v3_fee_tier(*fee) || out.is_zero() {
                         continue;
                     }
-                    if let Ok(p) =
-                        calculate_price_from_decimals(info.amount_in, *out, info.decimals_a, info.decimals_b)
-                    {
+                    if let Ok(p) = calculate_price_from_decimals(
+                        info.amount_in,
+                        *out,
+                        info.decimals_a,
+                        info.decimals_b,
+                    ) {
                         if p > 0.0 {
                             tier_prices.push(p);
                         }
                     }
                 }
                 if tier_prices.len() >= 2 {
-                    tier_prices.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    tier_prices
+                        .sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                     let mid = tier_prices[tier_prices.len() / 2];
                     let max_dev = tier_prices
                         .iter()
@@ -684,18 +757,27 @@ impl DexContract for UniswapV3Dex {
                 if self.debug_mode {
                     tracing::info!(
                         "[{}] {}→{} fee={} in={} out={} price={:.8} (multicall)",
-                        DEX_NAME, info.token_a, info.token_b, best_fee, info.amount_in, best_out, price
+                        DEX_NAME,
+                        info.token_a,
+                        info.token_b,
+                        best_fee,
+                        info.amount_in,
+                        best_out,
+                        price
                     );
                 }
                 if let Some(p) = normalize_price(price) {
                     cache_fee_tier(DEX_NAME, &info.token_a, &info.token_b, best_fee);
 
-                    results.push(TokenPairPrice::new(
-                        info.token_a.clone(),
-                        info.token_b.clone(),
-                        p,
-                        DEX_NAME.into(),
-                    ).with_fee_tier(best_fee));
+                    results.push(
+                        TokenPairPrice::new(
+                            info.token_a.clone(),
+                            info.token_b.clone(),
+                            p,
+                            DEX_NAME.into(),
+                        )
+                        .with_fee_tier(best_fee),
+                    );
                 }
             }
         }
@@ -708,24 +790,41 @@ impl DexContract for UniswapV3Dex {
     // ========================================================
     async fn swap(&self, token_in: Address, token_out: Address, amount_in: U256) -> Result<U256> {
         if self.config.execution.dry_run {
-            info!("[{}] Dry-run swap {:?} -> {:?}", DEX_NAME, token_in, token_out);
+            info!(
+                "[{}] Dry-run swap {:?} -> {:?}",
+                DEX_NAME, token_in, token_out
+            );
             return Ok(amount_in);
         }
-        
+
         // 1. CRÍTICO: Checar se o par existe antes de tentar o swap (evitar revert)
-        if self.get_pair_or_pool_address(token_in, token_out).await?.is_none() {
-            return Err(anyhow!("[{}] Swap: Nenhum Pool V3 encontrado para o par.", DEX_NAME));
+        if self
+            .get_pair_or_pool_address(token_in, token_out)
+            .await?
+            .is_none()
+        {
+            return Err(anyhow!(
+                "[{}] Swap: Nenhum Pool V3 encontrado para o par.",
+                DEX_NAME
+            ));
         }
 
-        let router_abi = Self::load_abi_from_wrapper(include_str!("../../../abi/UniswapV3Router.json"))?;
+        let router_abi =
+            Self::load_abi_from_wrapper(include_str!("../../../abi/UniswapV3Router.json"))?;
         let router = Contract::new(self.router, router_abi, self.client.clone());
 
         // A2: fee tier hardcoded 3000 revertia em pools fee=500/10000. Resolver
         // via cache (preenchido pelo get_price/multicall) — fallback 3000 só se
         // sem cache (e loga, pois é arriscado).
         let (sym_in, sym_out) = (
-            self.token_cache.get_by_address(&token_in).await.map(|i| i.symbol),
-            self.token_cache.get_by_address(&token_out).await.map(|i| i.symbol),
+            self.token_cache
+                .get_by_address(&token_in)
+                .await
+                .map(|i| i.symbol),
+            self.token_cache
+                .get_by_address(&token_out)
+                .await
+                .map(|i| i.symbol),
         );
         let fee_tier = match (sym_in.as_deref(), sym_out.as_deref()) {
             (Some(a), Some(b)) => crate::dex::cached_fee_tier(DEX_NAME, a, b),
@@ -757,7 +856,7 @@ impl DexContract for UniswapV3Dex {
             info!("✅ [{}] Swap executado: {:?}", DEX_NAME, r.transaction_hash);
         }
 
-        Ok(amount_in) 
+        Ok(amount_in)
     }
 
     // ========================================================

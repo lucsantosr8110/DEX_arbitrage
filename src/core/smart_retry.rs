@@ -10,7 +10,7 @@
 // ================================================================
 
 use anyhow::Result;
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::{
     fmt::Debug,
     time::{Duration, Instant},

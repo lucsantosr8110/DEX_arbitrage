@@ -170,15 +170,13 @@ impl CrossModelCycle {
         self.legs
             .iter()
             .map(|l| {
-                l.v3_fee_tier
-                    .map(|f| f.to_string())
-                    .unwrap_or_else(|| {
-                        if l.model() == CurveModel::StableSwap {
-                            "4bps".into()
-                        } else {
-                            "-".into()
-                        }
-                    })
+                l.v3_fee_tier.map(|f| f.to_string()).unwrap_or_else(|| {
+                    if l.model() == CurveModel::StableSwap {
+                        "4bps".into()
+                    } else {
+                        "-".into()
+                    }
+                })
             })
             .collect::<Vec<_>>()
             .join(";")
@@ -193,10 +191,7 @@ impl CrossModelCycle {
 pub type QuoteIndex = std::collections::HashMap<(String, String, String), (f64, Option<u32>)>;
 
 /// Melhor ciclo A→B→C→A exigindo `cross_model` (ou same_model se `require_cross=false`).
-pub fn find_best_stable_cycle(
-    quotes: &QuoteIndex,
-    require_cross: bool,
-) -> Option<CrossModelCycle> {
+pub fn find_best_stable_cycle(quotes: &QuoteIndex, require_cross: bool) -> Option<CrossModelCycle> {
     let stables = ["USDC", "USDT", "DAI"];
     let mut best: Option<CrossModelCycle> = None;
 
@@ -306,7 +301,11 @@ mod tests {
     #[test]
     fn cross_model_flag_mixed_venues() {
         assert!(cycle_is_cross_model(["Curve", "UniswapV3", "QuickSwap"]));
-        assert!(!cycle_is_cross_model(["UniswapV3", "QuickSwap", "SushiSwap"]));
+        assert!(!cycle_is_cross_model([
+            "UniswapV3",
+            "QuickSwap",
+            "SushiSwap"
+        ]));
         assert!(!cycle_is_cross_model(["Curve", "Curve", "Curve"]));
     }
 
@@ -319,8 +318,16 @@ mod tests {
         assert!(should_eth_call_for_route(true, 0, 40, true));
         assert!(!should_eth_call_for_route(false, 0, 40, true));
         // cross-model route with Curve never eth_calls
-        assert!(!route_all_legs_executable(["Curve", "UniswapV3", "QuickSwap"]));
-        assert!(route_all_legs_executable(["UniswapV3", "QuickSwap", "SushiSwap"]));
+        assert!(!route_all_legs_executable([
+            "Curve",
+            "UniswapV3",
+            "QuickSwap"
+        ]));
+        assert!(route_all_legs_executable([
+            "UniswapV3",
+            "QuickSwap",
+            "SushiSwap"
+        ]));
     }
 
     #[test]
@@ -339,19 +346,37 @@ mod tests {
     fn find_cross_model_cycle_from_quotes() {
         let mut q = QuoteIndex::new();
         // Force mispricing: Curve USDC→USDT high, CPMM elsewhere
-        q.insert(("Curve".into(), "USDC".into(), "USDT".into()), (1.002, None));
-        q.insert(("UniswapV3".into(), "USDT".into(), "DAI".into()), (1.0, Some(100)));
-        q.insert(("QuickSwap".into(), "DAI".into(), "USDC".into()), (1.0, None));
+        q.insert(
+            ("Curve".into(), "USDC".into(), "USDT".into()),
+            (1.002, None),
+        );
+        q.insert(
+            ("UniswapV3".into(), "USDT".into(), "DAI".into()),
+            (1.0, Some(100)),
+        );
+        q.insert(
+            ("QuickSwap".into(), "DAI".into(), "USDC".into()),
+            (1.0, None),
+        );
         // also CPMM-only alternatives below 1
-        q.insert(("UniswapV3".into(), "USDC".into(), "USDT".into()), (0.999, Some(100)));
+        q.insert(
+            ("UniswapV3".into(), "USDC".into(), "USDT".into()),
+            (0.999, Some(100)),
+        );
         q.insert(("Curve".into(), "USDT".into(), "DAI".into()), (0.999, None));
         q.insert(("Curve".into(), "DAI".into(), "USDC".into()), (0.999, None));
 
         let cross = find_best_stable_cycle(&q, true).expect("cross");
         assert!(cross.cross_model);
         assert!(cross.cycle_rate > 1.0);
-        assert!(cross.venues().iter().any(|v| venue_curve_model(v) == CurveModel::StableSwap));
-        assert!(cross.venues().iter().any(|v| venue_curve_model(v) == CurveModel::Cpmm));
+        assert!(cross
+            .venues()
+            .iter()
+            .any(|v| venue_curve_model(v) == CurveModel::StableSwap));
+        assert!(cross
+            .venues()
+            .iter()
+            .any(|v| venue_curve_model(v) == CurveModel::Cpmm));
 
         let same = find_best_stable_cycle(&q, false);
         if let Some(s) = same {

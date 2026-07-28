@@ -12,8 +12,8 @@
 use once_cell::sync::Lazy;
 use prometheus::{
     register, register_counter, register_gauge, register_histogram, register_int_counter,
-    register_int_counter_vec, register_int_gauge, Counter, Gauge, Histogram, IntCounter,
-    HistogramVec, IntCounterVec, IntGauge, Opts,
+    register_int_counter_vec, register_int_gauge, Counter, Gauge, Histogram, HistogramVec,
+    IntCounter, IntCounterVec, IntGauge, Opts,
 };
 use std::{collections::HashMap, sync::Mutex};
 use tracing::{debug, warn};
@@ -22,20 +22,28 @@ use tracing::{debug, warn};
 // 🔧 REGISTROS PROMETHEUS GLOBAIS
 // ============================================================
 
-pub static BOT_START_TOTAL: Lazy<Counter> =
-    Lazy::new(|| register_counter!("bot_start_total", "Número total de inicializações do bot").unwrap());
+pub static BOT_START_TOTAL: Lazy<Counter> = Lazy::new(|| {
+    register_counter!("bot_start_total", "Número total de inicializações do bot").unwrap()
+});
 
-pub static BOT_STATUS: Lazy<Gauge> =
-    Lazy::new(|| register_gauge!("bot_status", "Status atual do bot (1 = ativo, 0 = inativo)").unwrap());
+pub static BOT_STATUS: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!("bot_status", "Status atual do bot (1 = ativo, 0 = inativo)").unwrap()
+});
 
-pub static ARBITRAGE_EXECUTIONS: Lazy<Counter> =
-    Lazy::new(|| register_counter!("arbitrage_executions_total", "Número total de execuções de arbitragem").unwrap());
+pub static ARBITRAGE_EXECUTIONS: Lazy<Counter> = Lazy::new(|| {
+    register_counter!(
+        "arbitrage_executions_total",
+        "Número total de execuções de arbitragem"
+    )
+    .unwrap()
+});
 
 pub static LAST_PROFIT: Lazy<Gauge> =
     Lazy::new(|| register_gauge!("last_profit_usd", "Lucro da última operação em USD").unwrap());
 
-pub static LAST_GAS_USD: Lazy<Gauge> =
-    Lazy::new(|| register_gauge!("last_gas_usd", "Custo de gás da última operação em USD").unwrap());
+pub static LAST_GAS_USD: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!("last_gas_usd", "Custo de gás da última operação em USD").unwrap()
+});
 
 pub static ERRORS_TOTAL: Lazy<Counter> =
     Lazy::new(|| register_counter!("errors_total", "Número total de erros registrados").unwrap());
@@ -55,14 +63,17 @@ pub static RISK_SCORE: Lazy<Gauge> =
 pub static RISK_REJECT: Lazy<Counter> =
     Lazy::new(|| register_counter!("risk_reject_total", "Número de rejeições por risco").unwrap());
 
-pub static RISK_APPROVE: Lazy<Counter> =
-    Lazy::new(|| register_counter!("risk_approve_total", "Número de aprovações por risco").unwrap());
+pub static RISK_APPROVE: Lazy<Counter> = Lazy::new(|| {
+    register_counter!("risk_approve_total", "Número de aprovações por risco").unwrap()
+});
 
-pub static ADAPTIVE_APPROVE: Lazy<Counter> =
-    Lazy::new(|| register_counter!("adaptive_approve_total", "Aprovações em modo adaptativo").unwrap());
+pub static ADAPTIVE_APPROVE: Lazy<Counter> = Lazy::new(|| {
+    register_counter!("adaptive_approve_total", "Aprovações em modo adaptativo").unwrap()
+});
 
-pub static ADAPTIVE_MODE: Lazy<Gauge> =
-    Lazy::new(|| register_gauge!("adaptive_mode", "Modo adaptativo ativo (1) ou inativo (0)").unwrap());
+pub static ADAPTIVE_MODE: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!("adaptive_mode", "Modo adaptativo ativo (1) ou inativo (0)").unwrap()
+});
 
 pub static HIT_RATE: Lazy<Gauge> =
     Lazy::new(|| register_gauge!("hit_rate_percent", "Taxa de acerto (%)").unwrap());
@@ -70,34 +81,55 @@ pub static HIT_RATE: Lazy<Gauge> =
 pub static SUCCESS_RATE: Lazy<Gauge> =
     Lazy::new(|| register_gauge!("success_rate", "Taxa de sucesso global (0–1)").unwrap());
 
-pub static EXEC_OK: Lazy<IntCounter> =
-    Lazy::new(|| register_int_counter!("exec_ok_total", "Total de execuções bem-sucedidas").unwrap());
+pub static EXEC_OK: Lazy<IntCounter> = Lazy::new(|| {
+    register_int_counter!("exec_ok_total", "Total de execuções bem-sucedidas").unwrap()
+});
 
 /// B7: trades provisórios revertidos por reorg (blockHash mudou / tx sumiu).
-pub static REORG_REVERTED_TRADES: Lazy<IntCounter> = Lazy::new(||
-    register_int_counter!("reorg_reverted_trades", "Trades provisórios revertidos por reorg").unwrap()
-);
+pub static REORG_REVERTED_TRADES: Lazy<IntCounter> = Lazy::new(|| {
+    register_int_counter!(
+        "reorg_reverted_trades",
+        "Trades provisórios revertidos por reorg"
+    )
+    .unwrap()
+});
 
 /// B7: lucro provisório (txs incluídas, ainda < profit_confirmations).
-pub static PROVISORY_PROFIT_USD: Lazy<Gauge> = Lazy::new(||
-    register_gauge!("provisory_profit_usd", "Lucro provisório (não final) em USD").unwrap()
-);
+pub static PROVISORY_PROFIT_USD: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!(
+        "provisory_profit_usd",
+        "Lucro provisório (não final) em USD"
+    )
+    .unwrap()
+});
 
 /// B7: lucro final (txs com ≥ profit_confirmations).
-pub static FINAL_PROFIT_USD: Lazy<Gauge> = Lazy::new(||
-    register_gauge!("final_profit_usd", "Lucro final (≥ profit_confirmations) em USD").unwrap()
-);
+pub static FINAL_PROFIT_USD: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!(
+        "final_profit_usd",
+        "Lucro final (≥ profit_confirmations) em USD"
+    )
+    .unwrap()
+});
 
 /// B8: nonces presos recuperados pelo reaper (no-op cancel).
-pub static NONCE_GAPS_RECOVERED: Lazy<IntCounter> = Lazy::new(||
-    register_int_counter!("nonce_gaps_recovered", "Nonces presos cancelados pelo reaper").unwrap()
-);
+pub static NONCE_GAPS_RECOVERED: Lazy<IntCounter> = Lazy::new(|| {
+    register_int_counter!(
+        "nonce_gaps_recovered",
+        "Nonces presos cancelados pelo reaper"
+    )
+    .unwrap()
+});
 
-pub static DEX_REQUESTS: Lazy<IntCounter> =
-    Lazy::new(|| register_int_counter!("dex_requests_total", "Total de requisições a DEXs").unwrap());
+pub static DEX_REQUESTS: Lazy<IntCounter> = Lazy::new(|| {
+    register_int_counter!("dex_requests_total", "Total de requisições a DEXs").unwrap()
+});
 
 pub static EXEC_FAIL: Lazy<IntCounterVec> = Lazy::new(|| {
-    let opts = Opts::new("exec_fail_total", "Total de execuções com falha (por motivo)");
+    let opts = Opts::new(
+        "exec_fail_total",
+        "Total de execuções com falha (por motivo)",
+    );
     let vec = IntCounterVec::new(opts, &["reason"]).unwrap();
     register(Box::new(vec.clone())).ok();
     vec
@@ -107,7 +139,8 @@ pub static DEX_QUOTE_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     let vec = IntCounterVec::new(
         Opts::new("dex_quote_total", "Lotes de quote por DEX e resultado"),
         &["dex_name", "outcome"],
-    ).unwrap();
+    )
+    .unwrap();
     register(Box::new(vec.clone())).unwrap();
     vec
 });
@@ -115,30 +148,50 @@ pub static DEX_QUOTE_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
 pub static DEX_QUOTE_LATENCY_MS: Lazy<HistogramVec> = Lazy::new(|| {
     let vec = HistogramVec::new(
         prometheus::HistogramOpts::new("dex_quote_latency_ms", "Latência de lote de quote por DEX")
-            .buckets(vec![5.0, 20.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 3000.0, 10_000.0]),
+            .buckets(vec![
+                5.0, 20.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 3000.0, 10_000.0,
+            ]),
         &["dex_name"],
-    ).unwrap();
+    )
+    .unwrap();
     register(Box::new(vec.clone())).unwrap();
     vec
 });
 
-pub static GAS_CALIBRATION_RATIO: Lazy<Gauge> = Lazy::new(||
-    register_gauge!("gas_calibration_ratio", "gas_used real / estimativa de unidades").unwrap()
-);
+pub static GAS_CALIBRATION_RATIO: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!(
+        "gas_calibration_ratio",
+        "gas_used real / estimativa de unidades"
+    )
+    .unwrap()
+});
 
-pub static GAS_USED_OBSERVED: Lazy<Histogram> = Lazy::new(||
-    register_histogram!("gas_used_observed", "Gas usado confirmado", vec![100_000.0, 250_000.0, 400_000.0, 600_000.0, 900_000.0, 1_500_000.0]).unwrap()
-);
+pub static GAS_USED_OBSERVED: Lazy<Histogram> = Lazy::new(|| {
+    register_histogram!(
+        "gas_used_observed",
+        "Gas usado confirmado",
+        vec![
+            100_000.0,
+            250_000.0,
+            400_000.0,
+            600_000.0,
+            900_000.0,
+            1_500_000.0
+        ]
+    )
+    .unwrap()
+});
 
 /// B2: erro absoluto da estimativa de gas em bps (|estimado − real| / estimado * 10_000).
 /// Por rota (não por venue); permite detectar drift sistemático da modelagem.
-pub static GAS_ESTIMATE_ERROR_BPS: Lazy<Histogram> = Lazy::new(||
+pub static GAS_ESTIMATE_ERROR_BPS: Lazy<Histogram> = Lazy::new(|| {
     register_histogram!(
         "gas_estimate_error_bps",
         "Erro absoluto |est−real|/est em bps por rota",
         vec![0.0, 50.0, 100.0, 250.0, 500.0, 1_000.0, 2_500.0, 5_000.0]
-    ).unwrap()
-);
+    )
+    .unwrap()
+});
 
 // ============================================================
 // ⚡️ MÉTRICAS FLASHLOAN
@@ -147,30 +200,35 @@ pub static GAS_ESTIMATE_ERROR_BPS: Lazy<Histogram> = Lazy::new(||
 use lazy_static::lazy_static;
 
 lazy_static! {
-    pub static ref FLASHLOAN_EXECUTIONS: IntCounter =
-        register_int_counter!("flashloan_executions_total", "Total de execuções de flashloan").unwrap();
-
+    pub static ref FLASHLOAN_EXECUTIONS: IntCounter = register_int_counter!(
+        "flashloan_executions_total",
+        "Total de execuções de flashloan"
+    )
+    .unwrap();
     pub static ref FLASHLOAN_PROFIT: Counter =
         register_counter!("flashloan_profit_usd", "Lucro total de flashloans em USD").unwrap();
-
-    pub static ref FLASHLOAN_PREMIUM_PAID: Counter =
-        register_counter!("flashloan_premium_paid_usd", "Premium total pago em flashloans em USD").unwrap();
-
+    pub static ref FLASHLOAN_PREMIUM_PAID: Counter = register_counter!(
+        "flashloan_premium_paid_usd",
+        "Premium total pago em flashloans em USD"
+    )
+    .unwrap();
     pub static ref FLASHLOAN_GAS_USAGE: Histogram = register_histogram!(
         "flashloan_gas_used",
         "Gas usado em execuções de flashloan",
         vec![100_000.0, 300_000.0, 600_000.0, 900_000.0, 1_200_000.0]
     )
     .unwrap();
-
-    pub static ref ACTIVE_FLASHLOAN_MODE: IntGauge =
-        register_int_gauge!("active_flashloan_mode", "Modo ativo (0=off, 1=wrapper, 2=aave)").unwrap();
-
+    pub static ref ACTIVE_FLASHLOAN_MODE: IntGauge = register_int_gauge!(
+        "active_flashloan_mode",
+        "Modo ativo (0=off, 1=wrapper, 2=aave)"
+    )
+    .unwrap();
     pub static ref COUNTER_DEX_REQUESTS: IntCounterVec = register_int_counter_vec!(
         "dex_requests_by_name_total",
         "Total de requisições para DEXs (por nome)",
         &["dex_name"]
-    ).unwrap();
+    )
+    .unwrap();
 }
 
 // ============================================================
@@ -282,8 +340,12 @@ pub fn inc_dex_request(dex_name: &str) {
 }
 
 pub fn observe_dex_quote(dex_name: &str, outcome: &str, elapsed_ms: f64) {
-    DEX_QUOTE_TOTAL.with_label_values(&[dex_name, outcome]).inc();
-    DEX_QUOTE_LATENCY_MS.with_label_values(&[dex_name]).observe(elapsed_ms.max(0.0));
+    DEX_QUOTE_TOTAL
+        .with_label_values(&[dex_name, outcome])
+        .inc();
+    DEX_QUOTE_LATENCY_MS
+        .with_label_values(&[dex_name])
+        .observe(elapsed_ms.max(0.0));
 }
 
 pub fn record_gas_calibration(estimated_units: f64, actual_units: f64) {

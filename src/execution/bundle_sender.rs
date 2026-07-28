@@ -42,8 +42,8 @@ impl<S: Signer + 'static> BundleSender<S> {
             .parse()
             .context("Endereço do Signer inválido")?;
 
-        let min_tip_matic_wei = parse_ether(&cfg.min_tip_matic)
-            .context("Valor de min_tip_matic inválido")?;
+        let min_tip_matic_wei =
+            parse_ether(&cfg.min_tip_matic).context("Valor de min_tip_matic inválido")?;
 
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(cfg.timeout_seconds))
@@ -84,13 +84,19 @@ impl<S: Signer + 'static> BundleSender<S> {
         });
 
         let body = serde_json::to_vec(&payload).expect("serialize payload");
-        let signature = self.signer
+        let signature = self
+            .signer
             .sign_message(ethers::utils::hash_message(&body))
             .await
             .context("Falha ao assinar header X-Flashbots-Signature")?;
-        let header_value = format!("{}:0x{}", self.cfg.signer_address, hex::encode(signature.to_vec()));
+        let header_value = format!(
+            "{}:0x{}",
+            self.cfg.signer_address,
+            hex::encode(signature.to_vec())
+        );
 
-        let response = self.http_client
+        let response = self
+            .http_client
             .post(&self.cfg.relay_url)
             .header("X-Flashbots-Signature", header_value)
             .json(&payload)
@@ -111,14 +117,16 @@ impl<S: Signer + 'static> BundleSender<S> {
             .context("Falha ao desserializar resposta JSON do relay")?;
 
         if let Some(err) = json_resp.get("error") {
-            let msg = err.get("message")
+            let msg = err
+                .get("message")
                 .map(|m| m.to_string())
                 .unwrap_or_else(|| err.to_string());
             warn!("BUNDLE REJEITADO: {}", msg);
             return Err(anyhow!("BUNDLE REJEITADO: {}", msg));
         }
 
-        let bundle_hash = json_resp.get("result")
+        let bundle_hash = json_resp
+            .get("result")
             .and_then(|r| r.as_str())
             .unwrap_or("sem_hash");
 

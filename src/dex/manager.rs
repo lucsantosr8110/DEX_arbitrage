@@ -15,17 +15,19 @@ use crate::{
     //    ser compatível com o campo `base_opportunity` de `FlashloanOpportunity`.
     core::types::{ArbitrageOpportunity, FlashloanOpportunity},
     dex::{
-        adapters::{
-            curve::CurveDex, uniswap_v2::V2Dex, uniswap_v3::UniswapV3Dex,
-        },
+        adapters::{curve::CurveDex, uniswap_v2::V2Dex, uniswap_v3::UniswapV3Dex},
         // ❌ `ArbitrageOpportunity` de `dex` (mod.rs) não é o usado para Flashloans.
-        DexContract, TokenPairPrice,
+        DexContract,
+        TokenPairPrice,
     },
     infra::metrics,
     AppMiddleware,
 };
 use anyhow::{anyhow, Context, Result};
-use ethers::{providers::Middleware, types::{Address, U64, U256}};
+use ethers::{
+    providers::Middleware,
+    types::{Address, U256, U64},
+};
 use std::{
     collections::HashMap,
     str::FromStr,
@@ -60,10 +62,7 @@ impl DexManager {
     /// ============================================================
     /// 🏗️ Inicializa o DexManager e carrega adaptadores configurados
     /// ============================================================
-    pub async fn new(
-        client: Arc<AppMiddleware>,
-        config: Arc<Config>,
-    ) -> Result<Self> {
+    pub async fn new(client: Arc<AppMiddleware>, config: Arc<Config>) -> Result<Self> {
         info!("🔧 Inicializando DexManager (TokenCache dinâmico)…");
 
         let mut adapters: Vec<Arc<dyn DexContract + Send + Sync>> = Vec::new();
@@ -84,7 +83,13 @@ impl DexManager {
 
             let adapter: Option<Arc<dyn DexContract + Send + Sync>> = match dex_cfg.name.as_str() {
                 "UniswapV2" | "SushiSwap" | "QuickSwap" => Some(Arc::new(
-                    V2Dex::new(client.clone(), router_addr, config.clone(), dex_cfg.name.clone()).await,
+                    V2Dex::new(
+                        client.clone(),
+                        router_addr,
+                        config.clone(),
+                        dex_cfg.name.clone(),
+                    )
+                    .await,
                 )),
                 "UniswapV3" => Some(Arc::new(
                     UniswapV3Dex::new(client.clone(), router_addr, config.clone()).await,
@@ -180,8 +185,9 @@ impl DexManager {
         let circular_opps = self.find_circular_arbitrage(base_token).await?;
 
         for opp in circular_opps {
-            if let Some(flash_opp) =
-                self.convert_to_flashloan_opportunity(opp, base_token, amount).await?
+            if let Some(flash_opp) = self
+                .convert_to_flashloan_opportunity(opp, base_token, amount)
+                .await?
             {
                 opportunities.push(flash_opp);
             }
@@ -201,14 +207,15 @@ impl DexManager {
         base_token: &str,
         amount: U256,
     ) -> Result<Option<FlashloanOpportunity>> {
-        
         // 🚀 CORREÇÃO SOLICITADA: VALIDAR SE A ROTA COMEÇA E TERMINA COM O TOKEN BASE
         let base_token_upper = base_token.to_uppercase();
         let first_token = opp.path.first().map(|s| s.to_uppercase());
         let last_token = opp.path.last().map(|s| s.to_uppercase());
 
         // Garante que é circular E que o token de empréstimo é o start/end
-        if first_token != Some(base_token_upper.clone()) || last_token != Some(base_token_upper.clone()) {
+        if first_token != Some(base_token_upper.clone())
+            || last_token != Some(base_token_upper.clone())
+        {
             warn!(
                 "⚠️ Oportunidade ignorada: O token base do flashloan ({}) não é o ponto de partida/chegada da rota: {:?}",
                 base_token, opp.path
@@ -216,7 +223,7 @@ impl DexManager {
             return Ok(None);
         }
         // FIM DA CORREÇÃO SOLICITADA
-        
+
         let premium_cost = self.calculate_flashloan_premium(amount);
         let gas_overhead = self.estimate_flashloan_gas(&opp).await?;
 
@@ -238,7 +245,7 @@ impl DexManager {
     fn is_valid_flashloan_route(&self, opp: &ArbitrageOpportunity) -> bool {
         // A função foi mantida por compatibilidade.
         if let (Some(first), Some(last)) = (opp.path.first(), opp.path.last()) {
-             // Ex: path [USDC, WETH, USDC] -> first=USDC, last=USDC
+            // Ex: path [USDC, WETH, USDC] -> first=USDC, last=USDC
             first == last
         } else {
             false
@@ -396,21 +403,26 @@ impl DexManager {
         quote_block: Option<U64>,
     ) -> Result<Vec<TokenPairPrice>> {
         let mut prices = Vec::new();
-        
+
         // ✅ Verificar circuit breaker primeiro
         if self.should_circuit_break(adapter_name).await {
             warn!("🚫 Circuit breaker ativo para {}, pulando", adapter_name);
             return Ok(prices);
         }
-        
+
         // Encontrar o adapter correto
         let adapters = self.active_adapters.read().await;
-        let adapter = adapters.iter()
+        let adapter = adapters
+            .iter()
             .find(|a| a.name() == adapter_name)
             .ok_or_else(|| anyhow!("Adapter não encontrado: {}", adapter_name))?;
-        
-        debug!("📊 Coletando preços para {} pares via {}", pairs.len(), adapter_name);
-        
+
+        debug!(
+            "📊 Coletando preços para {} pares via {}",
+            pairs.len(),
+            adapter_name
+        );
+
         // Converter pares para formato (String, String)
         let converted_pairs: Vec<(String, String)> = pairs
             .iter()
@@ -424,47 +436,64 @@ impl DexManager {
                 }
             })
             .collect();
-        
+
         if converted_pairs.is_empty() {
             warn!("❌ Nenhum par válido após conversão");
             return Ok(prices);
         }
-        
+
         // Métrica única no manager cobre Curve/V2/V3 e também os fallbacks.
         let quote_started = Instant::now();
         metrics::inc_dex_request(adapter_name);
         // ✅ Timeout para operação completa
         let multicall_result = tokio::time::timeout(
             MULTICALL_TOTAL_TIMEOUT,
-            adapter.get_prices_multicall(&converted_pairs, quote_block)
-        ).await;
-        
+            adapter.get_prices_multicall(&converted_pairs, quote_block),
+        )
+        .await;
+
         match multicall_result {
             Ok(Ok(mut adapter_prices)) => {
                 prices.append(&mut adapter_prices);
-                metrics::observe_dex_quote(adapter_name, "ok", quote_started.elapsed().as_secs_f64() * 1_000.0);
+                metrics::observe_dex_quote(
+                    adapter_name,
+                    "ok",
+                    quote_started.elapsed().as_secs_f64() * 1_000.0,
+                );
                 debug!("✅ {}: {} preços coletados", adapter_name, prices.len());
                 // ✅ Reset error count em caso de sucesso
                 self.mark_healthy(adapter_name).await;
             }
             Ok(Err(e)) => {
-                metrics::observe_dex_quote(adapter_name, "error", quote_started.elapsed().as_secs_f64() * 1_000.0);
+                metrics::observe_dex_quote(
+                    adapter_name,
+                    "error",
+                    quote_started.elapsed().as_secs_f64() * 1_000.0,
+                );
                 warn!("❌ Erro no multicall do {}: {:?}", adapter_name, e);
                 self.record_error(adapter_name).await;
-                
+
                 // Fallback: tentar preços individuais
-                prices = self.get_prices_fallback(adapter, &converted_pairs, adapter_name).await;
+                prices = self
+                    .get_prices_fallback(adapter, &converted_pairs, adapter_name)
+                    .await;
             }
             Err(_) => {
-                metrics::observe_dex_quote(adapter_name, "timeout", quote_started.elapsed().as_secs_f64() * 1_000.0);
+                metrics::observe_dex_quote(
+                    adapter_name,
+                    "timeout",
+                    quote_started.elapsed().as_secs_f64() * 1_000.0,
+                );
                 warn!("⏰ Timeout no multicall do {}", adapter_name);
                 self.record_error(adapter_name).await;
-                
+
                 // Fallback mesmo em timeout
-                prices = self.get_prices_fallback(adapter, &converted_pairs, adapter_name).await;
+                prices = self
+                    .get_prices_fallback(adapter, &converted_pairs, adapter_name)
+                    .await;
             }
         }
-        
+
         Ok(prices)
     }
 
@@ -490,10 +519,7 @@ impl DexManager {
         min_usd: f64,
     ) -> Result<Vec<crate::dex::TokenPairPrice>> {
         let adapters = self.active_adapters.read().await;
-        let adapter = adapters
-            .iter()
-            .find(|a| a.name() == adapter_name)
-            .cloned();
+        let adapter = adapters.iter().find(|a| a.name() == adapter_name).cloned();
         drop(adapters);
 
         let Some(adapter) = adapter else {
@@ -574,21 +600,24 @@ impl DexManager {
     ) -> Vec<TokenPairPrice> {
         let mut fallback_prices = Vec::new();
         let mut success_count = 0;
-        
+
         for (token_a, token_b) in pairs {
             if let (Some(token_a_info), Some(token_b_info)) = (
                 self.token_cache.get_by_symbol(token_a).await,
-                self.token_cache.get_by_symbol(token_b).await
+                self.token_cache.get_by_symbol(token_b).await,
             ) {
-                match adapter.get_price(&token_a_info.address, &token_b_info.address).await {
+                match adapter
+                    .get_price(&token_a_info.address, &token_b_info.address)
+                    .await
+                {
                     Ok(Some(price)) => {
                         let token_pair = TokenPairPrice::new(
                             token_a.clone(),
                             token_b.clone(),
                             price,
-                            adapter_name.to_string()
+                            adapter_name.to_string(),
                         );
-                        
+
                         if token_pair.is_valid() {
                             fallback_prices.push(token_pair);
                             success_count += 1;
@@ -600,12 +629,17 @@ impl DexManager {
                     }
                 }
             }
-            
+
             // Pequena pausa para não sobrecarregar
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        
-        info!("🔄 {}: {}/{} preços via fallback", adapter_name, success_count, pairs.len());
+
+        info!(
+            "🔄 {}: {}/{} preços via fallback",
+            adapter_name,
+            success_count,
+            pairs.len()
+        );
         fallback_prices
     }
 

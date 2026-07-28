@@ -10,18 +10,16 @@
 
 use crate::{
     config::{token_cache::TokenCache, Config},
+    utils::utils::u256_to_f64_precise,
     AppMiddleware,
-    utils::utils::u256_to_f64_precise, 
 };
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use ethers::{
-    types::{Address, U256}
-};
+use ethers::types::{Address, U256};
+use once_cell::sync::Lazy;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::RwLock;
-use once_cell::sync::Lazy;
 use tracing::{debug, warn};
 
 // ================================================================
@@ -173,7 +171,10 @@ pub fn cache_fee_tier(dex_name: &str, token_a: &str, token_b: &str, fee_tier: u3
         );
     }
     if let Ok(mut cache) = DIRECTIONAL_FEE_TIER_CACHE.write() {
-        cache.insert(directional_fee_cache_key(dex_name, token_a, token_b), fee_tier);
+        cache.insert(
+            directional_fee_cache_key(dex_name, token_a, token_b),
+            fee_tier,
+        );
     }
 }
 
@@ -186,11 +187,7 @@ pub fn cached_fee_tier(dex_name: &str, token_a: &str, token_b: &str) -> Option<u
 
 /// Tier selecionado pelo quote desta direção. Nunca usar cache canônico para
 /// preencher `ArbitrageStep`: A→B e B→A podem escolher pools/tier distintos.
-pub fn cached_directional_fee_tier(
-    dex_name: &str,
-    token_in: &str,
-    token_out: &str,
-) -> Option<u32> {
+pub fn cached_directional_fee_tier(dex_name: &str, token_in: &str, token_out: &str) -> Option<u32> {
     let key = directional_fee_cache_key(dex_name, token_in, token_out);
     DIRECTIONAL_FEE_TIER_CACHE.read().ok()?.get(&key).cloned()
 }
@@ -211,7 +208,7 @@ pub trait DexContract: Send + Sync {
 
     // âœ… Assinatura correta
     async fn get_price(&self, token_a: &Address, token_b: &Address) -> Result<Option<f64>>;
-    
+
     /// Cota um lote no bloco informado. Todos os venues de um scan devem usar
     /// o mesmo `quote_block`, evitando spreads fabricados entre blocos distintos.
     async fn get_prices_multicall(
@@ -221,7 +218,7 @@ pub trait DexContract: Send + Sync {
     ) -> Result<Vec<TokenPairPrice>>;
 
     async fn swap(&self, token_in: Address, token_out: Address, amount_in: U256) -> Result<U256>;
-    
+
     // 🚀 NOVO MÉTODO CRÍTICO: Consulta a Factory/Quoter para obter o endereço do Par/Pool.
     async fn get_pair_or_pool_address(
         &self,
@@ -290,12 +287,12 @@ pub trait DexContract: Send + Sync {
     ) -> Result<U256> {
         let decimals =
             get_token_decimals::get_token_decimals(self.client().clone(), token_address).await?;
-        let amount = (base_amount * 10f64.powi(decimals as i32)) as u128; 
+        let amount = (base_amount * 10f64.powi(decimals as i32)) as u128;
         Ok(U256::from(amount))
     }
     fn client(&self) -> &Arc<AppMiddleware>;
     fn config(&self) -> &Arc<Config>;
-    
+
     // ðŸ”„ ImplementaÃ§Ã£o padrÃ£o usando Config (AGORA VAI ENCONTRAR O CAMPO `addresses`)
     /// Notional em USD usado para dimensionar as cotacoes de preco.
     ///
@@ -364,7 +361,10 @@ pub async fn quote_amount_for_usd(symbol: &str, decimals: u8, usd_notional: f64)
 
     let price_usd = PRICE_FEED.get_price(symbol).await.unwrap_or(0.0);
 
-    if !price_usd.is_finite() || price_usd <= 0.0 || !usd_notional.is_finite() || usd_notional <= 0.0
+    if !price_usd.is_finite()
+        || price_usd <= 0.0
+        || !usd_notional.is_finite()
+        || usd_notional <= 0.0
     {
         return Err(anyhow!(
             "[quote_size] sem preço de referência utilizável para {symbol} (usd={price_usd})"
@@ -389,22 +389,27 @@ pub fn calculate_price_from_decimals(
     decimals_in: u8,
     decimals_out: u8,
 ) -> Result<f64> {
-    
     let amount_in_f64 = u256_to_f64_precise(amount_in, decimals_in);
     let amount_out_f64 = u256_to_f64_precise(amount_out, decimals_out);
 
     if amount_in_f64 <= 0.0 {
-        warn!("âš ï¸ [PRICE_CALC_LOCAL] amount_in zero ou negativo: {}", amount_in_f64);
+        warn!(
+            "âš ï¸ [PRICE_CALC_LOCAL] amount_in zero ou negativo: {}",
+            amount_in_f64
+        );
         return Ok(0.0);
     }
 
     let price = amount_out_f64 / amount_in_f64;
-    
+
     if price > 1_000_000.0 || price <= 1e-12 {
         // debug, nao warn: pools de poeira (reserva minima) devolvem preco extremo
         // e sao rejeitados aqui. E esperado ao monitorar tokens menos liquidos —
         // logar a cada ciclo por pool inundaria o log. O descarte e o correto.
-        debug!("[PRICE_CALC_LOCAL] preco extremo/zero descartado: {:.6}", price);
+        debug!(
+            "[PRICE_CALC_LOCAL] preco extremo/zero descartado: {:.6}",
+            price
+        );
         return Ok(0.0);
     }
 
@@ -422,7 +427,6 @@ pub fn normalize_price(price: f64) -> Option<f64> {
     }
 }
 
-
 // ================================================================
 // SUBMÃ“DULOS INTERNOS
 // ================================================================
@@ -431,8 +435,8 @@ pub mod circuit_breaker;
 pub mod error;
 pub mod get_token_decimals;
 pub mod liquidity;
-pub mod metadata_warm;
 pub mod manager;
+pub mod metadata_warm;
 pub mod radar;
 pub mod rate_limiter;
 pub mod resilient_dex_system;
@@ -441,7 +445,8 @@ pub mod resilient_dex_system;
 // REEXPORTS
 // ================================================================
 pub use adapters::{
-    uniswap_v2::{UniswapV2Dex, V2Dex}, uniswap_v3::UniswapV3Dex,
+    uniswap_v2::{UniswapV2Dex, V2Dex},
+    uniswap_v3::UniswapV3Dex,
 };
 pub use error::{DexError, DexResult};
 pub use get_token_decimals::{cache_token_decimals, cached_token_decimals, get_token_decimals};
@@ -516,7 +521,6 @@ impl ArbitrageOpportunity {
     }
 }
 
-
 // ================================================================
 // CONSTANTES GLOBAIS
 // ================================================================
@@ -524,7 +528,7 @@ pub mod addresses {
     use ethers::types::Address;
     // ðŸš¨ EndereÃ§os de Factory e Router (COMPLETOS)
     pub const UNISWAP_V2_ROUTER: &str = "0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24";
-    pub const UNISWAP_V2_FACTORY: &str = "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"; 
+    pub const UNISWAP_V2_FACTORY: &str = "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f";
     pub const QUICKSWAP_ROUTER: &str = "0xa5E0829CaCEd8fFDD4De3c43696c57F7D7A678ff";
     pub const QUICKSWAP_FACTORY: &str = "0x5757371414417b8C6CA4EcAe1E7c9a75d0a21e56"; // Polygon QuickSwap Factory
     pub const SUSHISWAP_ROUTER: &str = "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506";
@@ -532,10 +536,10 @@ pub mod addresses {
     pub const UNISWAP_V3_QUOTER: &str = "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6";
     pub const UNISWAP_V3_FACTORY: &str = "0x1F98431c8ADf9730573766cd80bd442F4B6c4fC8"; // Uniswap V3 Factory (Polygon)
     pub const QUOTER_V2_ADDRESS: &str = "0x61fFE691821291C350f9C4b99d0e0e5B0d64E8b7"; // Fallback Quoter V2 para V3
-    
+
     // WBTC Polygon PoS (bridged) — alinhado com [pairs.tokens]
-    pub const WBTC_ADDRESS: &str = "0x1BFD67037B42Cf73acF2047067bd4F2C47D9BfD6"; 
-    
+    pub const WBTC_ADDRESS: &str = "0x1BFD67037B42Cf73acF2047067bd4F2C47D9BfD6";
+
     pub fn router_address(router: &str) -> Address {
         router.parse().expect("EndereÃ§o de router invÃ¡lido")
     }
@@ -571,9 +575,10 @@ pub fn all_trading_pairs() -> Vec<(String, String)> {
 #[cfg(test)]
 mod fee_tier_cache_tests {
     use super::{
-        cache_fee_tier, cached_directional_fee_tier, cached_fee_tier, cached_fee_tier_pair, fee_cache_key,
-        fee100_best_discarded_count, is_executable_v3_fee_tier, reset_fee100_best_discarded_count,
-        select_executable_v3_best_out, EXECUTABLE_V3_FEE_TIERS, OBSERVED_V3_FEE_TIER_100,
+        cache_fee_tier, cached_directional_fee_tier, cached_fee_tier, cached_fee_tier_pair,
+        fee100_best_discarded_count, fee_cache_key, is_executable_v3_fee_tier,
+        reset_fee100_best_discarded_count, select_executable_v3_best_out, EXECUTABLE_V3_FEE_TIERS,
+        OBSERVED_V3_FEE_TIER_100,
     };
     use ethers::types::U256;
 

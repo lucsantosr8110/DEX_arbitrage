@@ -8,11 +8,11 @@
 // ============================================================
 
 use crate::{
-    config::Config, 
+    config::Config,
     dex::{DexContract, TokenPairPrice},
-    AppMiddleware
+    AppMiddleware,
 };
-use anyhow::Result; 
+use anyhow::Result;
 use async_trait::async_trait;
 use ethers::types::{Address, U256};
 use std::sync::Arc;
@@ -42,12 +42,24 @@ impl<D: DexContract + Send + Sync + 'static> DexContract for ResilientDex<D> {
     }
 
     // Funções de endereço (wrappers - delegadas ao primary)
-    fn get_wmatic_address(&self) -> Option<Address> { self.primary.get_wmatic_address() }
-    fn get_weth_address(&self) -> Option<Address> { self.primary.get_weth_address() }
-    fn get_usdc_address(&self) -> Option<Address> { self.primary.get_usdc_address() }
-    fn get_usdt_address(&self) -> Option<Address> { self.primary.get_usdt_address() }
-    fn get_dai_address(&self) -> Option<Address> { self.primary.get_dai_address() }
-    fn get_wbtc_address(&self) -> Option<Address> { self.primary.get_wbtc_address() } // 🆕 WBTC
+    fn get_wmatic_address(&self) -> Option<Address> {
+        self.primary.get_wmatic_address()
+    }
+    fn get_weth_address(&self) -> Option<Address> {
+        self.primary.get_weth_address()
+    }
+    fn get_usdc_address(&self) -> Option<Address> {
+        self.primary.get_usdc_address()
+    }
+    fn get_usdt_address(&self) -> Option<Address> {
+        self.primary.get_usdt_address()
+    }
+    fn get_dai_address(&self) -> Option<Address> {
+        self.primary.get_dai_address()
+    }
+    fn get_wbtc_address(&self) -> Option<Address> {
+        self.primary.get_wbtc_address()
+    } // 🆕 WBTC
 
     // 🚀 NOVO: Implementação de get_pair_or_pool_address (Factory Check)
     // Delega a checagem da Factory para o adapter primário.
@@ -56,7 +68,9 @@ impl<D: DexContract + Send + Sync + 'static> DexContract for ResilientDex<D> {
         token_a: Address,
         token_b: Address,
     ) -> Result<Option<Address>> {
-        self.primary.get_pair_or_pool_address(token_a, token_b).await
+        self.primary
+            .get_pair_or_pool_address(token_a, token_b)
+            .await
     }
 
     async fn get_pool_address_for_liquidity(
@@ -69,9 +83,8 @@ impl<D: DexContract + Send + Sync + 'static> DexContract for ResilientDex<D> {
             .get_pool_address_for_liquidity(token_a, token_b, fee_hint)
             .await
     }
-    
+
     async fn get_price(&self, token_a: &Address, token_b: &Address) -> Result<Option<f64>> {
-        
         match self.primary.get_price(token_a, token_b).await {
             Ok(Some(price)) => {
                 debug!("✅ [ResilientDex] Preço obtido do primary: {:.6}", price);
@@ -116,9 +129,12 @@ impl<D: DexContract + Send + Sync + 'static> DexContract for ResilientDex<D> {
         // Para multicall, tentamos o primário. Se falhar, tentamos o fallback.
         match self.primary.get_prices_multicall(pairs, quote_block).await {
             Ok(prices) if !prices.is_empty() => {
-                debug!("✅ [ResilientDex] Multicall bem-sucedido no primary {}", self.primary.name());
+                debug!(
+                    "✅ [ResilientDex] Multicall bem-sucedido no primary {}",
+                    self.primary.name()
+                );
                 Ok(prices)
-            },
+            }
             Ok(_) => {
                 // Sucesso, mas sem preços (sem liquidez). Tentar fallback.
                 debug!("📭 [ResilientDex] Multicall no primary {} sem resultados, tentando fallback...", self.primary.name());
@@ -127,10 +143,14 @@ impl<D: DexContract + Send + Sync + 'static> DexContract for ResilientDex<D> {
                 } else {
                     Ok(vec![]) // Sem fallback, retorna vazio
                 }
-            },
+            }
             Err(e) => {
-                warn!("⚠️ [ResilientDex] Multicall no primary {} falhou: {}. Tentando fallback...", self.primary.name(), e);
-                   if let Some(fallback) = &self.fallback {
+                warn!(
+                    "⚠️ [ResilientDex] Multicall no primary {} falhou: {}. Tentando fallback...",
+                    self.primary.name(),
+                    e
+                );
+                if let Some(fallback) = &self.fallback {
                     fallback.get_prices_multicall(pairs, quote_block).await
                 } else {
                     Err(e) // Sem fallback, propaga o erro
@@ -138,7 +158,6 @@ impl<D: DexContract + Send + Sync + 'static> DexContract for ResilientDex<D> {
             }
         }
     }
-
 
     async fn swap(&self, token_in: Address, token_out: Address, amount_in: U256) -> Result<U256> {
         self.primary.swap(token_in, token_out, amount_in).await
@@ -148,8 +167,14 @@ impl<D: DexContract + Send + Sync + 'static> DexContract for ResilientDex<D> {
         self.primary.get_token_address(symbol).await
     }
 
-    async fn get_amount_with_decimals( &self, token_address: Address, base_amount: f64) -> Result<U256> {
-        self.primary.get_amount_with_decimals(token_address, base_amount).await
+    async fn get_amount_with_decimals(
+        &self,
+        token_address: Address,
+        base_amount: f64,
+    ) -> Result<U256> {
+        self.primary
+            .get_amount_with_decimals(token_address, base_amount)
+            .await
     }
 
     fn client(&self) -> &Arc<AppMiddleware> {

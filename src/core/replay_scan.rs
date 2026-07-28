@@ -21,8 +21,9 @@ use crate::{
             min_pool_liquidity_usd, note_low_liquidity_discarded_pub, passes_liquidity_gate,
             pool_tvl_usd_from_balances,
         },
-        quote_amount_for_usd, rate_limiter::ALCHEMY_RATE_LIMITER, select_executable_v3_best_out,
-        EXECUTABLE_V3_FEE_TIERS,
+        quote_amount_for_usd,
+        rate_limiter::ALCHEMY_RATE_LIMITER,
+        select_executable_v3_best_out, EXECUTABLE_V3_FEE_TIERS,
     },
     AppMiddleware,
 };
@@ -503,8 +504,10 @@ impl ReplayScanSummary {
                         && s.profit_realizado_usd.map(|p| p > 0.0).unwrap_or(false)
                 })
                 .count() as u64,
-            n_reached_eth_call: samples.iter().filter(|s| s.eth_call_block.is_some()).count()
-                as u64,
+            n_reached_eth_call: samples
+                .iter()
+                .filter(|s| s.eth_call_block.is_some())
+                .count() as u64,
             n_sim_ok: samples.iter().filter(|s| s.sim_ok == Some(true)).count() as u64,
             n_reverts,
             revert_reasons,
@@ -834,12 +837,7 @@ impl HistQuoter {
                 let Some((best_fee, best_out)) = select_executable_v3_best_out(&quotes) else {
                     continue;
                 };
-                let price = calculate_price_from_decimals(
-                    m.amount_in,
-                    best_out,
-                    m.dec_a,
-                    m.dec_b,
-                )?;
+                let price = calculate_price_from_decimals(m.amount_in, best_out, m.dec_a, m.dec_b)?;
                 if price > 0.0 {
                     cache_fee_tier("UniswapV3", &m.token_a, &m.token_b, best_fee);
                     results.insert((m.token_a.clone(), m.token_b.clone()), (price, best_fee));
@@ -896,8 +894,7 @@ impl HistQuoter {
                 if out.is_zero() {
                     continue;
                 }
-                let price =
-                    calculate_price_from_decimals(m.amount_in, *out, m.dec_a, m.dec_b)?;
+                let price = calculate_price_from_decimals(m.amount_in, *out, m.dec_a, m.dec_b)?;
                 if price > 0.0 {
                     results.insert((m.token_a.clone(), m.token_b.clone()), price);
                 }
@@ -907,10 +904,7 @@ impl HistQuoter {
     }
 
     /// Curve Aave pool get_dy@block — sequencial. Índices: DAI=0, USDC=1, USDT=2.
-    async fn quote_curve_stables(
-        &self,
-        block_num: u64,
-    ) -> Result<HashMap<(String, String), f64>> {
+    async fn quote_curve_stables(&self, block_num: u64) -> Result<HashMap<(String, String), f64>> {
         if !self.curve_liquid {
             // B2 gate falhou no probe inicial — sem quote-only silencioso: cross_model
             // simplesmente não aparece nesta janela (sem eth_call, sem fake edge).
@@ -1117,10 +1111,7 @@ fn append_csv(path: &Path, sample: &ReplayBlockSample, header: bool) -> Result<(
             .erro_rel_pct
             .map(|v| format!("{v:.4}"))
             .unwrap_or_default(),
-        sample
-            .sim_ok
-            .map(|v| v.to_string())
-            .unwrap_or_default(),
+        sample.sim_ok.map(|v| v.to_string()).unwrap_or_default(),
         sample
             .revert_reason
             .as_deref()
@@ -1229,9 +1220,8 @@ async fn scan_window(
                     sample.cross_model = true;
                     sample.cross_model_rate = cross.cycle_rate;
                     sample.edge_cross_model = edge_exists(cross.cycle_rate);
-                    sample.quote_only = !replay_cross_model::route_all_legs_executable(
-                        cross.venues().into_iter(),
-                    );
+                    sample.quote_only =
+                        !replay_cross_model::route_all_legs_executable(cross.venues().into_iter());
                     // Prefer cross route in CSV when present (inspection)
                     sample.pair = cross.pair_label();
                     sample.route = cross.route_label();
@@ -1306,8 +1296,7 @@ async fn scan_window(
                         }
                     } else if sample.edge_cross_model && sample.quote_only {
                         sample.revert_reason = Some(
-                            "cross_model QUOTE_ONLY: Curve not in FlashloanExecutor DexType"
-                                .into(),
+                            "cross_model QUOTE_ONLY: Curve not in FlashloanExecutor DexType".into(),
                         );
                     }
                 } else if sample.edge_cross_model {
@@ -1532,7 +1521,9 @@ mod tests {
         assert!(paper_validation::is_archive_state_error(
             "historical state is not available"
         ));
-        assert!(!paper_validation::is_archive_state_error("execution reverted"));
+        assert!(!paper_validation::is_archive_state_error(
+            "execution reverted"
+        ));
     }
 
     #[test]
@@ -1685,7 +1676,9 @@ mod tests {
                 edge_same_model: false,
                 edge_cross_model: true,
                 pair: "B".into(),
-                route: "Curve[StableSwap]:USDC→USDT|UniswapV3[Cpmm]:USDT→DAI|QuickSwap[Cpmm]:DAI→USDC".into(),
+                route:
+                    "Curve[StableSwap]:USDC→USDT|UniswapV3[Cpmm]:USDT→DAI|QuickSwap[Cpmm]:DAI→USDC"
+                        .into(),
                 fee_tiers: "4bps;100;-".into(),
                 models: "StableSwap+Cpmm+Cpmm".into(),
                 net_previsto_usd: None,
@@ -1733,7 +1726,8 @@ mod tests {
 
         let mut all = s1;
         all.extend(s2);
-        let agg = ReplayScanSummary::from_samples(&all, 1, 10, 1, "AGGREGATE", "multi_window", None);
+        let agg =
+            ReplayScanSummary::from_samples(&all, 1, 10, 1, "AGGREGATE", "multi_window", None);
         assert_eq!(agg.n_blocos_amostrados, 3);
         assert_eq!(agg.same_model.n_blocos_com_edge, 1);
         assert_eq!(agg.cross_model.n_blocos_com_edge, 1);

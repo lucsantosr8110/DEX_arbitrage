@@ -50,7 +50,10 @@ pub fn decimals_from_config(cfg: &Config, symbol: &str) -> Result<u8> {
         .or_else(|| cfg.pairs.metadata.get(symbol))
         .ok_or_else(|| anyhow!("metadata ausente para token {}", symbol))?;
     meta.decimals.ok_or_else(|| {
-        anyhow!("decimals ausente em [pairs.metadata] para {} — sem fallback 18", symbol)
+        anyhow!(
+            "decimals ausente em [pairs.metadata] para {} — sem fallback 18",
+            symbol
+        )
     })
 }
 
@@ -305,11 +308,7 @@ mod tests {
     #[test]
     fn monitor_symbols_from_pairs() {
         let mut cfg = Config::default();
-        cfg.pairs.monitor = vec![
-            "USDC-WETH".into(),
-            "WBTC-USDC".into(),
-            "WMATIC-WETH".into(),
-        ];
+        cfg.pairs.monitor = vec!["USDC-WETH".into(), "WBTC-USDC".into(), "WMATIC-WETH".into()];
         let s = monitor_symbols(&cfg);
         assert_eq!(s, vec!["USDC", "WBTC", "WETH", "WMATIC"]);
     }

@@ -136,25 +136,21 @@ impl TuiApp {
         let reader_shutdown = Arc::new(AtomicBool::new(false));
         let sd = reader_shutdown.clone();
 
-        let handle = thread::spawn(move || {
-            loop {
-                if sd.load(Ordering::Relaxed) {
-                    break;
-                }
-                match crossterm::event::poll(Duration::from_millis(100)) {
-                    Ok(true) => {
-                        match crossterm::event::read() {
-                            Ok(ev) => {
-                                if event_tx.send(ev).is_err() {
-                                    break;
-                                }
-                            }
-                            Err(_) => break,
+        let handle = thread::spawn(move || loop {
+            if sd.load(Ordering::Relaxed) {
+                break;
+            }
+            match crossterm::event::poll(Duration::from_millis(100)) {
+                Ok(true) => match crossterm::event::read() {
+                    Ok(ev) => {
+                        if event_tx.send(ev).is_err() {
+                            break;
                         }
                     }
-                    Ok(false) => {}
                     Err(_) => break,
-                }
+                },
+                Ok(false) => {}
+                Err(_) => break,
             }
         });
 
@@ -212,7 +208,8 @@ impl TuiApp {
             // Shutdown check via broadcast (sinal do Ctrl+C no main).
             match shutdown_rx.try_recv() {
                 Ok(_) | Err(broadcast::error::TryRecvError::Closed) => return Ok(()),
-                Err(broadcast::error::TryRecvError::Lagged(_)) | Err(broadcast::error::TryRecvError::Empty) => {}
+                Err(broadcast::error::TryRecvError::Lagged(_))
+                | Err(broadcast::error::TryRecvError::Empty) => {}
             }
 
             // Heartbeat + uptime: computado na thread da TUI, independente
@@ -240,7 +237,9 @@ impl TuiApp {
                                 let _ = self.shutdown_tx.send(());
                                 return Ok(());
                             }
-                            KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                            KeyCode::Char('c')
+                                if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
+                            {
                                 crate::emergency_shutdown::request_emergency_shutdown();
                                 let _ = self.shutdown_tx.send(());
                                 return Ok(());
@@ -276,10 +275,10 @@ impl TuiApp {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(5),   // Header (border + 3 lines de conteúdo)
-                Constraint::Length(6),   // Status (border + 4 lines de conteúdo)
-                Constraint::Min(10),     // Center: Prices | TopSpreads (split horizontal)
-                Constraint::Length(4),   // Footer (border + 2 lines de conteúdo)
+                Constraint::Length(5), // Header (border + 3 lines de conteúdo)
+                Constraint::Length(6), // Status (border + 4 lines de conteúdo)
+                Constraint::Min(10),   // Center: Prices | TopSpreads (split horizontal)
+                Constraint::Length(4), // Footer (border + 2 lines de conteúdo)
             ])
             .split(f.area());
 
@@ -299,9 +298,12 @@ impl TuiApp {
 
     fn draw_header(&self, f: &mut Frame, area: Rect) {
         let header = Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled("  DEX ARBITRAGE BOT v1.0", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            ]),
+            Line::from(vec![Span::styled(
+                "  DEX ARBITRAGE BOT v1.0",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )]),
             Line::from(vec![
                 Span::styled("  Polygon", Style::default().fg(Color::Yellow)),
                 Span::raw(" | "),
@@ -309,26 +311,42 @@ impl TuiApp {
             ]),
             Line::from(vec![
                 Span::raw("  Press "),
-                Span::styled("q", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "q",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
                 Span::raw(" to quit"),
             ]),
         ])
-        .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        );
         f.render_widget(header, area);
     }
 
     fn draw_status(&self, f: &mut Frame, area: Rect) {
         let state = self.blocking_read();
 
-        let uptime_str = format!("{:02}:{:02}:{:02}",
+        let uptime_str = format!(
+            "{:02}:{:02}:{:02}",
             state.uptime.as_secs() / 3600,
             (state.uptime.as_secs() % 3600) / 60,
             state.uptime.as_secs() % 60
         );
 
         // Heartbeat: pisca a cada render tick (4 ticks/s). Parado = TUI travou.
-        let beat = if state.render_tick % 2 == 0 { "●" } else { "○" };
-        let beat_color = if state.render_tick % 2 == 0 { Color::Green } else { Color::DarkGray };
+        let beat = if state.render_tick % 2 == 0 {
+            "●"
+        } else {
+            "○"
+        };
+        let beat_color = if state.render_tick % 2 == 0 {
+            Color::Green
+        } else {
+            Color::DarkGray
+        };
 
         // Idade do último scan: quanto faz que o radar entregou preços. Se crescer
         // além de ~normal (segundos), radar stallou (WS morto / RPC rate-limit).
@@ -353,9 +371,17 @@ impl TuiApp {
         let status_items = vec![
             ListItem::new(Line::from(vec![
                 Span::styled("  ", Style::default()),
-                Span::styled(beat, Style::default().fg(beat_color).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    beat,
+                    Style::default().fg(beat_color).add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(" Status: ", Style::default().fg(Color::Gray)),
-                Span::styled("RUNNING", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "RUNNING",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw(" | "),
                 Span::raw(format!("Uptime: {}", uptime_str)),
                 Span::raw(" | "),
@@ -364,7 +390,10 @@ impl TuiApp {
             ])),
             ListItem::new(Line::from(vec![
                 Span::styled("  DEXes: ", Style::default().fg(Color::Gray)),
-                Span::styled(format!("{}", state.dex_count), Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    format!("{}", state.dex_count),
+                    Style::default().fg(Color::Cyan),
+                ),
                 Span::raw(" | "),
                 Span::raw(format!("Pares: {}", state.pairs_count)),
                 Span::raw(" | "),
@@ -372,18 +401,48 @@ impl TuiApp {
             ])),
             ListItem::new(Line::from(vec![
                 Span::styled("  Econ: ", Style::default().fg(Color::Gray)),
-                Span::styled(format!("gross={}", state.gross_positive), Style::default().fg(if state.gross_positive > 0 { Color::Green } else { Color::Red })),
+                Span::styled(
+                    format!("gross={}", state.gross_positive),
+                    Style::default().fg(if state.gross_positive > 0 {
+                        Color::Green
+                    } else {
+                        Color::Red
+                    }),
+                ),
                 Span::raw(" | "),
-                Span::styled(format!("net+={}", state.net_positive), Style::default().fg(if state.net_positive > 0 { Color::Green } else { Color::Yellow })),
+                Span::styled(
+                    format!("net+={}", state.net_positive),
+                    Style::default().fg(if state.net_positive > 0 {
+                        Color::Green
+                    } else {
+                        Color::Yellow
+                    }),
+                ),
                 Span::raw(" | "),
-                Span::styled(format!("net=${:.2}", state.net_usd_total), Style::default().fg(if state.net_usd_total > 0.0 { Color::Green } else if state.net_usd_total < 0.0 { Color::Red } else { Color::Gray })),
+                Span::styled(
+                    format!("net=${:.2}", state.net_usd_total),
+                    Style::default().fg(if state.net_usd_total > 0.0 {
+                        Color::Green
+                    } else if state.net_usd_total < 0.0 {
+                        Color::Red
+                    } else {
+                        Color::Gray
+                    }),
+                ),
                 Span::raw(" | "),
-                Span::styled(format!("neg={}", state.negative_cycles), Style::default().fg(Color::Gray)),
+                Span::styled(
+                    format!("neg={}", state.negative_cycles),
+                    Style::default().fg(Color::Gray),
+                ),
             ])),
         ];
 
-        let status_list = List::new(status_items)
-            .block(Block::default().borders(Borders::ALL).title(" Status ").border_style(Style::default().fg(Color::Yellow)));
+        let status_list = List::new(status_items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Status ")
+                .border_style(Style::default().fg(Color::Yellow)),
+        );
         f.render_widget(status_list, area);
     }
 
@@ -391,7 +450,11 @@ impl TuiApp {
         let state = self.blocking_read();
 
         let header = Row::new(vec![
-            Cell::from("Pair").style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Cell::from("Pair").style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Cell::from("QuickSwap").style(Style::default().fg(Color::Green)),
             Cell::from("SushiSwap").style(Style::default().fg(Color::Magenta)),
             Cell::from("Curve").style(Style::default().fg(Color::Yellow)),
@@ -410,7 +473,10 @@ impl TuiApp {
 
             let spread = if venue_prices.len() >= 2 {
                 let min = venue_prices.iter().cloned().fold(f64::INFINITY, f64::min);
-                let max = venue_prices.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let max = venue_prices
+                    .iter()
+                    .cloned()
+                    .fold(f64::NEG_INFINITY, f64::max);
                 (max - min) / min * 100.0
             } else {
                 0.0
@@ -429,32 +495,44 @@ impl TuiApp {
                 Cell::from(format_opt(p.sushiswap)),
                 Cell::from(format_opt(p.curve)),
                 Cell::from(format_opt(p.uniswap_v3)),
-                Cell::from(format!("{:.2}%", spread)).style(  // Reduzir para 2 casas decimais
-                    if spread > 0.5 { Style::default().fg(Color::Red) }
-                    else if spread > 0.1 { Style::default().fg(Color::Yellow) }
-                    else { Style::default().fg(Color::Gray) }
+                Cell::from(format!("{:.2}%", spread)).style(
+                    // Reduzir para 2 casas decimais
+                    if spread > 0.5 {
+                        Style::default().fg(Color::Red)
+                    } else if spread > 0.1 {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::Gray)
+                    },
                 ),
                 Cell::from(fmt_opt_net(p.net_usd)).style(
-                    if matches!(p.net_usd, Some(n) if n > 0.0) { Style::default().fg(Color::Green) }
-                    else if matches!(p.net_usd, Some(n) if n < 0.0) { Style::default().fg(Color::Red) }
-                    else { Style::default().fg(Color::Gray) }
+                    if matches!(p.net_usd, Some(n) if n > 0.0) {
+                        Style::default().fg(Color::Green)
+                    } else if matches!(p.net_usd, Some(n) if n < 0.0) {
+                        Style::default().fg(Color::Red)
+                    } else {
+                        Style::default().fg(Color::Gray)
+                    },
                 ),
             ]));
         }
 
         let widths = [
-            Constraint::Length(14),     // Pair
-            Constraint::Length(13),     // QuickSwap
-            Constraint::Length(13),     // SushiSwap
-            Constraint::Length(13),     // Curve
-            Constraint::Length(13),     // UniV3
-            Constraint::Length(10),     // Spread%
-            Constraint::Length(9),      // Net$
+            Constraint::Length(14), // Pair
+            Constraint::Length(13), // QuickSwap
+            Constraint::Length(13), // SushiSwap
+            Constraint::Length(13), // Curve
+            Constraint::Length(13), // UniV3
+            Constraint::Length(10), // Spread%
+            Constraint::Length(9),  // Net$
         ];
 
-        let table = Table::new(rows, widths)
-            .header(header)
-            .block(Block::default().borders(Borders::ALL).title(" Preços Cross-DEX ").border_style(Style::default().fg(Color::Green)));
+        let table = Table::new(rows, widths).header(header).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Preços Cross-DEX ")
+                .border_style(Style::default().fg(Color::Green)),
+        );
 
         f.render_widget(table, area);
     }
@@ -463,7 +541,11 @@ impl TuiApp {
         let state = self.blocking_read();
 
         let header = Row::new(vec![
-            Cell::from("Pair").style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Cell::from("Pair").style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Cell::from("Spread%").style(Style::default().fg(Color::Red)),
             Cell::from("cyc").style(Style::default().fg(Color::Yellow)),
             Cell::from("Net$").style(Style::default().fg(Color::Green)),
@@ -505,9 +587,12 @@ impl TuiApp {
             Constraint::Length(6),  // exec
         ];
 
-        let table = Table::new(rows, widths)
-            .header(header)
-            .block(Block::default().borders(Borders::ALL).title(" Top Spreads ").border_style(Style::default().fg(Color::Magenta)));
+        let table = Table::new(rows, widths).header(header).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Top Spreads ")
+                .border_style(Style::default().fg(Color::Magenta)),
+        );
 
         f.render_widget(table, area);
     }
@@ -525,16 +610,18 @@ impl TuiApp {
                 Span::styled("UniV3 0.01-1%", Style::default().fg(Color::Blue)),
             ]),
         ])
-        .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Gray)));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Gray)),
+        );
         f.render_widget(footer, area);
     }
 
     fn blocking_read(&self) -> TuiState {
         match self.state.read() {
             Ok(guard) => guard.clone(),
-            Err(poisoned) => {
-                poisoned.into_inner().clone()
-            }
+            Err(poisoned) => poisoned.into_inner().clone(),
         }
     }
 }
@@ -588,7 +675,10 @@ pub fn norm_pair(pair: &str) -> String {
 /// nenhum comando respondia, precisava `reset`. O join espera a TUI sair do
 /// run_inner (que ela faz ao receber o broadcast de shutdown), momento em
 /// que o cleanup já rodou.
-pub fn spawn_tui(state: Arc<RwLock<TuiState>>, shutdown_tx: broadcast::Sender<()>) -> std::thread::JoinHandle<()> {
+pub fn spawn_tui(
+    state: Arc<RwLock<TuiState>>,
+    shutdown_tx: broadcast::Sender<()>,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut sd_rx = shutdown_tx.subscribe();
         let app = TuiApp::new(state, shutdown_tx);

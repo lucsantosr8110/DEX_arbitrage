@@ -12,8 +12,8 @@ use crate::core::types::{
 use crate::infra::metrics;
 use crate::utils::validate_price;
 use once_cell::sync::OnceCell;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, info};
@@ -25,7 +25,9 @@ use tracing::{debug, info};
 pub static RISK_MANAGER: OnceCell<Arc<Mutex<RiskManager>>> = OnceCell::new();
 
 pub fn init_global_risk_manager(cfg: RiskConfig) -> bool {
-    RISK_MANAGER.set(Arc::new(Mutex::new(RiskManager::new(cfg)))).is_ok()
+    RISK_MANAGER
+        .set(Arc::new(Mutex::new(RiskManager::new(cfg))))
+        .is_ok()
 }
 
 pub fn get_global_risk_manager() -> Option<&'static Arc<Mutex<RiskManager>>> {
@@ -237,7 +239,8 @@ impl RiskManager {
             risk_score += self.config.weight_high_execution_risk;
         }
 
-        let approved = adjusted_net_profit >= min_profit_usd && risk_score <= self.config.max_risk_score;
+        let approved =
+            adjusted_net_profit >= min_profit_usd && risk_score <= self.config.max_risk_score;
 
         if approved {
             info!(
@@ -252,7 +255,12 @@ impl RiskManager {
         }
 
         self.update_metrics(risk_score, approved, false);
-        RiskAssessment { approved, risk_factors, risk_score, adaptive_mode: false }
+        RiskAssessment {
+            approved,
+            risk_factors,
+            risk_score,
+            adaptive_mode: false,
+        }
     }
 
     // ============================================================
@@ -280,33 +288,37 @@ impl RiskManager {
             risk_factors.push(RiskFactor::NegativeProfit);
             risk_score += self.config.weight_negative_profit_adaptive * 0.5;
         }
-        
+
         if opportunity.profit_percent < (self.config.adaptive_min_profit_percent * 0.5) {
             risk_factors.push(RiskFactor::ProfitTooLow);
             risk_score += self.config.weight_profit_too_low_adaptive * 0.5;
         }
-        
-        let gas_ratio = if adjusted_net_profit > 0.0 { 
-            gas_real / adjusted_net_profit 
-        } else { 
-            f64::INFINITY 
+
+        let gas_ratio = if adjusted_net_profit > 0.0 {
+            gas_real / adjusted_net_profit
+        } else {
+            f64::INFINITY
         };
-        
+
         if gas_ratio > (self.config.adaptive_gas_ratio * 1.5) {
             risk_factors.push(RiskFactor::GasCostTooHigh);
             risk_score += self.config.weight_gas_too_high_adaptive * 0.5;
         }
-        
-        if opportunity.confidence < (self.config.min_confidence * self.config.adaptive_confidence_factor) {
+
+        if opportunity.confidence
+            < (self.config.min_confidence * self.config.adaptive_confidence_factor)
+        {
             risk_factors.push(RiskFactor::LowConfidence);
             risk_score += self.config.weight_low_confidence_adaptive * 0.5;
         }
-        
-        if opportunity.estimated_volume_usd < (self.config.min_volume_usd * self.config.adaptive_volume_factor) {
+
+        if opportunity.estimated_volume_usd
+            < (self.config.min_volume_usd * self.config.adaptive_volume_factor)
+        {
             risk_factors.push(RiskFactor::LowVolume);
             risk_score += self.config.weight_low_volume_adaptive * 0.5;
         }
-        
+
         if opportunity.execution_risk > self.config.max_execution_risk {
             risk_factors.push(RiskFactor::HighExecutionRisk);
             risk_score += self.config.weight_high_execution_risk_adaptive;
@@ -323,7 +335,12 @@ impl RiskManager {
         }
 
         self.update_metrics(risk_score, approved, true);
-        RiskAssessment { approved, risk_factors, risk_score, adaptive_mode: true }
+        RiskAssessment {
+            approved,
+            risk_factors,
+            risk_score,
+            adaptive_mode: true,
+        }
     }
 
     // ============================================================
@@ -334,22 +351,25 @@ impl RiskManager {
         opportunity: &FlashloanOpportunity,
     ) -> RiskAssessment {
         let mut assessment = self.assess_opportunity(&opportunity.base_opportunity);
-        
+
         // ✅ PENALIDADE POR STEPS ADICIONAIS - COMPATÍVEL
         let extra_steps = opportunity.steps.len().saturating_sub(3) as f64;
         let penalty = (extra_steps * self.config.weight_step_penalty).max(0.0);
         assessment.risk_score = (assessment.risk_score + penalty).min(100.0);
-        
+
         assessment.adaptive_mode = self.adaptive_mode.load(Ordering::Relaxed);
-        
+
         let max_risk = if self.adaptive_mode.load(Ordering::Relaxed) {
             self.config.max_risk_score * 1.1
         } else {
             self.config.max_risk_score
         };
-        
+
         let approved = assessment.risk_score <= max_risk;
-        RiskAssessment { approved, ..assessment }
+        RiskAssessment {
+            approved,
+            ..assessment
+        }
     }
 
     // ============================================================
@@ -370,7 +390,8 @@ impl RiskManager {
     fn update_adaptive_mode(&mut self) {
         let now = Instant::now();
         if self.opportunities_analyzed % self.config.adaptive_check_every_ops as u64 == 0
-            || now.duration_since(self.last_adjustment) > Duration::from_secs(self.config.adaptive_check_secs as u64)
+            || now.duration_since(self.last_adjustment)
+                > Duration::from_secs(self.config.adaptive_check_secs as u64)
         {
             let hit_rate = self.calculate_hit_rate();
             let should_activate = hit_rate < self.config.adaptive_activate_below_hitrate;
@@ -456,7 +477,7 @@ mod tests {
             buy_price: 0.999,
             sell_price: 1.001,
             spread_percent: 0.2,
-            amount_in: U256::from(100_000_000u64), // 100 USDT
+            amount_in: U256::from(100_000_000u64),  // 100 USDT
             amount_out: U256::from(100_200_000u64), // 100.2 USDC
             estimated_profit_usd: 0.15,
             gas_cost_usd: 0.05,
@@ -540,13 +561,13 @@ mod tests {
     #[test]
     fn test_adaptive_mode_switch() {
         let mut manager = RiskManager::with_defaults();
-        
+
         // Forçar modo adaptativo
         manager.adaptive_mode.store(true, Ordering::Relaxed);
-        
+
         let op = create_test_opportunity();
         let assessment = manager.assess_opportunity(&op);
-        
+
         assert!(assessment.adaptive_mode);
     }
 }

@@ -1730,8 +1730,8 @@ impl Default for ExecutionConfig {
             // NOTA: default_dex_fee_bps e default_price_impact_bps NÃO entram no
             // cálculo de net profit — quotes já são fee+impact-inclusive.
             // Ver core::economics. Mantidos só para overrides de simulação legada.
-            default_dex_fee_bps: 30,      // 0.30%
-            default_price_impact_bps: 50, // 0.50%
+            default_dex_fee_bps: 30,                      // 0.30%
+            default_price_impact_bps: 50,                 // 0.50%
             adverse_move_bps: default_adverse_move_bps(), // B5: 5 bps/hop compounded
             dex_fee_bps_map: HashMap::new(),
             dex_price_impact_bps_map: HashMap::new(),
