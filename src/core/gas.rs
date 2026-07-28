@@ -308,10 +308,30 @@ where
         let gas_units = baseline_units * multiplier;
 
         // Preço do POL (token de gás da Polygon) via Coingecko com cache de 2 min.
-        let matic_price = crate::infra::price_feed::PRICE_FEED
-            .get_price("WMATIC")
-            .await
-            .unwrap_or_else(|_| crate::infra::price_feed::CachedPriceFeed::fallback_price("WMATIC"));
+        //
+        // Fail-closed opcional: se `require_fresh_native_price`, rejeita opp quando
+        // o preço for fallback/stale/ausente em vez de cair no fallback heurístico
+        // (que poderia subestimar gás e aprovar opp inviável). Validade numérica
+        // (finito, > 0) é sempre checada — defesa em profundidade contra preço 0.
+        let matic_price = if gas_cfg.require_fresh_native_price {
+            let max_stale = Duration::from_secs(gas_cfg.native_price_max_stale_secs);
+            crate::infra::price_feed::PRICE_FEED
+                .get_price_strict("WMATIC", max_stale)
+                .await?
+        } else {
+            crate::infra::price_feed::PRICE_FEED
+                .get_price("WMATIC")
+                .await
+                .unwrap_or_else(|_| {
+                    crate::infra::price_feed::CachedPriceFeed::fallback_price("WMATIC")
+                })
+        };
+        if !matic_price.is_finite() || matic_price <= 0.0 {
+            anyhow::bail!(
+                "preço de native token (WMATIC) inválido: {} — fail-closed",
+                matic_price
+            );
+        }
         let cost = gas_units * (eff * 1e-9) * matic_price;
 
         // Finder guarda referência canônica de 3 hops; publicar uma rota de

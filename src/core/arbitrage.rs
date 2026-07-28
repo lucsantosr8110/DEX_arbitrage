@@ -988,15 +988,25 @@ impl ArbitrageEngine {
 
         // Validação final (paper observe: permite net<min para eth_call medir delta;
         // execução real continua gated por would_execute + sends_forbidden).
+        // Gate compartilhado com o executor (economics::TradeEconomics) — mesma
+        // fonte de verdade para net profit. Executor re-valida em UsdE8 (mais
+        // estrito) pré-broadcast; aqui é o pré-filtro do finder.
         let min_profit = app_config.arbitrage.min_profit_threshold_usd.unwrap_or(0.0015);
         let paper_observe = crate::core::paper_validation::observation_active(app_config);
 
-        if net_profit_usd < min_profit && !paper_observe {
-            return Err(anyhow!(
-                "Lucro líquido insuficiente: ${:.6} < ${:.6}",
+        if !paper_observe {
+            let econ = economics::TradeEconomics {
+                trade_size_usd: trade_amount_usd,
+                gross_profit_usd,
+                gas_cost_usd,
+                flashloan_fee_usd: costs.flashloan_fee_usd,
+                adverse_move_usd: costs.adverse_move_usd,
                 net_profit_usd,
-                min_profit
-            ));
+                edge_bps: economics::edge_budget_bps(net_profit_usd, trade_amount_usd),
+            };
+            if let Err(r) = econ.validate_gate(min_profit) {
+                return Err(anyhow!("Lucro líquido insuficiente: {}", r));
+            }
         }
 
         // Slippage protection: teto do config, apertado pelo edge realmente disponível.

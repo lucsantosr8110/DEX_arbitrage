@@ -1140,6 +1140,16 @@ pub struct GasConfig {
     /// Consumo de gás ESPERADO da rota (não o teto). 0 = cai em `default_gas_limit`.
     /// Usar o teto para precificar custo infla o hurdle de lucro.
     #[serde(default)] pub estimated_gas_units: u64,
+
+    /// Fail-closed em preço de native token (POL): quando true, `estimate_gas_usd`
+    /// rejeita opp se o preço do WMATIC for fallback heurístico, stale ou ausente,
+    /// em vez de cair no fallback. Default false preserva comportamento; ligar é
+    /// recomendado para segurança econômica (evita subestimar gás com preço 0).
+    #[serde(default)] pub require_fresh_native_price: bool,
+
+    /// Idade máxima (segundos) do preço de native token no cache antes de considerar
+    /// stale. 0 = sem limite de idade extra (só o TTL normal do cache valem).
+    #[serde(default)] pub native_price_max_stale_secs: u64,
 }
 impl Default for GasConfig {
     fn default() -> Self {
@@ -1167,6 +1177,8 @@ impl Default for GasConfig {
             min_priority_gwei: default_min_priority_gwei(),
             // flashloan Aave + 3 swaps ≈ 400k gás queimado
             estimated_gas_units: 400_000,
+            require_fresh_native_price: false,
+            native_price_max_stale_secs: 0,
         }
     }
 }

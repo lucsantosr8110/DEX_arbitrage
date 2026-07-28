@@ -157,6 +157,46 @@ impl CachedPriceFeed {
         }
     }
 
+    /// Preço **estrito**: só retorna `Ok` se houver entrada de cache NÃO-fallback
+    /// (Coingecko real) com idade ≤ `max_stale`. Caso contrário `Err` — fail-closed.
+    ///
+    /// Usado para precificar gás quando o operador opta por rejeitar opps com
+    /// preço de native token ausente/stale/fallback. `max_stale = Duration::ZERO`
+    /// exige apenas que exista entrada não-fallback (qualquer idade dentro do
+    /// TTL do cache, já garantido por `read_fresh_cache`).
+    pub async fn get_price_strict(&self, symbol: &str, max_stale: Duration) -> Result<f64> {
+        let key = symbol.to_lowercase();
+        let cache = CACHE.read().unwrap();
+        let entry = cache.get(&key).ok_or_else(|| {
+            anyhow!("preço de {} ausente do cache (fail-closed)", symbol)
+        })?;
+        if entry.is_fallback {
+            return Err(anyhow!(
+                "preço de {} é fallback heurístico, não Coingecko real (fail-closed)",
+                symbol
+            ));
+        }
+        let age = entry.timestamp.elapsed();
+        if max_stale > Duration::ZERO && age > max_stale {
+            return Err(anyhow!(
+                "preço de {} stale: {:?} > max {:?} (fail-closed)",
+                symbol,
+                age,
+                max_stale
+            ));
+        }
+        // Validade numérica final (gate inteiro/literal, sem f64 na decisão de
+        // rejeição: NaN/<=0 são rejeitados por comparação direta).
+        if !entry.price_usd.is_finite() || entry.price_usd <= 0.0 {
+            return Err(anyhow!(
+                "preço de {} inválido ({} <= 0 ou NaN) — fail-closed",
+                symbol,
+                entry.price_usd
+            ));
+        }
+        Ok(entry.price_usd)
+    }
+
     /// Jitter de ±12.5%, derivado de chave + relógio de inserção. Evita burst
     /// de refresh quando muitos caches expiram na mesma janela (I5).
     fn ttl_with_jitter(base: Duration, key: &str) -> Duration {

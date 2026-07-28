@@ -26,6 +26,7 @@
 //! GROSS usando este módulo — convenção A5, uma única dedução por custo.
 
 use serde::Serialize;
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// `FLASHLOAN_PREMIUM_TOTAL` da Aave V3 (5 bps). Verificado on-chain 2026-07-24.
@@ -183,6 +184,82 @@ pub fn edge_budget_bps(net_profit_usd: f64, trade_amount_usd: f64) -> i64 {
         return 0;
     }
     ((net_profit_usd / trade_amount_usd) * 10_000.0).floor() as i64
+}
+
+/// Snapshot econômico de uma rota — **fonte única de verdade** compartilhada
+/// entre finder (`arbitrage.rs`) e executor (`flashloan.rs`).
+///
+/// Ambos derivam `net_profit_usd` da mesma fórmula [`net_profit_usd`]
+/// (finder em f64, executor em `UsdE8` — versão inteira mais estrita, que é o
+/// gate final pré-broadcast). Decimals desconhecidos ou preço de native token
+/// zero/stale devem ser rejeitados **antes** de preencher este snapshot
+/// (fail-closed nos respectivos módulos: `get_token_decimals_smart`,
+/// `GasEstimator::estimate_gas_usd_for_hops`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct TradeEconomics {
+    pub trade_size_usd: f64,
+    pub gross_profit_usd: f64,
+    pub gas_cost_usd: f64,
+    pub flashloan_fee_usd: f64,
+    pub adverse_move_usd: f64,
+    pub net_profit_usd: f64,
+    pub edge_bps: i64,
+}
+
+impl TradeEconomics {
+    /// Constrói a partir dos custos já calculados pela fonte única.
+    pub fn from_costs(
+        trade_size_usd: f64,
+        gross_profit_usd: f64,
+        costs: &TradeCosts,
+    ) -> Self {
+        let net = net_profit_usd(gross_profit_usd, costs);
+        Self {
+            trade_size_usd,
+            gross_profit_usd,
+            gas_cost_usd: costs.gas_usd,
+            flashloan_fee_usd: costs.flashloan_fee_usd,
+            adverse_move_usd: costs.adverse_move_usd,
+            net_profit_usd: net,
+            edge_bps: edge_budget_bps(net, trade_size_usd),
+        }
+    }
+
+    /// Gate de aprovação compartilhado. Rejeita fail-closed se:
+    ///   - net_profit_usd não é finito (custo NaN/inf virou −∞ em net_profit_usd);
+    ///   - net_profit_usd <= min_profit_usd (sem edge positivo acima do piso).
+    ///
+    /// Retorna o net validado em caso de aprovação.
+    pub fn validate_gate(&self, min_profit_usd: f64) -> Result<f64, EconomicsRejection> {
+        if !self.net_profit_usd.is_finite() {
+            return Err(EconomicsRejection::NonFiniteNet);
+        }
+        if self.net_profit_usd <= min_profit_usd {
+            return Err(EconomicsRejection::BelowMinProfit {
+                net: self.net_profit_usd,
+                min: min_profit_usd,
+            });
+        }
+        Ok(self.net_profit_usd)
+    }
+}
+
+/// Motivo de rejeição econômica — explícito, não "skipped".
+#[derive(Debug, Clone, PartialEq)]
+pub enum EconomicsRejection {
+    NonFiniteNet,
+    BelowMinProfit { net: f64, min: f64 },
+}
+
+impl fmt::Display for EconomicsRejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EconomicsRejection::NonFiniteNet => write!(f, "net profit não-finito (custo NaN/inf)"),
+            EconomicsRejection::BelowMinProfit { net, min } => {
+                write!(f, "net profit ${:.6} <= min ${:.6}", net, min)
+            }
+        }
+    }
 }
 
 /// Teto cumulativo de slippage autorizado pelo edge líquido.
@@ -406,5 +483,47 @@ mod tests {
         assert_eq!(allowed, Some(9));
         // route_limit estático não autoriza slippage > edge líquido.
         assert!(allowed.unwrap() < 10);
+    }
+
+    // ===== FASE 5: TradeEconomics gate compartilhado finder/executor =====
+
+    #[test]
+    fn trade_economics_gate_approves_above_min() {
+        let costs = TradeCosts {
+            gas_usd: 0.005,
+            flashloan_fee_usd: 0.05,
+            adverse_move_usd: 0.0,
+        };
+        let econ = TradeEconomics::from_costs(100.0, 0.30, &costs);
+        // net = 0.30 − 0.055 = 0.245; edge_bps = floor(0.245/100*10000) = 24
+        assert!((econ.net_profit_usd - 0.245).abs() < 1e-9);
+        assert_eq!(econ.edge_bps, 24);
+        assert!(econ.validate_gate(0.0015).is_ok());
+    }
+
+    #[test]
+    fn trade_economics_gate_rejects_below_min() {
+        let costs = TradeCosts {
+            gas_usd: 0.005,
+            flashloan_fee_usd: 0.05,
+            adverse_move_usd: 0.0,
+        };
+        let econ = TradeEconomics::from_costs(100.0, 0.05, &costs);
+        // net = 0.05 − 0.055 = -0.005
+        let err = econ.validate_gate(0.0015).unwrap_err();
+        assert_eq!(err, EconomicsRejection::BelowMinProfit { net: econ.net_profit_usd, min: 0.0015 });
+    }
+
+    #[test]
+    fn trade_economics_gate_rejects_nonfinite_net() {
+        // custo NaN → net = −∞ (net_profit_usd trata).
+        let costs = TradeCosts {
+            gas_usd: f64::NAN,
+            flashloan_fee_usd: 0.0,
+            adverse_move_usd: 0.0,
+        };
+        let econ = TradeEconomics::from_costs(100.0, 1.0, &costs);
+        assert_eq!(econ.net_profit_usd, f64::NEG_INFINITY);
+        assert_eq!(econ.validate_gate(0.0015).unwrap_err(), EconomicsRejection::NonFiniteNet);
     }
 }
