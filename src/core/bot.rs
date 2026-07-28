@@ -20,12 +20,7 @@ use crate::{
 use anyhow::Result;
 use chrono::Utc;
 use ethers::types::Address;
-use std::{
-    collections::HashMap,
-    fs::OpenOptions,
-    io::Write,
-    sync::Arc,
-};
+use std::{collections::HashMap, fs::OpenOptions, io::Write, sync::Arc};
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tracing::{debug, info, warn};
 
@@ -89,20 +84,13 @@ impl Bot {
             .flashloan
             .executor_address
             .clone()
-            .unwrap_or_else(|| {
-                "0xb391aEebB4Db4e99A456B28d29d3AF50193F078F".into()
-            });
+            .unwrap_or_else(|| "0xb391aEebB4Db4e99A456B28d29d3AF50193F078F".into());
 
-        let executor_address: Address =
-            executor_address_str.parse().unwrap_or_default();
+        let executor_address: Address = executor_address_str.parse().unwrap_or_default();
 
         // ✅ ArbitrageClient sem execution_engine
-        let arbitrage_client = ArbitrageClient::new(
-            executor_address,
-            client.clone(),
-            config.clone(),
-            None,
-        );
+        let arbitrage_client =
+            ArbitrageClient::new(executor_address, client.clone(), config.clone(), None);
 
         let execution_mode = if cfg_guard.flashloan.enabled {
             if cfg_guard
@@ -205,12 +193,15 @@ impl Bot {
         }
 
         if self.telegram.is_enabled() {
-            let _ = self.telegram.notify_opportunity(
-                opportunity.spread_percent,
-                opportunity.estimated_profit_usd,
-                &opportunity.pair,
-                &[&opportunity.buy_dex, &opportunity.sell_dex],
-            ).await;
+            let _ = self
+                .telegram
+                .notify_opportunity(
+                    opportunity.spread_percent,
+                    opportunity.estimated_profit_usd,
+                    &opportunity.pair,
+                    &[&opportunity.buy_dex, &opportunity.sell_dex],
+                )
+                .await;
         }
 
         self.arbitrage_client
@@ -466,9 +457,9 @@ mod should_try_next_tests {
 
     #[test]
     fn continues_only_on_aborted_pre_broadcast() {
-        let aborted = BundleResult::skipped().with_outcome(
-            ExecutionOutcome::AbortedPreBroadcast { reason: "sim failed".into() },
-        );
+        let aborted = BundleResult::skipped().with_outcome(ExecutionOutcome::AbortedPreBroadcast {
+            reason: "sim failed".into(),
+        });
         assert!(should_try_next_opp(&aborted));
 
         let h = ethers::types::H256::repeat_byte(0x1);
@@ -477,7 +468,10 @@ mod should_try_next_tests {
             reason: None,
             gas_used: None,
         });
-        assert!(!should_try_next_opp(&reverted), "revert é terminal — não tenta próxima");
+        assert!(
+            !should_try_next_opp(&reverted),
+            "revert é terminal — não tenta próxima"
+        );
 
         let stuck = BundleResult::skipped().with_outcome(ExecutionOutcome::TimeoutStuck {
             nonce: U256::from(1),
@@ -485,12 +479,17 @@ mod should_try_next_tests {
         });
         assert!(!should_try_next_opp(&stuck), "timeout stuck é terminal");
 
-        let same_block = BundleResult::skipped().with_outcome(
-            ExecutionOutcome::SameBlockRejected { tx_hash: None },
+        let same_block = BundleResult::skipped()
+            .with_outcome(ExecutionOutcome::SameBlockRejected { tx_hash: None });
+        assert!(
+            !should_try_next_opp(&same_block),
+            "same-block não tenta próxima"
         );
-        assert!(!should_try_next_opp(&same_block), "same-block não tenta próxima");
 
         let no_outcome = BundleResult::skipped();
-        assert!(!should_try_next_opp(&no_outcome), "sem outcome = não continua");
+        assert!(
+            !should_try_next_opp(&no_outcome),
+            "sem outcome = não continua"
+        );
     }
 }

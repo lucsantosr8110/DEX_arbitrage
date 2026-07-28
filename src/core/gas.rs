@@ -98,7 +98,10 @@ where
             base_fee_cache: Arc::new(RwLock::new(None)),
             oracle_cache: Arc::new(RwLock::new(None)),
             gas_unit_multiplier: Arc::new(RwLock::new(1.0)),
-            http: Client::builder().timeout(Duration::from_secs(3)).build().unwrap(),
+            http: Client::builder()
+                .timeout(Duration::from_secs(3))
+                .build()
+                .unwrap(),
         }
     }
 
@@ -131,7 +134,8 @@ where
                 let max_fee = gwei_f64(max_fee_gwei);
                 let priority_fee = gwei_f64(prio_gwei);
 
-                self.set_cached_gas(&cache_key, max_fee, priority_fee, base_fee).await;
+                self.set_cached_gas(&cache_key, max_fee, priority_fee, base_fee)
+                    .await;
                 // M7: popular base_fee_cache com o base_fee derivado do oracle
                 // (max_fee − priority). Antes ia p/ campo `_base_fee` (unused) e o
                 // custo fazia SEGUNDA RPC `get_cached_base_fee`. Agora quem ler
@@ -158,11 +162,15 @@ where
         // ============================================================
         // 🧩 Fallback via RPC BaseFee
         // ============================================================
-        let base_fee =
-            self.get_cached_base_fee(ttl).await?.unwrap_or(gwei(gas.default_gas_price_gwei as u64));
+        let base_fee = self
+            .get_cached_base_fee(ttl)
+            .await?
+            .unwrap_or(gwei(gas.default_gas_price_gwei as u64));
 
         let priority_fee = self.calculate_dynamic_priority_fee(&cfg, base_fee).await?;
-        let max_fee = self.calculate_dynamic_max_fee(&cfg, base_fee, priority_fee).await?;
+        let max_fee = self
+            .calculate_dynamic_max_fee(&cfg, base_fee, priority_fee)
+            .await?;
 
         self.set_cached_gas(&cache_key, max_fee, priority_fee, base_fee)
             .await;
@@ -228,11 +236,7 @@ where
     // ============================================================
     // 🧮 Cálculos Dinâmicos (fallback)
     // ============================================================
-    async fn calculate_dynamic_priority_fee(
-        &self,
-        cfg: &Config,
-        base_fee: U256,
-    ) -> Result<U256> {
+    async fn calculate_dynamic_priority_fee(&self, cfg: &Config, base_fee: U256) -> Result<U256> {
         let base_fee_gwei = u256_to_f64(base_fee, 9);
         let mut priority = cfg.gas.priority_gwei;
         let max_priority = cfg.gas.max_priority_gwei;
@@ -291,9 +295,9 @@ where
 
         // M7: populate_dynamic_gas pode popular base_fee_cache via oracle, evitando
         // a segunda RPC `get_cached_base_fee` que antes sempre rodava.
-        let (_, priority_fee) =
-            self.populate_dynamic_gas(&mut Eip1559TransactionRequest::default())
-                .await?;
+        let (_, priority_fee) = self
+            .populate_dynamic_gas(&mut Eip1559TransactionRequest::default())
+            .await?;
         let base_fee = self
             .get_cached_base_fee(ttl)
             .await?
@@ -395,15 +399,22 @@ where
         strategy: GasStrategyKind,
     ) {
         let actual = actual_units.as_u64() as f64;
-        if actual <= 0.0 { return; }
+        if actual <= 0.0 {
+            return;
+        }
         let cfg = self.config.lock().await.clone();
         let estimated = Self::gas_units_for_hops(&cfg.gas, &cfg, n_hops, strategy);
-        if estimated <= 0.0 { return; }
+        if estimated <= 0.0 {
+            return;
+        }
         let mut multiplier = self.gas_unit_multiplier.write().await;
         // EWMA 20% observação / 80% histórico, limitado para segurança.
         *multiplier = next_gas_multiplier(*multiplier, actual, estimated);
         crate::infra::metrics::record_gas_calibration(estimated, actual);
-        info!("⛽ [GasCalibration] hops={} estimated={:.0} actual={:.0} multiplier={:.3}", n_hops, estimated, actual, *multiplier);
+        info!(
+            "⛽ [GasCalibration] hops={} estimated={:.0} actual={:.0} multiplier={:.3}",
+            n_hops, estimated, actual, *multiplier
+        );
     }
 
     // ============================================================
@@ -461,7 +472,11 @@ fn gwei(n: u64) -> U256 {
 }
 
 fn next_gas_multiplier(previous: f64, actual_units: f64, estimated_units: f64) -> f64 {
-    if !actual_units.is_finite() || !estimated_units.is_finite() || actual_units <= 0.0 || estimated_units <= 0.0 {
+    if !actual_units.is_finite()
+        || !estimated_units.is_finite()
+        || actual_units <= 0.0
+        || estimated_units <= 0.0
+    {
         return previous.clamp(0.8, 1.5);
     }
     let ratio = (actual_units / estimated_units).clamp(0.5, 2.0);
@@ -577,7 +592,11 @@ mod tests {
         let u2 = GasEstimator::<ethers::providers::Provider<ethers::providers::Http>>::gas_units_for_hops(&gas_cfg, &cfg, 2, GasStrategyKind::WithFlashloan);
         let u4 = GasEstimator::<ethers::providers::Provider<ethers::providers::Http>>::gas_units_for_hops(&gas_cfg, &cfg, 4, GasStrategyKind::WithFlashloan);
         // 3 hops flashloan deve reproduzir o estimated_gas_units de referência.
-        assert!((u3 - gas_cfg.estimated_gas_units as f64).abs() < 1e-6, "3 hops={u3} ref={}", gas_cfg.estimated_gas_units);
+        assert!(
+            (u3 - gas_cfg.estimated_gas_units as f64).abs() < 1e-6,
+            "3 hops={u3} ref={}",
+            gas_cfg.estimated_gas_units
+        );
         assert!(u4 > u3, "4 hops ({u4}) deve custar mais que 3 ({u3})");
         assert!(u2 < u3, "2 hops ({u2}) deve custar menos que 3 ({u3})");
         // 0 hops (degen) não divide por zero — clamp em 1.
@@ -585,7 +604,10 @@ mod tests {
         assert!(u0.is_finite() && u0 > 0.0);
         // Direct: sem overhead Aave — 3 hops < referência flashloan.
         let u3_direct = GasEstimator::<ethers::providers::Provider<ethers::providers::Http>>::gas_units_for_hops(&gas_cfg, &cfg, 3, GasStrategyKind::Direct);
-        assert!(u3_direct < u3, "Direct 3 hops ({u3_direct}) < flashloan 3 hops ({u3})");
+        assert!(
+            u3_direct < u3,
+            "Direct 3 hops ({u3_direct}) < flashloan 3 hops ({u3})"
+        );
     }
 
     #[test]

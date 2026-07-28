@@ -10,13 +10,13 @@ use crate::{
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use ethers::types::{Address, U256};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     collections::{HashMap, HashSet},
     fmt,
     str::FromStr,
     sync::Arc,
 };
-use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
 use tracing::{debug, info, instrument, warn};
 
@@ -91,7 +91,9 @@ enum IntraCycleResult {
         final_rate: f64,
     },
     MissingLeg,
-    BelowSpread { final_rate: f64 },
+    BelowSpread {
+        final_rate: f64,
+    },
     Unrealistic,
     /// Hop V3 sem fee executável / venue não mapeável — descarta (não default).
     NotExecutable,
@@ -133,7 +135,10 @@ impl ArbitrageEngine {
     // ------------------------------------------------------------
     fn log_route_delta(&self, steps: &[ArbitrageStep], total_rate: f64, opp_id: &str) {
         if steps.len() < 2 {
-            debug!("🔹 [delta] Rota {} tem menos de 2 steps, ignorando.", opp_id);
+            debug!(
+                "🔹 [delta] Rota {} tem menos de 2 steps, ignorando.",
+                opp_id
+            );
             return;
         }
 
@@ -148,12 +153,7 @@ impl ArbitrageEngine {
 
             debug!(
                 "Step {} | {} | {} -> {} | rate={:.8} | DEX={}",
-                i,
-                s.dex_name,
-                s.token_in,
-                s.token_out,
-                s.expected_rate,
-                s.dex_name
+                i, s.dex_name, s.token_in, s.token_out, s.expected_rate, s.dex_name
             );
 
             if i > 0 {
@@ -262,7 +262,8 @@ impl ArbitrageEngine {
         info!("🔧 DEBUG: Price_map criado com {} DEXs", price_map.len());
 
         // Chamar o método normal
-        self.find_arbitrage_opportunities(&price_map, app_config).await
+        self.find_arbitrage_opportunities(&price_map, app_config)
+            .await
     }
 
     // ------------------------------------------------------------
@@ -292,12 +293,13 @@ impl ArbitrageEngine {
         // confiável. Rejeitar por padrão evita que quote absurdo passe pelo
         // fallback amplo; novos ativos devem entrar em pairs.metadata.
         const KNOWN_TOKENS: &[&str] = &[
-            "USDT", "USDC", "USDC.E", "DAI", "WETH", "WMATIC", "WPOL", "WBTC",
-            "LINK", "UNI", "LDO", "CRV", "AAVE", "SUSHI", "GRT", "GHST", "SAND",
+            "USDT", "USDC", "USDC.E", "DAI", "WETH", "WMATIC", "WPOL", "WBTC", "LINK", "UNI",
+            "LDO", "CRV", "AAVE", "SUSHI", "GRT", "GHST", "SAND",
         ];
         let token_in = token_in.to_ascii_uppercase();
         let token_out = token_out.to_ascii_uppercase();
-        if !KNOWN_TOKENS.contains(&token_in.as_str()) || !KNOWN_TOKENS.contains(&token_out.as_str()) {
+        if !KNOWN_TOKENS.contains(&token_in.as_str()) || !KNOWN_TOKENS.contains(&token_out.as_str())
+        {
             return false;
         }
 
@@ -309,16 +311,16 @@ impl ArbitrageEngine {
 
             // stable -> non-stable: "how many tokens per 1 stable"
             (true, false) => match token_out.as_str() {
-                "WETH" => price >= 0.00005 && price <= 0.002,   // ~0.00034 WETH/USDT
-                "WMATIC" => price >= 1.0 && price <= 50.0,       // ~7.14 WMATIC/USDT
+                "WETH" => price >= 0.00005 && price <= 0.002, // ~0.00034 WETH/USDT
+                "WMATIC" => price >= 1.0 && price <= 50.0,    // ~7.14 WMATIC/USDT
                 _ => price >= 0.0000001 && price <= 10_000_000.0,
             },
 
             // non-stable -> stable: "how many stables per 1 token"
             (false, true) => match token_in.as_str() {
-                "WETH" => price >= 500.0 && price <= 15_000.0,    // ~2900 USDT/WETH
-                "WMATIC" => price >= 0.01 && price <= 2.0,        // ~0.14 USDT/WMATIC
-                "LINK" => price >= 1.0 && price <= 100.0,         // ~$5-30
+                "WETH" => price >= 500.0 && price <= 15_000.0, // ~2900 USDT/WETH
+                "WMATIC" => price >= 0.01 && price <= 2.0,     // ~0.14 USDT/WMATIC
+                "LINK" => price >= 1.0 && price <= 100.0,      // ~$5-30
                 "CRV" => price >= 0.1 && price <= 10.0,
                 "UNI" => price >= 1.0 && price <= 50.0,
                 "GHST" => price >= 0.5 && price <= 20.0,
@@ -331,8 +333,8 @@ impl ArbitrageEngine {
 
             // Ambos non-stable: ratio entre tokens
             (false, false) => match (token_in.as_str(), token_out.as_str()) {
-                ("WETH", "WMATIC") => price >= 500.0 && price <= 100_000.0,  // ~21k
-                ("WMATIC", "WETH") => price >= 0.000001 && price <= 0.01,    // ~0.000047
+                ("WETH", "WMATIC") => price >= 500.0 && price <= 100_000.0, // ~21k
+                ("WMATIC", "WETH") => price >= 0.000001 && price <= 0.01,   // ~0.000047
                 _ => price >= 0.0000001 && price <= 10_000_000.0,
             },
         }
@@ -352,7 +354,10 @@ impl ArbitrageEngine {
             if !step.expected_rate.is_finite() || step.expected_rate <= 0.0 {
                 bail!(
                     "Taxa inválida no step {}: {} ({}→{})",
-                    i, step.expected_rate, step.token_in, step.token_out
+                    i,
+                    step.expected_rate,
+                    step.token_in,
+                    step.token_out
                 );
             }
 
@@ -360,7 +365,11 @@ impl ArbitrageEngine {
             if !Self::is_realistic_price(step.expected_rate, &step.token_in, &step.token_out) {
                 bail!(
                     "Preço irreal no step {}: {} {}→{} = {:.8}",
-                    i, step.dex_name, step.token_in, step.token_out, step.expected_rate
+                    i,
+                    step.dex_name,
+                    step.token_in,
+                    step.token_out,
+                    step.expected_rate
                 );
             }
 
@@ -375,7 +384,9 @@ impl ArbitrageEngine {
             if !total_rate.is_finite() {
                 bail!(
                     "Taxa acumulada infinita após step {}: {} | Steps: {:?}",
-                    i, total_rate, debug_info
+                    i,
+                    total_rate,
+                    debug_info
                 );
             }
         }
@@ -385,11 +396,15 @@ impl ArbitrageEngine {
         if total_rate < 0.90 || total_rate > 1.50 {
             bail!(
                 "Taxa total suspeita: {:.8} (esperado 0.90-1.50) | Route: {:?}",
-                total_rate, debug_info
+                total_rate,
+                debug_info
             );
         }
 
-        debug!("✅ Taxa total validada: {:.8} | Route: {:?}", total_rate, debug_info);
+        debug!(
+            "✅ Taxa total validada: {:.8} | Route: {:?}",
+            total_rate, debug_info
+        );
 
         Ok(total_rate)
     }
@@ -402,7 +417,10 @@ impl ArbitrageEngine {
             return Err(anyhow!("Spread inválido: {}", opp.spread_percent));
         }
         if opp.estimated_profit_usd.is_nan() || opp.estimated_profit_usd.is_infinite() {
-            return Err(anyhow!("Lucro estimado inválido: {}", opp.estimated_profit_usd));
+            return Err(anyhow!(
+                "Lucro estimado inválido: {}",
+                opp.estimated_profit_usd
+            ));
         }
         if opp.steps.0.is_empty() || opp.steps.0.len() > max_hops_allowed {
             return Err(anyhow!("Número de hops inválido: {}", opp.steps.0.len()));
@@ -515,7 +533,10 @@ impl ArbitrageEngine {
                 0.008
             });
 
-        let min_profit_usd = app_config.arbitrage.min_profit_threshold_usd.unwrap_or(0.0015);
+        let min_profit_usd = app_config
+            .arbitrage
+            .min_profit_threshold_usd
+            .unwrap_or(0.0015);
 
         debug!(
             target = "arbitrage",
@@ -577,7 +598,11 @@ impl ArbitrageEngine {
             );
         }
 
-        info!("📊 Oportunidades iniciais: {} (pairs={})", all_opportunities.len(), total_pairs);
+        info!(
+            "📊 Oportunidades iniciais: {} (pairs={})",
+            all_opportunities.len(),
+            total_pairs
+        );
 
         all_opportunities.retain(|opp| opp.spread_percent >= min_spread_pct);
         info!(
@@ -587,7 +612,10 @@ impl ArbitrageEngine {
         );
 
         if all_opportunities.is_empty() {
-            debug!(target = "arbitrage", "Nenhuma oportunidade após filtro de spread");
+            debug!(
+                target = "arbitrage",
+                "Nenhuma oportunidade após filtro de spread"
+            );
             return vec![];
         }
 
@@ -604,7 +632,9 @@ impl ArbitrageEngine {
                 i, opp.path, opp.spread_percent, opp.estimated_profit_usd
             );
 
-            if let Some(usdt_opp) = self.force_usdt_start_end_optimized(&mut opp, price_map, app_config).await
+            if let Some(usdt_opp) = self
+                .force_usdt_start_end_optimized(&mut opp, price_map, app_config)
+                .await
             {
                 if Self::validate_opportunity(&usdt_opp).is_ok() {
                     info!(
@@ -622,7 +652,10 @@ impl ArbitrageEngine {
             }
         }
 
-        info!("📊 Oportunidades após conversão USDT: {}", usdt_opportunities.len());
+        info!(
+            "📊 Oportunidades após conversão USDT: {}",
+            usdt_opportunities.len()
+        );
 
         for (i, opp) in usdt_opportunities.iter().enumerate() {
             debug!(
@@ -653,7 +686,8 @@ impl ArbitrageEngine {
             debug!(
                 target = "arbitrage",
                 "Nenhuma oportunidade acima do threshold (min_spread={}%, min_profit=${})",
-                min_spread_pct, min_profit_usd
+                min_spread_pct,
+                min_profit_usd
             );
         } else {
             let best = &usdt_opportunities[0];
@@ -662,7 +696,10 @@ impl ArbitrageEngine {
             info!("═══════════════════════════════════════════════════════════════════");
             info!("🎯 {} OPORTUNIDADES ENCONTRADAS", usdt_opportunities.len());
             info!("═══════════════════════════════════════════════════════════════════");
-            info!("{:<8} {:<20} {:<12} {:<12} {:<10}", "RANK", "PAR", "SPREAD%", "NET($)", "CONFIAB.");
+            info!(
+                "{:<8} {:<20} {:<12} {:<12} {:<10}",
+                "RANK", "PAR", "SPREAD%", "NET($)", "CONFIAB."
+            );
             info!("───────────────────────────────────────────────────────────────────");
 
             for (i, opp) in usdt_opportunities.iter().take(10).enumerate() {
@@ -687,7 +724,11 @@ impl ArbitrageEngine {
             );
 
             if usdt_opportunities.len() > 1 {
-                let avg_spread: f64 = usdt_opportunities.iter().map(|o| o.spread_percent).sum::<f64>() / usdt_opportunities.len() as f64;
+                let avg_spread: f64 = usdt_opportunities
+                    .iter()
+                    .map(|o| o.spread_percent)
+                    .sum::<f64>()
+                    / usdt_opportunities.len() as f64;
                 let total_net: f64 = usdt_opportunities.iter().map(|o| o.net_profit_usd).sum();
                 info!(
                     "📊 Média spread: {:.4}% | Total net potencial: ${:.6}",
@@ -742,7 +783,8 @@ impl ArbitrageEngine {
         }
 
         debug!("🔄 Convertendo oportunidade não-USDT...");
-        self.convert_non_usdt_opportunity(path, steps, price_map, app_config).await
+        self.convert_non_usdt_opportunity(path, steps, price_map, app_config)
+            .await
     }
 
     async fn convert_non_usdt_opportunity(
@@ -835,7 +877,11 @@ impl ArbitrageEngine {
         app_config: &Config,
     ) -> Option<ArbitrageOpportunity> {
         if steps.len() > MAX_HOPS_FOR_EXECUTION {
-            debug!("🚫 Muitos hops: {} > {}", steps.len(), MAX_HOPS_FOR_EXECUTION);
+            debug!(
+                "🚫 Muitos hops: {} > {}",
+                steps.len(),
+                MAX_HOPS_FOR_EXECUTION
+            );
             return None;
         }
 
@@ -912,11 +958,10 @@ impl ArbitrageEngine {
         let amount_in = Self::usd_to_token_amount(trade_amount_usd, 1.0, start_decimals);
 
         // CORREÇÃO: Calcular taxa total com validação rigorosa
-        let total_rate = Self::calculate_total_rate_corrected(&opp.steps.0)
-            .map_err(|e| {
-                debug!("❌ Oportunidade rejeitada: {}", e);
-                anyhow!("Cálculo de taxa falhou: {}", e)
-            })?;
+        let total_rate = Self::calculate_total_rate_corrected(&opp.steps.0).map_err(|e| {
+            debug!("❌ Oportunidade rejeitada: {}", e);
+            anyhow!("Cálculo de taxa falhou: {}", e)
+        })?;
 
         // 🔍 DEBUG DELTA ENTRE STEPS
         self.log_route_delta(&opp.steps.0, total_rate, &opp.id);
@@ -943,9 +988,7 @@ impl ArbitrageEngine {
         let gross_profit_usd = economics::gross_profit_usd(trade_amount_usd, total_rate);
 
         // Custos reais, um de cada. NÃO deduzir fee/price impact de novo.
-        let gas_cost_usd = self
-            .estimate_gas_cost(app_config, opp.steps.0.len())
-            .await;
+        let gas_cost_usd = self.estimate_gas_cost(app_config, opp.steps.0.len()).await;
 
         let flashloan_fee_usd = if app_config.flashloan.enabled {
             let fee_pct = app_config
@@ -953,11 +996,7 @@ impl ArbitrageEngine {
                 .fee_pct
                 .unwrap_or(economics::AAVE_V3_PREMIUM_PCT);
             let amount_in_tokens = u256_to_f64(amount_in, start_decimals);
-            economics::flashloan_fee_usd_from_amount(
-                amount_in_tokens,
-                1.0,
-                fee_pct,
-            )
+            economics::flashloan_fee_usd_from_amount(amount_in_tokens, 1.0, fee_pct)
         } else {
             0.0
         };
@@ -991,7 +1030,10 @@ impl ArbitrageEngine {
         // Gate compartilhado com o executor (economics::TradeEconomics) — mesma
         // fonte de verdade para net profit. Executor re-valida em UsdE8 (mais
         // estrito) pré-broadcast; aqui é o pré-filtro do finder.
-        let min_profit = app_config.arbitrage.min_profit_threshold_usd.unwrap_or(0.0015);
+        let min_profit = app_config
+            .arbitrage
+            .min_profit_threshold_usd
+            .unwrap_or(0.0015);
         let paper_observe = crate::core::paper_validation::observation_active(app_config);
 
         if !paper_observe {
@@ -1084,10 +1126,14 @@ impl ArbitrageEngine {
         // budget_bps = floor(net/trade*10_000); se budget ≤ margin → None → rejeita.
         // allowed_total = min(configured, budget−margin, route_limit).
         let hop_count = steps.len();
-        let route_limit_bps = (app_config.arbitrage.route_validation.max_cumulative_slippage
+        let route_limit_bps = (app_config
+            .arbitrage
+            .route_validation
+            .max_cumulative_slippage
             * 100.0)
             .floor()
-            .max(economics::MIN_SLIPPAGE_BPS as f64 * hop_count as f64) as u32;
+            .max(economics::MIN_SLIPPAGE_BPS as f64 * hop_count as f64)
+            as u32;
         let allowed_total_bps = match economics::slippage_allowed_total_bps(
             net_profit_usd,
             trade_amount_usd,
@@ -1147,8 +1193,12 @@ impl ArbitrageEngine {
         let mut used_slippage_bps = 0u32;
 
         for (idx, step) in steps.iter_mut().enumerate() {
-            let input_decimals = self.get_token_decimals_smart(&step.token_in, app_config).await?;
-            let output_decimals = self.get_token_decimals_smart(&step.token_out, app_config).await?;
+            let input_decimals = self
+                .get_token_decimals_smart(&step.token_in, app_config)
+                .await?;
+            let output_decimals = self
+                .get_token_decimals_smart(&step.token_out, app_config)
+                .await?;
 
             // Cálculo de output esperado aplicando fee/impact (considerando override por step, se existir)
             let expected_output = self
@@ -1167,8 +1217,8 @@ impl ArbitrageEngine {
             // Proposto = base per-hop + aumento por hop extra. Cap cumulativo pelo
             // MENOR entre configured/edge/route (allowed_total_bps), reservando o
             // piso MIN_SLIPPAGE_BPS para cada perna restante — proteção efetiva.
-            let proposed_slippage_bps = base_slippage_bps
-                .saturating_add((idx as u32).saturating_mul(hop_increase_bps));
+            let proposed_slippage_bps =
+                base_slippage_bps.saturating_add((idx as u32).saturating_mul(hop_increase_bps));
             let remaining = hop_count.saturating_sub(idx + 1) as u32;
             let max_here = allowed_total_bps
                 .saturating_sub(used_slippage_bps)
@@ -1195,7 +1245,10 @@ impl ArbitrageEngine {
             if expected_output < U256::from(MIN_EXPECTED_OUTPUT_RAW) {
                 bail!(
                     "hop {} ({}) output esperado {} < piso {} raw — rota inviável (sandwich guard)",
-                    idx, step.dex_name, expected_output, MIN_EXPECTED_OUTPUT_RAW
+                    idx,
+                    step.dex_name,
+                    expected_output,
+                    MIN_EXPECTED_OUTPUT_RAW
                 );
             }
 
@@ -1216,7 +1269,8 @@ impl ArbitrageEngine {
         if used_slippage_bps > allowed_total_bps {
             bail!(
                 "slippage cumulativa {} bps > teto de edge {} bps — invariant violado",
-                used_slippage_bps, allowed_total_bps
+                used_slippage_bps,
+                allowed_total_bps
             );
         }
 
@@ -1291,7 +1345,12 @@ impl ArbitrageEngine {
         }
 
         if rates_ab.is_empty() || rates_ba.is_empty() {
-            info!("  ❌ {}: rates_ab={} rates_ba={}", pair, rates_ab.len(), rates_ba.len());
+            info!(
+                "  ❌ {}: rates_ab={} rates_ba={}",
+                pair,
+                rates_ab.len(),
+                rates_ba.len()
+            );
             return None;
         }
 
@@ -1328,21 +1387,37 @@ impl ArbitrageEngine {
                 }
 
                 if best.is_none() || cycle_rate > best.as_ref().unwrap().0 {
-                    best = Some((cycle_rate, *rate_ab, buy_dex.clone(), sell_dex.clone(), spread_pct));
+                    best = Some((
+                        cycle_rate,
+                        *rate_ab,
+                        buy_dex.clone(),
+                        sell_dex.clone(),
+                        spread_pct,
+                    ));
                 }
             }
         }
 
         if best.is_none() {
-            debug!("  ❌ {}: nenhum cycle cross-DEX viável (rates_ab={:?}, rates_ba={:?})", pair,
-                rates_ab.iter().map(|(r,d)| format!("{}={:.4}", d, r)).collect::<Vec<_>>(),
-                rates_ba.iter().map(|(r,d)| format!("{}={:.4}", d, r)).collect::<Vec<_>>());
+            debug!(
+                "  ❌ {}: nenhum cycle cross-DEX viável (rates_ab={:?}, rates_ba={:?})",
+                pair,
+                rates_ab
+                    .iter()
+                    .map(|(r, d)| format!("{}={:.4}", d, r))
+                    .collect::<Vec<_>>(),
+                rates_ba
+                    .iter()
+                    .map(|(r, d)| format!("{}={:.4}", d, r))
+                    .collect::<Vec<_>>()
+            );
         }
 
         let (cycle_rate, rate_ab, buy_dex, sell_dex, spread_pct) = best?;
 
         // Encontrar o rate_ba correspondente ao sell_dex escolhido
-        let rate_ba = rates_ba.iter()
+        let rate_ba = rates_ba
+            .iter()
             .find(|(_, d)| *d == sell_dex)
             .map(|(r, _)| *r)
             .unwrap_or(0.0);
@@ -1352,8 +1427,11 @@ impl ArbitrageEngine {
             Self::create_step(&sell_dex, token_b, token_a, rate_ba),
         ];
 
-        let path: Vec<String> =
-            vec![token_a.to_string(), token_b.to_string(), token_a.to_string()];
+        let path: Vec<String> = vec![
+            token_a.to_string(),
+            token_b.to_string(),
+            token_a.to_string(),
+        ];
 
         let trade_amount_usd = self.calculate_safe_trade_amount(app_config);
 
@@ -1441,8 +1519,7 @@ impl ArbitrageEngine {
                         IntraCycleResult::BelowSpread { final_rate } => {
                             if final_rate > best_rate {
                                 best_rate = final_rate;
-                                best_label =
-                                    format!("cross:{}→{}→{}→{}", start, mid, hop, start);
+                                best_label = format!("cross:{}→{}→{}→{}", start, mid, hop, start);
                             }
                         }
                         IntraCycleResult::Ok {
@@ -1479,14 +1556,8 @@ impl ArbitrageEngine {
                                 pair: format!("{}->{}->{}->{}", start, mid, hop, start),
                                 buy_dex: venues.first().unwrap_or(&"?").to_string(),
                                 sell_dex: venues.last().unwrap_or(&"?").to_string(),
-                                buy_price: steps
-                                    .first()
-                                    .map(|s| s.expected_rate)
-                                    .unwrap_or(0.0),
-                                sell_price: steps
-                                    .last()
-                                    .map(|s| s.expected_rate)
-                                    .unwrap_or(0.0),
+                                buy_price: steps.first().map(|s| s.expected_rate).unwrap_or(0.0),
+                                sell_price: steps.last().map(|s| s.expected_rate).unwrap_or(0.0),
                                 spread_percent: spread,
                                 amount_in: U256::zero(),
                                 amount_out: U256::zero(),
@@ -1669,14 +1740,8 @@ impl ArbitrageEngine {
                             continue;
                         }
                         evaluated += 1;
-                        match Self::try_intra_dex_cycle(
-                            venue,
-                            start,
-                            mid,
-                            hop,
-                            &graph,
-                            min_spread,
-                        ) {
+                        match Self::try_intra_dex_cycle(venue, start, mid, hop, &graph, min_spread)
+                        {
                             IntraCycleResult::MissingLeg => {
                                 note_triangular_leg_low_liquidity_discarded(1);
                             }
@@ -1684,7 +1749,8 @@ impl ArbitrageEngine {
                             IntraCycleResult::BelowSpread { final_rate } => {
                                 if final_rate > best_rate {
                                     best_rate = final_rate;
-                                    best_label = format!("{}:{}→{}→{}→{}", venue, start, mid, hop, start);
+                                    best_label =
+                                        format!("{}:{}→{}→{}→{}", venue, start, mid, hop, start);
                                 }
                             }
                             IntraCycleResult::Ok {
@@ -1695,15 +1761,14 @@ impl ArbitrageEngine {
                             } => {
                                 if final_rate > best_rate {
                                     best_rate = final_rate;
-                                    best_label = format!("{}:{}→{}→{}→{}", venue, start, mid, hop, start);
+                                    best_label =
+                                        format!("{}:{}→{}→{}→{}", venue, start, mid, hop, start);
                                 }
                                 if spread > 0.0 {
                                     gross_positive += 1;
                                 }
-                                let trade_amount_usd =
-                                    self.calculate_safe_trade_amount(app_config);
-                                let steps_sanitized =
-                                    Self::sanitize_steps_for_execution(&steps);
+                                let trade_amount_usd = self.calculate_safe_trade_amount(app_config);
+                                let steps_sanitized = Self::sanitize_steps_for_execution(&steps);
                                 opportunities.push(ArbitrageOpportunity {
                                     id: next_opp_id("intra_tri"),
                                     pair: format!("{}->{}->{}->{}", start, mid, hop, start),
@@ -1903,7 +1968,10 @@ impl ArbitrageEngine {
     // ------------------------------------------------------------
     #[inline]
     fn is_usd_stable_symbol(sym: &str) -> bool {
-        matches!(sym.to_ascii_uppercase().as_str(), "USDT" | "USDC" | "USDC.E")
+        matches!(
+            sym.to_ascii_uppercase().as_str(),
+            "USDT" | "USDC" | "USDC.E"
+        )
     }
 
     /// Ciclo fechado em USDT ou USDC (flashloan $1-stable).
@@ -1942,7 +2010,10 @@ impl ArbitrageEngine {
     #[inline]
     fn calculate_safe_trade_amount(&self, app_config: &Config) -> f64 {
         let (base_amount, max_amount) = if app_config.flashloan.enabled {
-            (app_config.flashloan.capital_usd, MAX_TRADE_AMOUNT_FLASHLOAN_USD)
+            (
+                app_config.flashloan.capital_usd,
+                MAX_TRADE_AMOUNT_FLASHLOAN_USD,
+            )
         } else {
             (
                 app_config
@@ -2122,7 +2193,8 @@ impl ArbitrageEngine {
         let mut best: Option<(&str, f64)> = None;
         for (dex_name, dex_prices) in price_map {
             if let Some(&rate) = dex_prices.get(&key) {
-                if rate.is_finite() && rate > 0.0
+                if rate.is_finite()
+                    && rate > 0.0
                     && best.map(|(_, current)| rate > current).unwrap_or(true)
                 {
                     best = Some((dex_name, rate));
@@ -2170,14 +2242,14 @@ impl ArbitrageEngine {
     #[inline]
     fn dex_fee(dex_name: &str, pair: &str) -> f64 {
         match dex_name {
-            "QuickSwap" | "SushiSwap" => 0.003,  // V2: sempre 0.3%
-            "Curve" => 0.0004,                    // Curve stables: 0.04%
+            "QuickSwap" | "SushiSwap" => 0.003, // V2: sempre 0.3%
+            "Curve" => 0.0004,                  // Curve stables: 0.04%
             "UniswapV3" => {
                 // Fee V3 = hundredths of a bip → fração = fee_tier / 1e6
                 if let Some(fee_tier) = crate::dex::cached_fee_tier_pair(dex_name, pair) {
                     fee_tier as f64 / 1_000_000.0
                 } else {
-                    0.003  // Default: 0.3% (fee tier mais comum)
+                    0.003 // Default: 0.3% (fee tier mais comum)
                 }
             }
             _ => DEX_FEE_DEFAULT,
@@ -2248,7 +2320,11 @@ impl ArbitrageEngine {
                 w.insert(symbol.to_string(), decimals as u32);
                 Ok(decimals as u32)
             }
-            Err(e) => Err(anyhow!("On-chain decimal fetch failed for {}: {}", symbol, e)),
+            Err(e) => Err(anyhow!(
+                "On-chain decimal fetch failed for {}: {}",
+                symbol,
+                e
+            )),
         }
     }
 
@@ -2258,7 +2334,8 @@ impl ArbitrageEngine {
         price_map: &HashMap<String, HashMap<String, f64>>,
         app_config: &Config,
     ) -> Option<ArbitrageOpportunity> {
-        self.convert_to_usdt_centric(opp, price_map, app_config).await
+        self.convert_to_usdt_centric(opp, price_map, app_config)
+            .await
     }
 }
 
@@ -2287,19 +2364,30 @@ mod tests {
         let cycle_rate = rate_ab * rate_ba;
 
         // Verificar que é loss (mercado eficiente)
-        assert!(cycle_rate < 1.0,
-            "cycle_rate {} deveria ser < 1.0 (loss)", cycle_rate);
+        assert!(
+            cycle_rate < 1.0,
+            "cycle_rate {} deveria ser < 1.0 (loss)",
+            cycle_rate
+        );
 
         // Verificar valor esperado
         let expected: f64 = 12.64 * 0.0770;
-        assert!((cycle_rate - expected).abs() < 1e-10,
-            "cycle_rate {} difere do esperado {}", cycle_rate, expected);
+        assert!(
+            (cycle_rate - expected).abs() < 1e-10,
+            "cycle_rate {} difere do esperado {}",
+            cycle_rate,
+            expected
+        );
 
         // Double-fee seria MENOR que o correto — prova que double-fee é bug
         let fee = 0.003;
         let cycle_rate_double_fee = rate_ab * (1.0 - fee) * rate_ba * (1.0 - fee);
-        assert!(cycle_rate > cycle_rate_double_fee,
-            "cycle_rate sem double-fee {} deveria ser > com double-fee {}", cycle_rate, cycle_rate_double_fee);
+        assert!(
+            cycle_rate > cycle_rate_double_fee,
+            "cycle_rate sem double-fee {} deveria ser > com double-fee {}",
+            cycle_rate,
+            cycle_rate_double_fee
+        );
     }
 
     /// Testa cenário hipotético onde há profit real cross-DEX.
@@ -2320,13 +2408,19 @@ mod tests {
         let cycle_rate = rate_ab * rate_ba;
 
         // Deveria ser profit
-        assert!(cycle_rate > 1.0,
-            "cycle_rate {} deveria ser > 1.0 (profit)", cycle_rate);
+        assert!(
+            cycle_rate > 1.0,
+            "cycle_rate {} deveria ser > 1.0 (profit)",
+            cycle_rate
+        );
 
         // Verificar margem razoável
         let spread_pct = (cycle_rate - 1.0) * 100.0;
-        assert!(spread_pct > 5.0 && spread_pct < 10.0,
-            "spread {}% deveria estar entre 5-10%", spread_pct);
+        assert!(
+            spread_pct > 5.0 && spread_pct < 10.0,
+            "spread {}% deveria estar entre 5-10%",
+            spread_pct
+        );
     }
 
     /// Valida que dex_fee retorna valores corretos por DEX.
@@ -2338,7 +2432,10 @@ mod tests {
         assert_eq!(ArbitrageEngine::dex_fee("SushiSwap", pair), 0.003);
         // UniswapV3 retorna 0.003 se não houver cache (default)
         assert_eq!(ArbitrageEngine::dex_fee("UniswapV3", pair), 0.003);
-        assert_eq!(ArbitrageEngine::dex_fee("UnknownDex", pair), DEX_FEE_DEFAULT);
+        assert_eq!(
+            ArbitrageEngine::dex_fee("UnknownDex", pair),
+            DEX_FEE_DEFAULT
+        );
     }
 
     /// Valida que UniswapV3 usa fee tier do cache quando disponível.
@@ -2369,22 +2466,31 @@ mod tests {
     /// o preço deveria ser 60,000.0 USDC por WBTC.
     #[test]
     fn decimals_round_trip_wbtc_usdc() {
-        let amount_in = U256::from(100_000_000u64);      // 1.0 WBTC (8 dec)
-        let amount_out = U256::from(60_000_000_000u64);   // 60,000 USDC (6 dec)
+        let amount_in = U256::from(100_000_000u64); // 1.0 WBTC (8 dec)
+        let amount_out = U256::from(60_000_000_000u64); // 60,000 USDC (6 dec)
         let decimals_in: u8 = 8;
         let decimals_out: u8 = 6;
 
         let in_human = crate::utils::utils::u256_to_f64_precise(amount_in, decimals_in);
         let out_human = crate::utils::utils::u256_to_f64_precise(amount_out, decimals_out);
 
-        assert!((in_human - 1.0).abs() < 1e-10,
-            "WBTC amount_in deveria ser 1.0, obtido {}", in_human);
-        assert!((out_human - 60000.0).abs() < 1e-10,
-            "USDC amount_out deveria ser 60000.0, obtido {}", out_human);
+        assert!(
+            (in_human - 1.0).abs() < 1e-10,
+            "WBTC amount_in deveria ser 1.0, obtido {}",
+            in_human
+        );
+        assert!(
+            (out_human - 60000.0).abs() < 1e-10,
+            "USDC amount_out deveria ser 60000.0, obtido {}",
+            out_human
+        );
 
         let price = out_human / in_human;
-        assert!((price - 60000.0).abs() < 1e-6,
-            "Preço WBTC/USDC deveria ser 60000.0, obtido {}", price);
+        assert!(
+            (price - 60000.0).abs() < 1e-6,
+            "Preço WBTC/USDC deveria ser 60000.0, obtido {}",
+            price
+        );
     }
 
     /// Valida round-trip de decimais para USDT/USDC (6 vs 6 decimais).
@@ -2393,21 +2499,30 @@ mod tests {
     /// amount_out = 999,000 (0.999 USDC com fee 0.3%), preço = 0.999.
     #[test]
     fn decimals_round_trip_stable_stable() {
-        let amount_in = U256::from(1_000_000u64);  // 1.0 USDT (6 dec)
-        let amount_out = U256::from(999_000u64);    // 0.999 USDC (6 dec)
+        let amount_in = U256::from(1_000_000u64); // 1.0 USDT (6 dec)
+        let amount_out = U256::from(999_000u64); // 0.999 USDC (6 dec)
         let decimals: u8 = 6;
 
         let in_human = crate::utils::utils::u256_to_f64_precise(amount_in, decimals);
         let out_human = crate::utils::utils::u256_to_f64_precise(amount_out, decimals);
 
-        assert!((in_human - 1.0).abs() < 1e-10,
-            "USDT amount_in deveria ser 1.0, obtido {}", in_human);
-        assert!((out_human - 0.999).abs() < 1e-6,
-            "USDC amount_out deveria ser 0.999, obtido {}", out_human);
+        assert!(
+            (in_human - 1.0).abs() < 1e-10,
+            "USDT amount_in deveria ser 1.0, obtido {}",
+            in_human
+        );
+        assert!(
+            (out_human - 0.999).abs() < 1e-6,
+            "USDC amount_out deveria ser 0.999, obtido {}",
+            out_human
+        );
 
         let price = out_human / in_human;
-        assert!((price - 0.999).abs() < 1e-6,
-            "Preço USDT/USDC deveria ser 0.999, obtido {}", price);
+        assert!(
+            (price - 0.999).abs() < 1e-6,
+            "Preço USDT/USDC deveria ser 0.999, obtido {}",
+            price
+        );
     }
 
     /// Valida invariante rate_ab × rate_ba ≈ 1.0 para o mesmo par no mesmo DEX.
@@ -2424,16 +2539,25 @@ mod tests {
 
         // Sem fees: deveria ser ≈ 1.0
         let cycle_no_fees: f64 = rate_ab * rate_ba;
-        assert!((cycle_no_fees - 1.0).abs() < 0.01,
-            "rate_ab × rate_ba deveria ser ≈ 1.0, obtido {}", cycle_no_fees);
+        assert!(
+            (cycle_no_fees - 1.0).abs() < 0.01,
+            "rate_ab × rate_ba deveria ser ≈ 1.0, obtido {}",
+            cycle_no_fees
+        );
 
         // Com fees: deveria ser < 1.0 (sempre loss no mesmo DEX)
         let fee: f64 = 0.003;
         let cycle_com_fees: f64 = rate_ab * (1.0 - fee) * rate_ba * (1.0 - fee);
-        assert!(cycle_com_fees < 1.0,
-            "cycle_rate com fees deveria ser < 1.0, obtido {}", cycle_com_fees);
-        assert!(cycle_com_fees > 0.98,
-            "cycle_rate com fees deveria ser > 0.98, obtido {}", cycle_com_fees);
+        assert!(
+            cycle_com_fees < 1.0,
+            "cycle_rate com fees deveria ser < 1.0, obtido {}",
+            cycle_com_fees
+        );
+        assert!(
+            cycle_com_fees > 0.98,
+            "cycle_rate com fees deveria ser > 0.98, obtido {}",
+            cycle_com_fees
+        );
     }
 
     /// Valida que fee não é aplicada duas vezes no cycle_rate.
@@ -2452,16 +2576,24 @@ mod tests {
 
         // Se aplicasse fee dupla:
         let fee: f64 = 0.003;
-        let cycle_rate_doubled: f64 = rate_ab_with_fee * (1.0 - fee) * rate_ba_with_fee * (1.0 - fee);
+        let cycle_rate_doubled: f64 =
+            rate_ab_with_fee * (1.0 - fee) * rate_ba_with_fee * (1.0 - fee);
 
         // A diferença deveria existir (fee dupla reduz o resultado)
-        assert!(cycle_rate > cycle_rate_doubled,
-            "Fee dupla deveria reduzir o cycle_rate: {} <= {}", cycle_rate, cycle_rate_doubled);
+        assert!(
+            cycle_rate > cycle_rate_doubled,
+            "Fee dupla deveria reduzir o cycle_rate: {} <= {}",
+            cycle_rate,
+            cycle_rate_doubled
+        );
 
         // Verificar que a redução é proporcional ao fee aplicado
         let reduction_pct: f64 = ((cycle_rate - cycle_rate_doubled) / cycle_rate) * 100.0;
-        assert!(reduction_pct > 0.05,
-            "Redução de fee dupla deveria ser > 0.05%, obtido {}%", reduction_pct);
+        assert!(
+            reduction_pct > 0.05,
+            "Redução de fee dupla deveria ser > 0.05%, obtido {}%",
+            reduction_pct
+        );
     }
 
     /// Valida fórmula getAmountsOut manual para V2.
@@ -2477,10 +2609,10 @@ mod tests {
     /// Preço = 6474.17 / 1000 = 6.47417 WMATIC/USDT
     #[test]
     fn get_amounts_out_manual_v2() {
-        let reserve_in: f64 = 10_000.0;   // 10,000 USDC
-        let reserve_out: f64 = 71_400.0;  // 71,400 WMATIC
-        let amount_in: f64 = 1_000.0;     // 1,000 USDC
-        let fee_pct: f64 = 0.003;         // 0.3%
+        let reserve_in: f64 = 10_000.0; // 10,000 USDC
+        let reserve_out: f64 = 71_400.0; // 71,400 WMATIC
+        let amount_in: f64 = 1_000.0; // 1,000 USDC
+        let fee_pct: f64 = 0.003; // 0.3%
 
         // Fórmula V2 com fee
         let amount_in_with_fee = amount_in * (1.0 - fee_pct);
@@ -2488,13 +2620,18 @@ mod tests {
         let price = amount_out / amount_in;
 
         // Verificar que preço está em range razoável
-        assert!(price > 6.0 && price < 7.0,
-            "Preço USDT→WMATIC deveria estar entre 6.0-7.0, obtido {}", price);
+        assert!(
+            price > 6.0 && price < 7.0,
+            "Preço USDT→WMATIC deveria estar entre 6.0-7.0, obtido {}",
+            price
+        );
 
         // Verificar que fee reduz o output
         let amount_out_no_fee = (amount_in * reserve_out) / (reserve_in + amount_in);
-        assert!(amount_out < amount_out_no_fee,
-            "Output com fee deveria ser menor que sem fee");
+        assert!(
+            amount_out < amount_out_no_fee,
+            "Output com fee deveria ser menor que sem fee"
+        );
     }
 
     /// Valida fórmula completa do cycle_rate com cenário real.
@@ -2510,8 +2647,8 @@ mod tests {
     /// spread = (0.9996 - 1.0) × 100 = -0.04% (loss mínimo)
     #[test]
     fn cycle_rate_formula_validation() {
-        let rate_ab: f64 = 7.14;  // já inclui fee
-        let rate_ba: f64 = 0.14;  // já inclui fee
+        let rate_ab: f64 = 7.14; // já inclui fee
+        let rate_ba: f64 = 0.14; // já inclui fee
 
         // ✅ CORRETO: rates já incluem fee, não aplicar (1-fee) novamente
         let cycle_rate: f64 = rate_ab * rate_ba;
@@ -2519,18 +2656,27 @@ mod tests {
 
         // Verificar fórmula
         let expected: f64 = 7.14 * 0.14;
-        assert!((cycle_rate - expected).abs() < 1e-10,
-            "cycle_rate {} difere do esperado {}", cycle_rate, expected);
+        assert!(
+            (cycle_rate - expected).abs() < 1e-10,
+            "cycle_rate {} difere do esperado {}",
+            cycle_rate,
+            expected
+        );
 
         // Verificar que é loss (round-trrip no mesmo par cross-DEX sem spread)
-        assert!(cycle_rate <= 1.0,
-            "cycle_rate {} deveria ser <= 1.0 (round-trip)", cycle_rate);
-        assert!(spread_pct <= 0.0,
-            "spread {}% deveria ser <= 0", spread_pct);
+        assert!(
+            cycle_rate <= 1.0,
+            "cycle_rate {} deveria ser <= 1.0 (round-trip)",
+            cycle_rate
+        );
+        assert!(spread_pct <= 0.0, "spread {}% deveria ser <= 0", spread_pct);
 
         // Verificar que spread está em range razoável
-        assert!(spread_pct > -2.0,
-            "spread {}% deveria ser > -2.0%", spread_pct);
+        assert!(
+            spread_pct > -2.0,
+            "spread {}% deveria ser > -2.0%",
+            spread_pct
+        );
     }
 
     /// Valida que calculate_price_from_decimals retorna out_human / in_human.
@@ -2545,16 +2691,18 @@ mod tests {
     #[test]
     fn calculate_price_from_decimals_validation() {
         // Simular USDC→WMATIC (6 dec → 18 dec)
-        let amount_in = U256::from(1_000_000u64);   // 1.0 USDC (6 dec)
+        let amount_in = U256::from(1_000_000u64); // 1.0 USDC (6 dec)
         let amount_out = U256::from(7_140_000_000_000_000_000u128); // 7.14 WMATIC (18 dec)
 
-        let price = crate::dex::calculate_price_from_decimals(
-            amount_in, amount_out, 6, 18
-        ).unwrap();
+        let price =
+            crate::dex::calculate_price_from_decimals(amount_in, amount_out, 6, 18).unwrap();
 
         // Preço deveria ser ~7.14 (WMATIC por USDC)
-        assert!((price - 7.14).abs() < 0.01,
-            "Preço USDC→WMATIC deveria ser ~7.14, obtido {}", price);
+        assert!(
+            (price - 7.14).abs() < 0.01,
+            "Preço USDC→WMATIC deveria ser ~7.14, obtido {}",
+            price
+        );
     }
 
     // ============================================================
@@ -2586,7 +2734,10 @@ mod tests {
         //       = 1_000_000 * 94_525_000 / 100_000_000
         //       = 945_250
         let expected = U256::from(945_250u64);
-        assert_eq!(result_dangerous, expected, "Resultado do clamp deveria ser 945_250");
+        assert_eq!(
+            result_dangerous, expected,
+            "Resultado do clamp deveria ser 945_250"
+        );
     }
 
     /// Com `safety_margin_bps = 10000` (config nova) o haircut é só o slippage —
@@ -2635,7 +2786,10 @@ mod tests {
 
         // final = 1_000_000 * 9950 * 9800 / 100_000_000 = 975_100
         let expected = U256::from(975_100u64);
-        assert_eq!(result, expected, "safety_margin_bps=9800 deveria produzir 975_100");
+        assert_eq!(
+            result, expected,
+            "safety_margin_bps=9800 deveria produzir 975_100"
+        );
     }
 
     /// safety_margin_bps abaixo de 9500 deve ser clampeado para 9500.
@@ -2648,18 +2802,27 @@ mod tests {
         // 9499 < 9500, deve ser clampeado para 9500
         let result_9499 = ArbitrageEngine::apply_slippage_safe(amount, 50, 9499);
         let result_9500 = ArbitrageEngine::apply_slippage_safe(amount, 50, 9500);
-        assert_eq!(result_9499, result_9500, "9499 deve ser clampeado para 9500");
+        assert_eq!(
+            result_9499, result_9500,
+            "9499 deve ser clampeado para 9500"
+        );
 
         // 9500 = exatamente o piso, NÃO deve ser alterado
         // (já testado em slippage_safe_respects_valid_margin com 9800)
 
         // 5000 também é clampeado para 9500 (abaixo do piso)
         let result_5000 = ArbitrageEngine::apply_slippage_safe(amount, 50, 5000);
-        assert_eq!(result_5000, result_9500, "5000 deve ser clampeado para 9500");
+        assert_eq!(
+            result_5000, result_9500,
+            "5000 deve ser clampeado para 9500"
+        );
 
         // 9800 > 9500, NÃO deve ser clampeado (resultado diferente de 9500)
         let result_9800 = ArbitrageEngine::apply_slippage_safe(amount, 50, 9800);
-        assert_ne!(result_9800, result_9500, "9800 não deve ser clampeado (>= 9500)");
+        assert_ne!(
+            result_9800, result_9500,
+            "9800 não deve ser clampeado (>= 9500)"
+        );
     }
 
     /// next_opp_id deve produzir IDs únicos mesmo chamado rapidamente.
@@ -2713,13 +2876,12 @@ mod tests {
             amount_out_min: U256::from(1),
             ..Default::default()
         }];
-        let clean = ArbitrageEngine::sanitize_steps_with_token_identity(&steps, |symbol| {
-            match symbol {
+        let clean =
+            ArbitrageEngine::sanitize_steps_with_token_identity(&steps, |symbol| match symbol {
                 "USDC" => Some("0x3c499c542cef5e3811e1192ce70d8cc03d5c3359".into()),
                 "USDC.e" => Some("0x2791bca1f2de4661ed88a30c99a7a9449aa84174".into()),
                 _ => None,
-            }
-        });
+            });
         assert_eq!(clean.len(), 1, "USDC e USDC.e não são hop no-op");
     }
 
@@ -2760,7 +2922,10 @@ mod tests {
         let once = ArbitrageEngine::apply_slippage_safe(expected, slip_bps, safety);
         // Segunda aplicação (bug antigo no flashloan) seria mais baixa:
         let twice = ArbitrageEngine::apply_slippage_safe(once, slip_bps, safety);
-        assert!(once > twice, "dupla slip reduz demais: once={once} twice={twice}");
+        assert!(
+            once > twice,
+            "dupla slip reduz demais: once={once} twice={twice}"
+        );
         // expected * 0.995 * 0.98 = expected * 0.9751
         let expected_f = 1_000_000.0 * (1.0 - 0.005) * 0.98;
         let once_f = once.as_u128() as f64;
@@ -2812,22 +2977,13 @@ mod tests {
         uni.insert("LINK-USDC".into(), 18.0);
         let graph = ArbitrageEngine::build_price_graph_for_dex("UniswapV3", &uni);
 
-        let r = ArbitrageEngine::try_intra_dex_cycle(
-            "UniswapV3",
-            "USDC",
-            "LINK",
-            "WETH",
-            &graph,
-            0.01,
-        );
+        let r =
+            ArbitrageEngine::try_intra_dex_cycle("UniswapV3", "USDC", "LINK", "WETH", &graph, 0.01);
         assert!(matches!(r, IntraCycleResult::MissingLeg));
 
         // Simula o finder: MissingLeg → note
         note_triangular_leg_low_liquidity_discarded(1);
-        assert_eq!(
-            triangular_leg_low_liquidity_discarded_count(),
-            before + 1
-        );
+        assert_eq!(triangular_leg_low_liquidity_discarded_count(), before + 1);
         reset_triangular_leg_low_liquidity_discarded_count();
     }
 
@@ -2844,7 +3000,7 @@ mod tests {
         uni.insert("USDC-LINK".into(), 0.06); // LINK per USDC
         uni.insert("LINK-WETH".into(), 0.004); // WETH per LINK
         uni.insert("WETH-USDC".into(), 4200.0); // USDC per WETH
-        // 0.06 * 0.004 * 4200 = 1.008 → +0.8%
+                                                // 0.06 * 0.004 * 4200 = 1.008 → +0.8%
         let graph = ArbitrageEngine::build_price_graph_for_dex("UniswapV3", &uni);
 
         let r = ArbitrageEngine::try_intra_dex_cycle(
@@ -2953,8 +3109,8 @@ mod tests {
     /// M4: create_step grava fee tiers executáveis {500,3000,10000} no step.
     #[test]
     fn triangular_v3_steps_use_executable_fee_tiers() {
-        use crate::dex::{cache_fee_tier, EXECUTABLE_V3_FEE_TIERS};
         use crate::core::flashloan::ArbitrageClient;
+        use crate::dex::{cache_fee_tier, EXECUTABLE_V3_FEE_TIERS};
 
         for &fee in &EXECUTABLE_V3_FEE_TIERS {
             let tag = format!("TRI_FEE_{}", fee);
@@ -2973,12 +3129,7 @@ mod tests {
 
     #[test]
     fn stable_flashloan_centric_accepts_usdc() {
-        let path = vec![
-            "USDC".into(),
-            "LINK".into(),
-            "WETH".into(),
-            "USDC".into(),
-        ];
+        let path = vec!["USDC".into(), "LINK".into(), "WETH".into(), "USDC".into()];
         assert!(ArbitrageEngine::is_stable_flashloan_centric(&path));
         assert!(!ArbitrageEngine::is_usdt_centric(&path));
     }

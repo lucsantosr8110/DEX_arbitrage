@@ -3,19 +3,12 @@
 // ============================================================
 
 use anyhow::{Context, Result};
-use ethers::{
-    providers::{Middleware, Provider, Ws},
-};
+use ethers::providers::{Middleware, Provider, Ws};
 use futures::future;
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    sync::Arc,
-    time::Duration,
-};
-use tokio::sync::{broadcast, mpsc, Mutex};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::{broadcast, mpsc, Mutex};
 use tracing::{debug, error, info, warn, Level};
 use tracing_subscriber::{
     filter::LevelFilter,
@@ -28,8 +21,12 @@ use flashloan_bot::{
     core::bot::{execute_opportunity_standalone, should_try_next_opp, Bot},
     core::flashloan::ArbitrageClient,
     dex::{
-        circuit_breaker::DexCircuitBreaker, manager::DexManager,
-        radar::{compute_top_spreads, extract_edges, start_high_hit_rate_radar, AdjCostParams, TopSpreadInfo},
+        circuit_breaker::DexCircuitBreaker,
+        manager::DexManager,
+        radar::{
+            compute_top_spreads, extract_edges, start_high_hit_rate_radar, AdjCostParams,
+            TopSpreadInfo,
+        },
     },
     emergency_shutdown::{self, EMERGENCY_SHUTDOWN},
     // execution:: imports removidos: ExecutionEngine/MevConfig/gwei eram codigo morto
@@ -53,8 +50,19 @@ fn log_config_snapshot(config: &Config) {
         "  Versão: {}",
         config.general.version.as_deref().unwrap_or("unknown")
     );
-    info!("  Modo: {} | Dry Run: {}", if config.flashloan.enabled { "FLASHLOAN" } else { "DIRECT" }, config.execution.dry_run);
-    info!("  Gas: priority={:.1} gwei, max={} gwei", config.gas.priority_gwei, config.gas.max_gwei);
+    info!(
+        "  Modo: {} | Dry Run: {}",
+        if config.flashloan.enabled {
+            "FLASHLOAN"
+        } else {
+            "DIRECT"
+        },
+        config.execution.dry_run
+    );
+    info!(
+        "  Gas: priority={:.1} gwei, max={} gwei",
+        config.gas.priority_gwei, config.gas.max_gwei
+    );
     info!(
         "  Min Profit: ${:.4} | Min Spread: {}%",
         config
@@ -232,7 +240,10 @@ async fn main() -> Result<()> {
         let p = from_env.unwrap_or_else(|| "config/config.toml".to_string());
         PathBuf::from(p.replace('\\', "/"))
     };
-    info!("🧩 Usando arquivo de configuração: {}", config_path.display());
+    info!(
+        "🧩 Usando arquivo de configuração: {}",
+        config_path.display()
+    );
 
     let config = Config::from_file(config_path.clone()).with_context(|| {
         format!(
@@ -383,18 +394,17 @@ async fn main() -> Result<()> {
     // 5️⃣ DexManager
     // ============================================================
     let dex_manager = Arc::new(
-        DexManager::new(
-            client_http.clone(),
-            cfg_unlocked.clone(),
-        )
-        .await
-        .context("❌ Falha ao inicializar DexManager")?,
+        DexManager::new(client_http.clone(), cfg_unlocked.clone())
+            .await
+            .context("❌ Falha ao inicializar DexManager")?,
     );
     info!("🧩 DexManager inicializado com sucesso.");
     // Health-checker como task sinalizada: antes era tokio::spawn detached
     // sem shutdown_rx (leaked até o processo morrer). Agora recebe broadcast
     // e sai limpo no shutdown.
-    dex_manager.start_health_checker(shutdown_tx.subscribe()).await;
+    dex_manager
+        .start_health_checker(shutdown_tx.subscribe())
+        .await;
 
     // ============================================================
     // 6️⃣ ExecutionEngine removido (codigo morto)
@@ -403,7 +413,6 @@ async fn main() -> Result<()> {
     // descartados (_execution_engine). O bot executa via ArbitrageClient
     // diretamente (execute_direct/execute_flashloan/execute_wrapper).
     // Ver ESTADO_ATUAL.md secao 6.
-    
 
     // ============================================================
     // 7️⃣ Circuit Breaker
@@ -413,26 +422,17 @@ async fn main() -> Result<()> {
     // ============================================================
     // 8️⃣ Inicialização do Bot
     // ============================================================
-    let bot = match Bot::init_with_engine(
-        client_http.clone(),
-        config.clone(),
-        telegram.clone(),
-        None,
-    )
-    .await
-    {
-        Ok(bot) => bot,
-        Err(e) => {
-            warn!("⚠️ Bot::init_with_engine() falhou: {:?}", e);
-            Bot::new_with_engine(
-                client_http.clone(),
-                config.clone(),
-                telegram.clone(),
-                None,
-            )
+    let bot =
+        match Bot::init_with_engine(client_http.clone(), config.clone(), telegram.clone(), None)
             .await
-        }
-    };
+        {
+            Ok(bot) => bot,
+            Err(e) => {
+                warn!("⚠️ Bot::init_with_engine() falhou: {:?}", e);
+                Bot::new_with_engine(client_http.clone(), config.clone(), telegram.clone(), None)
+                    .await
+            }
+        };
 
     let bot = Arc::new(Mutex::new(bot));
 
@@ -697,10 +697,10 @@ async fn main() -> Result<()> {
             // ── Espera UM sinal de encerramento ──
             #[cfg(unix)]
             {
-                let mut sigint = signal(SignalKind::interrupt())
-                    .expect("falha ao registrar handler SIGINT");
-                let mut sigterm = signal(SignalKind::terminate())
-                    .expect("falha ao registrar handler SIGTERM");
+                let mut sigint =
+                    signal(SignalKind::interrupt()).expect("falha ao registrar handler SIGINT");
+                let mut sigterm =
+                    signal(SignalKind::terminate()).expect("falha ao registrar handler SIGTERM");
 
                 tokio::select! {
                     _ = sigint.recv() => warn!("🛑 SIGINT recebido — encerrando..."),
@@ -710,7 +710,9 @@ async fn main() -> Result<()> {
 
             #[cfg(not(unix))]
             {
-                tokio::signal::ctrl_c().await.expect("falha ao registrar Ctrl+C handler");
+                tokio::signal::ctrl_c()
+                    .await
+                    .expect("falha ao registrar Ctrl+C handler");
                 warn!("🛑 Ctrl-C recebido — encerrando...");
             }
 
@@ -720,7 +722,8 @@ async fn main() -> Result<()> {
             let _ = tokio::time::timeout(
                 Duration::from_secs(5),
                 telegram.send_alert("Shutdown", "Sinal recebido - encerrando bot"),
-            ).await;
+            )
+            .await;
             let _ = shutdown_tx.send(());
             // NÃO faz process::exit nem loop: o watchdog de emergência
             // (emergency_shutdown.rs) cuida da saída forçada se o runtime
@@ -751,7 +754,8 @@ async fn main() -> Result<()> {
     // contando desde "Sistema pronto" — matava o bot em 180s mesmo sem ninguém
     // pedir shutdown. Agora o bloqueio abaixo só acontece APÓS o sinal, então
     // este valor só é gasto drenando tasks na saída.
-    let shutdown_timeout = Duration::from_secs(cfg_unlocked.general.shutdown_timeout.max(10) as u64);
+    let shutdown_timeout =
+        Duration::from_secs(cfg_unlocked.general.shutdown_timeout.max(10) as u64);
 
     info!("🎯 Sistema pronto (modo hot-reload).");
 
@@ -769,7 +773,10 @@ async fn main() -> Result<()> {
     // em 180s desde o startup. Agora o bot roda indefinidamente até um sinal.
     let mut main_shutdown_rx = shutdown_tx.subscribe();
     let _ = main_shutdown_rx.recv().await;
-    info!("🛑 Shutdown solicitado — drenando tasks (teto {}s)...", shutdown_timeout.as_secs());
+    info!(
+        "🛑 Shutdown solicitado — drenando tasks (teto {}s)...",
+        shutdown_timeout.as_secs()
+    );
 
     // ── Drena as tasks com teto de tempo ──
     // Cada task responde ao broadcast: radar/bot quebram o loop no
@@ -784,7 +791,9 @@ async fn main() -> Result<()> {
                 "⏰ Drenagem excedeu {}s — abortando tasks restantes (kill -9 não mais necessário).",
                 shutdown_timeout.as_secs()
             );
-            for a in &aborts { a.abort(); }
+            for a in &aborts {
+                a.abort();
+            }
         }
     }
 

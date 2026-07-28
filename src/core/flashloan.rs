@@ -2,7 +2,6 @@
 // src/core/flashloan.rs — FINAL v7.4 — CORREÇÕES CRÍTICAS APLICADAS
 // ============================================================================
 
-use ethers::abi::Tokenizable;
 use crate::{
     config::Config,
     contracts::{FlashloanCaller, FlashloanExecutor, SwapStep as AbiSwapStep, ERC20},
@@ -15,9 +14,10 @@ use crate::{
         types::{ArbitrageOpportunity, BundleResult, ExecutionOutcome},
     },
     infra::metrics,
-    utils::{u256_to_f64},
+    utils::u256_to_f64,
     AppMiddleware,
 };
+use ethers::abi::Tokenizable;
 
 use anyhow::{anyhow, bail, Context, Result};
 use ethers::{
@@ -31,7 +31,7 @@ use tokio::{
     sync::Mutex,
     time::{timeout, Duration},
 };
-use tracing::{warn, info, debug};
+use tracing::{debug, info, warn};
 
 const DEFAULT_AAVE_POOL_POLYGON: &str = "0x794a61358D6845594F94dc1DB02A252b5b4814aD";
 const FLASHLOAN_PREMIUM_ABI: &str = r#"[{"inputs":[],"name":"FLASHLOAN_PREMIUM_TOTAL","outputs":[{"type":"uint128"}],"stateMutability":"view","type":"function"}]"#;
@@ -60,19 +60,19 @@ impl std::fmt::Display for ExecutionStrategy {
 pub enum FlashloanError {
     #[error("Route too complex: {0}")]
     RouteTooComplex(String),
-    
+
     #[error("Invalid route: {0}")]
     InvalidRoute(String),
-    
+
     #[error("Slippage too high: {0}")]
     SlippageTooHigh(String),
-    
+
     #[error("Insufficient profit: {0}")]
     InsufficientProfit(String),
-    
+
     #[error("Execution failed: {0}")]
     ExecutionFailed(String),
-    
+
     #[error("Configuration error: {0}")]
     ConfigError(String),
 }
@@ -87,9 +87,8 @@ pub struct ArbitrageClient {
     gas_estimator: GasEstimator<AppMiddleware>,
     config: Arc<Mutex<Config>>,
     pub last_exec_block: Arc<Mutex<Option<u64>>>,
-    pub execution_engine: Option<
-        Arc<crate::execution::ExecutionEngine<AppMiddleware, Wallet<SigningKey>>>
-    >,
+    pub execution_engine:
+        Option<Arc<crate::execution::ExecutionEngine<AppMiddleware, Wallet<SigningKey>>>>,
     /// Hub paper (CSV async). Lazy-init sob flag.
     paper_hub: Arc<Mutex<Option<Arc<PaperValidationHub>>>>,
     /// Premium Aave on-chain cache (M5), refreshed at most hourly.
@@ -97,16 +96,14 @@ pub struct ArbitrageClient {
 }
 
 impl ArbitrageClient {
-
     pub fn new(
         executor_address: Address,
         middleware: Arc<AppMiddleware>,
         config: Arc<Mutex<Config>>,
         execution_engine: Option<
-            Arc<crate::execution::ExecutionEngine<AppMiddleware, Wallet<SigningKey>>>
+            Arc<crate::execution::ExecutionEngine<AppMiddleware, Wallet<SigningKey>>>,
         >,
     ) -> Self {
-
         let executor = FlashloanExecutor::new(executor_address, middleware.clone());
         let gas_estimator = GasEstimator::new(middleware.clone(), config.clone());
 
@@ -151,35 +148,38 @@ impl ArbitrageClient {
         let address = pool_address
             .and_then(|raw| Address::from_str(raw).ok())
             .or_else(|| Address::from_str(DEFAULT_AAVE_POOL_POLYGON).ok());
-        let Some(address) = address else { return fallback_pct; };
+        let Some(address) = address else {
+            return fallback_pct;
+        };
         let Ok(abi) = serde_json::from_str::<ethers::abi::Abi>(FLASHLOAN_PREMIUM_ABI) else {
             return fallback_pct;
         };
         let pool = Contract::new(address, abi, self.middleware.clone());
         match pool.method::<_, U256>("FLASHLOAN_PREMIUM_TOTAL", ()) {
-            Ok(call) => {
-                match tokio::time::timeout(Duration::from_secs(10), call.call()).await {
-                    Ok(Ok(bps)) if bps <= U256::from(10_000u64) => {
-                        let pct = bps.as_u64() as f64 / 10_000.0;
-                        *self.flashloan_fee_cache.lock().await = Some((StdInstant::now(), pct));
-                        info!("Aave premium on-chain: {:.2} bps", pct * 10_000.0);
-                        pct
-                    }
-                    Ok(Ok(_)) => {
-                        warn!("⚠️ FLASHLOAN_PREMIUM_TOTAL fora do range; usando fallback");
-                        fallback_pct
-                    }
-                    Ok(Err(e)) => {
-                        warn!("⚠️ Falha ao ler FLASHLOAN_PREMIUM_TOTAL: {}; usando fallback", e);
-                        fallback_pct
-                    }
-                    Err(_) => {
-                        warn!("⏱️ Timeout ao ler FLASHLOAN_PREMIUM_TOTAL (>10s); usando fallback");
-                        crate::infra::metrics::inc_counter("rpc_call_timeout");
-                        fallback_pct
-                    }
+            Ok(call) => match tokio::time::timeout(Duration::from_secs(10), call.call()).await {
+                Ok(Ok(bps)) if bps <= U256::from(10_000u64) => {
+                    let pct = bps.as_u64() as f64 / 10_000.0;
+                    *self.flashloan_fee_cache.lock().await = Some((StdInstant::now(), pct));
+                    info!("Aave premium on-chain: {:.2} bps", pct * 10_000.0);
+                    pct
                 }
-            }
+                Ok(Ok(_)) => {
+                    warn!("⚠️ FLASHLOAN_PREMIUM_TOTAL fora do range; usando fallback");
+                    fallback_pct
+                }
+                Ok(Err(e)) => {
+                    warn!(
+                        "⚠️ Falha ao ler FLASHLOAN_PREMIUM_TOTAL: {}; usando fallback",
+                        e
+                    );
+                    fallback_pct
+                }
+                Err(_) => {
+                    warn!("⏱️ Timeout ao ler FLASHLOAN_PREMIUM_TOTAL (>10s); usando fallback");
+                    crate::infra::metrics::inc_counter("rpc_call_timeout");
+                    fallback_pct
+                }
+            },
             Err(_) => fallback_pct,
         }
     }
@@ -191,13 +191,17 @@ impl ArbitrageClient {
             (
                 cfg.flashloan.enabled,
                 cfg.flashloan.aave_pool_address.clone(),
-                cfg.flashloan.fee_pct.unwrap_or(economics::AAVE_V3_PREMIUM_PCT),
+                cfg.flashloan
+                    .fee_pct
+                    .unwrap_or(economics::AAVE_V3_PREMIUM_PCT),
             )
         };
         if !enabled {
             return;
         }
-        let pct = self.current_flashloan_fee_pct(pool.as_deref(), fallback).await;
+        let pct = self
+            .current_flashloan_fee_pct(pool.as_deref(), fallback)
+            .await;
         self.config.lock().await.flashloan.fee_pct = Some(pct);
     }
 
@@ -393,10 +397,7 @@ impl ArbitrageClient {
     }
 
     fn is_uniswap_v3_step(dex_name: &str) -> bool {
-        let n = dex_name
-            .to_lowercase()
-            .replace(' ', "")
-            .replace('_', "");
+        let n = dex_name.to_lowercase().replace(' ', "").replace('_', "");
         n.contains("uniswapv3") || n == "uniswapv3"
     }
 
@@ -406,14 +407,17 @@ impl ArbitrageClient {
         let fee = step.v3_fee_tier.ok_or_else(|| {
             anyhow!(
                 "V3 fee_tier ausente no step {}→{} — abort (não forçar 3000 / não re-query)",
-                step.token_in, step.token_out
+                step.token_in,
+                step.token_out
             )
         })?;
         Self::executable_v3_fee_tier(fee)
     }
 
     /// Monta `extraData`: V3 = abi.encode(uint24); V2/Curve = vazio.
-    pub(crate) fn build_extra_data_for_step(step: &crate::core::types::ArbitrageStep) -> Result<Bytes> {
+    pub(crate) fn build_extra_data_for_step(
+        step: &crate::core::types::ArbitrageStep,
+    ) -> Result<Bytes> {
         if Self::is_uniswap_v3_step(&step.dex_name) {
             let fee = Self::resolve_v3_fee_for_step(step)?;
             Ok(Self::encode_v3_fee_extra_data(fee))
@@ -427,36 +431,41 @@ impl ArbitrageClient {
         if steps.is_empty() {
             return Err(FlashloanError::InvalidRoute("Empty steps".into()));
         }
-        
+
         for (i, step) in steps.iter().enumerate() {
             if step.amount_out_min.is_zero() {
-                return Err(FlashloanError::InvalidRoute(
-                    format!("Step {}: amount_out_min is zero", i)
-                ));
+                return Err(FlashloanError::InvalidRoute(format!(
+                    "Step {}: amount_out_min is zero",
+                    i
+                )));
             }
         }
-        
+
         self.validate_route_consistency(steps)?;
-        
+
         Ok(())
     }
 
     /// CORREÇÃO: Valida complexidade sem bloquear arbitragem triangular
-    fn validate_route_complexity(&self, steps: &[AbiSwapStep], config: &Config) -> Result<(), FlashloanError> {
+    fn validate_route_complexity(
+        &self,
+        steps: &[AbiSwapStep],
+        config: &Config,
+    ) -> Result<(), FlashloanError> {
         let route = &config.arbitrage.route_validation;
         let max_hops_allowed = if route.enabled {
             config.arbitrage.max_path_length.min(route.max_hops.max(1)) as usize
         } else {
             config.arbitrage.max_path_length as usize
         };
-        
+
         // CORREÇÃO: Permitir até 4 hops para arbitragem triangular
         if steps.len() > max_hops_allowed {
             let reason = format!("{} hops exceeds maximum {}", steps.len(), max_hops_allowed);
             self.log_route_rejection(steps, &reason);
             return Err(FlashloanError::RouteTooComplex(reason));
         }
-        
+
         if route.enabled && route.block_same_dex_consecutive {
             for pair in steps.windows(2) {
                 if pair[0].dex_type == pair[1].dex_type {
@@ -496,33 +505,43 @@ impl ArbitrageClient {
     fn validate_route_consistency(&self, steps: &[AbiSwapStep]) -> Result<(), FlashloanError> {
         for i in 0..steps.len() - 1 {
             if steps[i].token_out != steps[i + 1].token_in {
-                return Err(FlashloanError::InvalidRoute(
-                    format!("Step {}: token_out {:?} != next token_in {:?}", 
-                           i, steps[i].token_out, steps[i + 1].token_in)
-                ));
+                return Err(FlashloanError::InvalidRoute(format!(
+                    "Step {}: token_out {:?} != next token_in {:?}",
+                    i,
+                    steps[i].token_out,
+                    steps[i + 1].token_in
+                )));
             }
         }
-        
+
         // CORREÇÃO: Mantida validação de ciclo - importante para flashloan
         if steps[0].token_in != steps[steps.len() - 1].token_out {
-            return Err(FlashloanError::InvalidRoute(
-                format!("Route doesn't return to initial token: {:?} != {:?}", 
-                       steps[0].token_in, steps[steps.len() - 1].token_out)
-            ));
+            return Err(FlashloanError::InvalidRoute(format!(
+                "Route doesn't return to initial token: {:?} != {:?}",
+                steps[0].token_in,
+                steps[steps.len() - 1].token_out
+            )));
         }
-        
+
         Ok(())
     }
 
     /// Aplica filtros de complexidade
-    fn apply_complexity_filters(&self, steps: &[AbiSwapStep], config: &Config) -> Result<(), FlashloanError> {
+    fn apply_complexity_filters(
+        &self,
+        steps: &[AbiSwapStep],
+        config: &Config,
+    ) -> Result<(), FlashloanError> {
         self.validate_route_complexity(steps, config)?;
         self.validate_steps_critical(steps)?;
-        
+
         if config.arbitrage.advanced_filters_enabled && steps.len() >= 3 {
-            info!("🔍 Rota complexa detectada ({} hops) - monitorando", steps.len());
+            info!(
+                "🔍 Rota complexa detectada ({} hops) - monitorando",
+                steps.len()
+            );
         }
-        
+
         Ok(())
     }
 
@@ -537,12 +556,12 @@ impl ArbitrageClient {
         if steps.is_empty() {
             return "Empty".to_string();
         }
-        
+
         let mut route = format!("{:?}", steps[0].token_in);
         for step in steps {
             route.push_str(&format!(" → {:?}", step.token_out));
         }
-        
+
         route
     }
 
@@ -551,30 +570,44 @@ impl ArbitrageClient {
     // ========================================================================
     pub async fn execute_opportunity(
         &self,
-        opp: &mut ArbitrageOpportunity
+        opp: &mut ArbitrageOpportunity,
     ) -> Result<BundleResult> {
-
         // NOTE: update_execution_block() era chamado AQUI (antes da execução),
         // o que faria debounce_same_block() sempre retornar true se fosse
         // implementado. Movido para após TX confirmada em send_and_confirm_transaction.
-        let (strategy, min_profit, risk_cfg, slippage_bps, flashloan_decimals, configured_fee_pct, pool_address, max_premium_bps, adverse_move_bps) = {
+        let (
+            strategy,
+            min_profit,
+            risk_cfg,
+            slippage_bps,
+            flashloan_decimals,
+            configured_fee_pct,
+            pool_address,
+            max_premium_bps,
+            adverse_move_bps,
+        ) = {
             let cfg = self.config.lock().await;
 
             (
-    self.determine_execution_strategy(opp, &cfg).await,
-    cfg.arbitrage.min_profit_absolute.parse::<f64>().unwrap_or(0.0001),
-    cfg.risk.clone(),
-    cfg.flashloan.slippage_bps.unwrap_or(50) as u64,
-    // 6 decimais (USDC/USDT) — MESMO default dos outros dois call sites.
-    // Divergia (18 aqui, 6 nos demais): com o campo ausente no TOML a fee do
-    // flashloan saía dividida por 1e18 em vez de 1e6, virando ~zero.
-    cfg.flashloan.flashloan_decimals.unwrap_or(6) as u32,
-    // Mesma fonte do engine (`recalculate_profitability`); default 5 bps Aave V3.
-    cfg.flashloan.fee_pct.unwrap_or(economics::AAVE_V3_PREMIUM_PCT),
-    cfg.flashloan.aave_pool_address.clone(),
-    cfg.flashloan.max_premium_bps,
-    cfg.execution.adverse_move_bps,
-)
+                self.determine_execution_strategy(opp, &cfg).await,
+                cfg.arbitrage
+                    .min_profit_absolute
+                    .parse::<f64>()
+                    .unwrap_or(0.0001),
+                cfg.risk.clone(),
+                cfg.flashloan.slippage_bps.unwrap_or(50) as u64,
+                // 6 decimais (USDC/USDT) — MESMO default dos outros dois call sites.
+                // Divergia (18 aqui, 6 nos demais): com o campo ausente no TOML a fee do
+                // flashloan saía dividida por 1e18 em vez de 1e6, virando ~zero.
+                cfg.flashloan.flashloan_decimals.unwrap_or(6) as u32,
+                // Mesma fonte do engine (`recalculate_profitability`); default 5 bps Aave V3.
+                cfg.flashloan
+                    .fee_pct
+                    .unwrap_or(economics::AAVE_V3_PREMIUM_PCT),
+                cfg.flashloan.aave_pool_address.clone(),
+                cfg.flashloan.max_premium_bps,
+                cfg.execution.adverse_move_bps,
+            )
         };
 
         // Direct = capital próprio: sem premium Aave.
@@ -646,7 +679,9 @@ impl ArbitrageClient {
                 Ok(v) => v,
                 Err(e) => {
                     warn!("principal usd_e8 failed: {e}");
-                    return Ok(BundleResult::skipped().with_execution_mode("principal_usd_overflow"));
+                    return Ok(
+                        BundleResult::skipped().with_execution_mode("principal_usd_overflow")
+                    );
                 }
             };
         let flashloan_fee_e8 = match fixed_usd::flashloan_fee_usd_e8(principal_e8, fee_bps) {
@@ -690,8 +725,7 @@ impl ArbitrageClient {
         }
 
         let flashloan_fee_usd = flashloan_fee_e8.display_f64();
-        let net_e8 =
-            fixed_usd::net_profit_usd_e8(gross_e8, gas_e8, flashloan_fee_e8, adverse_e8);
+        let net_e8 = fixed_usd::net_profit_usd_e8(gross_e8, gas_e8, flashloan_fee_e8, adverse_e8);
         opp.net_profit_usd = net_e8.display_f64();
 
         let min_profit_e8 = match fixed_usd::usd_f64_to_e8_ceil(min_profit) {
@@ -736,8 +770,11 @@ impl ArbitrageClient {
             }
         }
 
-        info!("🔄 Executando rota: {} hops | Profit: ${:.4}", 
-              opp.steps.0.len(), opp.net_profit_usd);
+        info!(
+            "🔄 Executando rota: {} hops | Profit: ${:.4}",
+            opp.steps.0.len(),
+            opp.net_profit_usd
+        );
 
         // EXEC
         match strategy {
@@ -774,7 +811,9 @@ impl ArbitrageClient {
             let cfg = self.config.lock().await;
             (
                 cfg.flashloan.slippage_bps.unwrap_or(50) as u64,
-                cfg.flashloan.fee_pct.unwrap_or(economics::AAVE_V3_PREMIUM_PCT),
+                cfg.flashloan
+                    .fee_pct
+                    .unwrap_or(economics::AAVE_V3_PREMIUM_PCT),
                 cfg.flashloan.aave_pool_address.clone(),
                 cfg.flashloan.flashloan_decimals.unwrap_or(6) as u32,
                 cfg.execution.adverse_move_bps,
@@ -918,14 +957,10 @@ impl ArbitrageClient {
         let block_id = paper_validation::block_id(block);
         let holder = paper_from;
 
-        let _bal_before = paper_validation::erc20_balance(
-            self.middleware.clone(),
-            asset,
-            holder,
-            block_id,
-        )
-        .await
-        .ok();
+        let _bal_before =
+            paper_validation::erc20_balance(self.middleware.clone(), asset, holder, block_id)
+                .await
+                .ok();
 
         let call = self
             .executor
@@ -936,7 +971,8 @@ impl ArbitrageClient {
         let (sim_ok, revert_reason) = match timeout(Duration::from_secs(15), call.call()).await {
             Ok(Ok(true)) => (true, None),
             Ok(Ok(false)) => {
-                let params = self.encode_flashloan_callback_params(paper_from, &steps, U256::zero());
+                let params =
+                    self.encode_flashloan_callback_params(paper_from, &steps, U256::zero());
                 let state_ovr = if use_overrides {
                     Some(paper_validation::erc20_balance_state_override(
                         asset,
@@ -1043,13 +1079,13 @@ impl ArbitrageClient {
     }
 
     /// Fail-closed: `profitRecipient` resolvido deve == `owner()` on-chain.
-    async fn assert_profit_recipient_matches_owner(
-        &self,
-        profit_recipient: Address,
-    ) -> Result<()> {
-        let onchain_owner: Address = self.executor.owner().call().await.map_err(|e| {
-            anyhow!("ProfitRecipientPreflight: failed to read owner(): {e}")
-        })?;
+    async fn assert_profit_recipient_matches_owner(&self, profit_recipient: Address) -> Result<()> {
+        let onchain_owner: Address = self
+            .executor
+            .owner()
+            .call()
+            .await
+            .map_err(|e| anyhow!("ProfitRecipientPreflight: failed to read owner(): {e}"))?;
         Self::ensure_profit_recipient_matches_owner(profit_recipient, onchain_owner)
     }
 
@@ -1131,7 +1167,7 @@ impl ArbitrageClient {
     async fn determine_execution_strategy(
         &self,
         _opp: &ArbitrageOpportunity,
-        cfg: &Config
+        cfg: &Config,
     ) -> ExecutionStrategy {
         // `dry_run` NÃO é mais um curto-circuito aqui. Antes ele retornava `Skip`
         // antes de qualquer coisa, então `simulate_before_execute` nunca rodava — o
@@ -1158,9 +1194,8 @@ impl ArbitrageClient {
     pub async fn execute_direct(
         &self,
         opp: &ArbitrageOpportunity,
-        slippage_bps: u64
+        slippage_bps: u64,
     ) -> Result<BundleResult> {
-
         // CORREÇÃO: Anti-MEV não bloqueia mais
         if self.debounce_same_block().await? {
             return Ok(BundleResult::skipped()
@@ -1170,7 +1205,8 @@ impl ArbitrageClient {
 
         let (dry, simulate, asset, amount, steps, flashloan_decimals, min_profit_raw) = {
             let cfg = self.config.lock().await;
-            let (asset, amount, steps) = self.extract_and_convert_opp_data(opp, &cfg, slippage_bps)?;
+            let (asset, amount, steps) =
+                self.extract_and_convert_opp_data(opp, &cfg, slippage_bps)?;
 
             if let Err(e) = self.apply_complexity_filters(&steps, &cfg) {
                 warn!("{}", e);
@@ -1209,7 +1245,10 @@ impl ArbitrageClient {
 
         // APPROVE
         if !dry {
-            if let Err(e) = self.approve_token_for_execution(asset, self.executor.address(), amount).await {
+            if let Err(e) = self
+                .approve_token_for_execution(asset, self.executor.address(), amount)
+                .await
+            {
                 warn!("❌ Approve falhou: {}", e);
                 return Ok(BundleResult::skipped()
                     .with_execution_mode("approve_failed")
@@ -1219,7 +1258,9 @@ impl ArbitrageClient {
             }
         }
 
-        let direct = self.executor.execute_direct(asset, amount, steps.clone(), min_profit_raw);
+        let direct = self
+            .executor
+            .execute_direct(asset, amount, steps.clone(), min_profit_raw);
 
         if simulate {
             info!("🔬 Simulando Direct Arbitrage...");
@@ -1237,10 +1278,15 @@ impl ArbitrageClient {
         }
 
         if dry {
-            return Ok(BundleResult::new(true, opp.estimated_profit_usd, opp.gas_cost_usd));
+            return Ok(BundleResult::new(
+                true,
+                opp.estimated_profit_usd,
+                opp.gas_cost_usd,
+            ));
         }
 
-        self.send_and_confirm_transaction(direct, opp, "direct", flashloan_decimals).await
+        self.send_and_confirm_transaction(direct, opp, "direct", flashloan_decimals)
+            .await
     }
 
     // ========================================================================
@@ -1249,9 +1295,8 @@ impl ArbitrageClient {
     pub async fn execute_flashloan(
         &self,
         opp: &ArbitrageOpportunity,
-        slippage_bps: u64
+        slippage_bps: u64,
     ) -> Result<BundleResult> {
-
         // CORREÇÃO: Anti-MEV não bloqueia mais
         if self.debounce_same_block().await? {
             return Ok(BundleResult::skipped()
@@ -1261,7 +1306,8 @@ impl ArbitrageClient {
 
         let (dry, simulate, asset, amount, steps, flashloan_decimals, min_profit_raw) = {
             let cfg = self.config.lock().await;
-            let (asset, amount, steps) = self.extract_and_convert_opp_data(opp, &cfg, slippage_bps)?;
+            let (asset, amount, steps) =
+                self.extract_and_convert_opp_data(opp, &cfg, slippage_bps)?;
 
             if let Err(e) = self.apply_complexity_filters(&steps, &cfg) {
                 warn!("{}", e);
@@ -1297,7 +1343,9 @@ impl ArbitrageClient {
             )
         };
 
-        let call = self.executor.execute_flashloan(asset, amount, steps, min_profit_raw);
+        let call = self
+            .executor
+            .execute_flashloan(asset, amount, steps, min_profit_raw);
 
         if simulate {
             info!("🔬 Simulando Flashloan...");
@@ -1315,10 +1363,15 @@ impl ArbitrageClient {
         }
 
         if dry {
-            return Ok(BundleResult::new(true, opp.estimated_profit_usd, opp.gas_cost_usd));
+            return Ok(BundleResult::new(
+                true,
+                opp.estimated_profit_usd,
+                opp.gas_cost_usd,
+            ));
         }
 
-        self.send_and_confirm_transaction(call, opp, "flashloan", flashloan_decimals).await
+        self.send_and_confirm_transaction(call, opp, "flashloan", flashloan_decimals)
+            .await
     }
 
     // ========================================================================
@@ -1327,9 +1380,8 @@ impl ArbitrageClient {
     pub async fn execute_wrapper(
         &self,
         opp: &ArbitrageOpportunity,
-        slippage_bps: u64
+        slippage_bps: u64,
     ) -> Result<BundleResult> {
-
         // CORREÇÃO: Anti-MEV não bloqueia mais
         if self.debounce_same_block().await? {
             return Ok(BundleResult::skipped()
@@ -1337,11 +1389,22 @@ impl ArbitrageClient {
                 .with_outcome(ExecutionOutcome::SameBlockRejected { tx_hash: None }));
         }
 
-        let (dry, simulate, wrapper_addr, asset, amount, steps, flashloan_decimals, min_profit_raw, profit_recipient) = {
+        let (
+            dry,
+            simulate,
+            wrapper_addr,
+            asset,
+            amount,
+            steps,
+            flashloan_decimals,
+            min_profit_raw,
+            profit_recipient,
+        ) = {
             let cfg = self.config.lock().await;
 
             let wrapper_addr = Address::from_str(&cfg.wrapper.address)?;
-            let (asset, amount, steps) = self.extract_and_convert_opp_data(opp, &cfg, slippage_bps)?;
+            let (asset, amount, steps) =
+                self.extract_and_convert_opp_data(opp, &cfg, slippage_bps)?;
 
             if let Err(e) = self.validate_wrapper_steps(&steps, asset) {
                 warn!("❌ Steps inválidos para wrapper: {}", e);
@@ -1424,39 +1487,56 @@ impl ArbitrageClient {
         }
 
         if dry {
-            return Ok(BundleResult::new(true, opp.estimated_profit_usd, opp.gas_cost_usd));
+            return Ok(BundleResult::new(
+                true,
+                opp.estimated_profit_usd,
+                opp.gas_cost_usd,
+            ));
         }
 
-        self.send_and_confirm_transaction(call, opp, "wrapper", flashloan_decimals).await
+        self.send_and_confirm_transaction(call, opp, "wrapper", flashloan_decimals)
+            .await
     }
 
     /// Valida steps para wrapper (igual contrato)
-    fn validate_wrapper_steps(&self, steps: &[AbiSwapStep], asset: Address) -> Result<(), FlashloanError> {
+    fn validate_wrapper_steps(
+        &self,
+        steps: &[AbiSwapStep],
+        asset: Address,
+    ) -> Result<(), FlashloanError> {
         if steps.is_empty() {
-            return Err(FlashloanError::InvalidRoute("Empty steps for wrapper".into()));
+            return Err(FlashloanError::InvalidRoute(
+                "Empty steps for wrapper".into(),
+            ));
         }
-        
+
         if steps[0].token_in != asset {
-            return Err(FlashloanError::InvalidRoute(
-                format!("First step token_in {:?} != flashloan asset {:?}", 
-                       steps[0].token_in, asset)
-            ));
+            return Err(FlashloanError::InvalidRoute(format!(
+                "First step token_in {:?} != flashloan asset {:?}",
+                steps[0].token_in, asset
+            )));
         }
-        
+
         if steps[steps.len() - 1].token_out != asset {
-            return Err(FlashloanError::InvalidRoute(
-                format!("Last step token_out {:?} != flashloan asset {:?}", 
-                       steps[steps.len() - 1].token_out, asset)
-            ));
+            return Err(FlashloanError::InvalidRoute(format!(
+                "Last step token_out {:?} != flashloan asset {:?}",
+                steps[steps.len() - 1].token_out,
+                asset
+            )));
         }
-        
+
         Ok(())
     }
 
     // ========================================================================
     // APPROVE
     // ========================================================================
-    async fn approve_token_for_execution(&self, token_addr: Address, spender: Address, amount: U256) -> Result<()> {
+    async fn approve_token_for_execution(
+        &self,
+        token_addr: Address,
+        spender: Address,
+        amount: U256,
+    ) -> Result<()> {
         {
             let cfg = self.config.lock().await;
             if paper_validation::sends_forbidden(&cfg) {
@@ -1468,9 +1548,12 @@ impl ArbitrageClient {
         let wallet_addr = self.get_wallet_address()?;
         let token_contract = ERC20::new(token_addr, self.middleware.clone());
 
-        let allowance: U256 = token_contract.allowance(wallet_addr, spender).call().await
+        let allowance: U256 = token_contract
+            .allowance(wallet_addr, spender)
+            .call()
+            .await
             .context("Failed to get allowance")?;
-        
+
         if allowance >= amount {
             return Ok(());
         }
@@ -1478,7 +1561,7 @@ impl ArbitrageClient {
         info!("🔓 Approving {:?} for spender {:?}", token_addr, spender);
         let call = token_contract.approve(spender, U256::MAX);
         let pending = call.send().await.context("Failed to send approve")?;
-        
+
         match timeout(Duration::from_secs(30), pending).await {
             Ok(Ok(Some(receipt))) => {
                 if receipt.status == Some(1.into()) {
@@ -1502,8 +1585,8 @@ impl ArbitrageClient {
     // SIMULAÇÃO
     // ========================================================================
     async fn simulate_transaction<T: Detokenize>(
-        &self, 
-        call: &ContractCall<AppMiddleware, T>
+        &self,
+        call: &ContractCall<AppMiddleware, T>,
     ) -> Result<()> {
         // Simular em `pending` inclui swaps concorrentes que o RPC já viu.
         // Se o nó não puder dar esta garantia, falhar fechado evita broadcast
@@ -1514,7 +1597,7 @@ impl ArbitrageClient {
             Ok(Err(e)) => {
                 let error_msg = self.decode_revert_reason(&e.to_string());
                 Err(anyhow!("Simulation failed: {}", error_msg))
-            },
+            }
             Err(_) => Err(anyhow!("Simulation timeout")),
         }
     }
@@ -1546,7 +1629,7 @@ impl ArbitrageClient {
             Ok(Err(e)) => {
                 let error_msg = self.decode_revert_reason(&e.to_string());
                 Err(anyhow!("Simulation failed: {}", error_msg))
-            },
+            }
             Err(_) => Err(anyhow!("Simulation timeout")),
         }
     }
@@ -1565,7 +1648,6 @@ impl ArbitrageClient {
         mode: &'static str,
         flashloan_decimals: u32,
     ) -> Result<BundleResult> {
-
         // HARD GATE: paper / dry_run_only / dry_run — fisicamente impossível broadcast.
         {
             let cfg = self.config.lock().await;
@@ -1657,8 +1739,7 @@ impl ArbitrageClient {
             if attempt > 0 {
                 // Bump integer (x100 → /100) p/ evitar drift de f64. Mesmo nonce.
                 max_fee = max_fee.saturating_mul(multiplier_bps) / U256::from(100u64);
-                max_priority =
-                    max_priority.saturating_mul(multiplier_bps) / U256::from(100u64);
+                max_priority = max_priority.saturating_mul(multiplier_bps) / U256::from(100u64);
                 replacement_count += 1;
                 info!(
                     opp_id = %opp_id, mode, attempt, replacement_count,
@@ -1711,13 +1792,23 @@ impl ArbitrageClient {
                                         GasStrategyKind::WithFlashloan
                                     };
                                     self.gas_estimator
-                                        .observe_gas_used(opp.steps.0.len().max(1), gas_used, gas_kind)
+                                        .observe_gas_used(
+                                            opp.steps.0.len().max(1),
+                                            gas_used,
+                                            gas_kind,
+                                        )
                                         .await;
                                 }
                                 let contract_profit = self
-                                    .extract_real_profit_from_receipt(&receipt, opp, flashloan_decimals)
+                                    .extract_real_profit_from_receipt(
+                                        &receipt,
+                                        opp,
+                                        flashloan_decimals,
+                                    )
                                     .unwrap_or_else(|| {
-                                        warn!("receipt sem evento de lucro; PnL será limite inferior");
+                                        warn!(
+                                            "receipt sem evento de lucro; PnL será limite inferior"
+                                        );
                                         0.0
                                     });
                                 let real_profit = self
@@ -1761,21 +1852,33 @@ impl ArbitrageClient {
                             // replacement mesmo nonce. Último attempt → TimeoutStuck.
                             warn!(opp_id = %opp_id, nonce = ?nonce, "⏰ receipt None — tx possivelmente pending");
                             if attempt + 1 >= max_retries {
-                                return Ok(self.timeout_stuck_result(&opp_id, nonce, latest_tx_hash));
+                                return Ok(self.timeout_stuck_result(
+                                    &opp_id,
+                                    nonce,
+                                    latest_tx_hash,
+                                ));
                             }
                             continue;
                         }
                         Ok(Err(e)) => {
                             warn!(opp_id = %opp_id, nonce = ?nonce, error = %e, "⏰ erro na confirmação");
                             if attempt + 1 >= max_retries {
-                                return Ok(self.timeout_stuck_result(&opp_id, nonce, latest_tx_hash));
+                                return Ok(self.timeout_stuck_result(
+                                    &opp_id,
+                                    nonce,
+                                    latest_tx_hash,
+                                ));
                             }
                             continue;
                         }
                         Err(_) => {
                             warn!(opp_id = %opp_id, nonce = ?nonce, "⏰ timeout na confirmação");
                             if attempt + 1 >= max_retries {
-                                return Ok(self.timeout_stuck_result(&opp_id, nonce, latest_tx_hash));
+                                return Ok(self.timeout_stuck_result(
+                                    &opp_id,
+                                    nonce,
+                                    latest_tx_hash,
+                                ));
                             }
                             continue;
                         }
@@ -1795,7 +1898,10 @@ impl ArbitrageClient {
                         let (mode_str, outcome) = if already_known {
                             (
                                 "timeout_stuck",
-                                ExecutionOutcome::TimeoutStuck { nonce, latest_tx_hash },
+                                ExecutionOutcome::TimeoutStuck {
+                                    nonce,
+                                    latest_tx_hash,
+                                },
                             )
                         } else {
                             ("dropped", ExecutionOutcome::Dropped { nonce })
@@ -1842,7 +1948,10 @@ impl ArbitrageClient {
         BundleResult::skipped()
             .with_execution_mode("timeout_stuck")
             .with_tx_hash(latest_tx_hash.map(|h| format!("{:?}", h)))
-            .with_outcome(ExecutionOutcome::TimeoutStuck { nonce, latest_tx_hash })
+            .with_outcome(ExecutionOutcome::TimeoutStuck {
+                nonce,
+                latest_tx_hash,
+            })
     }
 
     /// C3: decodifica o profit REAL do evento `FlashLoanSuccess` emitido pelo
@@ -1873,7 +1982,9 @@ impl ArbitrageClient {
         ));
 
         for log in receipt.logs.iter() {
-            let Some(t0) = log.topics.first() else { continue };
+            let Some(t0) = log.topics.first() else {
+                continue;
+            };
             if (*t0 != flashloan_topic && *t0 != direct_topic)
                 || log.address != self.executor.address()
             {
@@ -1882,7 +1993,10 @@ impl ArbitrageClient {
             // Dados não-indexados: amount, premium, profit (3 × 32 bytes).
             let data = log.data.as_ref();
             if data.len() < 96 {
-                warn!("FlashLoanSuccess: log data curto ({} bytes) — decode skip", data.len());
+                warn!(
+                    "FlashLoanSuccess: log data curto ({} bytes) — decode skip",
+                    data.len()
+                );
                 continue;
             }
             let tokens = match ethers::abi::decode(
@@ -1940,7 +2054,9 @@ impl ArbitrageClient {
         let pol_usd = crate::infra::price_feed::PRICE_FEED
             .get_price("WMATIC")
             .await
-            .unwrap_or_else(|_| crate::infra::price_feed::CachedPriceFeed::fallback_price("WMATIC"));
+            .unwrap_or_else(|_| {
+                crate::infra::price_feed::CachedPriceFeed::fallback_price("WMATIC")
+            });
         let gas_usd = gas_pol * pol_usd;
         let net = contract_profit_usd - gas_usd;
         info!(
@@ -1959,7 +2075,6 @@ impl ArbitrageClient {
         cfg: &Config,
         _slippage_bps: u64,
     ) -> Result<(Address, U256, Vec<AbiSwapStep>)> {
-
         // M13: `USDC` e `USDC.e` são contratos distintos. Sanitiza com a
         // identidade de endereço resolvida da config, não pelo ticker.
         let steps = ArbitrageEngine::sanitize_steps_with_token_identity(&opp.steps.0, |symbol| {
@@ -2002,18 +2117,22 @@ impl ArbitrageClient {
     // MAP DEX
     // ========================================================================
     fn map_dex_type(&self, dex: &str) -> Result<u8> {
-        let normalized = dex.to_lowercase()
+        let normalized = dex
+            .to_lowercase()
             .replace(" ", "")
             .replace("_", "")
             .replace("v2", "")
             .replace("v3", "");
-        
+
         match normalized.as_str() {
             "quickswap" => Ok(0),
             "sushiswap" => Ok(1),
             "uniswap" => Ok(2),
             _ => {
-                warn!("⚠️ DEX não mapeada: '{}' (normalizada: '{}')", dex, normalized);
+                warn!(
+                    "⚠️ DEX não mapeada: '{}' (normalizada: '{}')",
+                    dex, normalized
+                );
                 Err(anyhow!("DEX não suportada: {}", dex))
             }
         }
@@ -2024,7 +2143,9 @@ impl ArbitrageClient {
             return Ok(*addr);
         }
 
-        let s = cfg.pairs.tokens
+        let s = cfg
+            .pairs
+            .tokens
             .get(symbol)
             .ok_or_else(|| anyhow!("Token não encontrado: {}", symbol))?;
 
@@ -2044,10 +2165,10 @@ impl ArbitrageClient {
 mod tests {
     use super::*;
 
+    use crate::infra::rotating_http_client::RotatingHttpClient;
     use ethers::providers::Provider;
     use ethers::signers::LocalWallet;
     use std::str::FromStr;
-    use crate::infra::rotating_http_client::RotatingHttpClient;
 
     // Chave de teste hardhat account #0 — bem conhecida, sem valor.
     const TEST_PK: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
@@ -2120,7 +2241,7 @@ mod tests {
     // extract_real_profit_from_receipt — C3
     // ------------------------------------------------------------------------
     fn flashloan_success_log(profit_raw: U256) -> ethers::types::Log {
-        use ethers::types::{Bytes, H256, Log};
+        use ethers::types::{Bytes, Log, H256};
         let topic0 = H256::from(ethers::utils::keccak256(
             b"FlashLoanSuccess(address,uint256,uint256,uint256,address)",
         ));
@@ -2139,7 +2260,7 @@ mod tests {
     }
 
     fn direct_execution_log(profit_raw: U256) -> ethers::types::Log {
-        use ethers::types::{Bytes, H256, Log};
+        use ethers::types::{Bytes, Log, H256};
         let topic0 = H256::from(ethers::utils::keccak256(
             b"DirectExecution(address,uint256,uint256,address,uint256)",
         ));
@@ -2179,7 +2300,9 @@ mod tests {
         let client = make_client();
         let receipt = TransactionReceipt::default();
         let opp = ArbitrageOpportunity::default();
-        assert!(client.extract_real_profit_from_receipt(&receipt, &opp, 6).is_none());
+        assert!(client
+            .extract_real_profit_from_receipt(&receipt, &opp, 6)
+            .is_none());
     }
 
     #[test]
@@ -2216,7 +2339,10 @@ mod tests {
     fn apply_slippage_full_amount_bps() {
         let client = make_client();
         // 10000 bps = 100% => 0
-        assert_eq!(client.apply_slippage(U256::from(1_000_000), 10000), U256::zero());
+        assert_eq!(
+            client.apply_slippage(U256::from(1_000_000), 10000),
+            U256::zero()
+        );
     }
 
     // ------------------------------------------------------------------------
@@ -2267,7 +2393,9 @@ mod tests {
         let gross = 10.0_f64;
         let gas = 1.0_f64;
         let fee = 0.5_f64;
-        assert!(client.validate_profit_after_fees(gross, gas, fee, 0.0).is_ok());
+        assert!(client
+            .validate_profit_after_fees(gross, gas, fee, 0.0)
+            .is_ok());
         let expected_net = gross - gas - fee;
         assert!((expected_net - 8.5).abs() < 1e-12);
         // Se subtraísse de novo (double), net ficaria 8.5 - 1 - 0.5 = 7.0 — gate
@@ -2284,7 +2412,9 @@ mod tests {
         let fee_tok = client.calculate_flashloan_fee(amount, 0.0005);
         let fee_usd = client.token_amount_to_usd_display_f64(fee_tok, 1.0, 6);
         assert!((fee_usd - 0.05).abs() < 1e-9, "fee_usd={fee_usd}");
-        assert!(client.validate_profit_after_fees(2.0, 0.1, fee_usd, 0.0).is_ok());
+        assert!(client
+            .validate_profit_after_fees(2.0, 0.1, fee_usd, 0.0)
+            .is_ok());
     }
 
     // ------------------------------------------------------------------------
@@ -2429,7 +2559,9 @@ mod tests {
             // token_in c != prev token_out b
             step(0, c, a, U256::from(99)),
         ];
-        let err = client.validate_route_consistency(&steps).expect_err("cadeia quebrada");
+        let err = client
+            .validate_route_consistency(&steps)
+            .expect_err("cadeia quebrada");
         assert!(matches!(err, FlashloanError::InvalidRoute(_)));
     }
 
@@ -2445,7 +2577,9 @@ mod tests {
         // Quebra o ciclo: último token_out != primeiro token_in
         let mut broken = steps.clone();
         broken[1].token_out = Address::from_low_u64_be(3);
-        let err = client.validate_route_consistency(&broken).expect_err("não fecha ciclo");
+        let err = client
+            .validate_route_consistency(&broken)
+            .expect_err("não fecha ciclo");
         assert!(err.to_string().contains("return to initial token"));
     }
 
@@ -2455,7 +2589,9 @@ mod tests {
     #[test]
     fn steps_critical_rejects_empty() {
         let client = make_client();
-        let err = client.validate_steps_critical(&[]).expect_err("steps vazios");
+        let err = client
+            .validate_steps_critical(&[])
+            .expect_err("steps vazios");
         assert!(matches!(err, FlashloanError::InvalidRoute(_)));
         assert!(err.to_string().contains("Empty steps"));
     }
@@ -2469,7 +2605,9 @@ mod tests {
             step(0, a, b, U256::zero()), // amount_out_min zero
             step(0, b, a, U256::from(99)),
         ];
-        let err = client.validate_steps_critical(&steps).expect_err("amount_out_min zero");
+        let err = client
+            .validate_steps_critical(&steps)
+            .expect_err("amount_out_min zero");
         assert!(err.to_string().contains("amount_out_min is zero"));
     }
 
@@ -2516,7 +2654,8 @@ mod tests {
             step(0, c, d, U256::from(98)),
             step(0, d, a, U256::from(97)),
         ];
-        let err = client.validate_route_complexity(&steps, &cfg)
+        let err = client
+            .validate_route_complexity(&steps, &cfg)
             .expect_err("excede max hops");
         assert!(matches!(err, FlashloanError::RouteTooComplex(_)));
         assert!(err.to_string().contains("exceeds maximum"));
@@ -2545,7 +2684,8 @@ mod tests {
         let steps = vec![
             step(0, b, asset, U256::from(99)), // token_in != asset
         ];
-        let err = client.validate_wrapper_steps(&steps, asset)
+        let err = client
+            .validate_wrapper_steps(&steps, asset)
             .expect_err("primeiro step não casa com asset");
         assert!(err.to_string().contains("First step token_in"));
     }
@@ -2560,7 +2700,8 @@ mod tests {
             step(0, asset, b, U256::from(100)),
             step(0, b, c, U256::from(99)), // token_out != asset
         ];
-        let err = client.validate_wrapper_steps(&steps, asset)
+        let err = client
+            .validate_wrapper_steps(&steps, asset)
             .expect_err("último step não fecha no asset");
         assert!(err.to_string().contains("Last step token_out"));
     }
@@ -2569,7 +2710,9 @@ mod tests {
     fn wrapper_steps_rejects_empty() {
         let client = make_client();
         let asset = Address::from_low_u64_be(1);
-        let err = client.validate_wrapper_steps(&[], asset).expect_err("steps vazios");
+        let err = client
+            .validate_wrapper_steps(&[], asset)
+            .expect_err("steps vazios");
         assert!(err.to_string().contains("Empty steps"));
     }
 
@@ -2642,7 +2785,10 @@ mod tests {
     fn decode_revert_panic_selector() {
         let client = make_client();
         let msg = client.decode_revert_reason("execution reverted: data: 0x4e487b71");
-        assert!(msg.contains("Panic") || msg.contains("4e487b71"), "msg={msg}");
+        assert!(
+            msg.contains("Panic") || msg.contains("4e487b71"),
+            "msg={msg}"
+        );
     }
 
     #[test]
@@ -2715,10 +2861,7 @@ mod tests {
         let cfg = Config::default();
         let a = Address::from_low_u64_be(1);
         let b = Address::from_low_u64_be(2);
-        let steps = vec![
-            step(0, a, b, U256::zero()),
-            step(0, b, a, U256::from(99)),
-        ];
+        let steps = vec![step(0, a, b, U256::zero()), step(0, b, a, U256::from(99))];
         assert!(client.apply_complexity_filters(&steps, &cfg).is_err());
     }
 
@@ -2863,7 +3006,8 @@ mod tests {
         ];
 
         for (recipient, min_profit, name) in cases {
-            let encoded = ArbitrageClient::encode_callback_data(recipient, &[step.clone()], min_profit);
+            let encoded =
+                ArbitrageClient::encode_callback_data(recipient, &[step.clone()], min_profit);
             let decoded = decode(&params, encoded.as_ref()).expect(name);
             assert_eq!(decoded.len(), 3, "{name}");
             match &decoded[0] {
@@ -2924,10 +3068,7 @@ mod tests {
         let err = ArbitrageClient::ensure_profit_recipient_matches_owner(wallet, owner)
             .expect_err("wallet != owner must abort");
         let msg = format!("{err:#}");
-        assert!(
-            msg.contains("ProfitRecipientMismatch"),
-            "got: {msg}"
-        );
+        assert!(msg.contains("ProfitRecipientMismatch"), "got: {msg}");
         assert!(msg.contains("abort before broadcast"), "got: {msg}");
     }
 
@@ -2988,16 +3129,10 @@ mod tests {
         }
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test/fixtures");
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("callback_abi_hex.json"), serde_json::to_string_pretty(&out).unwrap())
-            .unwrap();
+        fs::write(
+            dir.join("callback_abi_hex.json"),
+            serde_json::to_string_pretty(&out).unwrap(),
+        )
+        .unwrap();
     }
 }
-
-
-
-
-
-
-
-
-

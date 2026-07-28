@@ -167,9 +167,9 @@ impl CachedPriceFeed {
     pub async fn get_price_strict(&self, symbol: &str, max_stale: Duration) -> Result<f64> {
         let key = symbol.to_lowercase();
         let cache = CACHE.read().unwrap();
-        let entry = cache.get(&key).ok_or_else(|| {
-            anyhow!("preço de {} ausente do cache (fail-closed)", symbol)
-        })?;
+        let entry = cache
+            .get(&key)
+            .ok_or_else(|| anyhow!("preço de {} ausente do cache (fail-closed)", symbol))?;
         if entry.is_fallback {
             return Err(anyhow!(
                 "preço de {} é fallback heurístico, não Coingecko real (fail-closed)",
@@ -206,7 +206,9 @@ impl CachedPriceFeed {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos() as u64)
             .unwrap_or(0);
-        let hash = key.bytes().fold(clock, |acc, byte| acc.wrapping_mul(31).wrapping_add(byte as u64));
+        let hash = key.bytes().fold(clock, |acc, byte| {
+            acc.wrapping_mul(31).wrapping_add(byte as u64)
+        });
         let offset = hash % (spread * 2 + 1);
         Duration::from_secs(base_secs + offset - spread)
     }

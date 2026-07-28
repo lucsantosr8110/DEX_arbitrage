@@ -158,8 +158,7 @@ impl ArbitrageOpportunity {
         if self.estimated_profit_usd <= 0.0 {
             return 0.0;
         }
-        self.estimated_profit_usd
-            / (self.estimated_volume_usd + self.gas_cost_usd.max(1e-9))
+        self.estimated_profit_usd / (self.estimated_volume_usd + self.gas_cost_usd.max(1e-9))
     }
 
     // ------------------------------------------------------------
@@ -564,7 +563,10 @@ mod outcome_tests {
     #[test]
     fn timeout_stuck_and_dropped_carry_nonce_distinct() {
         let n = U256::from(7);
-        let stuck = ExecutionOutcome::TimeoutStuck { nonce: n, latest_tx_hash: None };
+        let stuck = ExecutionOutcome::TimeoutStuck {
+            nonce: n,
+            latest_tx_hash: None,
+        };
         let dropped = ExecutionOutcome::Dropped { nonce: n };
         // Ambos carregam o nonce reservado (não sumiu); estados distintos.
         assert_ne!(stuck, dropped);

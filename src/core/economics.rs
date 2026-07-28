@@ -157,8 +157,7 @@ pub fn max_slippage_bps_for_edge(
     if !per_hop.is_finite() || per_hop <= 0.0 {
         return MIN_SLIPPAGE_BPS.min(ceiling_bps.max(MIN_SLIPPAGE_BPS));
     }
-    (per_hop as u32)
-        .clamp(MIN_SLIPPAGE_BPS, ceiling_bps.max(MIN_SLIPPAGE_BPS))
+    (per_hop as u32).clamp(MIN_SLIPPAGE_BPS, ceiling_bps.max(MIN_SLIPPAGE_BPS))
 }
 
 /// Delta esperado de um `eth_call` de simulação.
@@ -178,8 +177,10 @@ pub fn expected_sim_delta_usd(gross_profit_usd: f64, flashloan_fee_usd: f64) -> 
 ///
 /// `budget_bps = floor(net_profit_usd / trade_amount_usd * 10_000)`.
 pub fn edge_budget_bps(net_profit_usd: f64, trade_amount_usd: f64) -> i64 {
-    if !net_profit_usd.is_finite() || net_profit_usd <= 0.0
-        || !trade_amount_usd.is_finite() || trade_amount_usd <= 0.0
+    if !net_profit_usd.is_finite()
+        || net_profit_usd <= 0.0
+        || !trade_amount_usd.is_finite()
+        || trade_amount_usd <= 0.0
     {
         return 0;
     }
@@ -208,11 +209,7 @@ pub struct TradeEconomics {
 
 impl TradeEconomics {
     /// Constrói a partir dos custos já calculados pela fonte única.
-    pub fn from_costs(
-        trade_size_usd: f64,
-        gross_profit_usd: f64,
-        costs: &TradeCosts,
-    ) -> Self {
+    pub fn from_costs(trade_size_usd: f64, gross_profit_usd: f64, costs: &TradeCosts) -> Self {
         let net = net_profit_usd(gross_profit_usd, costs);
         Self {
             trade_size_usd,
@@ -287,11 +284,7 @@ pub fn slippage_allowed_total_bps(
         return None;
     }
     let edge_total = (budget_bps - margin) as u32;
-    Some(
-        configured_slippage_bps
-            .min(edge_total)
-            .min(route_limit_bps),
-    )
+    Some(configured_slippage_bps.min(edge_total).min(route_limit_bps))
 }
 
 #[cfg(test)]
@@ -363,7 +356,7 @@ mod tests {
         publish_live_gas_usd(f64::NAN);
         publish_live_gas_usd(-1.0);
         publish_live_gas_usd(0.0); // < 1 micro-dólar => ignorado
-        // (outros testes podem já ter publicado; só exigimos o contrato do fallback)
+                                   // (outros testes podem já ter publicado; só exigimos o contrato do fallback)
         assert!((gas_usd_or_fallback(0.0092) - live_gas_usd().unwrap_or(0.0092)).abs() < 1e-9);
 
         publish_live_gas_usd(0.0051);
@@ -393,8 +386,14 @@ mod tests {
     #[test]
     fn slippage_budget_floors_on_zero_or_negative_edge() {
         // Sem lucro, aperta no piso — não abre folga para sandwich.
-        assert_eq!(max_slippage_bps_for_edge(0.0, 100.0, 3, 50), MIN_SLIPPAGE_BPS);
-        assert_eq!(max_slippage_bps_for_edge(-1.0, 100.0, 3, 50), MIN_SLIPPAGE_BPS);
+        assert_eq!(
+            max_slippage_bps_for_edge(0.0, 100.0, 3, 50),
+            MIN_SLIPPAGE_BPS
+        );
+        assert_eq!(
+            max_slippage_bps_for_edge(-1.0, 100.0, 3, 50),
+            MIN_SLIPPAGE_BPS
+        );
         assert_eq!(
             max_slippage_bps_for_edge(f64::NAN, 100.0, 3, 50),
             MIN_SLIPPAGE_BPS
@@ -473,7 +472,10 @@ mod tests {
         // Edge gordo (5% = 500 bps): configured 50 vence (route_limit 200 > 50).
         assert_eq!(slippage_allowed_total_bps(5.0, 100.0, 1, 50, 200), Some(50));
         // configured alto (250) mas route_limit 200 manda → 200.
-        assert_eq!(slippage_allowed_total_bps(5.0, 100.0, 1, 250, 200), Some(200));
+        assert_eq!(
+            slippage_allowed_total_bps(5.0, 100.0, 1, 250, 200),
+            Some(200)
+        );
     }
 
     #[test]
@@ -511,7 +513,13 @@ mod tests {
         let econ = TradeEconomics::from_costs(100.0, 0.05, &costs);
         // net = 0.05 − 0.055 = -0.005
         let err = econ.validate_gate(0.0015).unwrap_err();
-        assert_eq!(err, EconomicsRejection::BelowMinProfit { net: econ.net_profit_usd, min: 0.0015 });
+        assert_eq!(
+            err,
+            EconomicsRejection::BelowMinProfit {
+                net: econ.net_profit_usd,
+                min: 0.0015
+            }
+        );
     }
 
     #[test]
@@ -524,6 +532,9 @@ mod tests {
         };
         let econ = TradeEconomics::from_costs(100.0, 1.0, &costs);
         assert_eq!(econ.net_profit_usd, f64::NEG_INFINITY);
-        assert_eq!(econ.validate_gate(0.0015).unwrap_err(), EconomicsRejection::NonFiniteNet);
+        assert_eq!(
+            econ.validate_gate(0.0015).unwrap_err(),
+            EconomicsRejection::NonFiniteNet
+        );
     }
 }
