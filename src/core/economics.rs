@@ -173,6 +173,50 @@ pub fn expected_sim_delta_usd(gross_profit_usd: f64, flashloan_fee_usd: f64) -> 
     gross_profit_usd - sane(flashloan_fee_usd)
 }
 
+/// Orçamento de edge em BPS do notional (gate inteiro, sem f64 na decisão).
+///
+/// `budget_bps = floor(net_profit_usd / trade_amount_usd * 10_000)`.
+pub fn edge_budget_bps(net_profit_usd: f64, trade_amount_usd: f64) -> i64 {
+    if !net_profit_usd.is_finite() || net_profit_usd <= 0.0
+        || !trade_amount_usd.is_finite() || trade_amount_usd <= 0.0
+    {
+        return 0;
+    }
+    ((net_profit_usd / trade_amount_usd) * 10_000.0).floor() as i64
+}
+
+/// Teto cumulativo de slippage autorizado pelo edge líquido.
+///
+/// Regra:
+///   budget_bps    = floor(net/trade * 10_000)
+///   se budget_bps ≤ edge_safety_margin_bps → `None` (rejeita rota, fail-closed)
+///   allowed_total = min(configured_slippage_bps,
+///                       budget_bps − edge_safety_margin_bps,
+///                       route_limit_bps)
+///
+/// O `route_limit_bps` estático NUNCA autoriza mais que o edge: entra só como
+/// um teto adicional dentro do `min`. Gate de rejeição compara inteiros — f64
+/// só aparece na entrada `budget_bps`, nunca na decisão final.
+pub fn slippage_allowed_total_bps(
+    net_profit_usd: f64,
+    trade_amount_usd: f64,
+    edge_safety_margin_bps: u32,
+    configured_slippage_bps: u32,
+    route_limit_bps: u32,
+) -> Option<u32> {
+    let budget_bps = edge_budget_bps(net_profit_usd, trade_amount_usd);
+    let margin = edge_safety_margin_bps as i64;
+    if budget_bps <= margin {
+        return None;
+    }
+    let edge_total = (budget_bps - margin) as u32;
+    Some(
+        configured_slippage_bps
+            .min(edge_total)
+            .min(route_limit_bps),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,5 +352,59 @@ mod tests {
         };
         // inf - inf seria NaN; somar inf no total e subtrair gross finito dá -inf.
         assert!(net_profit_usd(1.0, &inf_costs) < 0.0);
+    }
+
+    // ===== FASE 4: slippage cap por edge líquido =====
+
+    #[test]
+    fn edge_budget_bps_floors_and_safe_on_zero() {
+        // 20 bps de edge em $100 → budget 20.
+        assert_eq!(edge_budget_bps(0.20, 100.0), 20);
+        // 0.5 bps em $100 → floor 0 (não arredonda p/ cima).
+        assert_eq!(edge_budget_bps(0.005, 100.0), 0);
+        // negativo/NaN/zero → 0.
+        assert_eq!(edge_budget_bps(-1.0, 100.0), 0);
+        assert_eq!(edge_budget_bps(0.20, 0.0), 0);
+        assert_eq!(edge_budget_bps(f64::NAN, 100.0), 0);
+    }
+
+    #[test]
+    fn slippage_total_caps_below_edge_when_hop_increase_would_exceed() {
+        // Edge 20 bps (net $0.20 em $100). hop_increase 5 bps × 3 hops daria 33 bps
+        // cumulativos sem o cap. allowed_total deve capar ABAIXO de 20 bps.
+        let allowed = slippage_allowed_total_bps(0.20, 100.0, 1, 50, 200);
+        assert_eq!(allowed, Some(19), "esperava 19 bps (20 - margin 1)");
+        // Cumulativo nunca pode passar o próprio edge.
+        assert!(allowed.unwrap() < 20);
+        // E jamais acima do teto configurado nem do route_limit.
+        assert!(allowed.unwrap() <= 50);
+        assert!(allowed.unwrap() <= 200);
+    }
+
+    #[test]
+    fn slippage_total_rejects_when_edge_le_safety_margin() {
+        // budget 1 bps, margin 1 bps → 1 ≤ 1 → rejeita (None).
+        assert_eq!(slippage_allowed_total_bps(0.01, 100.0, 1, 50, 200), None);
+        // budget 0 → rejeita.
+        assert_eq!(slippage_allowed_total_bps(0.0, 100.0, 1, 50, 200), None);
+        // budget 2 bps, margin 1 → edge_total 1 → Some(1) (não rejeita, aperta).
+        assert_eq!(slippage_allowed_total_bps(0.02, 100.0, 1, 50, 200), Some(1));
+    }
+
+    #[test]
+    fn slippage_total_accepts_with_limit_when_edge_is_fat() {
+        // Edge gordo (5% = 500 bps): configured 50 vence (route_limit 200 > 50).
+        assert_eq!(slippage_allowed_total_bps(5.0, 100.0, 1, 50, 200), Some(50));
+        // configured alto (250) mas route_limit 200 manda → 200.
+        assert_eq!(slippage_allowed_total_bps(5.0, 100.0, 1, 250, 200), Some(200));
+    }
+
+    #[test]
+    fn slippage_total_route_limit_never_authorizes_above_edge() {
+        // route_limit 200 mas edge só 10 bps → allowed ≤ 9 (10 − margin 1).
+        let allowed = slippage_allowed_total_bps(0.10, 100.0, 1, 50, 200);
+        assert_eq!(allowed, Some(9));
+        // route_limit estático não autoriza slippage > edge líquido.
+        assert!(allowed.unwrap() < 10);
     }
 }

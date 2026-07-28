@@ -994,6 +994,9 @@ fn default_true() -> bool { true }
 fn default_route_max_hops() -> u32 { 3 }
 fn default_route_max_cumulative_slippage() -> f64 { 2.0 }
 
+/// Margem padrão de 1 bps reservada do edge antes de autorizar slippage.
+fn default_edge_safety_margin_bps() -> u32 { 1 }
+
 impl Default for RouteValidationConfig {
     fn default() -> Self {
         Self {
@@ -1281,6 +1284,14 @@ pub struct ExecutionConfig {
     #[serde(default)] pub safety_margin_bps: u32,
     #[serde(default)] pub estimate_base_gas_usd: f64,
 
+    /// Margem de segurança em BPS reservada do orçamento de edge antes de
+    /// autorizar slippage. `used_slippage ≤ budget_bps − edge_safety_margin_bps`.
+    /// Se `budget_bps ≤ edge_safety_margin_bps`, a rota é rejeitada (fail-closed).
+    /// **Distinto de `safety_margin_bps`** (que é fator 0..=10000 para
+    /// `apply_slippage_safe`); este é uma reserva direta em BPS do edge.
+    #[serde(default = "default_edge_safety_margin_bps")]
+    pub edge_safety_margin_bps: u32,
+
     /// Buffer de drift quote→execução, em bps do notional. **Default 0.**
     ///
     /// NÃO é price impact: quotes já são impact-inclusive (ver `core::economics`).
@@ -1325,6 +1336,7 @@ impl Default for ExecutionConfig {
             hop_slippage_increase_bps: 5,       // 5 bps = 0.05% por hop adicional
             safety_margin_bps: 9800,            // 98% safety (BPS-like)
             estimate_base_gas_usd: 0.02,
+            edge_safety_margin_bps: default_edge_safety_margin_bps(),
         }
     }
 }

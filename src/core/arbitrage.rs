@@ -1029,8 +1029,19 @@ impl ArbitrageEngine {
     // ------------------------------------------------------------
     // 🛡️ Cálculo de Proteção contra Slippage (sem hardcodes, usa Config)
     // ------------------------------------------------------------
-    /// Slippage protection REALISTA e ACUMULATIVA
-    /// Lê base_slippage_bps, hop_increase_bps, safety_margin_bps e default dex/impact dos módulos de Config.
+    /// Slippage protection REALISTA e ACUMULATIVA, capada pelo edge líquido.
+    ///
+    /// Regra (orçamento de edge):
+    ///   budget_bps       = floor(net_profit_usd / trade_amount_usd * 10_000)
+    ///   allowed_total    = min(configured_slippage_bps,
+    ///                         budget_bps − edge_safety_margin_bps,
+    ///                         route_limit_bps)
+    ///   se budget_bps ≤ edge_safety_margin_bps → rejeita rota (fail-closed).
+    ///
+    /// O `route_limit_bps` estático (config) NUNCA autoriza slippage maior que
+    /// o edge líquido: ele entra só como um teto adicional dentro do `min`.
+    /// `safety_margin_bps` (fator 0..=10000 de `apply_slippage_safe`) é
+    /// **distinto** de `edge_safety_margin_bps` (reserva em BPS do edge).
     async fn calculate_slippage_protection(
         &self,
         steps: &mut [ArbitrageStep],
@@ -1041,15 +1052,39 @@ impl ArbitrageEngine {
     ) -> Result<()> {
         let mut current_amount = initial_amount;
 
-        // Ler parâmetros do Config
-        let configured_slippage_bps = app_config.execution.max_slippage_bps; // teto
-        let hop_increase_bps = app_config.execution.hop_slippage_increase_bps; // bps por hop extra
-        let safety_margin_bps = app_config.execution.safety_margin_bps; // 10000 = sem 2º haircut
+        let configured_slippage_bps = app_config.execution.max_slippage_bps; // teto por hop
+        let hop_increase_bps = app_config.execution.hop_slippage_increase_bps;
+        let safety_margin_bps = app_config.execution.safety_margin_bps; // fator apply_slippage_safe
+        let edge_safety_margin_bps = app_config.execution.edge_safety_margin_bps;
 
-        // Teto de slippage que ainda deixa a rota lucrativa. Sem isto, uma rota
-        // com edge de 20 bps carregava amount_out_min 250 bps abaixo do esperado
-        // — folga suficiente para um sandwich extrair 10x o edge e a tx ainda
-        // completar (com prejuízo) em vez de reverter.
+        // ----- Teto cumulativo efetivo (helper puro, gate inteiro) -----
+        // budget_bps = floor(net/trade*10_000); se budget ≤ margin → None → rejeita.
+        // allowed_total = min(configured, budget−margin, route_limit).
+        let hop_count = steps.len();
+        let route_limit_bps = (app_config.arbitrage.route_validation.max_cumulative_slippage
+            * 100.0)
+            .floor()
+            .max(economics::MIN_SLIPPAGE_BPS as f64 * hop_count as f64) as u32;
+        let allowed_total_bps = match economics::slippage_allowed_total_bps(
+            net_profit_usd,
+            trade_amount_usd,
+            edge_safety_margin_bps,
+            configured_slippage_bps,
+            route_limit_bps,
+        ) {
+            Some(v) => v,
+            None => {
+                let budget_bps = economics::edge_budget_bps(net_profit_usd, trade_amount_usd);
+                bail!(
+                    "edge líquido {} bps ≤ safety margin {} bps — rota sem folga de slippage (fail-closed)",
+                    budget_bps, edge_safety_margin_bps
+                );
+            }
+        };
+        let budget_bps = economics::edge_budget_bps(net_profit_usd, trade_amount_usd);
+        let edge_margin = edge_safety_margin_bps as i64;
+
+        // ----- Teto per-hop pelo edge (legacy helper, clamp [MIN, ceiling]) -----
         let base_slippage_bps = economics::max_slippage_bps_for_edge(
             net_profit_usd,
             trade_amount_usd,
@@ -1057,22 +1092,19 @@ impl ArbitrageEngine {
             configured_slippage_bps,
         );
 
-        if base_slippage_bps < configured_slippage_bps {
+        if allowed_total_bps < base_slippage_bps {
             debug!(
-                "🛡️ slippage apertado por orçamento de edge: {} → {} bps/hop (net=${:.6} em ${:.2}, {} hops)",
+                "🛡️ slippage apertado por orçamento de edge: teto/hop {} → {} bps total (net=${:.6} em ${:.2}, {} hops, budget={} bps, margin={} bps)",
                 configured_slippage_bps,
-                base_slippage_bps,
+                allowed_total_bps,
                 net_profit_usd,
                 trade_amount_usd,
-                steps.len()
+                hop_count,
+                budget_bps,
+                edge_margin
             );
         }
 
-        let hop_count = steps.len();
-        let route_limit_bps = (app_config.arbitrage.route_validation.max_cumulative_slippage
-            * 100.0)
-            .floor()
-            .max(economics::MIN_SLIPPAGE_BPS as f64 * hop_count as f64) as u32;
         let mut used_slippage_bps = 0u32;
 
         for (idx, step) in steps.iter_mut().enumerate() {
@@ -1093,21 +1125,21 @@ impl ArbitrageEngine {
                 )
                 .await;
 
-            // Limite de rota é orçamento total, não veto estático de 3 hops.
-            // Reserva piso para pernas restantes, preservando proteção efetiva.
+            // Proposto = base per-hop + aumento por hop extra. Cap cumulativo pelo
+            // MENOR entre configured/edge/route (allowed_total_bps), reservando o
+            // piso MIN_SLIPPAGE_BPS para cada perna restante — proteção efetiva.
             let proposed_slippage_bps = base_slippage_bps
                 .saturating_add((idx as u32).saturating_mul(hop_increase_bps));
             let remaining = hop_count.saturating_sub(idx + 1) as u32;
-            let max_here = route_limit_bps
+            let max_here = allowed_total_bps
                 .saturating_sub(used_slippage_bps)
                 .saturating_sub(remaining.saturating_mul(economics::MIN_SLIPPAGE_BPS));
             let adjusted_slippage_bps = proposed_slippage_bps
                 .min(max_here)
                 .max(economics::MIN_SLIPPAGE_BPS);
-            // Campo `price_impact_bps` é reutilizado para carregar o orçamento de
-            // slippage real (adjusted_slippage_bps) que o executor deve respeitar.
-            // NOTA: o nome é legado — não representa price impact real (que já vem
-            // embutido no quote fee-inclusive), e sim o slippage allowance por hop.
+            // Campo `price_impact_bps` carrega o orçamento de slippage real por hop
+            // que o executor respeita (nome legado — não é price impact, que já vem
+            // embutido no quote fee-inclusive).
             step.price_impact_bps = Some(adjusted_slippage_bps);
             used_slippage_bps = used_slippage_bps.saturating_add(adjusted_slippage_bps);
 
@@ -1133,11 +1165,20 @@ impl ArbitrageEngine {
             let min_f64 = u256_to_f64(step.amount_out_min, output_decimals);
 
             debug!(
-                "Step {}: {} -> {} | expected={:.6} | min={:.6} | slip={} bps | dex={}",
-                idx, step.token_in, step.token_out, output_f64, min_f64, adjusted_slippage_bps, step.dex_name
+                "Step {}: {} -> {} | expected={:.6} | min={:.6} | slip={} bps | cum={} bps | dex={}",
+                idx, step.token_in, step.token_out, output_f64, min_f64,
+                adjusted_slippage_bps, used_slippage_bps, step.dex_name
             );
 
             current_amount = expected_output;
+        }
+
+        // Assert final: slippage cumulativa nunca excede o budget de edge líquido.
+        if used_slippage_bps > allowed_total_bps {
+            bail!(
+                "slippage cumulativa {} bps > teto de edge {} bps — invariant violado",
+                used_slippage_bps, allowed_total_bps
+            );
         }
 
         Ok(())
