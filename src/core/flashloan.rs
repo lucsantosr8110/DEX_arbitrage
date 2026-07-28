@@ -1691,10 +1691,9 @@ impl ArbitrageClient {
                 return Ok(BundleResult::skipped()
                     .with_execution_mode("mev_relay_url_default_eth")
                     .with_outcome(ExecutionOutcome::AbortedPreBroadcast {
-                        reason:
-                            "mev.enabled com relay_url default Ethereum (flashbots.net) — \
+                        reason: "mev.enabled com relay_url default Ethereum (flashbots.net) — \
                              relay não cobre Polygon"
-                                .into(),
+                            .into(),
                     }));
             }
             if cfg.mev.private_relay_required {
@@ -1973,7 +1972,10 @@ impl ArbitrageClient {
                             || s.contains("nonce"));
                     if attempt + 1 >= max_retries {
                         let (mode_str, outcome) = if nonce_too_low {
-                            ("dropped_nonce_consumed", ExecutionOutcome::Dropped { nonce })
+                            (
+                                "dropped_nonce_consumed",
+                                ExecutionOutcome::Dropped { nonce },
+                            )
                         } else if already_known {
                             (
                                 "timeout_stuck",
