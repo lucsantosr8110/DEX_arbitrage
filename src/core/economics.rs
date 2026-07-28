@@ -146,6 +146,14 @@ pub fn flashloan_fee_usd_from_amount(
     flashloan_fee_usd(amount_usd, fee_pct)
 }
 
+/// B6 — fator de crescimento EIP-1559 do base_fee projetado `n` blocos à frente.
+/// `pow_bps(11_250, n)` = `1.125^n` (max 12.5%/bloco). Usado para precificar o
+/// custo de gas no EV (não o max_fee enviado). `pow_bps(10_000, n)` = 1.0.
+/// Razão `pow_bps(11_250, n) / pow_bps(10_000, n)` = `1.125^n`.
+pub fn pow_bps(numerator_bps: u32, exp: u32) -> f64 {
+    (numerator_bps as f64 / 10_000.0).powi(exp as i32)
+}
+
 /// Buffer opcional de drift quote→execução. **Não** é price impact.
 /// Single-hop (legado); prefira `compounded_adverse_move_usd` (B5).
 pub fn adverse_move_usd(trade_amount_usd: f64, adverse_move_bps: u32) -> f64 {
@@ -385,6 +393,20 @@ mod tests {
     fn adverse_move_is_opt_in() {
         assert_eq!(adverse_move_usd(100.0, 0), 0.0);
         assert!((adverse_move_usd(100.0, 25) - 0.25).abs() < 1e-12);
+    }
+
+    /// B6: pow_bps(11250,n)/pow_bps(10000,n) = 1.125^n (EIP-1559 12.5%/bloco).
+    /// n=0 → 1.0; n=1 → 1.125; n=2 → 1.265625.
+    #[test]
+    fn b6_pow_bps_eip1559_projection() {
+        assert!((pow_bps(11_250, 0) - 1.0).abs() < 1e-12);
+        assert!((pow_bps(11_250, 1) - 1.125).abs() < 1e-12);
+        let n2 = pow_bps(11_250, 2) / pow_bps(10_000, 2);
+        assert!((n2 - 1.265625).abs() < 1e-9, "1.125^2 = {}", n2);
+        // base_fee 100 gwei projetado 2 blocos → 126.5625 gwei (antes *1.05 = 105)
+        let projected = 100.0 * pow_bps(11_250, 2) / pow_bps(10_000, 2);
+        assert!(projected > 105.0, "projeção B6 > buffer 5%: {}", projected);
+        assert!((projected - 126.5625).abs() < 1e-9);
     }
 
     /// B5: haircut composto por hop. 1 hop ≡ legado; n hops > n*b (juros

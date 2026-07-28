@@ -332,13 +332,16 @@ where
         let base_fee_gwei = u256_to_f64(base_fee, 9);
         let priority_gwei = u256_to_f64(priority_fee, 9);
         let max_fee_gwei = u256_to_f64(max_fee, 9);
-        // A7: buffer de 5% sobre base_fee não cobre saltos de base_fee entre
-        // blocos na Polygon (pode passar de 5% em congestionamento). EIP-1559
-        // garante que o gas real pago = min(base_fee + priority, max_fee). Usar
-        // o max_fee como teto (pior caso) é conservador: superestima gás no gate
-        // → rejeita mais opps do que aprova perdedoras (fail-closed).
-        let eff_from_base = base_fee_gwei * 1.05 + priority_gwei;
-        let eff = eff_from_base.max(max_fee_gwei);
+        // B6: projeta base_fee `n` blocos à frente em 1.125^n (EIP-1559 max
+        // 12.5%/bloco) — buffer de 5% (A7) não cobre saltos entre blocos em
+        // congestionamento. n = expected_inclusion_blocks (default 2 → 1.2656×).
+        // Só precifica o CUSTO no EV; o max_fee enviado vem de populate_dynamic_gas.
+        // ceiling = max(projected, max_fee) — conserva o teto A7 como piso.
+        let n = gas_cfg.expected_inclusion_blocks;
+        let projected_base = base_fee_gwei * crate::core::economics::pow_bps(11_250, n)
+            / crate::core::economics::pow_bps(10_000, n);
+        let projected = projected_base + priority_gwei;
+        let eff = projected.max(max_fee_gwei);
 
         // B1/B2: gas units por venue, calibrado pelo oráculo EWMA quando houver
         // ≥20 amostras do venue (max(estático, ewma_p75); nunca abaixo do estático).

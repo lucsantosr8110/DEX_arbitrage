@@ -1254,6 +1254,11 @@ fn default_adverse_move_bps() -> u32 {
     5
 }
 
+/// B6: blocos esperados até inclusão (default 2).
+fn default_expected_inclusion_blocks() -> u32 {
+    2
+}
+
 impl Default for RouteValidationConfig {
     fn default() -> Self {
         Self {
@@ -1422,6 +1427,12 @@ pub struct GasConfig {
     #[serde(default)]
     pub estimated_gas_units: u64,
 
+    /// B6: número de blocos esperados até inclusão da tx. Projeta o base_fee
+    /// forward em `1.125^n` (EIP-1559 max 12.5%/bloco) para precificar o custo
+    /// de gas no EV. Default 2. Só afeta o EV (custo), nunca o `max_fee` enviado.
+    #[serde(default = "default_expected_inclusion_blocks")]
+    pub expected_inclusion_blocks: u32,
+
     /// Fail-closed em preço de native token (POL): quando true, `estimate_gas_usd`
     /// rejeita opp se o preço do WMATIC for fallback heurístico, stale ou ausente,
     /// em vez de cair no fallback. Default false preserva comportamento; ligar é
@@ -1466,6 +1477,7 @@ impl Default for GasConfig {
             min_priority_gwei: default_min_priority_gwei(),
             // flashloan Aave + 3 swaps ≈ 400k gás queimado
             estimated_gas_units: 400_000,
+            expected_inclusion_blocks: default_expected_inclusion_blocks(),
             require_fresh_native_price: false,
             native_price_max_stale_secs: 0,
             gas_oracle_path: None,
