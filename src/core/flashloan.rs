@@ -658,12 +658,16 @@ impl ArbitrageClient {
             return Ok(BundleResult::skipped().with_execution_mode("premium_cap"));
         }
 
-        // GAS — overhead Aave tipado por estratégia.
-        let n_hops = opp.steps.0.len().max(1);
+        // GAS — B1: venue-based route estimate. Flashloan path ⇒ AaveV3 overhead.
         let gas_kind = Self::gas_strategy_kind(&strategy);
+        let fl_provider = if gas_kind.include_flashloan_overhead() {
+            Some(crate::core::gas_profile::FlashloanProvider::AaveV3)
+        } else {
+            None
+        };
         let gas_cost = match self
             .gas_estimator
-            .estimate_gas_usd_for_hops(n_hops, gas_kind)
+            .estimate_gas_usd_for_route(&opp.steps.0, fl_provider)
             .await
         {
             Ok(v) => {
@@ -833,11 +837,13 @@ impl ArbitrageClient {
             .current_flashloan_fee_pct(pool_address.as_deref(), configured_fee_pct)
             .await;
 
-        // A6: paper valida flashloan → overhead WithFlashloan.
-        let n_hops = opp.steps.0.len().max(1);
+        // A6/B1: paper valida flashloan → overhead AaveV3, venue-based route.
         let gas_cost = match self
             .gas_estimator
-            .estimate_gas_usd_for_hops(n_hops, GasStrategyKind::WithFlashloan)
+            .estimate_gas_usd_for_route(
+                &opp.steps.0,
+                Some(crate::core::gas_profile::FlashloanProvider::AaveV3),
+            )
             .await
         {
             Ok(v) => {
@@ -1820,12 +1826,13 @@ impl ArbitrageClient {
                                     } else {
                                         GasStrategyKind::WithFlashloan
                                     };
+                                    let fl_provider = if gas_kind.include_flashloan_overhead() {
+                                        Some(crate::core::gas_profile::FlashloanProvider::AaveV3)
+                                    } else {
+                                        None
+                                    };
                                     self.gas_estimator
-                                        .observe_gas_used(
-                                            opp.steps.0.len().max(1),
-                                            gas_used,
-                                            gas_kind,
-                                        )
+                                        .observe_gas_used(&opp.steps.0, fl_provider, gas_used)
                                         .await;
                                 }
                                 // A1: sem evento de lucro decodificável (wrapper path

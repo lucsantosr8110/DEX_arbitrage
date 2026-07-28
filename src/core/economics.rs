@@ -34,7 +34,7 @@ pub const AAVE_V3_PREMIUM_PCT: f64 = 0.0005;
 
 /// Última estimativa VIVA de gás (micro-dólares; 0 = nunca publicada).
 ///
-/// Escrita por [`crate::core::gas::GasEstimator::estimate_arbitrage_gas_usd`],
+/// Escrita por [`crate::core::gas::GasEstimator::estimate_gas_usd_for_route`],
 /// lida pelo finder e pelo risk manager. Existe para que os três gates de lucro
 /// usem **o mesmo** número de gás em vez de três modelos divergentes (o finder
 /// usava um estático de config, o risk manager saturava num teto fixo de $0.10).

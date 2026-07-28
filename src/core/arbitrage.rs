@@ -988,7 +988,15 @@ impl ArbitrageEngine {
         let gross_profit_usd = economics::gross_profit_usd(trade_amount_usd, total_rate);
 
         // Custos reais, um de cada. NÃO deduzir fee/price impact de novo.
-        let gas_cost_usd = self.estimate_gas_cost(app_config, opp.steps.0.len()).await;
+        // B1: gas por venue (soma), provider = AaveV3 se a opp exige flashloan.
+        let fl_provider = if opp.force_flashloan {
+            Some(crate::core::gas_profile::FlashloanProvider::AaveV3)
+        } else {
+            None
+        };
+        let gas_cost_usd = self
+            .estimate_gas_cost(app_config, &opp.steps.0, fl_provider)
+            .await;
 
         let flashloan_fee_usd = if app_config.flashloan.enabled {
             let fee_pct = app_config
@@ -2160,11 +2168,18 @@ impl ArbitrageEngine {
     /// teto `max_path_length`. Antes rotas longas (4-5 hops) subestimavam custo
     /// → hurdle baixo → executa opps que dão prejuízo. O live publicado pelo
     /// executor é referência de 3 hops, então aplicamos o mesmo scale aqui.
-    async fn estimate_gas_cost(&self, app_config: &Config, n_hops: usize) -> f64 {
-        // A6: prefere a medição viva DA contagem de hops da rota (publicada pelo
-        // GasEstimator). Se houver, NÃO escala (já é do hops certo). Se não houver,
-        // cai no fallback estático (referência 3 hops) e escala via
-        // gas_cost_for_hops — preservando o comportamento M4 original.
+    async fn estimate_gas_cost(
+        &self,
+        app_config: &Config,
+        steps: &[ArbitrageStep],
+        _provider: Option<crate::core::gas_profile::FlashloanProvider>,
+    ) -> f64 {
+        // B1: o finder não tem GasEstimator (sem RPC de gas price aqui); usa a
+        // medição viva publicada pelo executor (agora por n_hops, A6) ou o
+        // fallback estático escalado. O gate venue-based canônico acontece no
+        // executor via `estimate_gas_usd_for_route`. `steps`/`_provider` ficam
+        // na assinatura para futura injeção de um GasEstimator leve no finder.
+        let n_hops = steps.len().max(1);
         if let Some(live) = economics::live_gas_usd_for_hops(n_hops) {
             return live;
         }
