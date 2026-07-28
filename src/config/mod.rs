@@ -1269,6 +1269,11 @@ pub(crate) fn default_loss_breaker_threshold() -> u32 {
     3
 }
 
+/// B8: stall de nonce antes do reaper cancelar (default 45s).
+fn default_nonce_stall_secs() -> u64 {
+    45
+}
+
 impl Default for RouteValidationConfig {
     fn default() -> Self {
         Self {
@@ -1685,6 +1690,13 @@ pub struct ExecutionConfig {
     /// de perda (kill switch consome). Estimated NÃO conta. Default 3.
     #[serde(default = "default_loss_breaker_threshold")]
     pub loss_breaker_threshold: u32,
+
+    /// B8: segundos que um nonce preso (gap pending_local > on_chain_pending)
+    /// persiste sem inclusão antes do reaper cancelá-lo com no-op agressivo.
+    // SAFETY-EV: Polygon ~2s/bloco; 45s ≈ 22 blocos sem inclusão = claramente
+    /// preso (não só lento). Abaixo disso cancelaria tx ainda válida.
+    #[serde(default = "default_nonce_stall_secs")]
+    pub nonce_stall_secs: u64,
 }
 
 impl Default for ExecutionConfig {
@@ -1730,6 +1742,7 @@ impl Default for ExecutionConfig {
             top_n_opportunities: default_top_n_opportunities(),
             profit_confirmations: default_profit_confirmations(),
             loss_breaker_threshold: default_loss_breaker_threshold(),
+            nonce_stall_secs: default_nonce_stall_secs(),
         }
     }
 }

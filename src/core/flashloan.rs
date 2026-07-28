@@ -131,6 +131,8 @@ pub struct ArbitrageClient {
     flashloan_fee_cache: Arc<Mutex<Option<(StdInstant, f64)>>>,
     /// B7: ledger de finalidade de lucro (provisory/final + reorg + loss CB).
     profit_ledger: Arc<tokio::sync::Mutex<crate::core::profit_ledger::ProfitLedger>>,
+    /// B8: nonce reaper (detecta/cancela nonces presos).
+    nonce_reaper: Arc<tokio::sync::Mutex<crate::core::nonce_reaper::NonceReaper>>,
 }
 
 impl ArbitrageClient {
@@ -171,6 +173,10 @@ impl ArbitrageClient {
                     crate::config::default_loss_breaker_threshold(),
                 ),
             )),
+            // B8: reaper de nonces presos.
+            nonce_reaper: Arc::new(tokio::sync::Mutex::new(
+                crate::core::nonce_reaper::NonceReaper::new(),
+            )),
         }
     }
 
@@ -196,6 +202,115 @@ impl ArbitrageClient {
     /// B7: acesso ao ledger (para watcher / telemetria externa).
     pub fn profit_ledger(&self) -> Arc<tokio::sync::Mutex<crate::core::profit_ledger::ProfitLedger>> {
         self.profit_ledger.clone()
+    }
+
+    /// B8: acesso ao reaper (telemetria / kill switch check externo).
+    pub fn nonce_reaper(&self) -> Arc<tokio::sync::Mutex<crate::core::nonce_reaper::NonceReaper>> {
+        self.nonce_reaper.clone()
+    }
+
+    /// B8: reaper — verifica nonces presos e cancela o mais baixo com no-op
+    /// agressivo (self-transfer 0). Re-fetch fresco de eth_getTransactionCount
+    /// (pending) ANTES de cancelar — nunca reusa nonce sem confirmar a chain.
+    /// Chamar no início de cada ciclo (antes de reservar novo nonce).
+    /// Retorna true se cancelou um nonce (gap recuperado).
+    pub async fn reap_stuck_nonces(&self) -> bool {
+        let sender = match self.get_wallet_address() {
+            Ok(a) => a,
+            Err(_) => return false,
+        };
+        let nonce_stall_secs = {
+            let cfg = self.config.lock().await;
+            cfg.execution.nonce_stall_secs
+        };
+        // Re-fetch fresco: eth_getTransactionCount pending (on_chain).
+        let on_chain_pending = match self
+            .middleware
+            .get_transaction_count(sender, Some(BlockId::Number(BlockNumber::Pending)))
+            .await
+        {
+            Ok(n) => n.as_u64(),
+            Err(e) => {
+                warn!(error = %e, "B8 reaper: falha ao buscar on_chain_pending");
+                let tripped = self.nonce_reaper.lock().await.record_failure();
+                if tripped {
+                    crate::infra::metrics::inc_counter("nonce_reaper_kill_switch");
+                }
+                return false;
+            }
+        };
+        self.reap_decide(sender, on_chain_pending, nonce_stall_secs).await
+    }
+
+    async fn reap_decide(&self, sender: Address, on_chain_pending: u64, stall: u64) -> bool {
+        let now = std::time::Instant::now();
+        let (verdict, pending_local) = {
+            let reaper = self.nonce_reaper.lock().await;
+            let pending_local = on_chain_pending + reaper.in_flight_count() as u64;
+            (reaper.verdict(pending_local, on_chain_pending, now, stall), pending_local)
+        };
+        match verdict {
+            crate::core::nonce_reaper::ReapVerdict::NoGap => {
+                self.nonce_reaper.lock().await.record_success();
+                false
+            }
+            crate::core::nonce_reaper::ReapVerdict::GapStalling { lowest, .. } => {
+                debug!(lowest, pending_local, "B8 reaper: gap stalling, sem cancel ainda");
+                false
+            }
+            crate::core::nonce_reaper::ReapVerdict::Reap { lowest } => {
+                // No-op cancel: self-transfer 0, gas agressivo, nonce = lowest.
+                // Re-fetch fresco ANTES de assinar (nunca reusar sem confirmar).
+                let fresh = self
+                    .middleware
+                    .get_transaction_count(sender, Some(BlockId::Number(BlockNumber::Pending)))
+                    .await
+                    .map(|n| n.as_u64())
+                    .unwrap_or(on_chain_pending);
+                if fresh > lowest {
+                    // nonce já foi incluído — não cancelar.
+                    self.nonce_reaper.lock().await.note_canceled(lowest);
+                    self.nonce_reaper.lock().await.record_success();
+                    return false;
+                }
+                let mut tx_req = Eip1559TransactionRequest::new()
+                    .from(sender)
+                    .to(sender)
+                    .value(U256::zero())
+                    .nonce(lowest);
+                // Gas agressivo: populate_dynamic_gas + bump 1.5× para substituir.
+                if let Ok((max_fee, priority)) =
+                    self.gas_estimator.populate_dynamic_gas(&mut tx_req).await
+                {
+                    let bump = U256::from(150u64);
+                    tx_req = tx_req
+                        .max_fee_per_gas(max_fee.saturating_mul(bump) / U256::from(100u64))
+                        .max_priority_fee_per_gas(
+                            priority.saturating_mul(bump) / U256::from(100u64),
+                        );
+                }
+                match self.middleware.send_transaction(tx_req, None).await {
+                    Ok(pending) => {
+                        info!(
+                            nonce = lowest, tx_hash = ?pending.tx_hash(),
+                            "🧹 B8 reaper: no-op cancel enviado para nonce preso"
+                        );
+                        self.nonce_reaper.lock().await.note_canceled(lowest);
+                        self.nonce_reaper.lock().await.record_success();
+                        crate::infra::metrics::inc_nonce_gaps_recovered();
+                        true
+                    }
+                    Err(e) => {
+                        warn!(nonce = lowest, error = %e, "B8 reaper: no-op cancel falhou");
+                        let tripped = self.nonce_reaper.lock().await.record_failure();
+                        if tripped {
+                            crate::infra::metrics::inc_counter("nonce_reaper_kill_switch");
+                        }
+                        false
+                    }
+                }
+            }
+        }
     }
 
     async fn current_flashloan_fee_pct(
@@ -1864,6 +1979,9 @@ impl ArbitrageClient {
         // aqui (uma vez) e fixá-lo no TypedTransaction faz ethers não re-fetch
         // nonce em cada call.send() — que era a raiz do bug double-execution.
         let sender = self.get_wallet_address()?;
+        // B8: reapa nonces presos antes de reservar um novo (libera o gap).
+        // Re-fetch fresco internamente — nunca reusa nonce sem confirmar chain.
+        self.reap_stuck_nonces().await;
         let nonce = match self
             .middleware
             .get_transaction_count(sender, Some(BlockId::Number(BlockNumber::Pending)))
@@ -1879,6 +1997,9 @@ impl ArbitrageClient {
                     }));
             }
         };
+        // B8: registra nonce como in-flight p/ o reaper rastrear stall.
+        let nonce_u64 = nonce.as_u64();
+        self.nonce_reaper.lock().await.note_broadcast(nonce_u64, std::time::Instant::now());
 
         let (mut max_fee, mut max_priority) = {
             let mut tx_req = Eip1559TransactionRequest::new();

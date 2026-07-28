@@ -88,6 +88,11 @@ pub static FINAL_PROFIT_USD: Lazy<Gauge> = Lazy::new(||
     register_gauge!("final_profit_usd", "Lucro final (≥ profit_confirmations) em USD").unwrap()
 );
 
+/// B8: nonces presos recuperados pelo reaper (no-op cancel).
+pub static NONCE_GAPS_RECOVERED: Lazy<IntCounter> = Lazy::new(||
+    register_int_counter!("nonce_gaps_recovered", "Nonces presos cancelados pelo reaper").unwrap()
+);
+
 pub static DEX_REQUESTS: Lazy<IntCounter> =
     Lazy::new(|| register_int_counter!("dex_requests_total", "Total de requisições a DEXs").unwrap());
 
@@ -191,6 +196,11 @@ pub fn inc_reorg_reverted_trades() {
 pub fn set_profit_finality(provisory_usd: f64, final_usd: f64) {
     PROVISORY_PROFIT_USD.set(provisory_usd);
     FINAL_PROFIT_USD.set(final_usd);
+}
+
+/// B8: incrementa contador de nonces recuperados pelo reaper.
+pub fn inc_nonce_gaps_recovered() {
+    NONCE_GAPS_RECOVERED.inc();
 }
 
 pub fn get_hit_rate() -> f64 {

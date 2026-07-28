@@ -10,6 +10,7 @@ pub mod flashloan;
 pub mod gas;
 pub mod gas_oracle;
 pub mod gas_profile;
+pub mod nonce_reaper;
 pub mod paper_validation;
 pub mod profit_ledger;
 pub mod replay_cross_model;
