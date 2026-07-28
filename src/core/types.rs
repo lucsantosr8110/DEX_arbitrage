@@ -517,3 +517,75 @@ impl From<SerializableSteps> for Vec<ArbitrageStep> {
         s.0
     }
 }
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::*;
+
+    #[test]
+    fn revert_is_not_skipped_and_distinct_from_same_block() {
+        let h = H256::repeat_byte(0xAB);
+        let reverted = ExecutionOutcome::Reverted {
+            tx_hash: h,
+            reason: Some("execution reverted".into()),
+            gas_used: Some(U256::from(21_000)),
+        };
+        let same_block = ExecutionOutcome::SameBlockRejected { tx_hash: None };
+
+        // Revert é execução on-chain falha — NUNCA skip.
+        assert!(reverted.is_executed_onchain());
+        assert!(reverted.is_reverted());
+        assert!(!reverted.is_confirmed());
+        // SameBlock é distinto de Reverted: não é execução on-chain.
+        assert!(!same_block.is_executed_onchain());
+        assert!(!same_block.is_reverted());
+        assert_ne!(reverted, same_block);
+    }
+
+    #[test]
+    fn confirmed_vs_loss_classified_by_sign() {
+        let h = H256::repeat_byte(0x01);
+        let profit = ExecutionOutcome::ConfirmedProfit {
+            tx_hash: h,
+            realized_profit_usd: 0.5,
+            gas_used: U256::from(200_000),
+        };
+        let loss = ExecutionOutcome::ConfirmedLoss {
+            tx_hash: h,
+            realized_loss_usd: 0.1,
+            gas_used: U256::from(200_000),
+        };
+        assert!(profit.is_confirmed());
+        assert!(loss.is_confirmed());
+        assert!(!profit.is_reverted());
+        assert_ne!(profit, loss);
+    }
+
+    #[test]
+    fn timeout_stuck_and_dropped_carry_nonce_distinct() {
+        let n = U256::from(7);
+        let stuck = ExecutionOutcome::TimeoutStuck { nonce: n, latest_tx_hash: None };
+        let dropped = ExecutionOutcome::Dropped { nonce: n };
+        // Ambos carregam o nonce reservado (não sumiu); estados distintos.
+        assert_ne!(stuck, dropped);
+        assert!(!stuck.is_executed_onchain());
+        assert!(!dropped.is_executed_onchain());
+    }
+
+    #[test]
+    fn bundle_result_with_reverted_outcome_is_not_a_plain_skip() {
+        let h = H256::repeat_byte(0x02);
+        let res = BundleResult::skipped()
+            .with_execution_mode("tx_reverted")
+            .with_tx_hash(Some(format!("{:?}", h)))
+            .with_outcome(ExecutionOutcome::Reverted {
+                tx_hash: h,
+                reason: None,
+                gas_used: None,
+            });
+        // success/accepted falsos (não foi lucro), mas outcome explícito = Reverted.
+        assert!(!res.success);
+        assert_eq!(res.execution_mode.as_deref(), Some("tx_reverted"));
+        assert!(res.outcome.as_ref().unwrap().is_reverted());
+    }
+}

@@ -1067,6 +1067,19 @@ impl ArbitrageEngine {
         let safety_margin_bps = app_config.execution.safety_margin_bps; // fator apply_slippage_safe
         let edge_safety_margin_bps = app_config.execution.edge_safety_margin_bps;
 
+        // FASE 6 — modo degradado em mempool público (relay privado indisponível):
+        // aperta o teto de slippage por hop e exige edge mínimo maior p/ compensar
+        // a exposição a MEV/sandwich que o relay privado evitaria.
+        let mev_enabled = app_config.mev.enabled;
+        let public_degraded = !mev_enabled;
+        let degraded_slippage_cap = app_config.mev.public_mempool_degraded_slippage_bps;
+        let public_min_edge_bps = app_config.mev.public_mempool_min_edge_bps as i64;
+        let effective_configured_bps = if public_degraded {
+            configured_slippage_bps.min(degraded_slippage_cap)
+        } else {
+            configured_slippage_bps
+        };
+
         // ----- Teto cumulativo efetivo (helper puro, gate inteiro) -----
         // budget_bps = floor(net/trade*10_000); se budget ≤ margin → None → rejeita.
         // allowed_total = min(configured, budget−margin, route_limit).
@@ -1079,7 +1092,7 @@ impl ArbitrageEngine {
             net_profit_usd,
             trade_amount_usd,
             edge_safety_margin_bps,
-            configured_slippage_bps,
+            effective_configured_bps,
             route_limit_bps,
         ) {
             Some(v) => v,
@@ -1092,6 +1105,14 @@ impl ArbitrageEngine {
             }
         };
         let budget_bps = economics::edge_budget_bps(net_profit_usd, trade_amount_usd);
+
+        // FASE 6 — modo degradado exige edge mínimo maior no mempool público.
+        if public_degraded && budget_bps < public_min_edge_bps {
+            bail!(
+                "edge {} bps < mínimo degradado em mempool público {} bps — rejeita (fail-closed, MEV exposure)",
+                budget_bps, public_min_edge_bps
+            );
+        }
         let edge_margin = edge_safety_margin_bps as i64;
 
         // ----- Teto per-hop pelo edge (legacy helper, clamp [MIN, ceiling]) -----
@@ -1099,19 +1120,27 @@ impl ArbitrageEngine {
             net_profit_usd,
             trade_amount_usd,
             steps.len(),
-            configured_slippage_bps,
+            effective_configured_bps,
         );
 
         if allowed_total_bps < base_slippage_bps {
             debug!(
-                "🛡️ slippage apertado por orçamento de edge: teto/hop {} → {} bps total (net=${:.6} em ${:.2}, {} hops, budget={} bps, margin={} bps)",
-                configured_slippage_bps,
+                "🛡️ slippage apertado por orçamento de edge: teto/hop {} → {} bps total (net=${:.6} em ${:.2}, {} hops, budget={} bps, margin={} bps{})",
+                effective_configured_bps,
                 allowed_total_bps,
                 net_profit_usd,
                 trade_amount_usd,
                 hop_count,
                 budget_bps,
-                edge_margin
+                edge_margin,
+                if public_degraded { " [PublicMempoolDegraded]" } else { "" }
+            );
+        }
+        if public_degraded {
+            info!(
+                "⚠️ PublicMempoolDegraded: relay privado indisponível (mev.enabled=false) — \
+                 slippage cap {} bps, edge mínimo {} bps",
+                degraded_slippage_cap, public_min_edge_bps
             );
         }
 

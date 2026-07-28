@@ -458,3 +458,39 @@ pub fn should_try_next_opp(res: &BundleResult) -> bool {
         Some(ExecutionOutcome::AbortedPreBroadcast { .. })
     )
 }
+
+#[cfg(test)]
+mod should_try_next_tests {
+    use super::*;
+    use ethers::types::U256;
+
+    #[test]
+    fn continues_only_on_aborted_pre_broadcast() {
+        let aborted = BundleResult::skipped().with_outcome(
+            ExecutionOutcome::AbortedPreBroadcast { reason: "sim failed".into() },
+        );
+        assert!(should_try_next_opp(&aborted));
+
+        let h = ethers::types::H256::repeat_byte(0x1);
+        let reverted = BundleResult::skipped().with_outcome(ExecutionOutcome::Reverted {
+            tx_hash: h,
+            reason: None,
+            gas_used: None,
+        });
+        assert!(!should_try_next_opp(&reverted), "revert é terminal — não tenta próxima");
+
+        let stuck = BundleResult::skipped().with_outcome(ExecutionOutcome::TimeoutStuck {
+            nonce: U256::from(1),
+            latest_tx_hash: Some(h),
+        });
+        assert!(!should_try_next_opp(&stuck), "timeout stuck é terminal");
+
+        let same_block = BundleResult::skipped().with_outcome(
+            ExecutionOutcome::SameBlockRejected { tx_hash: None },
+        );
+        assert!(!should_try_next_opp(&same_block), "same-block não tenta próxima");
+
+        let no_outcome = BundleResult::skipped();
+        assert!(!should_try_next_opp(&no_outcome), "sem outcome = não continua");
+    }
+}

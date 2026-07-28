@@ -300,6 +300,21 @@ pub struct MevConfig {
     #[serde(default)] pub min_tip_matic: String,
     #[serde(default)] pub target_block_offset: u64,
     #[serde(default)] pub timeout_seconds: u64,
+
+    /// Se true, execução só pode seguir por relay privado (BundleSender). Se o
+    /// relay estiver indisponível (mev.enabled=false ou ExecutionEngine ausente),
+    /// a opp é abortada pré-broadcast (fail-closed) — nunca cai no mempool público.
+    #[serde(default)] pub private_relay_required: bool,
+
+    /// No modo degradado (mempool público, relay indisponível), teto de slippage
+    /// por hop mais apertado que `max_slippage_bps`. Default 20 bps.
+    #[serde(default = "default_public_mempool_degraded_slippage_bps")]
+    pub public_mempool_degraded_slippage_bps: u32,
+
+    /// No modo degradado, edge mínimo (em bps) abaixo do qual a opp é rejeitada
+    /// — mempool público exige edge maior p/ compensar exposição a MEV. Default 10.
+    #[serde(default = "default_public_mempool_min_edge_bps")]
+    pub public_mempool_min_edge_bps: u32,
 }
 impl Default for MevConfig {
     fn default() -> Self {
@@ -310,9 +325,15 @@ impl Default for MevConfig {
             min_tip_matic: "0.1".to_string(),
             target_block_offset: 1,
             timeout_seconds: 10,
+            private_relay_required: false,
+            public_mempool_degraded_slippage_bps: default_public_mempool_degraded_slippage_bps(),
+            public_mempool_min_edge_bps: default_public_mempool_min_edge_bps(),
         }
     }
 }
+
+fn default_public_mempool_degraded_slippage_bps() -> u32 { 20 }
+fn default_public_mempool_min_edge_bps() -> u32 { 10 }
 
 // ===============================
 // Cooldown, rate limiting e deduplicacao

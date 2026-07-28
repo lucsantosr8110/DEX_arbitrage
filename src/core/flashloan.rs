@@ -1578,6 +1578,39 @@ impl ArbitrageClient {
             }
         }
 
+        // FASE 6 — relay privado obrigatório: se o operador exigir mempool privado
+        // e o caminho de envio via ExecutionEngine/BundleSender não estiver ativo,
+        // aborta pré-broadcast (fail-closed). Nunca cai no mempool público quando
+        // o relay é requisitado. (O routing via BundleSender é o ponto pendente;
+        // até estar wired, private_relay_required=true aborta todas as sends.)
+        {
+            let cfg = self.config.lock().await;
+            if cfg.mev.private_relay_required {
+                let routing_active = cfg.mev.enabled && self.execution_engine.is_some();
+                if !routing_active {
+                    warn!(
+                        "🚫 ABORT pre-broadcast: private_relay_required=true mas routing via \
+                         BundleSender inativo (mev.enabled={}, engine={})",
+                        cfg.mev.enabled,
+                        self.execution_engine.is_some()
+                    );
+                    return Ok(BundleResult::skipped()
+                        .with_execution_mode("private_relay_unavailable")
+                        .with_outcome(ExecutionOutcome::AbortedPreBroadcast {
+                            reason: "private relay required but BundleSender routing inactive"
+                                .into(),
+                        }));
+                }
+            }
+            if !cfg.mev.enabled {
+                info!(
+                    "⚠️ PublicMempoolDegraded: enviando via mempool público (relay privado off). \
+                     private_relay_required={}",
+                    cfg.mev.private_relay_required
+                );
+            }
+        }
+
         // Política de retry/RBF. Uma tentativa lógica = um nonce. Retry = replacement
         // (mesmo nonce + gas maior), nunca nonce novo. Evita double execution: duas
         // txs com nonces distintos que ambas incluem e ambas executam a arbitragem.
