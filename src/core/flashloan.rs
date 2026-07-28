@@ -1667,6 +1667,27 @@ impl ArbitrageClient {
         // até estar wired, private_relay_required=true aborta todas as sends.)
         {
             let cfg = self.config.lock().await;
+            // A5: relay_url default = flashbots.net (Ethereum mainnet). Polygon não
+            // é coberto por esse relay. Se o operador liga mev.enabled sem trocar a
+            // URL p/ um relay Polygon válido, eth_sendBundle vai p/ relay errado e
+            // toda opp falha (ou rejeita silenciosamente). Fail-closed explícito —
+            // não inventa URL Polygon.
+            const DEFAULT_ETH_RELAY: &str = "https://relay.flashbots.net";
+            if cfg.mev.enabled && cfg.mev.relay_url == DEFAULT_ETH_RELAY {
+                warn!(
+                    "🚫 ABORT pre-broadcast: mev.enabled=true mas relay_url é o default \
+                     Ethereum (flashbots.net) — Polygon não coberto. Configure um relay \
+                     MEV Polygon válido ou desative mev.enabled"
+                );
+                return Ok(BundleResult::skipped()
+                    .with_execution_mode("mev_relay_url_default_eth")
+                    .with_outcome(ExecutionOutcome::AbortedPreBroadcast {
+                        reason:
+                            "mev.enabled com relay_url default Ethereum (flashbots.net) — \
+                             relay não cobre Polygon"
+                                .into(),
+                    }));
+            }
             if cfg.mev.private_relay_required {
                 let routing_active = cfg.mev.enabled && self.execution_engine.is_some();
                 if !routing_active {
