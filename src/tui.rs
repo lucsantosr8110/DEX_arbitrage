@@ -61,6 +61,12 @@ pub struct TuiState {
     /// thread do bot_task — se ela bloqueava em process_prices().await,
     /// o uptime congelava junto.
     pub start: Instant,
+    /// Fase atual de inicialização exibida no splash screen.
+    pub startup_phase: String,
+    /// Startup finalizado — a partir daqui mostra dashboard completo.
+    pub startup_done: bool,
+    /// Erro fatal durante startup (ex.: RPC indisponível).
+    pub startup_error: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -105,7 +111,24 @@ impl Default for TuiState {
             last_update: None,
             render_tick: 0,
             start: Instant::now(),
+            startup_phase: "Inicializando...".into(),
+            startup_done: false,
+            startup_error: None,
         }
+    }
+}
+
+impl TuiState {
+    pub fn set_startup_phase(&mut self, phase: &str) {
+        self.startup_phase = phase.into();
+    }
+
+    pub fn mark_startup_done(&mut self) {
+        self.startup_done = true;
+    }
+
+    pub fn mark_startup_error(&mut self, err: String) {
+        self.startup_error = Some(err);
     }
 }
 
@@ -221,8 +244,15 @@ impl TuiApp {
                 s.uptime = s.start.elapsed();
             }
 
-            // Draw: ignoramos erro de resize (terminal muito pequeno).
-            let _ = terminal.draw(|f| self.draw(f));
+            // Draw: splash durante startup, dashboard depois.
+            let startup_done = self.state.read().map(|s| s.startup_done).unwrap_or(false);
+            let _ = terminal.draw(|f| {
+                if startup_done {
+                    self.draw(f);
+                } else {
+                    self.draw_splash(f);
+                }
+            });
 
             // Leitura NÃO-BLOQUEANTE de eventos via canal mpsc.
             // A thread dedicada (spawnada em TuiApp::new) lê do crossterm
@@ -616,6 +646,91 @@ impl TuiApp {
                 .border_style(Style::default().fg(Color::Gray)),
         );
         f.render_widget(footer, area);
+    }
+
+    /// Splash screen exibida durante a inicialização, antes do dashboard.
+    /// Mostra a fase atual, uptime e instruções — dá feedback imediato ao
+    /// operador quando RPC/DexManager/Bot ainda estão subindo.
+    fn draw_splash(&self, f: &mut Frame) {
+        let state = self.blocking_read();
+
+        let area = f.area();
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(20),
+                Constraint::Percentage(60),
+                Constraint::Percentage(20),
+            ])
+            .split(area);
+
+        let uptime_str = format!(
+            "{:02}:{:02}:{:02}",
+            state.uptime.as_secs() / 3600,
+            (state.uptime.as_secs() % 3600) / 60,
+            state.uptime.as_secs() % 60
+        );
+
+        let phase_color = if state.startup_error.is_some() {
+            Color::Red
+        } else {
+            Color::Yellow
+        };
+
+        let status_text = match &state.startup_error {
+            Some(err) => format!("Erro: {}", err),
+            None => state.startup_phase.clone(),
+        };
+
+        let body = Paragraph::new(vec![
+            Line::from(vec![Span::styled(
+                "  ⚡ DEX Arbitrage Bot",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  Status: ", Style::default().fg(Color::Gray)),
+                Span::styled(
+                    "INICIALIZANDO",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("  Fase:   ", Style::default().fg(Color::Gray)),
+                Span::styled(status_text, Style::default().fg(phase_color)),
+            ]),
+            Line::from(vec![
+                Span::styled("  Uptime: ", Style::default().fg(Color::Gray)),
+                Span::raw(uptime_str),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::raw("  Pressione "),
+                Span::styled(
+                    "q",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" ou "),
+                Span::styled(
+                    "Esc",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" para sair"),
+            ]),
+        ])
+        .alignment(ratatui::layout::Alignment::Center)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Inicializando ")
+                .border_style(Style::default().fg(Color::Cyan)),
+        );
+
+        f.render_widget(body, chunks[1]);
     }
 
     fn blocking_read(&self) -> TuiState {

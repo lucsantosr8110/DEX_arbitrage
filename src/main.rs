@@ -28,7 +28,7 @@ use flashloan_bot::{
             TopSpreadInfo,
         },
     },
-    emergency_shutdown::{self, EMERGENCY_SHUTDOWN},
+    emergency_shutdown::{self},
     // execution:: imports removidos: ExecutionEngine/MevConfig/gwei eram codigo morto
     infra::{
         metrics,
@@ -38,6 +38,35 @@ use flashloan_bot::{
     tui,
     utils::telegram::TelegramNotifier,
 };
+
+/// Detecta modo headless (sem TUI): PAPER_VALIDATION, BOT_NO_TUI=1 ou
+/// BOT_TUI=0 desligam a interface. Usado tanto no setup de logs quanto no
+/// spawn da TUI para manter comportamento único.
+fn headless_mode() -> bool {
+    fn env_true(name: &str) -> bool {
+        std::env::var(name)
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    }
+    fn env_false(name: &str) -> bool {
+        std::env::var(name)
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "no" | "off"
+                )
+            })
+            .unwrap_or(false)
+    }
+    env_true("BOT_NO_TUI")
+        || env_false("BOT_TUI")
+        || flashloan_bot::core::paper_validation::env_paper_flag()
+}
 
 // ============================================================
 // 0️⃣.5 FUNÇÃO AUXILIAR PARA LOG DE CONFIGURAÇÃO
@@ -165,6 +194,60 @@ fn top_spread_row_from_info(i: TopSpreadInfo) -> tui::TopSpreadRow {
     }
 }
 
+/// Guarda o JoinHandle da TUI e faz join com timeout no Drop. Isso garante
+/// que, em qualquer caminho de saída do main (Ok, Err, early return), o
+/// terminal seja restaurado antes do processo morrer. Sem isso, erros de
+/// startup deixavam a TUI thread órfã em raw mode.
+struct TuiGuard {
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Envia broadcast de shutdown quando dropped, assegurando que a thread da
+/// TUI saia do loop e execute o cleanup do terminal mesmo em caminhos de
+/// erro (retornos com `?`) que não dispararam shutdown explicitamente.
+struct ShutdownOnDrop(broadcast::Sender<()>);
+
+impl Drop for ShutdownOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
+
+impl TuiGuard {
+    fn join_with_timeout(&mut self, timeout: Duration) {
+        if let Some(handle) = self.handle.take() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = handle.join();
+                let _ = tx.send(());
+            });
+            if rx.recv_timeout(timeout).is_err() {
+                warn!("⚠️ TUI não finalizou em {:?} — prosseguindo.", timeout);
+            }
+        }
+    }
+}
+
+impl Drop for TuiGuard {
+    fn drop(&mut self) {
+        self.join_with_timeout(Duration::from_secs(5));
+    }
+}
+
+/// Restaura o terminal quando shutdown ocorre durante startup. A TUI thread
+/// já faz seu próprio cleanup ao sair do run_inner; este helper garante que
+/// esperemos ela por um curto prazo e registremos o estado de erro.
+fn graceful_startup_cleanup(
+    tui_guard: &mut TuiGuard,
+    tui_state: Arc<std::sync::RwLock<tui::TuiState>>,
+) -> Result<()> {
+    if let Ok(mut s) = tui_state.write() {
+        s.mark_startup_error("Shutdown solicitado durante inicialização".into());
+    }
+    tui_guard.join_with_timeout(Duration::from_secs(3));
+    Ok(())
+}
+
 // ============================================================
 // MAIN
 // ============================================================
@@ -179,10 +262,12 @@ async fn main() -> Result<()> {
         == "true";
 
     let env_filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
+    let headless = headless_mode();
 
     // TUI ocupa terminal inteiro (alternate screen). Logs direto no stdout
     // colidem com o buffer da TUI e aparecem como texto solto fora das boxes.
-    // Por isso logs vão sempre pra arquivo enquanto TUI roda.
+    // Por isso logs vão só pro arquivo quando a TUI roda. Em headless espelha
+    // também no stdout para o operador acompanhar o startup.
     std::fs::create_dir_all("logs").context("❌ Falha ao criar diretório logs/")?;
     let log_file = std::fs::OpenOptions::new()
         .create(true)
@@ -211,13 +296,32 @@ async fn main() -> Result<()> {
             .with_target(false)
             .with_writer(writer);
 
+        let stdout_layer = if headless {
+            let stdout_writer =
+                std::sync::Mutex::new(std::io::stdout()).with_max_level(Level::INFO);
+            Some(
+                fmt::layer()
+                    .compact()
+                    .with_ansi(false)
+                    .with_target(false)
+                    .with_writer(stdout_writer),
+            )
+        } else {
+            None
+        };
+
         tracing_subscriber::registry()
             .with(filter)
             .with(fmt_layer)
+            .with(stdout_layer)
             .init();
     }
 
-    info!("🧾 Logging habilitado em logs/bot.log (TUI usa terminal).");
+    if headless {
+        info!("🧾 Headless: logs em logs/bot.log + stdout.");
+    } else {
+        info!("🧾 Logging habilitado em logs/bot.log (TUI usa terminal).");
+    }
 
     info!("🚀 Iniciando Flashloan DEX Arbitrage Bot v4.8.4-HYBRID-SAFE...");
 
@@ -296,10 +400,34 @@ async fn main() -> Result<()> {
     // Criado o mais cedo possível para que TUI, metrics, health-checker e
     // listener Ctrl+C independente possam se inscrever.
     let (shutdown_tx, _) = broadcast::channel::<()>(4);
+    let _shutdown_on_drop = ShutdownOnDrop(shutdown_tx.clone());
     emergency_shutdown::spawn_emergency_watchdog();
 
+    // ── TUI sobe o mais cedo possível para dar feedback de startup ──
+    // Antes a TUI só aparecia depois de HTTP/WS/DexManager/Bot, então o
+    // operador via uma tela preta por segundos (ou indefinidamente se RPC
+    // travasse). Agora mostramos splash screen com a fase de inicialização.
+    let tui_state = Arc::new(std::sync::RwLock::new(tui::TuiState::default()));
+    let tui_enabled = !headless;
+    let mut tui_handle = TuiGuard {
+        handle: if tui_enabled {
+            Some(tui::spawn_tui(tui_state.clone(), shutdown_tx.clone()))
+        } else {
+            info!("📄 Headless: TUI desabilitado (logs em logs/bot.log)");
+            None
+        },
+    };
+
+    fn tui_phase(state: &Arc<std::sync::RwLock<tui::TuiState>>, phase: &str) {
+        if let Ok(mut s) = state.write() {
+            s.set_startup_phase(phase);
+        }
+    }
+
     // Listener Ctrl+C em runtime separado: se o runtime principal travar em RPC,
-    // este thread ainda consegue receber o sinal e forçar a saída.
+    // este thread ainda consegue receber o sinal. Agora ele primeiro tenta o
+    // shutdown gracioso via broadcast; só ativa a saída de emergência depois
+    // de uma janela maior, evitando que um Ctrl+C casual mate o processo em 5s.
     {
         let shutdown_tx = shutdown_tx.clone();
         std::thread::spawn(move || {
@@ -309,8 +437,12 @@ async fn main() -> Result<()> {
             if let Ok(rt) = rt {
                 rt.block_on(async {
                     let _ = tokio::signal::ctrl_c().await;
-                    EMERGENCY_SHUTDOWN.store(true, std::sync::atomic::Ordering::Relaxed);
+                    warn!("🛑 Ctrl+C antecipado — solicitando shutdown gracioso.");
                     let _ = shutdown_tx.send(());
+                    // Se o runtime principal estiver realmente preso, o shutdown
+                    // gracioso não finaliza. Depois de 8s forçamos emergência.
+                    tokio::time::sleep(Duration::from_secs(8)).await;
+                    emergency_shutdown::request_emergency_shutdown();
                 });
             }
             // watchdog cuida do exit forçado
@@ -373,38 +505,71 @@ async fn main() -> Result<()> {
 
     let private_key = std::env::var("PRIVATE_KEY").context("❌ PRIVATE_KEY ausente no .env")?;
 
-    let client_http = RpcProvider::connect_http_with_fallback(
-        &cfg_unlocked.network,
-        &private_key,
-        &rpc_endpoints,
-    )
-    .await
-    .context("❌ Falha ao conectar via HTTP (fallback esgotado)")?;
+    tui_phase(&tui_state, "conectando RPC HTTP...");
+    let client_http = {
+        let mut sd_rx = shutdown_tx.subscribe();
+        tokio::select! {
+            _ = sd_rx.recv() => {
+                info!("🔌 Shutdown durante conexão HTTP — abortando startup.");
+                return graceful_startup_cleanup(&mut tui_handle, tui_state);
+            }
+            res = RpcProvider::connect_http_with_fallback(
+                &cfg_unlocked.network,
+                &private_key,
+                &rpc_endpoints,
+            ) => res.context("❌ Falha ao conectar via HTTP (fallback esgotado)")?,
+        }
+    };
 
     let chain_id = client_http.get_chainid().await?.as_u64();
     info!("🌐 RPC HTTP conectado (chain_id = {}).", chain_id);
 
-    info!("📡 Conectando WebSocket...");
-    let client_ws: Arc<Provider<Ws>> = RpcProvider::connect_ws(&cfg_unlocked.network)
-        .await
-        .context("❌ Falha ao conectar via WebSocket")?;
+    tui_phase(&tui_state, "conectando WebSocket...");
+    let client_ws: Arc<Provider<Ws>> = {
+        let mut sd_rx = shutdown_tx.subscribe();
+        tokio::select! {
+            _ = sd_rx.recv() => {
+                info!("🔌 Shutdown durante conexão WS — abortando startup.");
+                return graceful_startup_cleanup(&mut tui_handle, tui_state);
+            }
+            res = RpcProvider::connect_ws(&cfg_unlocked.network) => {
+                res.context("❌ Falha ao conectar via WebSocket")?
+            }
+        }
+    };
     info!("✅ WebSocket conectado.");
 
     // ============================================================
     // 5️⃣ DexManager
     // ============================================================
-    let dex_manager = Arc::new(
-        DexManager::new(client_http.clone(), cfg_unlocked.clone())
-            .await
-            .context("❌ Falha ao inicializar DexManager")?,
-    );
+    tui_phase(&tui_state, "inicializando DexManager...");
+    let dex_manager = Arc::new({
+        let mut sd_rx = shutdown_tx.subscribe();
+        tokio::select! {
+            _ = sd_rx.recv() => {
+                info!("🔌 Shutdown durante DexManager — abortando startup.");
+                return graceful_startup_cleanup(&mut tui_handle, tui_state);
+            }
+            res = DexManager::new(client_http.clone(), cfg_unlocked.clone()) => {
+                res.context("❌ Falha ao inicializar DexManager")?
+            }
+        }
+    });
     info!("🧩 DexManager inicializado com sucesso.");
     // Health-checker como task sinalizada: antes era tokio::spawn detached
     // sem shutdown_rx (leaked até o processo morrer). Agora recebe broadcast
     // e sai limpo no shutdown.
-    dex_manager
-        .start_health_checker(shutdown_tx.subscribe())
-        .await;
+    tui_phase(&tui_state, "iniciando health checker...");
+    {
+        let mut sd_rx = shutdown_tx.subscribe();
+        tokio::select! {
+            _ = sd_rx.recv() => {
+                info!("🔌 Shutdown durante health checker — abortando startup.");
+                return graceful_startup_cleanup(&mut tui_handle, tui_state);
+            }
+            _ = dex_manager.start_health_checker(shutdown_tx.subscribe()) => {}
+        }
+    }
 
     // ============================================================
     // 6️⃣ ExecutionEngine removido (codigo morto)
@@ -422,17 +587,25 @@ async fn main() -> Result<()> {
     // ============================================================
     // 8️⃣ Inicialização do Bot
     // ============================================================
-    let bot =
-        match Bot::init_with_engine(client_http.clone(), config.clone(), telegram.clone(), None)
-            .await
-        {
-            Ok(bot) => bot,
-            Err(e) => {
-                warn!("⚠️ Bot::init_with_engine() falhou: {:?}", e);
-                Bot::new_with_engine(client_http.clone(), config.clone(), telegram.clone(), None)
-                    .await
+    tui_phase(&tui_state, "inicializando Bot...");
+    let bot = {
+        let mut sd_rx = shutdown_tx.subscribe();
+        tokio::select! {
+            _ = sd_rx.recv() => {
+                info!("🔌 Shutdown durante inicialização do Bot — abortando startup.");
+                return graceful_startup_cleanup(&mut tui_handle, tui_state);
             }
-        };
+            res = async {
+                match Bot::init_with_engine(client_http.clone(), config.clone(), telegram.clone(), None).await {
+                    Ok(bot) => bot,
+                    Err(e) => {
+                        warn!("⚠️ Bot::init_with_engine() falhou: {:?}", e);
+                        Bot::new_with_engine(client_http.clone(), config.clone(), telegram.clone(), None).await
+                    }
+                }
+            } => res
+        }
+    };
 
     let bot = Arc::new(Mutex::new(bot));
 
@@ -468,18 +641,6 @@ async fn main() -> Result<()> {
     // ============================================================
     let (price_tx, price_rx) = mpsc::channel::<HashMap<String, HashMap<String, f64>>>(256);
     let price_rx = Arc::new(Mutex::new(price_rx));
-
-    let tui_state = Arc::new(std::sync::RwLock::new(tui::TuiState::default()));
-    // Paper/headless: TUI precisa de TTY; skip quando PAPER_VALIDATION=1.
-    let tui_enabled = !flashloan_bot::core::paper_validation::env_paper_flag();
-    // JoinHandle da thread da TUI — guardado para o main() fazer join no
-    // shutdown e garantir restauração do terminal (ver spawn_tui doc).
-    let tui_handle: Option<std::thread::JoinHandle<()>> = if tui_enabled {
-        Some(tui::spawn_tui(tui_state.clone(), shutdown_tx.clone()))
-    } else {
-        info!("📄 PAPER mode: TUI desabilitado (headless)");
-        None
-    };
 
     let radar_task = {
         let mut client_ws = client_ws.clone();
@@ -735,7 +896,7 @@ async fn main() -> Result<()> {
     if tui_enabled {
         info!("🎯 TUI iniciado. Pressione 'q' no terminal da TUI para sair.");
     } else {
-        info!("🎯 Headless (paper) — Ctrl-C para sair.");
+        info!("🎯 Headless — Ctrl-C para sair.");
     }
 
     // ============================================================
@@ -756,6 +917,11 @@ async fn main() -> Result<()> {
     // este valor só é gasto drenando tasks na saída.
     let shutdown_timeout =
         Duration::from_secs(cfg_unlocked.general.shutdown_timeout.max(10) as u64);
+
+    // Transição splash → dashboard.
+    if let Ok(mut s) = tui_state.write() {
+        s.mark_startup_done();
+    }
 
     info!("🎯 Sistema pronto (modo hot-reload).");
 
@@ -797,17 +963,10 @@ async fn main() -> Result<()> {
         }
     }
 
-    // ── Restaura o terminal ──
-    // Join na thread da TUI: ela saiu do run_inner ao receber o broadcast de
-    // shutdown, momento em que run() já rodou o cleanup (disable_raw_mode +
-    // LeaveAlternateScreen). Sem este join, o processo podia sair com a TUI
-    // ainda em raw mode e o terminal do usuário ficava preso no alternate
-    // screen — nenhum comando respondia, precisava `reset`. Teto de 5s: se a
-    // TUI não sair (ex.: travou em draw), não penduramos o shutdown; o
-    // watchdog de emergência cuida do caso patológico.
-    if let Some(handle) = tui_handle {
-        let _ = handle.join();
-    }
+    // O join da thread da TUI (com timeout) é feito automaticamente pelo
+    // Drop de TuiGuard, garantindo restauração do terminal em qualquer caminho
+    // de saída. A TUI thread já rodou cleanup (disable_raw_mode +
+    // LeaveAlternateScreen) ao sair do run_inner.
 
     metrics::set_bot_status(0);
     info!("👋 Encerrando Flashloan Bot com segurança.");
