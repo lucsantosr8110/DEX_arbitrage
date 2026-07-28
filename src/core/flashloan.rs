@@ -12,7 +12,7 @@ use crate::{
         fixed_usd::{self, UsdE8},
         gas::{GasEstimator, GasStrategyKind},
         paper_validation::{self, PaperValidationHub},
-        types::{ArbitrageOpportunity, BundleResult},
+        types::{ArbitrageOpportunity, BundleResult, ExecutionOutcome},
     },
     infra::metrics,
     utils::{u256_to_f64},
@@ -1163,7 +1163,9 @@ impl ArbitrageClient {
 
         // CORREÇÃO: Anti-MEV não bloqueia mais
         if self.debounce_same_block().await? {
-            return Ok(BundleResult::skipped().with_execution_mode("same_block"));
+            return Ok(BundleResult::skipped()
+                .with_execution_mode("same_block")
+                .with_outcome(ExecutionOutcome::SameBlockRejected { tx_hash: None }));
         }
 
         let (dry, simulate, asset, amount, steps, flashloan_decimals, min_profit_raw) = {
@@ -1172,7 +1174,11 @@ impl ArbitrageClient {
 
             if let Err(e) = self.apply_complexity_filters(&steps, &cfg) {
                 warn!("{}", e);
-                return Ok(BundleResult::skipped().with_execution_mode("complexity_reject"));
+                return Ok(BundleResult::skipped()
+                    .with_execution_mode("complexity_reject")
+                    .with_outcome(ExecutionOutcome::AbortedPreBroadcast {
+                        reason: "route complexity filter reject".into(),
+                    }));
             }
 
             let decimals = cfg.flashloan.flashloan_decimals.unwrap_or(6) as u32;
@@ -1180,7 +1186,11 @@ impl ArbitrageClient {
                 Ok(v) => v,
                 Err(e) => {
                     warn!(error = %e, "MissingProfitTokenPrice — abort Direct");
-                    return Ok(BundleResult::skipped().with_execution_mode("missing_token_price"));
+                    return Ok(BundleResult::skipped()
+                        .with_execution_mode("missing_token_price")
+                        .with_outcome(ExecutionOutcome::AbortedPreBroadcast {
+                            reason: "missing profit token price".into(),
+                        }));
                 }
             };
 
@@ -1201,7 +1211,11 @@ impl ArbitrageClient {
         if !dry {
             if let Err(e) = self.approve_token_for_execution(asset, self.executor.address(), amount).await {
                 warn!("❌ Approve falhou: {}", e);
-                return Ok(BundleResult::skipped().with_execution_mode("approve_failed"));
+                return Ok(BundleResult::skipped()
+                    .with_execution_mode("approve_failed")
+                    .with_outcome(ExecutionOutcome::AbortedPreBroadcast {
+                        reason: format!("approve failed: {e}"),
+                    }));
             }
         }
 
@@ -1213,7 +1227,11 @@ impl ArbitrageClient {
                 Ok(_) => info!("✅ Simulação Direct: Sucesso"),
                 Err(e) => {
                     warn!("❌ Simulação Direct falhou: {}", e);
-                    return Ok(BundleResult::skipped().with_execution_mode("direct_sim_failed"));
+                    return Ok(BundleResult::skipped()
+                        .with_execution_mode("direct_sim_failed")
+                        .with_outcome(ExecutionOutcome::AbortedPreBroadcast {
+                            reason: format!("direct sim failed: {e}"),
+                        }));
                 }
             }
         }
@@ -1236,7 +1254,9 @@ impl ArbitrageClient {
 
         // CORREÇÃO: Anti-MEV não bloqueia mais
         if self.debounce_same_block().await? {
-            return Ok(BundleResult::skipped().with_execution_mode("same_block"));
+            return Ok(BundleResult::skipped()
+                .with_execution_mode("same_block")
+                .with_outcome(ExecutionOutcome::SameBlockRejected { tx_hash: None }));
         }
 
         let (dry, simulate, asset, amount, steps, flashloan_decimals, min_profit_raw) = {
@@ -1245,7 +1265,11 @@ impl ArbitrageClient {
 
             if let Err(e) = self.apply_complexity_filters(&steps, &cfg) {
                 warn!("{}", e);
-                return Ok(BundleResult::skipped().with_execution_mode("complexity_reject"));
+                return Ok(BundleResult::skipped()
+                    .with_execution_mode("complexity_reject")
+                    .with_outcome(ExecutionOutcome::AbortedPreBroadcast {
+                        reason: "route complexity filter reject".into(),
+                    }));
             }
 
             let decimals = cfg.flashloan.flashloan_decimals.unwrap_or(6) as u32;
@@ -1253,7 +1277,11 @@ impl ArbitrageClient {
                 Ok(v) => v,
                 Err(e) => {
                     warn!(error = %e, "MissingProfitTokenPrice — abort Flashloan");
-                    return Ok(BundleResult::skipped().with_execution_mode("missing_token_price"));
+                    return Ok(BundleResult::skipped()
+                        .with_execution_mode("missing_token_price")
+                        .with_outcome(ExecutionOutcome::AbortedPreBroadcast {
+                            reason: "missing profit token price".into(),
+                        }));
                 }
             };
 
@@ -1277,7 +1305,11 @@ impl ArbitrageClient {
                 Ok(_) => info!("✅ Simulação Flashloan: Sucesso"),
                 Err(e) => {
                     warn!("❌ Simulação Flashloan falhou: {}", e);
-                    return Ok(BundleResult::skipped().with_execution_mode("flashloan_sim_failed"));
+                    return Ok(BundleResult::skipped()
+                        .with_execution_mode("flashloan_sim_failed")
+                        .with_outcome(ExecutionOutcome::AbortedPreBroadcast {
+                            reason: format!("flashloan sim failed: {e}"),
+                        }));
                 }
             }
         }
@@ -1300,7 +1332,9 @@ impl ArbitrageClient {
 
         // CORREÇÃO: Anti-MEV não bloqueia mais
         if self.debounce_same_block().await? {
-            return Ok(BundleResult::skipped().with_execution_mode("same_block"));
+            return Ok(BundleResult::skipped()
+                .with_execution_mode("same_block")
+                .with_outcome(ExecutionOutcome::SameBlockRejected { tx_hash: None }));
         }
 
         let (dry, simulate, wrapper_addr, asset, amount, steps, flashloan_decimals, min_profit_raw, profit_recipient) = {
@@ -1311,12 +1345,20 @@ impl ArbitrageClient {
 
             if let Err(e) = self.validate_wrapper_steps(&steps, asset) {
                 warn!("❌ Steps inválidos para wrapper: {}", e);
-                return Ok(BundleResult::skipped().with_execution_mode("wrapper_invalid_steps"));
+                return Ok(BundleResult::skipped()
+                    .with_execution_mode("wrapper_invalid_steps")
+                    .with_outcome(ExecutionOutcome::AbortedPreBroadcast {
+                        reason: format!("wrapper invalid steps: {e}"),
+                    }));
             }
 
             if let Err(e) = self.apply_complexity_filters(&steps, &cfg) {
                 warn!("{}", e);
-                return Ok(BundleResult::skipped().with_execution_mode("complexity_reject"));
+                return Ok(BundleResult::skipped()
+                    .with_execution_mode("complexity_reject")
+                    .with_outcome(ExecutionOutcome::AbortedPreBroadcast {
+                        reason: "route complexity filter reject".into(),
+                    }));
             }
 
             let decimals = cfg.flashloan.flashloan_decimals.unwrap_or(6) as u32;
@@ -1324,7 +1366,11 @@ impl ArbitrageClient {
                 Ok(v) => v,
                 Err(e) => {
                     warn!(error = %e, "MissingProfitTokenPrice — abort Wrapper");
-                    return Ok(BundleResult::skipped().with_execution_mode("missing_token_price"));
+                    return Ok(BundleResult::skipped()
+                        .with_execution_mode("missing_token_price")
+                        .with_outcome(ExecutionOutcome::AbortedPreBroadcast {
+                            reason: "missing profit token price".into(),
+                        }));
                 }
             };
             let profit_recipient = self.resolve_profit_recipient(&cfg)?;
@@ -1350,7 +1396,11 @@ impl ArbitrageClient {
             .await
         {
             warn!(error = %e, "wrapper abort: recipient != owner");
-            return Ok(BundleResult::skipped().with_execution_mode("profit_recipient_mismatch"));
+            return Ok(BundleResult::skipped()
+                .with_execution_mode("profit_recipient_mismatch")
+                .with_outcome(ExecutionOutcome::AbortedPreBroadcast {
+                    reason: format!("profit recipient mismatch: {e}"),
+                }));
         }
 
         let params = Self::encode_callback_data(profit_recipient, &steps, min_profit_raw);
@@ -1364,7 +1414,11 @@ impl ArbitrageClient {
                 Ok(_) => info!("✅ Simulação Wrapper: Sucesso"),
                 Err(e) => {
                     warn!("❌ Simulação Wrapper falhou: {}", e);
-                    return Ok(BundleResult::skipped().with_execution_mode("wrapper_sim_failed"));
+                    return Ok(BundleResult::skipped()
+                        .with_execution_mode("wrapper_sim_failed")
+                        .with_outcome(ExecutionOutcome::AbortedPreBroadcast {
+                            reason: format!("wrapper sim failed: {e}"),
+                        }));
                 }
             }
         }
@@ -1524,39 +1578,99 @@ impl ArbitrageClient {
             }
         }
 
-        let mut tx_req = Eip1559TransactionRequest::new();
-        let (mut max_fee, mut max_priority) =
-            self.gas_estimator.populate_dynamic_gas(&mut tx_req).await?;
+        // Política de retry/RBF. Uma tentativa lógica = um nonce. Retry = replacement
+        // (mesmo nonce + gas maior), nunca nonce novo. Evita double execution: duas
+        // txs com nonces distintos que ambas incluem e ambas executam a arbitragem.
+        let (max_retries, replace_multiplier, confirm_timeout) = {
+            let cfg = self.config.lock().await;
+            let m = cfg.execution.replace_multiplier.unwrap_or(1.12).max(1.0);
+            // max_retries limitado a 4 p/ não virar spam de replacement.
+            let retries = cfg.execution.max_retries.clamp(1, 4) as usize;
+            (retries, m, Duration::from_secs(30))
+        };
+        let send_timeout = Duration::from_secs(10);
+        let multiplier_bps = U256::from((replace_multiplier * 100.0).round() as u64);
 
-        for attempt in 0..2 {
+        // Reserva UM nonce para a tentativa lógica inteira. Buscar pending nonce
+        // aqui (uma vez) e fixá-lo no TypedTransaction faz ethers não re-fetch
+        // nonce em cada call.send() — que era a raiz do bug double-execution.
+        let sender = self.get_wallet_address()?;
+        let nonce = match self
+            .middleware
+            .get_transaction_count(sender, Some(BlockId::Number(BlockNumber::Pending)))
+            .await
+        {
+            Ok(n) => n,
+            Err(e) => {
+                warn!(error = %e, "nonce fetch falhou — abort pre-broadcast");
+                return Ok(BundleResult::skipped()
+                    .with_execution_mode("nonce_fetch_failed")
+                    .with_outcome(ExecutionOutcome::AbortedPreBroadcast {
+                        reason: format!("nonce fetch failed: {e}"),
+                    }));
+            }
+        };
+
+        let (mut max_fee, mut max_priority) = {
+            let mut tx_req = Eip1559TransactionRequest::new();
+            self.gas_estimator.populate_dynamic_gas(&mut tx_req).await?
+        };
+
+        let opp_id = opp.id.clone();
+        let mut latest_tx_hash: Option<H256> = None;
+        let mut replacement_count: u32 = 0;
+
+        for attempt in 0..max_retries {
             if attempt > 0 {
-                max_fee = max_fee * 120 / 100;
-                max_priority = max_priority * 120 / 100;
-                info!("🔄 Retry {} com gas boost: {:?} Gwei", attempt, max_fee);
+                // Bump integer (x100 → /100) p/ evitar drift de f64. Mesmo nonce.
+                max_fee = max_fee.saturating_mul(multiplier_bps) / U256::from(100u64);
+                max_priority =
+                    max_priority.saturating_mul(multiplier_bps) / U256::from(100u64);
+                replacement_count += 1;
+                info!(
+                    opp_id = %opp_id, mode, attempt, replacement_count,
+                    nonce = ?nonce, max_fee = ?max_fee, max_priority = ?max_priority,
+                    "🔄 RBF replacement: mesmo nonce, gas bumped"
+                );
             }
 
+            // Fixa nonce + gas no TypedTransaction do ContractCall. ethers skipa
+            // o fetch de nonce em send() quando o campo já está setado.
             if let Some(tx) = call.tx.as_eip1559_mut() {
+                tx.nonce = Some(nonce);
                 tx.max_fee_per_gas = Some(max_fee);
                 tx.max_priority_fee_per_gas = Some(max_priority);
+            } else {
+                // Policy exige EIP-1559. Tx legada = abort fail-closed.
+                return Ok(BundleResult::skipped()
+                    .with_execution_mode("non_eip1559_abort")
+                    .with_outcome(ExecutionOutcome::AbortedPreBroadcast {
+                        reason: "tx não é EIP-1559 — abort fail-closed".into(),
+                    }));
             }
 
-            info!("💸 Enviando TX (Mode: {}, Attempt: {}) | Gas: {:?} Gwei", 
-                  mode, attempt + 1, max_fee);
+            info!(
+                opp_id = %opp_id, mode, attempt = attempt + 1, max_retries,
+                nonce = ?nonce, max_fee = ?max_fee, max_priority = ?max_priority,
+                "💸 Enviando TX"
+            );
 
-            match timeout(Duration::from_secs(10), call.send()).await {
+            match timeout(send_timeout, call.send()).await {
                 Ok(Ok(pending)) => {
-                    info!("⏳ TX Enviada: {:?} - Aguardando confirmação...", pending.tx_hash());
-                    
-                    match timeout(Duration::from_secs(30), pending).await {
+                    let tx_hash = pending.tx_hash();
+                    latest_tx_hash = Some(tx_hash);
+                    info!(
+                        opp_id = %opp_id, nonce = ?nonce, tx_hash = ?tx_hash,
+                        "⏳ TX enviada — aguardando confirmação"
+                    );
+
+                    match timeout(confirm_timeout, pending).await {
                         Ok(Ok(Some(receipt))) => {
+                            let r_hash = receipt.transaction_hash;
                             if receipt.status == Some(1.into()) {
-                                info!("✅ TX Confirmada: {:?}", receipt.transaction_hash);
-
-                                // Anti-MEV: registrar bloco da execução bem-sucedida
-                                // para que debounce_same_block bloqueie tentativas
-                                // subsequentes no mesmo bloco (contrato exige).
+                                info!(opp_id = %opp_id, tx_hash = ?r_hash, "✅ TX confirmada");
+                                // Anti-MEV: registra bloco só após execução confirmada.
                                 self.update_execution_block().await;
-
                                 if let Some(gas_used) = receipt.gas_used {
                                     let gas_kind = if mode == "direct" {
                                         GasStrategyKind::Direct
@@ -1564,61 +1678,138 @@ impl ArbitrageClient {
                                         GasStrategyKind::WithFlashloan
                                     };
                                     self.gas_estimator
-                                        .observe_gas_used(
-                                            opp.steps.0.len().max(1),
-                                            gas_used,
-                                            gas_kind,
-                                        )
+                                        .observe_gas_used(opp.steps.0.len().max(1), gas_used, gas_kind)
                                         .await;
                                 }
-
                                 let contract_profit = self
                                     .extract_real_profit_from_receipt(&receipt, opp, flashloan_decimals)
                                     .unwrap_or_else(|| {
-                                        // Projeção nunca é PnL realizado. Sem evento
-                                        // confiável, registrar limite inferior (zero
-                                        // antes do gás) evita contaminar calibração.
                                         warn!("receipt sem evento de lucro; PnL será limite inferior");
                                         0.0
                                     });
-                                // Evento do executor mede lucro do ativo após o premium,
-                                // mas gás sai da wallet em POL. Métrica/PnL sem esta
-                                // subtração superestima exatamente o tipo de edge de cents
-                                // que este bot tenta capturar.
                                 let real_profit = self
                                     .realized_net_profit_after_gas_usd(&receipt, contract_profit)
                                     .await;
                                 metrics::inc_arbitrage_executions();
                                 metrics::inc_exec_ok();
                                 metrics::set_last_profit(real_profit);
-                                
+                                let outcome = if real_profit >= 0.0 {
+                                    ExecutionOutcome::ConfirmedProfit {
+                                        tx_hash: r_hash,
+                                        realized_profit_usd: real_profit,
+                                        gas_used: receipt.gas_used.unwrap_or_default(),
+                                    }
+                                } else {
+                                    ExecutionOutcome::ConfirmedLoss {
+                                        tx_hash: r_hash,
+                                        realized_loss_usd: -real_profit,
+                                        gas_used: receipt.gas_used.unwrap_or_default(),
+                                    }
+                                };
                                 return Ok(BundleResult::new(true, real_profit, opp.gas_cost_usd)
                                     .with_execution_mode(mode)
-                                    .with_tx_hash(Some(format!("{:?}", receipt.transaction_hash))));
+                                    .with_tx_hash(Some(format!("{:?}", r_hash)))
+                                    .with_outcome(outcome));
                             } else {
-                                warn!("❌ TX Revertida: {:?}", receipt.transaction_hash);
-                                return Ok(BundleResult::skipped().with_execution_mode("tx_reverted"));
+                                // Revert: tx minerada com status 0. NUNCA skip.
+                                warn!(opp_id = %opp_id, tx_hash = ?r_hash, "❌ TX revertida");
+                                return Ok(BundleResult::skipped()
+                                    .with_execution_mode("tx_reverted")
+                                    .with_tx_hash(Some(format!("{:?}", r_hash)))
+                                    .with_outcome(ExecutionOutcome::Reverted {
+                                        tx_hash: r_hash,
+                                        reason: None,
+                                        gas_used: receipt.gas_used,
+                                    }));
                             }
-                        },
-                        _ => {
-                            warn!("⏰ Timeout na confirmação");
+                        }
+                        Ok(Ok(None)) => {
+                            // Receipt None: tx pode estar pending. Próximo attempt =
+                            // replacement mesmo nonce. Último attempt → TimeoutStuck.
+                            warn!(opp_id = %opp_id, nonce = ?nonce, "⏰ receipt None — tx possivelmente pending");
+                            if attempt + 1 >= max_retries {
+                                return Ok(self.timeout_stuck_result(&opp_id, nonce, latest_tx_hash));
+                            }
+                            continue;
+                        }
+                        Ok(Err(e)) => {
+                            warn!(opp_id = %opp_id, nonce = ?nonce, error = %e, "⏰ erro na confirmação");
+                            if attempt + 1 >= max_retries {
+                                return Ok(self.timeout_stuck_result(&opp_id, nonce, latest_tx_hash));
+                            }
+                            continue;
+                        }
+                        Err(_) => {
+                            warn!(opp_id = %opp_id, nonce = ?nonce, "⏰ timeout na confirmação");
+                            if attempt + 1 >= max_retries {
+                                return Ok(self.timeout_stuck_result(&opp_id, nonce, latest_tx_hash));
+                            }
                             continue;
                         }
                     }
-                },
+                }
                 Ok(Err(e)) => {
-                    warn!("❌ Erro ao enviar TX: {}", e);
-                    if attempt == 0 { continue; }
-                    return Ok(BundleResult::skipped().with_execution_mode("send_failed"));
-                },
+                    let s = e.to_string().to_lowercase();
+                    // Sinais de que a tx já está na rede (nonce low, already known,
+                    // replacement underpriced, known transaction): não recriar com nonce
+                    // novo. Último attempt → TimeoutStuck (assume pendente). Caso
+                    // contrário → Dropped (nonce liberado p/ reuso futuro).
+                    let already_known = s.contains("nonce")
+                        || s.contains("already known")
+                        || s.contains("replacement")
+                        || s.contains("known transaction");
+                    if attempt + 1 >= max_retries {
+                        let (mode_str, outcome) = if already_known {
+                            (
+                                "timeout_stuck",
+                                ExecutionOutcome::TimeoutStuck { nonce, latest_tx_hash },
+                            )
+                        } else {
+                            ("dropped", ExecutionOutcome::Dropped { nonce })
+                        };
+                        warn!(
+                            opp_id = %opp_id, nonce = ?nonce, already_known,
+                            error = %e, "❌ send falhou no último attempt"
+                        );
+                        return Ok(BundleResult::skipped()
+                            .with_execution_mode(mode_str)
+                            .with_tx_hash(latest_tx_hash.map(|h| format!("{:?}", h)))
+                            .with_outcome(outcome));
+                    }
+                    warn!(opp_id = %opp_id, nonce = ?nonce, error = %e, "❌ erro send — retry mesmo nonce");
+                    continue;
+                }
                 Err(_) => {
-                    warn!("⏰ Timeout no envio");
+                    // Timeout no envio: tx pode ter sido broadcast. Reenvio como
+                    // replacement mesmo nonce (RBF) no próximo attempt.
+                    warn!(opp_id = %opp_id, nonce = ?nonce, "⏰ timeout no envio — tentará replacement");
+                    if attempt + 1 >= max_retries {
+                        return Ok(self.timeout_stuck_result(&opp_id, nonce, latest_tx_hash));
+                    }
                     continue;
                 }
             }
         }
 
-        Ok(BundleResult::skipped().with_execution_mode("max_retries_exceeded"))
+        // Loop esgotado sem return defensivo — trata como stuck (não skip genérico).
+        Ok(self.timeout_stuck_result(&opp_id, nonce, latest_tx_hash))
+    }
+
+    /// Constrói BundleResult de TimeoutStuck com log estruturado único.
+    fn timeout_stuck_result(
+        &self,
+        opp_id: &str,
+        nonce: U256,
+        latest_tx_hash: Option<H256>,
+    ) -> BundleResult {
+        warn!(
+            opp_id = %opp_id, nonce = ?nonce, latest_tx_hash = ?latest_tx_hash,
+            outcome = "TimeoutStuck", "⏰ tentativa lógica esgotada — nonce possivelmente pendente, NÃO reusar"
+        );
+        BundleResult::skipped()
+            .with_execution_mode("timeout_stuck")
+            .with_tx_hash(latest_tx_hash.map(|h| format!("{:?}", h)))
+            .with_outcome(ExecutionOutcome::TimeoutStuck { nonce, latest_tx_hash })
     }
 
     /// C3: decodifica o profit REAL do evento `FlashLoanSuccess` emitido pelo

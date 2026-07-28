@@ -1,6 +1,78 @@
-use ethers::types::{Address, Bytes, U256};
+use ethers::types::{Address, Bytes, H256, U256};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+
+// ============================================================================
+// 🧾 ExecutionOutcome — estado explícito de uma tentativa lógica de execução
+// ============================================================================
+//
+// Uma tentativa lógica de arbitragem (uma oportunidade, uma decisão de envio)
+// produz exatamente um destes estados. Estados distintos jamais colapsam em
+// "skipped":
+//   - Reverted        = tx minerada com status 0 (queimou gás). NUNCA skip.
+//   - SameBlockRejected = bloqueada pelo anti-MEV (mesmo bloco). Distinto de
+//     Reverted (nem chegou a ser minerada como arbitragem).
+//   - TimeoutStuck    = tx broadcast mas sem receipt; nonce possivelmente
+//     pendente. Reenvio só como replacement (mesmo nonce), nunca nonce novo.
+//   - Dropped         = tx rejeitada antes de entrar na rede; nonce liberado.
+//   - AbortedPreBroadcast = abortada antes de qualquer broadcast (gate, simulação).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ExecutionOutcome {
+    ConfirmedProfit {
+        tx_hash: H256,
+        realized_profit_usd: f64,
+        gas_used: U256,
+    },
+    ConfirmedLoss {
+        tx_hash: H256,
+        realized_loss_usd: f64,
+        gas_used: U256,
+    },
+    Reverted {
+        tx_hash: H256,
+        reason: Option<String>,
+        gas_used: Option<U256>,
+    },
+    SameBlockRejected {
+        tx_hash: Option<H256>,
+    },
+    TimeoutStuck {
+        nonce: U256,
+        latest_tx_hash: Option<H256>,
+    },
+    Dropped {
+        nonce: U256,
+    },
+    AbortedPreBroadcast {
+        reason: String,
+    },
+}
+
+impl ExecutionOutcome {
+    /// True quando o estado NÃO representa uma execuição broadcast+minerada
+    /// (portanto não deve contar como sucesso nem como execução realizada).
+    pub fn is_executed_onchain(&self) -> bool {
+        matches!(
+            self,
+            ExecutionOutcome::ConfirmedProfit { .. }
+                | ExecutionOutcome::ConfirmedLoss { .. }
+                | ExecutionOutcome::Reverted { .. }
+        )
+    }
+
+    /// True quando a tx foi minerada com sucesso (status 1).
+    pub fn is_confirmed(&self) -> bool {
+        matches!(
+            self,
+            ExecutionOutcome::ConfirmedProfit { .. } | ExecutionOutcome::ConfirmedLoss { .. }
+        )
+    }
+
+    /// Revert é execução on-chain falha — distinto de skip/abort.
+    pub fn is_reverted(&self) -> bool {
+        matches!(self, ExecutionOutcome::Reverted { .. })
+    }
+}
 
 // ============================================================================
 // 🔹 Arbitrage Step — passo real de rota
@@ -329,6 +401,11 @@ pub struct BundleResult {
     pub risk_assessment: Option<RiskAssessment>,
     #[serde(default)]
     pub execution_mode: Option<String>,
+    /// Estado explícito da tentativa lógica de execução. `None` só em paths
+    /// legados que ainda não foram migrados (paper/dry_run). Nunca colapsar
+    /// `Reverted`/`TimeoutStuck`/`Dropped` em `None` ou em "skipped".
+    #[serde(default)]
+    pub outcome: Option<ExecutionOutcome>,
 }
 
 impl BundleResult {
@@ -341,6 +418,7 @@ impl BundleResult {
             accepted: success && profit > 0.0,
             risk_assessment: None,
             execution_mode: None,
+            outcome: None,
         }
     }
 
@@ -353,6 +431,7 @@ impl BundleResult {
             gas_cost: 0.0,
             risk_assessment: None,
             execution_mode: Some("skipped".to_string()),
+            outcome: None,
         }
     }
 
@@ -368,6 +447,14 @@ impl BundleResult {
 
     pub fn with_risk_assessment(mut self, assessment: Option<RiskAssessment>) -> Self {
         self.risk_assessment = assessment;
+        self
+    }
+
+    /// Anexa o outcome explícito. `success`/`execution_mode` continuam como
+    /// estavam para compat com telemetry legada, mas `outcome` é a fonte de
+    /// verdade para classificação de execução.
+    pub fn with_outcome(mut self, o: ExecutionOutcome) -> Self {
+        self.outcome = Some(o);
         self
     }
 }
