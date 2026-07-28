@@ -1259,6 +1259,16 @@ fn default_expected_inclusion_blocks() -> u32 {
     2
 }
 
+/// B7: confirmações para lucro final (default 24).
+fn default_profit_confirmations() -> u32 {
+    24
+}
+
+/// B7: perdas realizadas finais consecutivas → circuit breaker (default 3).
+pub(crate) fn default_loss_breaker_threshold() -> u32 {
+    3
+}
+
 impl Default for RouteValidationConfig {
     fn default() -> Self {
         Self {
@@ -1662,6 +1672,19 @@ pub struct ExecutionConfig {
     /// Após uma oportunidade ser ENVIADA (outcome não-Aborted), o loop para.
     #[serde(default = "default_top_n_opportunities")]
     pub top_n_opportunities: u32,
+
+    /// B7: confirmações necessárias p/ considerar lucro final (irreversível).
+    /// Polygon PoS finalidade ~512 blocos, mas 24 blocos já cobre reorgs rasos
+    /// observados (<8 blocos). Default 24. Abaixo disso, lucro é provisório.
+    // SAFETY-EV: Polygon reorga <8 blocos na prática; 24 dá folga segura sem
+    /// prender contabilidade por tempo excessivo.
+    #[serde(default = "default_profit_confirmations")]
+    pub profit_confirmations: u32,
+
+    /// B7: perdas REALIZADAS FINAIS consecutivas que tripam o circuit breaker
+    /// de perda (kill switch consome). Estimated NÃO conta. Default 3.
+    #[serde(default = "default_loss_breaker_threshold")]
+    pub loss_breaker_threshold: u32,
 }
 
 impl Default for ExecutionConfig {
@@ -1705,6 +1728,8 @@ impl Default for ExecutionConfig {
             estimate_base_gas_usd: 0.02,
             edge_safety_margin_bps: default_edge_safety_margin_bps(),
             top_n_opportunities: default_top_n_opportunities(),
+            profit_confirmations: default_profit_confirmations(),
+            loss_breaker_threshold: default_loss_breaker_threshold(),
         }
     }
 }

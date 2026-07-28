@@ -31,7 +31,7 @@ use tokio::{
     sync::Mutex,
     time::{timeout, Duration},
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 const DEFAULT_AAVE_POOL_POLYGON: &str = "0x794a61358D6845594F94dc1DB02A252b5b4814aD";
 const FLASHLOAN_PREMIUM_ABI: &str = r#"[{"inputs":[],"name":"FLASHLOAN_PREMIUM_TOTAL","outputs":[{"type":"uint128"}],"stateMutability":"view","type":"function"}]"#;
@@ -129,6 +129,8 @@ pub struct ArbitrageClient {
     paper_hub: Arc<Mutex<Option<Arc<PaperValidationHub>>>>,
     /// Premium Aave on-chain cache (M5), refreshed at most hourly.
     flashloan_fee_cache: Arc<Mutex<Option<(StdInstant, f64)>>>,
+    /// B7: ledger de finalidade de lucro (provisory/final + reorg + loss CB).
+    profit_ledger: Arc<tokio::sync::Mutex<crate::core::profit_ledger::ProfitLedger>>,
 }
 
 impl ArbitrageClient {
@@ -163,6 +165,12 @@ impl ArbitrageClient {
             last_exec_block: Arc::new(Mutex::new(None)),
             paper_hub,
             flashloan_fee_cache: Arc::new(Mutex::new(None)),
+            // B7: threshold default; init_profit_ledger sobrescreve via config.
+            profit_ledger: Arc::new(tokio::sync::Mutex::new(
+                crate::core::profit_ledger::ProfitLedger::new(
+                    crate::config::default_loss_breaker_threshold(),
+                ),
+            )),
         }
     }
 
@@ -171,6 +179,23 @@ impl ArbitrageClient {
     /// sobrescreve o oráculo em memória — não chamar a cada execução.
     pub async fn init_gas_oracle(&self) {
         self.gas_estimator.load_gas_oracle().await;
+    }
+
+    /// B7: ajusta o threshold do circuit breaker de perda a partir da config.
+    /// Chamar uma vez na inicialização (async). profit_confirmations é lido em
+    /// cada promote (config pode mudar em runtime).
+    pub async fn init_profit_ledger(&self) {
+        let threshold = {
+            let cfg = self.config.lock().await;
+            cfg.execution.loss_breaker_threshold
+        };
+        let mut led = self.profit_ledger.lock().await;
+        led.set_loss_breaker_threshold(threshold);
+    }
+
+    /// B7: acesso ao ledger (para watcher / telemetria externa).
+    pub fn profit_ledger(&self) -> Arc<tokio::sync::Mutex<crate::core::profit_ledger::ProfitLedger>> {
+        self.profit_ledger.clone()
     }
 
     async fn current_flashloan_fee_pct(
@@ -1188,9 +1213,33 @@ impl ArbitrageClient {
     async fn update_execution_block(&self) {
         if let Ok(block) = self.middleware.get_block_number().await {
             let block = block.as_u64();
-            let mut guard = self.last_exec_block.lock().await;
-            *guard = Some(block);
-            debug!("📦 Bloco atualizado: {}", block);
+            {
+                let mut guard = self.last_exec_block.lock().await;
+                *guard = Some(block);
+            }
+            // B7: promove finalidade dos trades (Included→Confirmed→Final) e
+            // publica gauges de lucro provisório/final.
+            let profit_confirmations = {
+                let cfg = self.config.lock().await;
+                cfg.execution.profit_confirmations as u64
+            };
+            let (provisory, final_, breaker) = {
+                let mut led = self.profit_ledger.lock().await;
+                led.promote(block, profit_confirmations);
+                (
+                    led.provisory_profit_usd(),
+                    led.final_profit_usd(),
+                    led.breaker_tripped(),
+                )
+            };
+            crate::infra::metrics::set_profit_finality(provisory, final_);
+            if breaker {
+                error!(
+                    "🚨 B7 circuit breaker de perda tripped: perdas REALIZADAS FINAIS \
+                     consecutivas ≥ threshold — kill switch deve atuar"
+                );
+            }
+            debug!("📦 Bloco atualizado: {} (provisory=${:.4} final=${:.4})", block, provisory, final_);
         }
     }
 
@@ -1972,6 +2021,24 @@ impl ArbitrageClient {
                                 metrics::inc_arbitrage_executions();
                                 metrics::inc_exec_ok();
                                 metrics::set_last_profit(real_profit);
+                                // B7: registra no ledger de finalidade. 1 confirmação =
+                                // provisory (Included). profit_source: Realized se o PnL
+                                // veio do receipt (evento decodificado); Estimated se caiu
+                                // no fallback do gross do finder (A1). Estimated NÃO alimenta
+                                // o circuit breaker de perda.
+                                let inclusion_block = receipt
+                                    .block_number
+                                    .map(|b| b.as_u64())
+                                    .unwrap_or(0);
+                                let source = if profit_measured {
+                                    crate::core::profit_ledger::ProfitSource::Realized { final_: false }
+                                } else {
+                                    crate::core::profit_ledger::ProfitSource::Estimated
+                                };
+                                {
+                                    let mut led = self.profit_ledger.lock().await;
+                                    led.record_included(r_hash, inclusion_block, real_profit, source);
+                                }
                                 let outcome = if real_profit >= 0.0 {
                                     ExecutionOutcome::ConfirmedProfit {
                                         tx_hash: r_hash,

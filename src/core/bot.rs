@@ -93,6 +93,8 @@ impl Bot {
             ArbitrageClient::new(executor_address, client.clone(), config.clone(), None);
         // B2: carrega oráculo EWMA de gas do path configurado (se houver).
         arbitrage_client.init_gas_oracle().await;
+        // B7: ajusta threshold do circuit breaker de perda via config.
+        arbitrage_client.init_profit_ledger().await;
 
         let execution_mode = if cfg_guard.flashloan.enabled {
             if cfg_guard

@@ -73,6 +73,21 @@ pub static SUCCESS_RATE: Lazy<Gauge> =
 pub static EXEC_OK: Lazy<IntCounter> =
     Lazy::new(|| register_int_counter!("exec_ok_total", "Total de execuções bem-sucedidas").unwrap());
 
+/// B7: trades provisórios revertidos por reorg (blockHash mudou / tx sumiu).
+pub static REORG_REVERTED_TRADES: Lazy<IntCounter> = Lazy::new(||
+    register_int_counter!("reorg_reverted_trades", "Trades provisórios revertidos por reorg").unwrap()
+);
+
+/// B7: lucro provisório (txs incluídas, ainda < profit_confirmations).
+pub static PROVISORY_PROFIT_USD: Lazy<Gauge> = Lazy::new(||
+    register_gauge!("provisory_profit_usd", "Lucro provisório (não final) em USD").unwrap()
+);
+
+/// B7: lucro final (txs com ≥ profit_confirmations).
+pub static FINAL_PROFIT_USD: Lazy<Gauge> = Lazy::new(||
+    register_gauge!("final_profit_usd", "Lucro final (≥ profit_confirmations) em USD").unwrap()
+);
+
 pub static DEX_REQUESTS: Lazy<IntCounter> =
     Lazy::new(|| register_int_counter!("dex_requests_total", "Total de requisições a DEXs").unwrap());
 
@@ -165,6 +180,17 @@ pub fn inc_exec_ok() {
 pub fn inc_exec_fail(reason: &str) {
     EXEC_FAIL.with_label_values(&[reason]).inc();
     warn!("❌ Execução com falha registrada: motivo = {reason}");
+}
+
+/// B7: incrementa contador de trades revertidos por reorg.
+pub fn inc_reorg_reverted_trades() {
+    REORG_REVERTED_TRADES.inc();
+}
+
+/// B7: publica lucro provisório e final (gauges).
+pub fn set_profit_finality(provisory_usd: f64, final_usd: f64) {
+    PROVISORY_PROFIT_USD.set(provisory_usd);
+    FINAL_PROFIT_USD.set(final_usd);
 }
 
 pub fn get_hit_rate() -> f64 {
