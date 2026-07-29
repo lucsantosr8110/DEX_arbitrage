@@ -16,5 +16,6 @@ pub mod profit_ledger;
 pub mod replay_cross_model;
 pub mod replay_scan;
 pub mod risk;
+pub mod bf_graph;
 pub mod smart_retry;
 pub mod types;
