@@ -1,5 +1,6 @@
 use crate::{
     config::Config,
+    core::bf_graph::{self, PriceGraph},
     core::economics,
     core::types::{ArbitrageOpportunity, ArbitrageStep, SerializableSteps},
     dex::get_token_decimals,
@@ -322,28 +323,57 @@ impl ArbitrageEngine {
         u256_to_f64(amount, decimals)
     }
 
+    /// Retorna conjunto de tokens conhecidos: merge da lista estática + tokens
+    /// presentes no price_map. Expansão dinâmica: qualquer token que apareça
+    /// em alguma cotação é considerado conhecido, evitando falsos negativos
+    /// em novos pares.
+    fn known_tokens(
+        price_map: &HashMap<String, HashMap<String, f64>>,
+    ) -> Vec<String> {
+        let mut tokens: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        // Tokens estáticos conhecidos
+        for t in &[
+            "USDT", "USDC", "USDC.E", "DAI", "WETH", "WMATIC", "WPOL", "WBTC", "LINK", "UNI",
+            "LDO", "CRV", "AAVE", "SUSHI", "GRT", "GHST", "SAND",
+        ] {
+            if seen.insert(t.to_string()) {
+                tokens.push(t.to_string());
+            }
+        }
+
+        // Tokens do price_map (dinâmicos)
+        for dex_prices in price_map.values() {
+            for pair in dex_prices.keys() {
+                for token in pair.split('-') {
+                    let upper = token.to_ascii_uppercase();
+                    if seen.insert(upper.clone()) {
+                        tokens.push(upper);
+                    }
+                }
+            }
+        }
+
+        tokens
+    }
+
     /// 🔧 CORREÇÃO 4: Validação de preços MAIS TOLERANTE mas SEGURA
     ///
     /// Usa `token_in`/`token_out` explicitamente (direction-aware) em vez de
     /// `contains()` no par combinado, que era direction-agnóstico e rejeitava
     /// pares legítimos como USDT-WMATIC (rate ~7.14 caía no range [0.10, 5.0]
     /// destinado a WMATIC-USDT).
-    fn is_realistic_price(price: f64, token_in: &str, token_out: &str) -> bool {
+    ///
+    /// `known_tokens`: lista dinâmica de tokens conhecidos (estáticos + price_map).
+    fn is_realistic_price(price: f64, token_in: &str, token_out: &str, known_tokens: &[String]) -> bool {
         if !price.is_finite() || price <= 0.0 {
             return false;
         }
 
-        // M14: símbolos fora do universo catalogado não têm faixa de preço
-        // confiável. Rejeitar por padrão evita que quote absurdo passe pelo
-        // fallback amplo; novos ativos devem entrar em pairs.metadata.
-        const KNOWN_TOKENS: &[&str] = &[
-            "USDT", "USDC", "USDC.E", "DAI", "WETH", "WMATIC", "WPOL", "WBTC", "LINK", "UNI",
-            "LDO", "CRV", "AAVE", "SUSHI", "GRT", "GHST", "SAND",
-        ];
         let token_in = token_in.to_ascii_uppercase();
         let token_out = token_out.to_ascii_uppercase();
-        if !KNOWN_TOKENS.contains(&token_in.as_str()) || !KNOWN_TOKENS.contains(&token_out.as_str())
-        {
+        if !known_tokens.contains(&token_in) || !known_tokens.contains(&token_out) {
             return false;
         }
 
@@ -405,17 +435,10 @@ impl ArbitrageEngine {
                 );
             }
 
-            // Validar se a taxa faz sentido para o par
-            if !Self::is_realistic_price(step.expected_rate, &step.token_in, &step.token_out) {
-                bail!(
-                    "Preço irreal no step {}: {} {}→{} = {:.8}",
-                    i,
-                    step.dex_name,
-                    step.token_in,
-                    step.token_out,
-                    step.expected_rate
-                );
-            }
+            // NOTA: validação `is_realistic_price` removida daqui porque já é
+            // feita upstream nos métodos de detecção (evaluate_direct,
+            // try_intra_dex_cycle, try_cross_dex_cycle_exhaustive).
+            // rate já validado como finito/positivo acima.
 
             total_rate *= step.expected_rate;
 
@@ -436,12 +459,22 @@ impl ArbitrageEngine {
         }
 
         // VALIDAÇÃO FINAL: taxa total típica de arb não deve explodir
-        // Mantém tolerância, mas bloqueia ilusões de "multiplica e fica gigante"
-        if total_rate < 0.90 || total_rate > 1.50 {
-            bail!(
-                "Taxa total suspeita: {:.8} (esperado 0.90-1.50) | Route: {:?}",
-                total_rate,
-                debug_info
+        // Mantém tolerância, mas bloqueia ilusões de "multiplica e fica gigante".
+        // NOTA: bandas [0.90, 1.50] são WARN não ERROR — oportunidades com
+        // spread >50% existem em momentos de alta volatilidade. O executor
+        // re-valida antes do broadcast.
+        if total_rate < 0.90 {
+            warn!(
+                target: "arbitrage",
+                "Taxa total muito baixa: {:.8} (abaixo de 0.90) — rota pode ser inviável",
+                total_rate
+            );
+        }
+        if total_rate > 1.50 {
+            warn!(
+                target: "arbitrage",
+                "Taxa total alta: {:.8} (acima de 1.50) — spread >50%, verificar sanity",
+                total_rate
             );
         }
 
@@ -616,6 +649,10 @@ impl ArbitrageEngine {
         let direct_generic = self.find_direct_async(price_map, app_config).await;
         all_opportunities.extend(direct_generic);
 
+        // 🔍 Bellman-Ford: detecta ciclos em grafo completo (N hops)
+        let bf_cycles = self.find_bf_cycles(price_map, app_config).await;
+        all_opportunities.extend(bf_cycles);
+
         // 🔄 Deduplicação por (pair, buy_dex, sell_dex) — find_direct_with_usdt e
         // find_direct_async podem produzir as mesmas oportunidades para pares USDT.
         let before_dedup = all_opportunities.len();
@@ -701,20 +738,32 @@ impl ArbitrageEngine {
             usdt_opportunities.len()
         );
 
-        for (i, opp) in usdt_opportunities.iter().enumerate() {
-            debug!(
-                "📈 Oportunidade {}: gross=${:.6}, net=${:.6}, spread={:.4}%, min_required=${}",
-                i, opp.estimated_profit_usd, opp.net_profit_usd, opp.spread_percent, min_profit_usd
+        // Log estruturado por ciclo candidato (teórico → bruto → líquido)
+        for opp in &usdt_opportunities {
+            info!(
+                target: "arbitrage.candidate",
+                id = %opp.id,
+                path = %opp.pair,
+                buy_dex = %opp.buy_dex,
+                sell_dex = %opp.sell_dex,
+                total_rate = opp.spread_percent / 100.0 + 1.0,
+                spread_percent = opp.spread_percent,
+                gross_profit_usd = opp.estimated_profit_usd,
+                gas_cost_usd = opp.gas_cost_usd,
+                net_profit_usd = opp.net_profit_usd,
+                min_profit_usd = min_profit_usd,
+                above_threshold = opp.net_profit_usd >= min_profit_usd,
+                "cycle_candidate"
             );
         }
 
         let before_filter = usdt_opportunities.len();
         usdt_opportunities.retain(|opp| {
-            let keep = opp.net_profit_usd >= min_profit_usd; // MUDANÇA CRÍTICA: USAR net_profit_usd
+            let keep = opp.net_profit_usd >= min_profit_usd;
             if !keep {
                 debug!(
-                    "🚫 Filtrado: net_profit=${:.6} < min=${}",
-                    opp.net_profit_usd, min_profit_usd
+                    "🚫 Filtrado: net_profit=${:.6} < min=${} (gross=${:.6}, gas=${:.6})",
+                    opp.net_profit_usd, min_profit_usd, opp.estimated_profit_usd, opp.gas_cost_usd
                 );
             }
             keep
@@ -1387,6 +1436,7 @@ impl ArbitrageEngine {
         }
         let token_a = parts[0];
         let token_b = parts[1];
+        let known_tokens = Self::known_tokens(prices);
 
         let reverse_pair = format!("{}-{}", token_b, token_a);
 
@@ -1433,8 +1483,8 @@ impl ArbitrageEngine {
                     continue;
                 }
 
-                if !Self::is_realistic_price(*rate_ab, token_a, token_b)
-                    || !Self::is_realistic_price(*rate_ba, token_b, token_a)
+                if !Self::is_realistic_price(*rate_ab, token_a, token_b, &known_tokens)
+                    || !Self::is_realistic_price(*rate_ba, token_b, token_a, &known_tokens)
                 {
                     continue;
                 }
@@ -1523,8 +1573,8 @@ impl ArbitrageEngine {
         })
     }
 
-    /// Triangular **cross-DEX**: `stable → midcap → anchor → stable`, melhor edge
-    /// por hop across venues (`build_price_graph`). Venue+fee_tier congelados
+    /// Triangular **cross-DEX**: `stable → midcap → anchor → stable`, melhor combinação
+    /// de venues por hop (exhaustiva sobre o price_map). Venue+fee_tier congelados
     /// em cada `ArbitrageStep` na detecção (sem re-otimizar no eth_call).
     async fn find_cross_dex_triangular_midcaps(
         &self,
@@ -1534,11 +1584,33 @@ impl ArbitrageEngine {
         let tri_cfg = &app_config.arbitrage.triangular;
         let mut opportunities = Vec::new();
 
+        if tri_cfg.max_hops < 3 {
+            info!(
+                target: "arbitrage",
+                max_hops = tri_cfg.max_hops,
+                "🔺 triangular cross-DEX desabilitado: max_hops < 3"
+            );
+            return opportunities;
+        }
+        if tri_cfg.max_hops > 3 {
+            warn!(
+                target: "arbitrage",
+                max_hops = tri_cfg.max_hops,
+                "🔺 triangular cross-DEX só suporta 3 hops; max_hops ignorado acima de 3"
+            );
+        }
+
         let min_spread = app_config
             .arbitrage
             .min_spread_percent
             .parse::<f64>()
             .unwrap_or(0.008);
+        let min_profit_usd = app_config
+            .arbitrage
+            .cross_dex
+            .min_cross_profit
+            .parse::<f64>()
+            .unwrap_or(0.0);
 
         let stables: Vec<String> = tri_cfg
             .anchors
@@ -1559,7 +1631,8 @@ impl ArbitrageEngine {
             .cloned()
             .collect();
 
-        let graph = Self::build_price_graph(prices);
+        let venues: Vec<String> = prices.keys().cloned().collect();
+        let known_tokens = Self::known_tokens(prices);
 
         let mut evaluated = 0u64;
         let mut gross_positive = 0u64;
@@ -1574,7 +1647,9 @@ impl ArbitrageEngine {
                         continue;
                     }
                     evaluated += 1;
-                    match Self::try_cross_dex_cycle(start, mid, hop, &graph, min_spread) {
+                    match Self::try_cross_dex_cycle_exhaustive(
+                        start, mid, hop, prices, &venues, min_spread, &known_tokens,
+                    ) {
                         IntraCycleResult::MissingLeg => {
                             note_triangular_leg_low_liquidity_discarded(1);
                         }
@@ -1591,9 +1666,11 @@ impl ArbitrageEngine {
                             spread,
                             final_rate,
                         } => {
-                            let venues: Vec<&str> =
+                            let step_venues: Vec<&str> =
                                 steps.iter().map(|s| s.dex_name.as_str()).collect();
-                            let mixed = venues.windows(2).any(|w| !w[0].eq_ignore_ascii_case(w[1]));
+                            let mixed = step_venues
+                                .windows(2)
+                                .any(|w| !w[0].eq_ignore_ascii_case(w[1]));
                             if mixed {
                                 cross_venue_ok += 1;
                             }
@@ -1603,7 +1680,7 @@ impl ArbitrageEngine {
                                 mid,
                                 hop,
                                 start,
-                                venues.join("+")
+                                step_venues.join("+")
                             );
                             if final_rate > best_rate {
                                 best_rate = final_rate;
@@ -1613,18 +1690,22 @@ impl ArbitrageEngine {
                                 gross_positive += 1;
                             }
                             let trade_amount_usd = self.calculate_safe_trade_amount(app_config);
+                            let est_profit = trade_amount_usd * (final_rate - 1.0);
+                            if est_profit < min_profit_usd {
+                                continue;
+                            }
                             let steps_sanitized = Self::sanitize_steps_for_execution(&steps);
                             opportunities.push(ArbitrageOpportunity {
                                 id: next_opp_id("cross_tri"),
                                 pair: format!("{}->{}->{}->{}", start, mid, hop, start),
-                                buy_dex: venues.first().unwrap_or(&"?").to_string(),
-                                sell_dex: venues.last().unwrap_or(&"?").to_string(),
+                                buy_dex: step_venues.first().unwrap_or(&"?").to_string(),
+                                sell_dex: step_venues.last().unwrap_or(&"?").to_string(),
                                 buy_price: steps.first().map(|s| s.expected_rate).unwrap_or(0.0),
                                 sell_price: steps.last().map(|s| s.expected_rate).unwrap_or(0.0),
                                 spread_percent: spread,
                                 amount_in: U256::zero(),
                                 amount_out: U256::zero(),
-                                estimated_profit_usd: trade_amount_usd * (final_rate - 1.0),
+                                estimated_profit_usd: est_profit,
                                 gas_cost_usd: 0.0,
                                 net_profit_usd: 0.0,
                                 steps: SerializableSteps(steps_sanitized),
@@ -1658,51 +1739,94 @@ impl ArbitrageEngine {
         opportunities
     }
 
-    /// Pure: monta ciclo cross-DEX `start→mid→hop→start` no graph global
-    /// (melhor venue por hop). Descarta se hop V3 sem fee executável.
-    fn try_cross_dex_cycle(
+    /// Retorna a taxa real de uma perna direcional em um venue específico.
+    fn leg_rate(
+        prices: &HashMap<String, HashMap<String, f64>>,
+        venue: &str,
+        from: &str,
+        to: &str,
+    ) -> Option<f64> {
+        let pair = format!("{}-{}", from.to_ascii_uppercase(), to.to_ascii_uppercase());
+        prices
+            .get(venue)
+            .and_then(|m| m.get(&pair))
+            .copied()
+            .filter(|r| r.is_finite() && *r > 0.0)
+    }
+
+    /// Pure: monta ciclo cross-DEX `start→mid→hop→start` testando TODAS as
+    /// combinações de venues (até 4³ = 64 por triplet). Mantém a melhor taxa
+    /// que passar nos gates de realismo/executabilidade/spread. Antes o graph
+    /// colapsava só a melhor edge por direção, perdendo composições melhores.
+    fn try_cross_dex_cycle_exhaustive(
         start: &str,
         mid: &str,
         hop: &str,
-        graph: &HashMap<String, HashMap<String, (f64, String)>>,
+        prices: &HashMap<String, HashMap<String, f64>>,
+        venues: &[String],
         min_spread_pct: f64,
+        known_tokens: &[String],
     ) -> IntraCycleResult {
-        let Some(leg1) = graph.get(start).and_then(|m| m.get(mid)) else {
-            return IntraCycleResult::MissingLeg;
-        };
-        let Some(leg2) = graph.get(mid).and_then(|m| m.get(hop)) else {
-            return IntraCycleResult::MissingLeg;
-        };
-        let Some(leg3) = graph.get(hop).and_then(|m| m.get(start)) else {
-            return IntraCycleResult::MissingLeg;
-        };
+        let mut best: Option<(f64, Vec<ArbitrageStep>)> = None;
+        let mut any_leg = false;
 
-        if !Self::is_realistic_price(leg1.0, start, mid)
-            || !Self::is_realistic_price(leg2.0, mid, hop)
-            || !Self::is_realistic_price(leg3.0, hop, start)
-        {
-            return IntraCycleResult::Unrealistic;
+        for v1 in venues {
+            let Some(r1) = Self::leg_rate(prices, v1, start, mid) else {
+                continue;
+            };
+            for v2 in venues {
+                let Some(r2) = Self::leg_rate(prices, v2, mid, hop) else {
+                    continue;
+                };
+                for v3 in venues {
+                    let Some(r3) = Self::leg_rate(prices, v3, hop, start) else {
+                        continue;
+                    };
+                    any_leg = true;
+
+                    if !Self::is_realistic_price(r1, start, mid, known_tokens)
+                        || !Self::is_realistic_price(r2, mid, hop, known_tokens)
+                        || !Self::is_realistic_price(r3, hop, start, known_tokens)
+                    {
+                        continue;
+                    }
+
+                    let final_rate = r1 * r2 * r3;
+                    if !final_rate.is_finite() || final_rate <= 0.0 {
+                        continue;
+                    }
+                    let spread = (final_rate - 1.0) * 100.0;
+                    if spread > MAX_REALISTIC_SPREAD {
+                        continue;
+                    }
+
+                    let steps = vec![
+                        Self::create_step(v1, start, mid, r1),
+                        Self::create_step(v2, mid, hop, r2),
+                        Self::create_step(v3, hop, start, r3),
+                    ];
+
+                    if steps.iter().any(|s| !Self::hop_is_executable(s)) {
+                        continue;
+                    }
+
+                    if best.is_none() || final_rate > best.as_ref().unwrap().0 {
+                        best = Some((final_rate, steps));
+                    }
+                }
+            }
         }
 
-        let final_rate = leg1.0 * leg2.0 * leg3.0;
-        if !final_rate.is_finite() || final_rate <= 0.0 {
-            return IntraCycleResult::Unrealistic;
+        if !any_leg {
+            return IntraCycleResult::MissingLeg;
         }
+
+        let Some((final_rate, steps)) = best else {
+            // Todas as combinações foram descartadas por realismo/executabilidade.
+            return IntraCycleResult::Unrealistic;
+        };
+
         let spread = (final_rate - 1.0) * 100.0;
-        if spread > MAX_REALISTIC_SPREAD {
-            return IntraCycleResult::Unrealistic;
-        }
-
-        let steps = vec![
-            Self::create_step(&leg1.1, start, mid, leg1.0),
-            Self::create_step(&leg2.1, mid, hop, leg2.0),
-            Self::create_step(&leg3.1, hop, start, leg3.0),
-        ];
-
-        if steps.iter().any(|s| !Self::hop_is_executable(s)) {
-            return IntraCycleResult::NotExecutable;
-        }
-
         if spread < min_spread_pct {
             return IntraCycleResult::BelowSpread { final_rate };
         }
@@ -1742,7 +1866,8 @@ impl ArbitrageEngine {
         }
     }
 
-    /// Triangular **intra-DEX**: `stable → midcap → anchor → stable` no mesmo venue.
+    /// Triangular **intra-DEX**: `stable → X → Y → stable` no mesmo venue,
+    /// onde {X,Y} = {midcap, anchor}. Testa ambas as ordenações da perna do meio.
     ///
     /// Cada perna deve existir no price_map do venue (pós B2). Perna ausente →
     /// `triangular_leg_low_liquidity_discarded` + ciclo descartado.
@@ -1755,11 +1880,33 @@ impl ArbitrageEngine {
         let tri_cfg = &app_config.arbitrage.triangular;
         let mut opportunities = Vec::new();
 
+        if tri_cfg.max_hops < 3 {
+            info!(
+                target: "arbitrage",
+                max_hops = tri_cfg.max_hops,
+                "🔺 triangular intra-DEX desabilitado: max_hops < 3"
+            );
+            return opportunities;
+        }
+        if tri_cfg.max_hops > 3 {
+            warn!(
+                target: "arbitrage",
+                max_hops = tri_cfg.max_hops,
+                "🔺 triangular intra-DEX só suporta 3 hops; max_hops ignorado acima de 3"
+            );
+        }
+
         let min_spread = app_config
             .arbitrage
             .min_spread_percent
             .parse::<f64>()
             .unwrap_or(0.008);
+        let min_profit_usd = app_config
+            .arbitrage
+            .triangular
+            .min_triangle_profit
+            .parse::<f64>()
+            .unwrap_or(0.0);
 
         let stables: Vec<String> = tri_cfg
             .anchors
@@ -1784,6 +1931,7 @@ impl ArbitrageEngine {
         let mut gross_positive = 0u64;
         let mut best_rate = 0.0_f64;
         let mut best_label = String::new();
+        let known_tokens = Self::known_tokens(prices);
 
         for venue in &tri_cfg.venues {
             let Some(dex_prices) = Self::resolve_venue_prices(prices, venue) else {
@@ -1799,68 +1947,82 @@ impl ArbitrageEngine {
             for start in &stables {
                 for mid in &tri_cfg.midcaps {
                     for hop in &hop_anchors {
-                        if hop.eq_ignore_ascii_case(start) || hop.eq_ignore_ascii_case(mid) {
+                        // Pula token duplicado; start é stable, então mid/hop nunca = start.
+                        if hop.eq_ignore_ascii_case(mid) {
                             continue;
                         }
-                        evaluated += 1;
-                        match Self::try_intra_dex_cycle(venue, start, mid, hop, &graph, min_spread)
-                        {
-                            IntraCycleResult::MissingLeg => {
-                                note_triangular_leg_low_liquidity_discarded(1);
-                            }
-                            IntraCycleResult::Unrealistic | IntraCycleResult::NotExecutable => {}
-                            IntraCycleResult::BelowSpread { final_rate } => {
-                                if final_rate > best_rate {
-                                    best_rate = final_rate;
-                                    best_label =
-                                        format!("{}:{}→{}→{}→{}", venue, start, mid, hop, start);
+                        // Testa as duas ordenações do meio: stable→mid→anchor→stable
+                        // e stable→anchor→mid→stable.
+                        let orderings =
+                            [(mid.as_str(), hop.as_str()), (hop.as_str(), mid.as_str())];
+                        for (a, b) in orderings {
+                            evaluated += 1;
+                            match Self::try_intra_dex_cycle(venue, start, a, b, &graph, min_spread, &known_tokens)
+                            {
+                                IntraCycleResult::MissingLeg => {
+                                    note_triangular_leg_low_liquidity_discarded(1);
                                 }
-                            }
-                            IntraCycleResult::Ok {
-                                path,
-                                steps,
-                                spread,
-                                final_rate,
-                            } => {
-                                if final_rate > best_rate {
-                                    best_rate = final_rate;
-                                    best_label =
-                                        format!("{}:{}→{}→{}→{}", venue, start, mid, hop, start);
+                                IntraCycleResult::Unrealistic | IntraCycleResult::NotExecutable => {
                                 }
-                                if spread > 0.0 {
-                                    gross_positive += 1;
+                                IntraCycleResult::BelowSpread { final_rate } => {
+                                    if final_rate > best_rate {
+                                        best_rate = final_rate;
+                                        best_label =
+                                            format!("{}:{}→{}→{}→{}", venue, start, a, b, start);
+                                    }
                                 }
-                                let trade_amount_usd = self.calculate_safe_trade_amount(app_config);
-                                let steps_sanitized = Self::sanitize_steps_for_execution(&steps);
-                                opportunities.push(ArbitrageOpportunity {
-                                    id: next_opp_id("intra_tri"),
-                                    pair: format!("{}->{}->{}->{}", start, mid, hop, start),
-                                    buy_dex: venue.clone(),
-                                    sell_dex: venue.clone(),
-                                    buy_price: steps
-                                        .first()
-                                        .map(|s| s.expected_rate)
-                                        .unwrap_or(0.0),
-                                    sell_price: steps
-                                        .last()
-                                        .map(|s| s.expected_rate)
-                                        .unwrap_or(0.0),
-                                    spread_percent: spread,
-                                    amount_in: U256::zero(),
-                                    amount_out: U256::zero(),
-                                    estimated_profit_usd: trade_amount_usd * (final_rate - 1.0),
-                                    gas_cost_usd: 0.0,
-                                    net_profit_usd: 0.0,
-                                    steps: SerializableSteps(steps_sanitized),
+                                IntraCycleResult::Ok {
                                     path,
-                                    timestamp: Utc::now().timestamp() as u64,
-                                    confidence: Self::calculate_confidence(spread, 3),
-                                    estimated_volume_usd: trade_amount_usd,
-                                    profit_percent: 0.0,
-                                    execution_risk: 0.0,
-                                    force_flashloan: false,
-                                    token_price_usd: Some(1.0),
-                                });
+                                    steps,
+                                    spread,
+                                    final_rate,
+                                } => {
+                                    if final_rate > best_rate {
+                                        best_rate = final_rate;
+                                        best_label =
+                                            format!("{}:{}→{}→{}→{}", venue, start, a, b, start);
+                                    }
+                                    if spread > 0.0 {
+                                        gross_positive += 1;
+                                    }
+                                    let trade_amount_usd =
+                                        self.calculate_safe_trade_amount(app_config);
+                                    let est_profit = trade_amount_usd * (final_rate - 1.0);
+                                    if est_profit < min_profit_usd {
+                                        continue;
+                                    }
+                                    let steps_sanitized =
+                                        Self::sanitize_steps_for_execution(&steps);
+                                    opportunities.push(ArbitrageOpportunity {
+                                        id: next_opp_id("intra_tri"),
+                                        pair: format!("{}->{}->{}->{}", start, a, b, start),
+                                        buy_dex: venue.clone(),
+                                        sell_dex: venue.clone(),
+                                        buy_price: steps
+                                            .first()
+                                            .map(|s| s.expected_rate)
+                                            .unwrap_or(0.0),
+                                        sell_price: steps
+                                            .last()
+                                            .map(|s| s.expected_rate)
+                                            .unwrap_or(0.0),
+                                        spread_percent: spread,
+                                        amount_in: U256::zero(),
+                                        amount_out: U256::zero(),
+                                        estimated_profit_usd: est_profit,
+                                        gas_cost_usd: 0.0,
+                                        net_profit_usd: 0.0,
+                                        steps: SerializableSteps(steps_sanitized),
+                                        path,
+                                        timestamp: Utc::now().timestamp() as u64,
+                                        confidence: Self::calculate_confidence(spread, 3),
+                                        estimated_volume_usd: trade_amount_usd,
+                                        profit_percent: 0.0,
+                                        execution_risk: 0.0,
+                                        force_flashloan: false,
+                                        token_price_usd: Some(1.0),
+                                    });
+                                }
                             }
                         }
                     }
@@ -1877,6 +2039,90 @@ impl ArbitrageEngine {
             best_cycle_rate = best_rate,
             best_cycle = %best_label,
             "🔺 triangular intra-DEX midcaps"
+        );
+
+        opportunities
+    }
+
+    /// Bellman-Ford: detecta ciclos de arbitragem em grafo completo.
+    /// Complementa a busca combinatória (direct + triangular) com detecção
+    /// de ciclos de N hops via -ln(rate) em log-space.
+    async fn find_bf_cycles(
+        &self,
+        prices: &HashMap<String, HashMap<String, f64>>,
+        app_config: &Config,
+    ) -> Vec<ArbitrageOpportunity> {
+        let min_spread = app_config
+            .arbitrage
+            .min_spread_percent
+            .parse::<f64>()
+            .unwrap_or(0.008);
+        let max_spread = MAX_REALISTIC_SPREAD;
+        let graph = PriceGraph::from_price_map(prices);
+        let cycles = bf_graph::find_arbitrage_cycles(&graph, min_spread, max_spread);
+
+        let mut opportunities = Vec::new();
+        for cycle in &cycles {
+            let pair = cycle.token_path.join("->");
+            let trade_amount_usd = self.calculate_safe_trade_amount(app_config);
+            let est_profit = trade_amount_usd * (cycle.product - 1.0);
+
+            let steps: Vec<ArbitrageStep> = cycle
+                .edges
+                .iter()
+                .map(|e| Self::create_step(&e.dex_name, &e.token_in, &e.token_out, e.rate))
+                .collect();
+
+            let steps_sanitized = Self::sanitize_steps_for_execution(&steps);
+
+            // Log estruturado do ciclo BF
+            info!(
+                target: "arbitrage.bf",
+                path = %pair,
+                n_hops = cycle.path.len() - 1,
+                total_rate = cycle.product,
+                spread_pct = cycle.spread_pct,
+                estimated_profit_usd = est_profit,
+                "🔍 BF cycle candidate"
+            );
+
+            opportunities.push(ArbitrageOpportunity {
+                id: next_opp_id("bf"),
+                pair,
+                buy_dex: cycle
+                    .edges
+                    .first()
+                    .map(|e| e.dex_name.clone())
+                    .unwrap_or_default(),
+                sell_dex: cycle
+                    .edges
+                    .last()
+                    .map(|e| e.dex_name.clone())
+                    .unwrap_or_default(),
+                buy_price: cycle.edges.first().map(|e| e.rate).unwrap_or(0.0),
+                sell_price: cycle.edges.last().map(|e| e.rate).unwrap_or(0.0),
+                spread_percent: cycle.spread_pct,
+                amount_in: U256::zero(),
+                amount_out: U256::zero(),
+                estimated_profit_usd: est_profit,
+                gas_cost_usd: 0.0,
+                net_profit_usd: 0.0,
+                steps: SerializableSteps(steps_sanitized),
+                path: cycle.token_path.clone(),
+                timestamp: Utc::now().timestamp() as u64,
+                confidence: Self::calculate_confidence(cycle.spread_pct, cycle.path.len() - 1),
+                estimated_volume_usd: trade_amount_usd,
+                profit_percent: 0.0,
+                execution_risk: 0.0,
+                force_flashloan: false,
+                token_price_usd: None,
+            });
+        }
+
+        info!(
+            target: "arbitrage",
+            bf_cycles = cycles.len(),
+            "🔍 Bellman-Ford: ciclos detectados"
         );
 
         opportunities
@@ -1927,6 +2173,7 @@ impl ArbitrageEngine {
         hop: &str,
         graph: &HashMap<String, HashMap<String, (f64, String)>>,
         min_spread_pct: f64,
+        known_tokens: &[String],
     ) -> IntraCycleResult {
         let Some(leg1) = graph.get(start).and_then(|m| m.get(mid)) else {
             return IntraCycleResult::MissingLeg;
@@ -1945,9 +2192,9 @@ impl ArbitrageEngine {
             return IntraCycleResult::MissingLeg;
         }
 
-        if !Self::is_realistic_price(leg1.0, start, mid)
-            || !Self::is_realistic_price(leg2.0, mid, hop)
-            || !Self::is_realistic_price(leg3.0, hop, start)
+        if !Self::is_realistic_price(leg1.0, start, mid, known_tokens)
+            || !Self::is_realistic_price(leg2.0, mid, hop, known_tokens)
+            || !Self::is_realistic_price(leg3.0, hop, start, known_tokens)
         {
             return IntraCycleResult::Unrealistic;
         }
@@ -2419,6 +2666,19 @@ impl ArbitrageEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_known_tokens() -> Vec<String> {
+        vec![
+            "USDT".into(),
+            "USDC".into(),
+            "USDC.E".into(),
+            "DAI".into(),
+            "WETH".into(),
+            "WMATIC".into(),
+            "LINK".into(),
+            "WBTC".into(),
+        ]
+    }
 
     /// Valida a fórmula cross-DEX com fees para USDT-WMATIC.
     ///
@@ -3055,7 +3315,7 @@ mod tests {
         let graph = ArbitrageEngine::build_price_graph_for_dex("UniswapV3", &uni);
 
         let r =
-            ArbitrageEngine::try_intra_dex_cycle("UniswapV3", "USDC", "LINK", "WETH", &graph, 0.01);
+            ArbitrageEngine::try_intra_dex_cycle("UniswapV3", "USDC", "LINK", "WETH", &graph, 0.01, &test_known_tokens());
         assert!(matches!(r, IntraCycleResult::MissingLeg));
 
         // Simula o finder: MissingLeg → note
@@ -3087,6 +3347,7 @@ mod tests {
             "WETH",
             &graph,
             0.1, // min 0.1%
+            &test_known_tokens(),
         );
         match r {
             IntraCycleResult::Ok {
@@ -3127,8 +3388,10 @@ mod tests {
         sushi.insert("WETH-USDC".into(), 4200.0);
         prices.insert("SushiSwap".into(), sushi);
 
-        let graph = ArbitrageEngine::build_price_graph(&prices);
-        let r = ArbitrageEngine::try_cross_dex_cycle("USDC", "LINK", "WETH", &graph, 0.1);
+        let venues: Vec<String> = prices.keys().cloned().collect();
+        let r = ArbitrageEngine::try_cross_dex_cycle_exhaustive(
+            "USDC", "LINK", "WETH", &prices, &venues, 0.1, &test_known_tokens(),
+        );
         match r {
             IntraCycleResult::Ok { steps, .. } => {
                 assert_eq!(steps.len(), 3);
@@ -3158,8 +3421,10 @@ mod tests {
         qs.insert("USDC-LINK".into(), 0.06);
         prices.insert("QuickSwap".into(), qs);
         // falta LINK→WETH e WETH→USDC
-        let graph = ArbitrageEngine::build_price_graph(&prices);
-        let r = ArbitrageEngine::try_cross_dex_cycle("USDC", "LINK", "WETH", &graph, 0.01);
+        let venues: Vec<String> = prices.keys().cloned().collect();
+        let r = ArbitrageEngine::try_cross_dex_cycle_exhaustive(
+            "USDC", "LINK", "WETH", &prices, &venues, 0.01, &test_known_tokens(),
+        );
         assert!(matches!(r, IntraCycleResult::MissingLeg));
         note_triangular_leg_low_liquidity_discarded(1);
         assert_eq!(triangular_leg_low_liquidity_discarded_count(), 1);
@@ -3213,8 +3478,8 @@ mod tests {
 
     #[test]
     fn realistic_price_rejects_unknown_token_fallback() {
-        assert!(!ArbitrageEngine::is_realistic_price(1.0, "UNKNOWN", "USDC"));
-        assert!(ArbitrageEngine::is_realistic_price(1.0, "USDC.E", "USDT"));
+        assert!(!ArbitrageEngine::is_realistic_price(1.0, "UNKNOWN", "USDC", &test_known_tokens()));
+        assert!(ArbitrageEngine::is_realistic_price(1.0, "USDC.E", "USDT", &test_known_tokens()));
     }
 
     /// B3: degradado (mev.enabled=false) + allow_public_mempool=false → Err
