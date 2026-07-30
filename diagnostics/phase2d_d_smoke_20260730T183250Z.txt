@@ -1,0 +1,19 @@
+PHASE=2D-D STAGE=STARTED
+[SAFETY] LIVE_TRADING_ENABLED=false TRANSACTION_BROADCAST_ALLOWED=false PRODUCTION_SIGNER_LOADED=false PRODUCTION_BROADCASTER_INITIALIZED=false
+FORK_RPC_LOOPBACK_VALIDATED=true domain=LocalForkOnly
+CANDIDATE structural_cycle_key=0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351| positive_sizes=[25.0, 50.0, 100.0, 200.0, 300.0, 500.0, 750.0, 1000.0] negative_control_sizes=[10.0] source_profiles=["base", "liquid"]
+FORK_ENGINE=anvil FORK_CHAIN_ID=137 FORK_ACCOUNT_MODE=UNLOCKED_LOCAL_ACCOUNT account=0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266 PRODUCTION_SIGNER_LOADED=false
+ALL_TARGET_CONTRACTS_HAVE_CODE=true REAL_CONTRACT_BYTECODE_USED=true
+START_TOKEN=USDC (per project config naming) decimals=6
+FUNDING_METHOD=STORAGE_OVERRIDE slot_index=9
+CASE anchor=91149850 size=25 smoke=true negative_control=false
+STAGE=APPROVE1
+STAGE=SWAP1
+STAGE=APPROVE2
+STAGE=SWAP2
+CASE_FAILED anchor=91149850 size=25 error=eth_sendTransaction failed
+
+Caused by:
+    (code: 3, message: execution reverted, data: Some(String("0x")))
+SMOKE_TEST_FAILED — aborting campaign before burning the remaining cases
+PHASE=2D-D STAGE=COMPLETE jsonl=/tmp/phase2d_d_final_smoke/phase2d_d_fork_bytecode_20260730T184019Z.jsonl csv=/tmp/phase2d_d_final_smoke/phase2d_d_fork_bytecode_20260730T184019Z.csv md=/tmp/phase2d_d_final_smoke/phase2d_d_fork_bytecode_20260730T184019Z.md gates=/tmp/phase2d_d_final_smoke/phase2d_d_gates_20260730T184019Z.txt failures=/tmp/phase2d_d_final_smoke/phase2d_d_failures_20260730T184019Z.jsonl traces=/tmp/phase2d_d_final_smoke/phase2d_d_traces_20260730T184019Z.jsonl codehashes=/tmp/phase2d_d_final_smoke/phase2d_d_contract_codehashes_20260730T184019Z.json

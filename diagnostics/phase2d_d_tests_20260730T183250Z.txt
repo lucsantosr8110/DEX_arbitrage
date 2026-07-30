@@ -1,0 +1,730 @@
+warning: unused import: `ethers::abi::Tokenizable`
+  --> src/core/flashloan.rs:20:5
+   |
+20 | use ethers::abi::Tokenizable;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `DEX_FEE_DEFAULT` is never used
+   --> src/core/arbitrage.rs:158:7
+    |
+158 | const DEX_FEE_DEFAULT: f64 = 0.003;
+    |       ^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated items `normalize_amount`, `build_price_graph`, `is_usdt_centric`, `calculate_expected_output`, `estimate_stable_step`, and `dex_fee` are never used
+    --> src/core/arbitrage.rs:319:8
+     |
+ 177 | impl ArbitrageEngine {
+     | -------------------- associated items in this implementation
+...
+ 319 |     fn normalize_amount(amount: U256, decimals: u32) -> f64 {
+     |        ^^^^^^^^^^^^^^^^
+...
+2260 |     fn build_price_graph(
+     |        ^^^^^^^^^^^^^^^^^
+...
+2323 |     fn is_usdt_centric(path: &[String]) -> bool {
+     |        ^^^^^^^^^^^^^^^
+...
+2457 |     async fn calculate_expected_output(
+     |              ^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2510 |     fn estimate_stable_step(
+     |        ^^^^^^^^^^^^^^^^^^^^
+...
+2583 |     fn dex_fee(dex_name: &str, pair: &str) -> f64 {
+     |        ^^^^^^^
+
+warning: methods `calculate_flashloan_fee` and `validate_profit_after_fees` are never used
+   --> src/core/flashloan.rs:437:8
+    |
+138 | impl ArbitrageClient {
+    | -------------------- methods in this implementation
+...
+437 |     fn calculate_flashloan_fee(&self, amount: U256, fee_pct: f64) -> U256 {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^
+...
+462 |     fn validate_profit_after_fees(
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `safe_low` and `fast` are never read
+  --> src/core/gas.rs:74:5
+   |
+72 | struct PolygonGasOracle {
+   |        ---------------- fields in this struct
+73 |     #[serde(rename = "safeLow")]
+74 |     safe_low: PolygonGasTier,
+   |     ^^^^^^^^
+75 |     standard: PolygonGasTier,
+76 |     fast: PolygonGasTier,
+   |     ^^^^
+   |
+   = note: `PolygonGasOracle` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: field `token_cache` is never read
+  --> src/dex/adapters/curve.rs:77:5
+   |
+73 | pub struct CurveDex {
+   |            -------- field in this struct
+...
+77 |     token_cache: Arc<TokenCache>,
+   |     ^^^^^^^^^^^
+   |
+   = note: `CurveDex` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: method `symbol_from_pair` is never used
+   --> src/dex/adapters/curve.rs:147:8
+    |
+ 92 | impl CurveDex {
+    | ------------- method in this implementation
+...
+147 |     fn symbol_from_pair(&self, pair: &str) -> Option<String> {
+    |        ^^^^^^^^^^^^^^^^
+
+warning: field `last_health_check` is never read
+  --> src/dex/manager.rs:58:5
+   |
+51 | pub struct DexManager {
+   |            ---------- field in this struct
+...
+58 |     last_health_check: Arc<RwLock<Instant>>,
+   |     ^^^^^^^^^^^^^^^^^
+   |
+   = note: `DexManager` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: method `is_valid_flashloan_route` is never used
+   --> src/dex/manager.rs:245:8
+    |
+ 61 | impl DexManager {
+    | --------------- method in this implementation
+...
+245 |     fn is_valid_flashloan_route(&self, opp: &ArbitrageOpportunity) -> bool {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `jsonrpc` and `id` are never read
+  --> src/infra/rotating_http_client.rs:74:5
+   |
+73 | struct JsonRpcResponse<R> {
+   |        --------------- fields in this struct
+74 |     jsonrpc: Option<String>,
+   |     ^^^^^^^
+75 |     id: Option<Value>,
+   |     ^^
+   |
+   = note: `JsonRpcResponse` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: `flashloan-bot` (lib) generated 10 warnings
+warning: unused import: `SerializableSteps`
+   --> src/core/gas_profile.rs:152:45
+    |
+152 |     use crate::core::types::{ArbitrageStep, SerializableSteps};
+    |                                             ^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `ethers::abi::Tokenizable`
+  --> src/core/flashloan.rs:20:5
+   |
+20 | use ethers::abi::Tokenizable;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated items `normalize_amount`, `build_price_graph`, `calculate_expected_output`, and `estimate_stable_step` are never used
+    --> src/core/arbitrage.rs:319:8
+     |
+ 177 | impl ArbitrageEngine {
+     | -------------------- associated items in this implementation
+...
+ 319 |     fn normalize_amount(amount: U256, decimals: u32) -> f64 {
+     |        ^^^^^^^^^^^^^^^^
+...
+2260 |     fn build_price_graph(
+     |        ^^^^^^^^^^^^^^^^^
+...
+2457 |     async fn calculate_expected_output(
+     |              ^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2510 |     fn estimate_stable_step(
+     |        ^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `flashloan-bot` (lib test) generated 9 warnings (6 duplicates) (run `cargo fix --lib -p flashloan-bot --tests` to apply 1 suggestion)
+    Finished `test` profile [optimized + debuginfo] target(s) in 0.27s
+     Running unittests src/lib.rs (/home/lucas/.cache/kamino-flashloan/target/debug/deps/flashloan_bot-b7c0f7f7bc9519c2)
+
+running 444 tests
+test config::config_parser_tests::executable_notional_uses_direct_size_without_flashloan ... ok
+test config::config_parser_tests::executable_notional_uses_flashloan_capital_when_enabled ... ok
+test config::config_parser_tests::ignored_keys_detects_unknown_section ... ok
+test config::config_parser_tests::ignored_keys_is_empty_for_fully_supported_toml ... ok
+test config::config_parser_tests::per_dex_liquidity_threshold_survives_toml_roundtrip ... ok
+test config::config_parser_tests::shipped_configs_have_no_ignored_keys ... ok
+test config::token_cache::tests::test_address_literal_resolution ... ok
+test config::token_cache::tests::test_token_cache_operations ... ok
+test config::token_cache::tests::test_token_cache_size ... ok
+test config::token_cache::tests::test_token_resolution ... ok
+test core::arbitrage::tests::amount_out_min_slippage_applied_once ... ok
+test core::arbitrage::tests::b3_no_private_route_fail_closed_when_degraded_and_not_allowed ... ok
+test core::arbitrage::tests::calculate_price_from_decimals_validation ... ok
+test core::arbitrage::tests::cross_dex_math_with_fees_profit_scenario ... ok
+test core::arbitrage::tests::cross_dex_math_with_fees_usdt_wmatic ... ok
+test core::arbitrage::tests::cycle_rate_formula_validation ... ok
+test core::arbitrage::tests::decimals_round_trip_stable_stable ... ok
+test core::arbitrage::tests::decimals_round_trip_wbtc_usdc ... ok
+test core::arbitrage::tests::dex_fee_returns_correct_values ... ok
+test core::arbitrage::tests::dex_fee_uses_cached_tier_for_v3 ... ok
+test core::arbitrage::tests::eth_call_uses_detection_fee_not_cache_reopt ... ok
+test core::arbitrage::tests::expected_out_equals_amount_times_fee_inclusive_rate ... ok
+test core::arbitrage::tests::fee_not_doubled ... ok
+test core::arbitrage::tests::gas_cost_scales_once_from_three_hop_baseline ... ok
+test core::arbitrage::tests::get_amounts_out_manual_v2 ... ok
+test core::arbitrage::tests::next_opp_id_includes_prefix ... ok
+test core::arbitrage::tests::next_opp_id_produces_unique_ids ... ok
+test core::arbitrage::tests::no_double_fee_is_higher_than_double_fee ... ok
+test core::arbitrage::tests::rate_round_trip_usdt_wmatic ... ok
+test core::arbitrage::tests::realistic_price_rejects_unknown_token_fallback ... ok
+test core::arbitrage::tests::safety_margin_10000_applies_single_haircut ... ok
+test core::arbitrage::tests::sanitize_steps_drops_identical_token_hops ... ok
+test core::arbitrage::tests::sanitize_steps_keeps_distinct_usdc_contracts ... ok
+test core::arbitrage::tests::slippage_budget_binds_amount_out_min_to_edge ... ok
+test core::arbitrage::tests::slippage_safe_clamps_at_boundary ... ok
+test core::arbitrage::tests::slippage_safe_clamps_dangerous_margin ... ok
+test core::arbitrage::tests::slippage_safe_respects_valid_margin ... ok
+test core::arbitrage::tests::stable_flashloan_centric_accepts_usdc ... ok
+test core::arbitrage::tests::triangular_cross_dex_discards_when_leg_low_liquidity ... ok
+test core::arbitrage::tests::triangular_cross_dex_preserves_venue_and_fee_per_hop ... ok
+test core::arbitrage::tests::triangular_discards_cycle_when_leg_missing_liquidity ... ok
+test core::arbitrage::tests::triangular_intra_dex_cycle_ok_when_legs_present ... ok
+test core::arbitrage::tests::triangular_v3_steps_use_executable_fee_tiers ... ok
+test core::bf_graph::tests::bf_4hop_profitable_no_crash ... ok
+test core::bf_graph::tests::bf_cycle_path_has_correct_tokens ... ok
+test core::bf_graph::tests::bf_detects_cross_dex_arbitrage ... ok
+test core::bf_graph::tests::bf_detects_triangular_arbitrage ... ok
+test core::bf_graph::tests::bf_diagnostic_deterministic_cycle ... ok
+test core::bf_graph::tests::bf_empty_graph_no_cycles ... ok
+test core::bf_graph::tests::bf_handles_disconnected_graphs ... ok
+test core::bf_graph::tests::bf_no_cycle_when_no_negative_loop ... ok
+test core::bf_graph::tests::bf_no_false_positive_on_efficient_market ... ok
+test core::bf_graph::tests::bf_spread_filter_respects_min_max ... ok
+test core::bot::should_try_next_tests::continues_only_on_aborted_pre_broadcast ... ok
+test core::diagnostic_graph::tests::graph_json_round_trip_preserves_edges ... ok
+test core::diagnostic_graph::tests::one_way_quote_has_no_cycle ... ok
+test core::diagnostic_graph::tests::parallel_edges_keep_their_own_edge_ids ... ok
+test core::diagnostic_graph::tests::phase2b_accepted_quote_is_in_pre_and_post ... ok
+test core::diagnostic_graph::tests::phase2b_filter_cannot_create_cycle_from_subset ... ok
+test core::diagnostic_graph::tests::phase2b_pairing_classes_cover_same_and_cross_direction ... ok
+test core::diagnostic_graph::tests::phase2b_post_cannot_contain_rejected_edge ... ok
+test core::diagnostic_graph::tests::phase2b_pre_negative_cycle_is_found_by_both_models ... ok
+test core::diagnostic_graph::tests::phase2b_rejected_quote_is_only_in_pre ... ok
+test core::diagnostic_graph::tests::phase2b_rejection_matrix_group_count_is_stable ... ok
+test core::diagnostic_graph::tests::phase2b_removed_edge_removes_cycle ... ok
+test core::diagnostic_graph::tests::phase2b_scan_graphs_are_isolated ... ok
+test core::diagnostic_graph::tests::phase2b_summary_multiple_scans_adds_observations ... ok
+test core::diagnostic_graph::tests::profitable_two_leg_cycle_is_exact_and_bf_detectable ... ok
+test core::diagnostic_graph::tests::replay_enumeration_is_deterministic ... ok
+test core::economics::tests::adverse_move_is_opt_in ... ok
+test core::economics::tests::b5_compounded_adverse_move_usd ... ok
+test core::economics::tests::b5_edge_6bps_rejected_with_default_adverse_accepted_with_zero ... ok
+test core::economics::tests::b6_pow_bps_eip1559_projection ... ok
+test core::economics::tests::edge_budget_bps_floors_and_safe_on_zero ... ok
+test core::economics::tests::flashloan_fee_uses_principal_token_value ... ok
+test core::economics::tests::live_gas_publish_and_fallback ... ok
+test core::economics::tests::negative_and_nonfinite_inputs_are_safe ... ok
+test core::economics::tests::net_deducts_each_cost_exactly_once ... ok
+test core::economics::tests::net_profit_rejects_nonfinite_costs ... ok
+test core::economics::tests::price_impact_is_not_a_cost_term ... ok
+test core::economics::tests::sim_delta_excludes_gas_includes_premium ... ok
+test core::economics::tests::slippage_budget_floors_on_zero_or_negative_edge ... ok
+test core::economics::tests::slippage_budget_never_exceeds_the_edge ... ok
+test core::economics::tests::slippage_budget_respects_ceiling_when_edge_is_fat ... ok
+test core::economics::tests::slippage_total_accepts_with_limit_when_edge_is_fat ... ok
+test core::economics::tests::slippage_total_caps_below_edge_when_hop_increase_would_exceed ... ok
+test core::economics::tests::slippage_total_rejects_when_edge_le_safety_margin ... ok
+test core::economics::tests::slippage_total_route_limit_never_authorizes_above_edge ... ok
+test core::economics::tests::trade_economics_gate_approves_above_min ... ok
+test core::economics::tests::trade_economics_gate_rejects_below_min ... ok
+test core::economics::tests::trade_economics_gate_rejects_nonfinite_net ... ok
+test core::fixed_usd::tests::ceil_when_not_divisible ... ok
+test core::fixed_usd::tests::cheap_token_ceil_rounds_up ... ok
+test core::fixed_usd::tests::fee_bps_five ... ok
+test core::fixed_usd::tests::large_raw_no_silent_saturation ... ok
+test core::fixed_usd::tests::missing_price_fails ... ok
+test core::fixed_usd::tests::property_grid_ceil_matches_reference_and_covers_hurdle ... ok
+test core::fixed_usd::tests::property_monotonic_in_hurdle_and_inverse_in_price ... ok
+test core::fixed_usd::tests::property_token_raw_to_usd_e8_monotonic_and_no_silent_clip ... ok
+test core::fixed_usd::tests::raw_to_usd_monotonic_no_clip ... ok
+test core::fixed_usd::tests::stable_6dec_hurdle_one_dollar ... ok
+test core::fixed_usd::tests::token_18dec_price_2000_ceil ... ok
+test core::flashloan::tests::apply_slippage_full_amount_bps ... ok
+test core::flashloan::tests::apply_slippage_reduces_by_bps ... ok
+test core::flashloan::tests::apply_slippage_zero_bps_noop ... ok
+test core::flashloan::tests::b10_rbf_underpriced_compounds_exact_15pct ... ok
+test core::flashloan::tests::b4_rbf_bump_gas_accumulates_and_caps ... ok
+test core::flashloan::tests::callback_data_abi_roundtrip_preserves_fields ... ok
+test core::flashloan::tests::complexity_filters_ok_valid_cycle ... ok
+test core::flashloan::tests::complexity_filters_rejects_broken_route ... ok
+test core::flashloan::tests::complexity_filters_rejects_zero_min_out ... ok
+test core::flashloan::tests::decode_revert_error_string_selector ... ok
+test core::flashloan::tests::decode_revert_non_revert_passthrough ... ok
+test core::flashloan::tests::decode_revert_panic_selector ... ok
+test core::flashloan::tests::decode_revert_unknown_selector ... ok
+test core::flashloan::tests::direct_fee_pct_is_zero_flashloan_nonzero ... ok
+test core::flashloan::tests::encode_v3_fee_extra_data_roundtrip ... ok
+test core::flashloan::tests::executable_route_extra_data_never_fee100 ... ok
+test core::flashloan::tests::export_callback_abi_fixtures ... ignored
+test core::flashloan::tests::extract_real_profit_decodes_direct_execution_event ... ok
+test core::flashloan::tests::extract_real_profit_decodes_flashloan_success_event ... ok
+test core::flashloan::tests::extract_real_profit_returns_none_when_no_event ... ok
+test core::flashloan::tests::flashloan_fee_is_five_bps ... ok
+test core::flashloan::tests::flashloan_fee_not_nine_bps ... ok
+test core::flashloan::tests::flashloan_fee_zero_amount ... ok
+test core::flashloan::tests::format_route_chains_tokens ... ok
+test core::flashloan::tests::format_route_empty ... ok
+test core::flashloan::tests::map_dex_type_known_dexes ... ok
+test core::flashloan::tests::map_dex_type_normalizes_variants ... ok
+test core::flashloan::tests::map_dex_type_rejects_unknown ... ok
+test core::flashloan::tests::minimum_profit_raw_rejects_missing_price ... ok
+test core::flashloan::tests::minimum_profit_raw_stable_6dec ... ok
+test core::flashloan::tests::minimum_profit_raw_weth_price_2000 ... ok
+test core::flashloan::tests::paper_eth_call_uses_configured_paper_from ... ok
+test core::flashloan::tests::paper_state_override_only_when_observation_active ... ok
+test core::flashloan::tests::profit_recipient_mismatch_aborts_before_broadcast ... ok
+test core::flashloan::tests::profit_validation_accepts_when_engine_net_already_positive ... ok
+test core::flashloan::tests::profit_validation_ok_when_net_positive ... ok
+test core::flashloan::tests::profit_validation_rejects_net_zero_or_negative ... ok
+test core::flashloan::tests::profit_validation_single_deduction_no_double ... ok
+test core::flashloan::tests::proptest_routes::b10_validate_steps_critical_classifies_random_routes ... ok
+test core::flashloan::tests::resolve_profit_recipient_falls_back_to_wallet ... ok
+test core::flashloan::tests::resolve_profit_recipient_prefers_wrapper_owner ... ok
+test core::flashloan::tests::resolve_then_mismatch_when_cfg_owner_differs_from_onchain ... ok
+test core::flashloan::tests::route_complexity_ok_within_max ... ok
+test core::flashloan::tests::route_complexity_rejects_exceeding_max ... ok
+test core::flashloan::tests::route_consistency_ok_for_valid_cycle ... ok
+test core::flashloan::tests::route_consistency_rejects_broken_chain ... ok
+test core::flashloan::tests::route_consistency_rejects_non_cycle ... ok
+test core::flashloan::tests::route_validation_enforces_hop_and_slippage_caps ... ok
+test core::flashloan::tests::steps_critical_ok_valid_cycle ... ok
+test core::flashloan::tests::steps_critical_rejects_empty ... ok
+test core::flashloan::tests::steps_critical_rejects_noop_hop ... ok
+test core::flashloan::tests::steps_critical_rejects_zero_amount_out_min ... ok
+test core::flashloan::tests::token_amount_to_usd_18_decimals ... ok
+test core::flashloan::tests::token_amount_to_usd_6_decimals ... ok
+test core::flashloan::tests::v2_and_curve_extra_data_empty ... ok
+test core::flashloan::tests::v3_extra_data_uses_cached_fee_not_silent_3000 ... ok
+test core::flashloan::tests::v3_fee_100_aborts_executor_unsupported ... ok
+test core::flashloan::tests::v3_without_fee_cache_aborts ... ok
+test core::flashloan::tests::wrapper_steps_ok_when_first_and_last_match_asset ... ok
+test core::flashloan::tests::wrapper_steps_rejects_empty ... ok
+test core::flashloan::tests::wrapper_steps_rejects_first_mismatch ... ok
+test core::flashloan::tests::wrapper_steps_rejects_last_mismatch ... ok
+test core::fork_balance_accounting::tests::gross_pnl_matches_signed_delta ... ok
+test core::fork_balance_accounting::tests::material_residual_above_threshold_is_flagged ... ok
+test core::fork_balance_accounting::tests::negative_delta_when_balance_decreases ... ok
+test core::fork_balance_accounting::tests::net_pnl_can_go_negative_when_gas_exceeds_gross ... ok
+test core::fork_balance_accounting::tests::net_pnl_subtracts_gas_cost ... ok
+test core::fork_balance_accounting::tests::positive_delta_when_balance_increases ... ok
+test core::fork_balance_accounting::tests::residual_at_or_below_threshold_is_not_flagged ... ok
+test core::fork_balance_accounting::tests::zero_delta_when_unchanged ... ok
+test core::fork_candidate_dedup::tests::dedups_base_and_liquid_profile_duplicates_into_one_physical_route ... ok
+test core::fork_candidate_dedup::tests::fewer_than_expected_rounds_is_not_counted_as_stable ... ok
+test core::fork_candidate_dedup::tests::missing_structural_key_is_rejected ... ok
+test core::fork_candidate_dedup::tests::negative_control_size_is_preserved_separately ... ok
+test core::fork_candidate_dedup::tests::one_negative_round_breaks_positive_classification ... ok
+test core::fork_candidate_dedup::tests::preserves_provenance_of_both_profiles ... ok
+test core::fork_candidate_dedup::tests::profile_divergence_in_pools_is_rejected_not_merged ... ok
+test core::fork_candidate_dedup::tests::real_phase2d_c_artifact_dedups_to_expected_counts ... ok
+test core::fork_candidate_dedup::tests::single_physical_candidate_rejects_two_distinct_positive_routes ... ok
+test core::fork_candidate_dedup::tests::single_physical_candidate_rejects_zero_positive_routes ... ok
+test core::fork_candidate_dedup::tests::single_physical_candidate_succeeds_with_exactly_one_positive_route ... ok
+test core::fork_economics_comparison::tests::both_negative_is_not_a_sign_flip ... ok
+test core::fork_economics_comparison::tests::both_zero_is_exact_match_not_sign_flip ... ok
+test core::fork_economics_comparison::tests::economically_equivalent_for_small_relative_delta_beyond_atomic_bound ... ok
+test core::fork_economics_comparison::tests::exact_match_when_identical ... ok
+test core::fork_economics_comparison::tests::material_divergence_for_large_relative_delta ... ok
+test core::fork_economics_comparison::tests::sign_flip_takes_priority_over_small_delta ... ok
+test core::fork_economics_comparison::tests::sign_flip_when_predicted_positive_actual_negative ... ok
+test core::fork_economics_comparison::tests::sign_flip_when_predicted_positive_actual_zero ... ok
+test core::fork_economics_comparison::tests::within_atomic_bound_for_tiny_rounding_delta ... ok
+test core::fork_execution_domain::tests::accepts_127_0_0_1 ... ok
+test core::fork_execution_domain::tests::accepts_ipv6_loopback ... ok
+test core::fork_execution_domain::tests::accepts_localhost ... ok
+test core::fork_execution_domain::tests::accepts_other_127_range_addresses ... ok
+test core::fork_execution_domain::tests::rejects_alchemy_style_url ... ok
+test core::fork_execution_domain::tests::rejects_empty_endpoint ... ok
+test core::fork_execution_domain::tests::rejects_external_hostname_even_if_it_contains_localhost_substring ... ok
+test core::fork_execution_domain::tests::rejects_private_network_ip ... ok
+test core::fork_execution_domain::tests::rejects_public_url ... ok
+test core::fork_execution_domain::tests::rejects_unparseable_endpoint ... ok
+test core::fork_route_executor::tests::slot_key_differs_by_account ... ok
+test core::fork_route_executor::tests::slot_key_differs_by_slot_index ... ok
+test core::fork_route_executor::tests::slot_key_is_32_bytes ... ok
+test core::fork_route_executor::tests::slot_key_is_deterministic ... ok
+test core::fork_trace_validation::tests::call_to_unlisted_address_is_flagged ... ok
+test core::fork_trace_validation::tests::clean_two_hop_trace_has_no_anomalies ... ok
+test core::fork_trace_validation::tests::delegatecall_to_allowlisted_implementation_is_not_flagged ... ok
+test core::fork_trace_validation::tests::delegatecall_to_unlisted_implementation_is_flagged_as_delegate_target ... ok
+test core::fork_trace_validation::tests::internal_revert_is_flagged ... ok
+test core::fork_trace_validation::tests::nested_anomaly_is_found_deep_in_the_tree ... ok
+test core::fork_trace_validation::tests::nonzero_native_value_is_flagged_even_to_allowlisted_target ... ok
+test core::fork_trace_validation::tests::selfdestruct_is_flagged ... ok
+test core::fork_trace_validation::tests::uniswap_v3_callback_to_non_allowlisted_caller_is_not_flagged ... ok
+test core::gas::tests::calibration_ewma_tracks_receipt_without_outlier_jump ... ok
+test core::gas::tests::cost_uses_estimated_units_not_limit ... ok
+test core::gas::tests::gwei_f64_keeps_fraction ... ok
+test core::gas::tests::gwei_f64_rejects_nonfinite_and_negative ... ok
+test core::gas_oracle::tests::at_min_samples_uses_max_static_p75 ... ok
+test core::gas_oracle::tests::below_min_samples_still_static ... ok
+test core::gas_oracle::tests::load_save_roundtrip ... ok
+test core::gas_oracle::tests::never_below_static_even_with_low_real ... ok
+test core::gas_oracle::tests::proportional_attribution_multi_venue ... ok
+test core::gas_oracle::tests::uncalibrated_venue_returns_static ... ok
+test core::gas_profile::tests::curve3_v3_aave_fl_units ... ok
+test core::gas_profile::tests::unknown_venue_superestimates_and_classifies ... ok
+test core::gas_profile::tests::v2_v2_balancer_fl_units ... ok
+test core::gas_profile::tests::v3_tier_selects_v3_variant ... ok
+test core::nonce_reaper::tests::b8_cancel_nonce_checked ... ok
+test core::nonce_reaper::tests::b8_kill_switch_after_three_consecutive_failures ... ok
+test core::nonce_reaper::tests::b8_no_gap_when_pending_le_on_chain ... ok
+test core::nonce_reaper::tests::b8_prune_included_removes_consumed_nonces ... ok
+test core::nonce_reaper::tests::b8_three_txs_first_dropped_reaper_cancels_lowest ... ok
+test core::paper_validation::tests::aggregate_counts_false_profitable ... ok
+test core::paper_validation::tests::alchemy_fixture_extracts_holder_delta ... ok
+test core::paper_validation::tests::balance_delta_abi_roundtrip ... ok
+test core::paper_validation::tests::balance_delta_parser_positive ... ok
+test core::paper_validation::tests::build_sample_marks_false_profitable ... ok
+test core::paper_validation::tests::decode_error_string_fixture_not_profitable ... ok
+test core::paper_validation::tests::decode_from_provider_error_string ... ok
+test core::paper_validation::tests::decode_nested_ethers_string_data ... ok
+test core::paper_validation::tests::decode_panic_fixture_overflow ... ok
+test core::paper_validation::tests::observe_above_exec_warns_but_resolves ... ok
+test core::paper_validation::tests::observe_mid_band_would_execute_false ... ok
+test core::paper_validation::tests::observe_min_spread_noop_when_paper_off ... ok
+test core::paper_validation::tests::reached_eth_call_filters_pre_encode_aborts ... ok
+test core::paper_validation::tests::resolve_paper_from_prefers_config_over_wallet ... ok
+test core::paper_validation::tests::route_executor_skips_curve ... ok
+test core::paper_validation::tests::sends_forbidden_blocks_broadcast_path ... ok
+test core::paper_validation::tests::sends_forbidden_when_dry_run_only ... ok
+test core::paper_validation::tests::sends_forbidden_when_env_paper ... ok
+test core::paper_validation::tests::state_override_json_has_token_key ... ok
+test core::phase2d_anchor::tests::divergent_hash_rejected ... ok
+test core::phase2d_anchor::tests::divergent_number_rejected ... ok
+test core::phase2d_anchor::tests::empty_graph_anchor_is_valid ... ok
+test core::phase2d_anchor::tests::failure_keeps_anchor_number ... ok
+test core::phase2d_anchor::tests::failure_kind_is_serializable ... ok
+test core::phase2d_anchor::tests::graph_anchor_accepts_matching_edge ... ok
+test core::phase2d_anchor::tests::graph_anchor_rejects_missing_hash ... ok
+test core::phase2d_anchor::tests::graph_anchor_rejects_missing_number ... ok
+test core::phase2d_anchor::tests::graph_anchor_rejects_unpinned_edge ... ok
+test core::phase2d_anchor::tests::matching_quote_accepted ... ok
+test core::phase2d_anchor::tests::metadata_has_zero_quote_span ... ok
+test core::phase2d_anchor::tests::metadata_records_head_advance ... ok
+test core::phase2d_anchor::tests::preserves_head_and_lag ... ok
+test core::phase2d_anchor::tests::provenance_hash_matches ... ok
+test core::phase2d_anchor::tests::provenance_is_pinned ... ok
+test core::phase2d_anchor::tests::provenance_number_matches ... ok
+test core::phase2d_anchor::tests::rejects_missing_block ... ok
+test core::phase2d_anchor::tests::rejects_missing_hash ... ok
+test core::phase2d_anchor::tests::rejects_number_mismatch ... ok
+test core::phase2d_anchor::tests::rejects_underflow ... ok
+test core::phase2d_anchor::tests::reorg_false_for_same_hash ... ok
+test core::phase2d_anchor::tests::reorg_true_for_changed_hash ... ok
+test core::phase2d_anchor::tests::reorg_true_for_missing_block ... ok
+test core::phase2d_anchor::tests::selects_lag_two_anchor ... ok
+test core::phase2d_anchor::tests::strict_context_contains_anchor ... ok
+test core::phase2d_anchor::tests::unpinned_quote_rejected ... ok
+test core::pipeline_obs::tests::counter_consistency_dex_quote ... ok
+test core::pipeline_obs::tests::counter_consistency_sizing ... ok
+test core::pipeline_obs::tests::counters_reset_and_increment ... ok
+test core::pipeline_obs::tests::rejection_reasons_map_to_counters ... ok
+test core::pipeline_obs::tests::scan_cycle_lifecycle ... ok
+test core::pool_state_sim::tests::classify_curve_is_stableswap ... ok
+test core::pool_state_sim::tests::classify_quickswap_v2_is_constant_product ... ok
+test core::pool_state_sim::tests::classify_uniswap_v3_is_concentrated ... ok
+test core::pool_state_sim::tests::constant_product_matches_hand_computed_example ... ok
+test core::pool_state_sim::tests::distinct_pools_do_not_interfere ... ok
+test core::pool_state_sim::tests::first_touch_then_reuse_diverges_from_naive_original_state_reuse ... ok
+test core::pool_state_sim::tests::only_constant_product_supports_reuse_mutation ... ok
+test core::pool_state_sim::tests::peek_reference_rate_none_before_first_touch ... ok
+test core::pool_state_sim::tests::peek_reference_rate_none_for_opaque_pool ... ok
+test core::pool_state_sim::tests::peek_reference_rate_reflects_pre_swap_state ... ok
+test core::pool_state_sim::tests::price_impact_bps_none_for_non_finite_inputs ... ok
+test core::pool_state_sim::tests::price_impact_bps_positive_when_effective_worse_than_reference ... ok
+test core::pool_state_sim::tests::price_impact_bps_zero_when_effective_equals_reference ... ok
+test core::pool_state_sim::tests::record_first_touch_is_idempotent_does_not_clobber_mutated_state ... ok
+test core::pool_state_sim::tests::reference_rate_from_reserves ... ok
+test core::pool_state_sim::tests::reuse_of_opaque_pool_is_unsupported_not_approximated ... ok
+test core::pool_state_sim::tests::tiny_amount_in_can_floor_to_zero_output ... ok
+test core::pool_state_sim::tests::zero_reserve_is_insufficient_liquidity_not_panic ... ok
+test core::profit_ledger::tests::b7_detect_reorg_verdicts ... ok
+test core::profit_ledger::tests::b7_estimated_loss_does_not_feed_loss_breaker ... ok
+test core::profit_ledger::tests::b7_finality_promotion_to_final_after_confirmations ... ok
+test core::profit_ledger::tests::b7_realized_profit_resets_consecutive_losses ... ok
+test core::profit_ledger::tests::b7_reorg_reverts_provisory_not_final ... ok
+test core::quantization::tests::decimals_0_is_whole_units ... ok
+test core::quantization::tests::decimals_8_matches_wbtc_scale ... ok
+test core::quantization::tests::decimals_over_36_rejected ... ok
+test core::quantization::tests::different_decimals_same_human_differ_in_atomic_scale ... ok
+test core::quantization::tests::dust_below_atomic_precision_floors_to_zero_and_is_flagged ... ok
+test core::quantization::tests::exact_amount_6_decimals ... ok
+test core::quantization::tests::floors_fractional_atomic_instead_of_rounding ... ok
+test core::quantization::tests::huge_amount_overflow_rejected ... ok
+test core::quantization::tests::infinite_rejected ... ok
+test core::quantization::tests::monotonic_in_human_amount ... ok
+test core::quantization::tests::nan_rejected ... ok
+test core::quantization::tests::negative_human_rejected ... ok
+test core::quantization::tests::non_dust_amount_is_not_flagged ... ok
+test core::quantization::tests::round_trip_display_matches_input_within_float_precision ... ok
+test core::quantization::tests::zero_human_is_zero_atomic ... ok
+test core::read_only::tests::counter_duplicate_terminal_category_fails ... ok
+test core::read_only::tests::counter_terminal_categories_do_not_duplicate ... ok
+test core::read_only::tests::safety_rejects_broadcast_or_live_execution ... ok
+test core::read_only::tests::safety_requires_explicit_diagnostic_mode ... ok
+test core::replay_cross_model::tests::cross_model_flag_mixed_venues ... ok
+test core::replay_cross_model::tests::curve_not_executable_quote_only ... ok
+test core::replay_cross_model::tests::find_cross_model_cycle_from_quotes ... ok
+test core::replay_cross_model::tests::stable_decimals_canonical ... ok
+test core::replay_scan::tests::archive_error_detected ... ok
+test core::replay_scan::tests::committed_windows_step1_contiguous ... ok
+test core::replay_scan::tests::edge_exists_gt_one ... ok
+test core::replay_scan::tests::eth_call_only_on_edge_and_under_cap ... ok
+test core::replay_scan::tests::fee_floor_three_v3_hops ... ok
+test core::replay_scan::tests::multi_window_aggregate_sums_counts ... ok
+test core::replay_scan::tests::same_block_tag_ok ... ok
+test core::replay_scan::tests::scan_requires_paper_observation ... ok
+test core::replay_scan::tests::step1_samples_all_contiguous_blocks ... ok
+test core::replay_scan::tests::us_session_window_weekday ... ok
+test core::replay_scan::tests::windows_priority_over_legacy_range ... ok
+test core::risk::tests::effective_gas_prefers_live_measurement ... ok
+test core::risk::tests::risk_uses_engine_net_not_own_cost_model ... ok
+test core::risk::tests::test_adaptive_mode_switch ... ok
+test core::risk::tests::test_opportunity_validation ... ok
+test core::risk::tests::test_risk_assessment_aggressive ... ok
+test core::route_artifact::tests::detects_hop_count_mismatch_as_edge_missing ... ok
+test core::route_artifact::tests::detects_not_closed ... ok
+test core::route_artifact::tests::detects_token_discontinuity ... ok
+test core::route_artifact::tests::duplicate_route_ids_are_flagged ... ok
+test core::route_artifact::tests::invalid_route_is_reported_as_failure_not_reconstructed ... ok
+test core::route_artifact::tests::loads_one_valid_route_with_stable_class ... ok
+test core::route_artifact::tests::malformed_json_is_invalid_error ... ok
+test core::route_artifact::tests::missing_artifact_file_is_missing_error ... ok
+test core::route_artifact::tests::parses_real_2hop_key_trailing_empty_fee ... ok
+test core::route_artifact::tests::parses_real_4hop_key_into_4_legs ... ok
+test core::route_artifact::tests::pool_reuse_detected_for_repeated_curve_pool ... ok
+test core::route_artifact::tests::pool_reuse_detected_when_same_pool_appears_twice ... ok
+test core::route_artifact::tests::real_phase2d_b_artifact_loads_all_11_structural_routes ... ok
+test core::route_artifact::tests::route_is_closed_and_continuous ... ok
+test core::route_artifact::tests::single_scan_observation_is_insufficient ... ok
+test core::sequential_route_economics::tests::all_gross_negative_is_gross_negative ... ok
+test core::sequential_route_economics::tests::all_three_net_positive_is_stable ... ok
+test core::sequential_route_economics::tests::any_route_invalid_short_circuits_everything ... ok
+test core::sequential_route_economics::tests::any_simulation_error_short_circuits ... ok
+test core::sequential_route_economics::tests::any_temporal_incoherence_short_circuits ... ok
+test core::sequential_route_economics::tests::any_unsupported_reused_pool_short_circuits ... ok
+test core::sequential_route_economics::tests::capacity_boundary_finds_first_negative_size ... ok
+test core::sequential_route_economics::tests::capacity_boundary_net_unavailable_does_not_count_as_net_positive ... ok
+test core::sequential_route_economics::tests::capacity_boundary_never_extrapolates_past_grid ... ok
+test core::sequential_route_economics::tests::consistently_gas_unavailable_is_gross_positive_gas_negative ... ok
+test core::sequential_route_economics::tests::consistently_slippage_negative_when_never_net_positive ... ok
+test core::sequential_route_economics::tests::empty_rounds_is_route_invalid_fail_closed ... ok
+test core::sequential_route_economics::tests::fork_candidate_requires_at_least_3_rounds ... ok
+test core::sequential_route_economics::tests::mixed_gross_sign_is_unstable ... ok
+test core::sequential_route_economics::tests::one_negative_round_breaks_stability_even_if_average_positive ... ok
+test core::types::outcome_tests::bundle_result_with_reverted_outcome_is_not_a_plain_skip ... ok
+test core::types::outcome_tests::confirmed_vs_loss_classified_by_sign ... ok
+test core::types::outcome_tests::revert_is_not_skipped_and_distinct_from_same_block ... ok
+test core::types::outcome_tests::timeout_stuck_and_dropped_carry_nonce_distinct ... ok
+test dex::adapters::curve::tests::curve_liquidity_gate_reports_pool ... ok
+test dex::adapters::curve::tests::discovered_am_tokens_keep_symbol_and_decimals ... ok
+test dex::adapters::curve::tests::raw_stable_address_resolves_to_symbol ... ok
+test dex::adapters::curve::tests::stable_pool_index_finds_three_stables ... ok
+test dex::adapters::curve::tests::stable_pool_index_rejects_non_stables ... ok
+test dex::adapters::uniswap_v3::tests::stable_pair_uses_tighter_price_deviation_limit ... ok
+test dex::circuit_breaker::tests::test_circuit_breaker_flow ... ok
+test dex::fee_tier_cache_tests::directional_fee_cache_does_not_overwrite_reverse_quote ... ok
+test dex::fee_tier_cache_tests::executable_tiers_are_500_3000_10000_not_100 ... ok
+test dex::fee_tier_cache_tests::fee_cache_key_symmetric_and_uppercase ... ok
+test dex::fee_tier_cache_tests::fee_tier_cache_write_read_no_miss ... ok
+test dex::fee_tier_cache_tests::price_feed_valid_price_produces_amount_in ... ok
+test dex::fee_tier_cache_tests::price_feed_zero_nan_and_infinity_are_rejected ... ok
+test dex::fee_tier_cache_tests::provider_error_is_not_converted_to_zero_amount ... ok
+test dex::fee_tier_cache_tests::quote_notional_default_uses_executable_not_default_trade_amount ... ok
+test dex::fee_tier_cache_tests::select_executable_discards_when_only_fee100_quotes ... ok
+test dex::fee_tier_cache_tests::select_executable_prefers_best_exec_over_fee100 ... ok
+test dex::fee_tier_cache_tests::v3_fee_tier_to_fraction_scale ... ok
+test dex::get_token_decimals::tests::test_cache_round_trip ... ok
+test dex::liquidity::tests::discard_counter_increments ... ok
+test dex::liquidity::tests::execution_modules_must_not_call_display_raw_to_usd ... ok
+test dex::liquidity::tests::gate_discards_below_keeps_above ... ok
+test dex::liquidity::tests::liquidity_gate_uses_e8_not_display_saturation ... ok
+test dex::liquidity::tests::per_dex_threshold_overrides_global ... ok
+test dex::liquidity::tests::pool_cache_roundtrip_symmetric ... ok
+test dex::liquidity::tests::raw_to_usd_preserves_large_balances_no_inf ... ok
+test dex::liquidity::tests::threshold_from_config_only ... ok
+test dex::liquidity::tests::tvl_from_balances_uses_price_feed_math ... ok
+test dex::metadata_warm::tests::decimals_from_config_no_silent_18 ... ok
+test dex::metadata_warm::tests::expected_decimals_curated ... ok
+test dex::metadata_warm::tests::link_tradable_address_not_pegswap ... ok
+test dex::metadata_warm::tests::monitor_symbols_from_pairs ... ok
+test dex::metadata_warm::tests::warm_aborts_without_link_decimals_metadata ... ok
+test dex::radar::tests::adj_cycle_key_e_hash_sao_deterministicos ... ok
+test dex::radar::tests::adj_tracker_conta_consecutivos_e_quebra_apos_gap ... ok
+test dex::radar::tests::analyze_pair_spread_best_two_hop_ignores_gt1_filter ... ok
+test dex::radar::tests::analyze_pair_spread_executable_and_curve_flags ... ok
+test dex::radar::tests::analyze_pair_spread_no_reverse ... ok
+test dex::radar::tests::analyze_pair_spread_outlier_is_median_deviant ... ok
+test dex::radar::tests::best_two_hop_shared_with_extract_edges ... ok
+test dex::radar::tests::compute_top_spreads_n_zero_vazio ... ok
+test dex::radar::tests::compute_top_spreads_no_reverse_cycle_none ... ok
+test dex::radar::tests::compute_top_spreads_sync_sem_tvl_ordenado_desc ... ok
+test dex::radar::tests::extract_adj_cycles_dedup_mirror_e_conta_net_positive ... ok
+test dex::radar::tests::extract_adj_cycles_marca_vitrine_e_caxa ... ok
+test dex::radar::tests::extract_edges_cycle_rate_equals_product_v2x_v2 ... ok
+test dex::radar::tests::extract_edges_cycle_rate_equals_product_v3x_v3 ... ok
+test dex::radar::tests::extract_edges_dedup_mirror_negative_cycles ... ok
+test dex::radar::tests::fmt_tvl_compact_tiers ... ok
+test dex::radar::tests::monitor_com_stable_stable_gera_pares_direcionais_para_curve ... ok
+test dex::radar::tests::pares_gerados_sao_direcionais_e_no_allowlist ... ok
+test dex::radar::tests::pares_monitor_curado_nao_injeta_matriz_m3 ... ok
+test dex::radar::tests::quick_filter_ignora_outlier_ao_calcular_referencia ... ok
+test dex::radar::tests::reciprocidade_derruba_cotacao_corrompida ... ok
+test dex::radar::tests::reciprocidade_derruba_pool_raso_para_o_notional ... ok
+test dex::radar::tests::reciprocidade_ignora_direcao_unica ... ok
+test dex::radar::tests::reciprocidade_mantem_par_v2_saudavel ... ok
+test dex::radar::tests::tui_spread_matches_tui_formula ... ok
+test infra::price_feed::tests::cache_ttl_jitter_stays_within_expected_band ... ok
+test infra::price_feed::tests::fallback_gas_price_is_not_10x_off ... ok
+test infra::price_feed::tests::gas_token_maps_to_pol_not_dead_matic_feed ... ok
+test infra::price_feed::tests::stablecoin_fallbacks_are_one ... ok
+test tui::tests::fmt_opt_net_tiers ... ok
+test tui::tests::norm_pair_canonico_direcao_agnostica ... ok
+
+test result: ok. 443 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 17.52s
+
+     Running unittests src/main.rs (/home/lucas/.cache/kamino-flashloan/target/debug/deps/flashloan_bot-c5a433f74b785276)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/phase2c_bf_audit.rs (/home/lucas/.cache/kamino-flashloan/target/debug/deps/phase2c_bf_audit-b1ab52c895ea99a7)
+
+running 24 tests
+test tests::aggregate_average ... ok
+test tests::aggregate_empty_is_unavailable ... ok
+test tests::aggregate_last_is_sequence_not_input_order ... ok
+test tests::aggregate_many_scans ... ok
+test tests::aggregate_one_scan ... ok
+test tests::aggregate_serializes_units ... ok
+test tests::aggregate_zero_is_measured ... ok
+test tests::curve_indices_are_distinct ... ok
+test tests::curve_pool_aggregate ... ok
+test tests::detection_miss_breaks_accounting ... ok
+test tests::exhaustive_inventory_counts_each_variant ... ok
+test tests::existential_contract_allows_variants ... ok
+test tests::final_accounting_identity ... ok
+test tests::fixtures_parse_and_are_valid ... ok
+test tests::offline_meta_never_selects_network ... ok
+test tests::parallel_variants_remain_distinct ... ok
+test tests::quickswap_and_sushi_variants_are_distinct_edges ... ok
+test tests::reconstruction_failure_is_counted ... ok
+test tests::reverse_is_distinct ... ok
+test tests::rotations_share_canonical_key ... ok
+test tests::single_negative_cycle_accounting ... ok
+test tests::v3_fee_aggregate ... ok
+test tests::v3_fee_tiers_are_distinct ... ok
+test tests::venue_values_do_not_mix ... ok
+
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/phase2c_finalize.rs (/home/lucas/.cache/kamino-flashloan/target/debug/deps/phase2c_finalize-f936d485719b016a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/phase2d_c_sequential_sim.rs (/home/lucas/.cache/kamino-flashloan/target/debug/deps/phase2d_c_sequential_sim-da341db627326dca)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/phase2d_d_fork_bytecode.rs (/home/lucas/.cache/kamino-flashloan/target/debug/deps/phase2d_d_fork_bytecode-b75cebc64726b14c)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/read_only_scan.rs (/home/lucas/.cache/kamino-flashloan/target/debug/deps/read_only_scan-ee38ee6136c56db5)
+
+running 12 tests
+test phase2c_tests::base_universe_has_five_tokens ... ok
+test phase2c_tests::curve_keeps_distinct_coin_indices ... ok
+test phase2c_tests::curve_rejects_non_pool_token ... ok
+test phase2c_tests::four_dexes_are_catalogued ... ok
+test phase2c_tests::invalid_profile_fails_closed ... ok
+test phase2c_tests::liquid_universe_has_ten_tokens ... ok
+test phase2c_tests::pair_key_preserves_direction ... ok
+test phase2c_tests::reciprocity_accounting_never_exceeds_raw ... ok
+test phase2c_tests::temporal_threshold_requires_three_of_five ... ok
+test phase2c_tests::token_category_is_stable ... ok
+test phase2c_tests::v3_fee_tiers_are_distinct_metric_keys ... ok
+test phase2c_tests::venue_counters_do_not_share_storage ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/phase1_integration_readonly.rs (/home/lucas/.cache/kamino-flashloan/target/debug/deps/phase1_integration_readonly-51aebcc4e007e79b)
+
+running 2 tests
+test diagnostic_deterministic_cycle_produces_expected_spread ... ok
+test readonly_scan_cycle_captures_metrics ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/phase2d_c_safety.rs (/home/lucas/.cache/kamino-flashloan/target/debug/deps/phase2d_c_safety-8208bdd27280ee24)
+
+running 5 tests
+test phase2d_c_campaign_only_imports_read_only_provider_types ... ok
+test phase2d_c_cli_exposes_no_ambiguous_execution_flag ... ok
+test phase2d_c_never_broadcasts_campaign_binary_is_clean ... ok
+test phase2d_c_never_broadcasts_supporting_core_modules_are_clean ... ok
+test phase2d_c_safety_gates_hardcoded_false ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/phase2d_d_fork_integration.rs (/home/lucas/.cache/kamino-flashloan/target/debug/deps/phase2d_d_fork_integration-1466f5974b758e06)
+
+running 3 tests
+test phase2d_d_reset_restores_anchor_state ... ok
+test phase2d_d_smoke_fork_has_real_contract_bytecode_at_anchor_block ... ok
+test phase2d_d_two_resets_to_same_block_produce_identical_state ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 39.56s
+
+     Running tests/phase2d_d_safety.rs (/home/lucas/.cache/kamino-flashloan/target/debug/deps/phase2d_d_safety-09b4dde1c2f86389)
+
+running 10 tests
+test phase2d_d_accepts_loopback_transaction_endpoint ... ok
+test phase2d_d_archive_rpc_value_is_never_formatted_into_a_log_string ... ok
+test phase2d_d_balance_delta_is_the_canonical_leg1_output ... ok
+test phase2d_d_cli_exposes_no_ambiguous_live_flag ... ok
+test phase2d_d_never_writes_to_upstream_rpc ... ok
+test phase2d_d_rejects_non_loopback_transaction_endpoint ... ok
+test phase2d_d_safety_gates_hardcoded_false ... ok
+test phase2d_d_source_never_references_production_signer ... ok
+test phase2d_d_uses_actual_leg1_output_as_leg2_input ... ok
+test phase2d_d_validates_fork_rpc_before_any_transaction ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests flashloan_bot
+
+running 2 tests
+test src/contracts/mod.rs - contracts::flashloan_caller::FlashloanCaller<M>::deploy (line 33) ... ignored
+test src/contracts/mod.rs - contracts::flashloan_executor::FlashloanExecutor<M>::deploy (line 27) ... ignored
+
+test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+CARGO_TEST_EXIT_CODE=0

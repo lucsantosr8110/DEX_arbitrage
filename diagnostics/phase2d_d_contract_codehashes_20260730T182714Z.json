@@ -1,0 +1,44 @@
+[
+  {
+    "address": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359",
+    "anchor_block": 91149850,
+    "code_hash": "0x7dbf0ee7d6d69b563891ceb7056cf0ff0fa09d21a48e5f812d89981c2ef95944",
+    "code_size": 1852,
+    "label": "USDC"
+  },
+  {
+    "address": "0xc2132d05d31c914a87c6611c10748aeb04b58e8f",
+    "anchor_block": 91149850,
+    "code_hash": "0x8cb0cfc9b3aa516d8c5a1cdf94a2c60b668a903e21711cb6f3f3501fdd8478b5",
+    "code_size": 2949,
+    "label": "USDT"
+  },
+  {
+    "address": "0xe592427a0aece92de3edee1f18e0157c05861564",
+    "anchor_block": 91149850,
+    "code_hash": "0x337e254015a15cf0284fa2e454033dce87417fd99c898da14ecc78e7d0d3a61d",
+    "code_size": 12070,
+    "label": "UniswapV3Router"
+  },
+  {
+    "address": "0xb27308f9f90d607463bb33ea1bebb41c27ce5ab6",
+    "anchor_block": 91149850,
+    "code_hash": "0xe0cff4493bfbb7e8eca775dfebb93d9be196d543108fad9ef2fcf12d1e83027d",
+    "code_size": 4631,
+    "label": "UniswapV3Quoter"
+  },
+  {
+    "address": "0x445fe580ef8d70ff569ab36e80c647af338db351",
+    "anchor_block": 91149850,
+    "code_hash": "0xd6eed64965cb4079ed779ee585297302ae36ec12626b69ae318c836df371165b",
+    "code_size": 22503,
+    "label": "CurveAavePool"
+  },
+  {
+    "address": "0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270",
+    "anchor_block": 91149850,
+    "code_hash": "0xae820ea59b005f58a45eea35b374afbd5dc503d4f219a6b670cd3453f1142ed5",
+    "code_size": 3000,
+    "label": "WMATIC"
+  }
+]

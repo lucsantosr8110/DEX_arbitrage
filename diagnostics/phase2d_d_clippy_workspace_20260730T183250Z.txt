@@ -1,0 +1,1611 @@
+    Checking flashloan-bot v0.1.0 (/home/lucas/projects/Projeto_Bots/DEX/DEX_arbitrage)
+error: empty line after doc comment
+    --> src/config/mod.rs:2706:5
+     |
+2706 | /     /// A partir daqui está ok
+2707 | |
+     | |_^
+2708 |       pub fn get_cooldown_manager(&self) -> Option<Arc<CooldownManager>> {
+     |       --------------------------- the comment documents this function
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#empty_line_after_doc_comments
+     = note: `-D clippy::empty-line-after-doc-comments` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::empty_line_after_doc_comments)]`
+     = help: if the empty line is unintentional, remove it
+
+error: empty line after doc comment
+   --> src/dex/radar.rs:388:1
+    |
+388 | / /// Ver `dex::liquidity::min_pool_liquidity_usd`. (Constante morta removida.)
+389 | |
+    | |_^
+390 |   /// Spread máximo realista entre DEXes. Acima disso é dust pool ou erro de oracle.
+391 |   const MAX_SPREAD_PCT: f64 = 50.0;
+    |   -------------------- the comment documents this constant item
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#empty_line_after_doc_comments
+    = help: if the empty line is unintentional, remove it
+help: if the documentation should include the empty line include it in the comment
+    |
+389 | ///
+    |
+
+error: empty line after doc comment
+   --> src/utils/reporting.rs:109:1
+    |
+109 | / /// ================================================================
+110 | |
+    | |_^
+111 |   /// Loga erro detalhado com todas as causas
+112 |   pub fn report_error(e: &Error) {
+    |   ------------------- the comment documents this function
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#empty_line_after_doc_comments
+    = help: if the empty line is unintentional, remove it
+help: if the documentation should include the empty line include it in the comment
+    |
+110 | ///
+    |
+
+error: unused import: `SerializableSteps`
+   --> src/core/gas_profile.rs:152:45
+    |
+152 |     use crate::core::types::{ArbitrageStep, SerializableSteps};
+    |                                             ^^^^^^^^^^^^^^^^^
+    |
+    = note: `-D unused-imports` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(unused_imports)]`
+
+error: unused import: `ethers::abi::Tokenizable`
+  --> src/core/flashloan.rs:20:5
+   |
+20 | use ethers::abi::Tokenizable;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `-D unused-imports` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(unused_imports)]`
+
+error: unused import: `ethers::abi::Tokenizable`
+  --> src/core/flashloan.rs:20:5
+   |
+20 | use ethers::abi::Tokenizable;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: constant `DEX_FEE_DEFAULT` is never used
+   --> src/core/arbitrage.rs:158:7
+    |
+158 | const DEX_FEE_DEFAULT: f64 = 0.003;
+    |       ^^^^^^^^^^^^^^^
+    |
+    = note: `-D dead-code` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[expect(dead_code)]` or `#[allow(dead_code)]`
+
+error: associated items `normalize_amount`, `build_price_graph`, `is_usdt_centric`, `calculate_expected_output`, `estimate_stable_step`, and `dex_fee` are never used
+    --> src/core/arbitrage.rs:319:8
+     |
+ 177 | impl ArbitrageEngine {
+     | -------------------- associated items in this implementation
+...
+ 319 |     fn normalize_amount(amount: U256, decimals: u32) -> f64 {
+     |        ^^^^^^^^^^^^^^^^
+...
+2260 |     fn build_price_graph(
+     |        ^^^^^^^^^^^^^^^^^
+...
+2323 |     fn is_usdt_centric(path: &[String]) -> bool {
+     |        ^^^^^^^^^^^^^^^
+...
+2457 |     async fn calculate_expected_output(
+     |              ^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2510 |     fn estimate_stable_step(
+     |        ^^^^^^^^^^^^^^^^^^^^
+...
+2583 |     fn dex_fee(dex_name: &str, pair: &str) -> f64 {
+     |        ^^^^^^^
+
+error: methods `calculate_flashloan_fee` and `validate_profit_after_fees` are never used
+   --> src/core/flashloan.rs:437:8
+    |
+138 | impl ArbitrageClient {
+    | -------------------- methods in this implementation
+...
+437 |     fn calculate_flashloan_fee(&self, amount: U256, fee_pct: f64) -> U256 {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^
+...
+462 |     fn validate_profit_after_fees(
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: fields `safe_low` and `fast` are never read
+  --> src/core/gas.rs:74:5
+   |
+72 | struct PolygonGasOracle {
+   |        ---------------- fields in this struct
+73 |     #[serde(rename = "safeLow")]
+74 |     safe_low: PolygonGasTier,
+   |     ^^^^^^^^
+75 |     standard: PolygonGasTier,
+76 |     fast: PolygonGasTier,
+   |     ^^^^
+   |
+   = note: `PolygonGasOracle` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+error: field `token_cache` is never read
+  --> src/dex/adapters/curve.rs:77:5
+   |
+73 | pub struct CurveDex {
+   |            -------- field in this struct
+...
+77 |     token_cache: Arc<TokenCache>,
+   |     ^^^^^^^^^^^
+   |
+   = note: `CurveDex` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+error: method `symbol_from_pair` is never used
+   --> src/dex/adapters/curve.rs:147:8
+    |
+ 92 | impl CurveDex {
+    | ------------- method in this implementation
+...
+147 |     fn symbol_from_pair(&self, pair: &str) -> Option<String> {
+    |        ^^^^^^^^^^^^^^^^
+
+error: field `last_health_check` is never read
+  --> src/dex/manager.rs:58:5
+   |
+51 | pub struct DexManager {
+   |            ---------- field in this struct
+...
+58 |     last_health_check: Arc<RwLock<Instant>>,
+   |     ^^^^^^^^^^^^^^^^^
+   |
+   = note: `DexManager` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+error: method `is_valid_flashloan_route` is never used
+   --> src/dex/manager.rs:245:8
+    |
+ 61 | impl DexManager {
+    | --------------- method in this implementation
+...
+245 |     fn is_valid_flashloan_route(&self, opp: &ArbitrageOpportunity) -> bool {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: fields `jsonrpc` and `id` are never read
+  --> src/infra/rotating_http_client.rs:74:5
+   |
+73 | struct JsonRpcResponse<R> {
+   |        --------------- fields in this struct
+74 |     jsonrpc: Option<String>,
+   |     ^^^^^^^
+75 |     id: Option<Value>,
+   |     ^^
+   |
+   = note: `JsonRpcResponse` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+error: this `impl` can be derived
+    --> src/config/mod.rs:1048:1
+     |
+1048 | / impl Default for WalletMultisigConfig {
+1049 | |     fn default() -> Self {
+1050 | |         Self {
+1051 | |             enabled: false,
+...    |
+1056 | | }
+     | |_^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#derivable_impls
+     = note: `-D clippy::derivable-impls` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::derivable_impls)]`
+help: replace the manual implementation with a derive attribute
+     |
+1043 + #[derive(Default)]
+1044 | pub struct WalletMultisigConfig {
+     |
+
+error: this `impl` can be derived
+    --> src/config/mod.rs:1847:1
+     |
+1847 | / impl Default for TelegramCommands {
+1848 | |     fn default() -> Self {
+1849 | |         Self {
+1850 | |             enable_controls: false,
+...    |
+1855 | | }
+     | |_^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#derivable_impls
+help: replace the manual implementation with a derive attribute
+     |
+1842 + #[derive(Default)]
+1843 | pub struct TelegramCommands {
+     |
+
+error: this `impl` can be derived
+    --> src/config/mod.rs:2185:1
+     |
+2185 | / impl Default for SecurityConfig {
+2186 | |     fn default() -> Self {
+2187 | |         Self {
+2188 | |             tls_enabled: false,
+...    |
+2192 | | }
+     | |_^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#derivable_impls
+help: replace the manual implementation with a derive attribute
+     |
+2179 + #[derive(Default)]
+2180 | pub struct SecurityConfig {
+     |
+
+error: this `impl` can be derived
+    --> src/config/mod.rs:2202:1
+     |
+2202 | / impl Default for BacktestingConfig {
+2203 | |     fn default() -> Self {
+2204 | |         Self {
+2205 | |             enabled: false,
+...    |
+2210 | | }
+     | |_^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#derivable_impls
+help: replace the manual implementation with a derive attribute
+     |
+2195 + #[derive(Default)]
+2196 | pub struct BacktestingConfig {
+     |
+
+error: this `impl` can be derived
+    --> src/config/mod.rs:2305:1
+     |
+2305 | / impl Default for PriceFeedOraclesConfig {
+2306 | |     fn default() -> Self {
+2307 | |         Self {
+2308 | |             chainlink: String::new(),
+...    |
+2312 | | }
+     | |_^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#derivable_impls
+help: replace the manual implementation with a derive attribute
+     |
+2299 + #[derive(Default)]
+2300 | pub struct PriceFeedOraclesConfig {
+     |
+
+error: this `impl` can be derived
+    --> src/config/mod.rs:2440:1
+     |
+2440 | / impl Default for RadarDebugConfig {
+2441 | |     fn default() -> Self {
+2442 | |         Self {
+2443 | |             show_price_updates: false,
+...    |
+2448 | | }
+     | |_^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#derivable_impls
+help: replace the manual implementation with a derive attribute
+     |
+2432 + #[derive(Default)]
+2433 | pub struct RadarDebugConfig {
+     |
+
+error: this expression creates a reference which is immediately dereferenced by the compiler
+    --> src/config/mod.rs:2772:28
+     |
+2772 |             re.replace_all(&cleaned, |caps: &regex::Captures| {
+     |                            ^^^^^^^^ help: change this to: `cleaned`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_borrow
+     = note: `-D clippy::needless-borrow` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::needless_borrow)]`
+
+error: this `map_or` can be simplified
+    --> src/config/mod.rs:2817:39
+     |
+2817 |                         let changed = last_mtime.map_or(true, |prev| modified > prev);
+     |                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unnecessary_map_or
+     = note: `-D clippy::unnecessary-map-or` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::unnecessary_map_or)]`
+help: use `is_none_or` instead
+     |
+2817 -                         let changed = last_mtime.map_or(true, |prev| modified > prev);
+2817 +                         let changed = last_mtime.is_none_or(|prev| modified > prev);
+     |
+
+error: this expression creates a reference which is immediately dereferenced by the compiler
+    --> src/config/mod.rs:2841:28
+     |
+2841 |             re.replace_all(&cleaned, |caps: &regex::Captures| {
+     |                            ^^^^^^^^ help: change this to: `cleaned`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_borrow
+
+error: this expression creates a reference which is immediately dereferenced by the compiler
+    --> src/config/mod.rs:2870:28
+     |
+2870 |             re.replace_all(&cleaned, |caps: &regex::Captures| {
+     |                            ^^^^^^^^ help: change this to: `cleaned`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_borrow
+
+error: stripping a prefix manually
+    --> src/config/mod.rs:2958:9
+     |
+2958 |         &content[3..]
+     |         ^^^^^^^^^^^^^
+     |
+note: the prefix was tested here
+    --> src/config/mod.rs:2957:5
+     |
+2957 |     if content.starts_with('\u{feff}') {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_strip
+     = note: `-D clippy::manual-strip` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::manual_strip)]`
+help: try using the `strip_prefix` method
+     |
+2957 ~     if let Some(<stripped>) = content.strip_prefix('\u{feff}') {
+2958 ~         <stripped>
+     |
+
+error: associated items `normalize_amount`, `build_price_graph`, `calculate_expected_output`, and `estimate_stable_step` are never used
+    --> src/core/arbitrage.rs:319:8
+     |
+ 177 | impl ArbitrageEngine {
+     | -------------------- associated items in this implementation
+...
+ 319 |     fn normalize_amount(amount: U256, decimals: u32) -> f64 {
+     |        ^^^^^^^^^^^^^^^^
+...
+2260 |     fn build_price_graph(
+     |        ^^^^^^^^^^^^^^^^^
+...
+2457 |     async fn calculate_expected_output(
+     |              ^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+2510 |     fn estimate_stable_step(
+     |        ^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `-D dead-code` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[expect(dead_code)]` or `#[allow(dead_code)]`
+
+error: doc quote line without `>` marker
+  --> src/core/arbitrage.rs:82:5
+   |
+82 | /// — work desperdiçado + contagem dupla "encontradas vs validadas".
+   |     ^
+   |
+   = help: if this not intended to be a quote at all, escape it with `\>`
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#doc_lazy_continuation
+   = note: `-D clippy::doc-lazy-continuation` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::doc_lazy_continuation)]`
+help: add markers to start of line
+   |
+82 | /// > — work desperdiçado + contagem dupla "encontradas vs validadas".
+   |     +
+
+error: doc quote line without `>` marker
+  --> src/core/arbitrage.rs:83:5
+   |
+83 | /// Unificado com a banda [0.90, 1.50] do recálculo: 50% = rate 1.50.
+   |     ^
+   |
+   = help: if this not intended to be a quote at all, escape it with `\>`
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#doc_lazy_continuation
+help: add markers to start of line
+   |
+83 | /// > Unificado com a banda [0.90, 1.50] do recálculo: 50% = rate 1.50.
+   |     +
+
+error: manual `RangeInclusive::contains` implementation
+   --> src/core/arbitrage.rs:387:29
+    |
+387 |             (true, true) => price >= 0.80 && price <= 1.20,
+    |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `(0.80..=1.20).contains(&price)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_range_contains
+    = note: `-D clippy::manual-range-contains` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::manual_range_contains)]`
+
+error: manual `RangeInclusive::contains` implementation
+   --> src/core/arbitrage.rs:391:27
+    |
+391 |                 "WETH" => price >= 0.00005 && price <= 0.002, // ~0.00034 WETH/USDT
+    |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `(0.00005..=0.002).contains(&price)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_range_contains
+
+error: manual `RangeInclusive::contains` implementation
+   --> src/core/arbitrage.rs:392:29
+    |
+392 |                 "WMATIC" => price >= 1.0 && price <= 50.0,    // ~7.14 WMATIC/USDT
+    |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `(1.0..=50.0).contains(&price)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_range_contains
+
+error: manual `RangeInclusive::contains` implementation
+   --> src/core/arbitrage.rs:393:22
+    |
+393 |                 _ => price >= 0.0000001 && price <= 10_000_000.0,
+    |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `(0.0000001..=10_000_000.0).contains(&price)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_range_contains
+
+error: manual `RangeInclusive::contains` implementation
+   --> src/core/arbitrage.rs:398:27
+    |
+398 |                 "WETH" => price >= 500.0 && price <= 15_000.0, // ~2900 USDT/WETH
+    |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `(500.0..=15_000.0).contains(&price)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_range_contains
+
+error: manual `RangeInclusive::contains` implementation
+   --> src/core/arbitrage.rs:399:29
+    |
+399 |                 "WMATIC" => price >= 0.01 && price <= 2.0,     // ~0.14 USDT/WMATIC
+    |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `(0.01..=2.0).contains(&price)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_range_contains
+
+error: manual `RangeInclusive::contains` implementation
+   --> src/core/arbitrage.rs:400:27
+    |
+400 |                 "LINK" => price >= 1.0 && price <= 100.0,      // ~$5-30
+    |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `(1.0..=100.0).contains(&price)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_range_contains
+
+error: manual `RangeInclusive::contains` implementation
+   --> src/core/arbitrage.rs:401:26
+    |
+401 |                 "CRV" => price >= 0.1 && price <= 10.0,
+    |                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `(0.1..=10.0).contains(&price)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_range_contains
+
+error: manual `RangeInclusive::contains` implementation
+   --> src/core/arbitrage.rs:402:26
+    |
+402 |                 "UNI" => price >= 1.0 && price <= 50.0,
+    |                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `(1.0..=50.0).contains(&price)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_range_contains
+
+error: manual `RangeInclusive::contains` implementation
+   --> src/core/arbitrage.rs:403:27
+    |
+403 |                 "GHST" => price >= 0.5 && price <= 20.0,
+    |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `(0.5..=20.0).contains(&price)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_range_contains
+
+error: manual `RangeInclusive::contains` implementation
+   --> src/core/arbitrage.rs:404:27
+    |
+404 |                 "SAND" => price >= 0.1 && price <= 5.0,
+    |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `(0.1..=5.0).contains(&price)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_range_contains
+
+error: manual `RangeInclusive::contains` implementation
+   --> src/core/arbitrage.rs:405:28
+    |
+405 |                 "SUSHI" => price >= 0.5 && price <= 20.0,
+    |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `(0.5..=20.0).contains(&price)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_range_contains
+
+error: manual `RangeInclusive::contains` implementation
+   --> src/core/arbitrage.rs:406:26
+    |
+406 |                 "GRT" => price >= 0.05 && price <= 5.0,
+    |                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `(0.05..=5.0).contains(&price)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_range_contains
+
+error: manual `RangeInclusive::contains` implementation
+   --> src/core/arbitrage.rs:407:26
+    |
+407 |                 "LDO" => price >= 0.5 && price <= 20.0,
+    |                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `(0.5..=20.0).contains(&price)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_range_contains
+
+error: manual `RangeInclusive::contains` implementation
+   --> src/core/arbitrage.rs:408:22
+    |
+408 |                 _ => price >= 0.0000001 && price <= 10_000_000.0,
+    |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `(0.0000001..=10_000_000.0).contains(&price)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_range_contains
+
+error: manual `RangeInclusive::contains` implementation
+   --> src/core/arbitrage.rs:413:39
+    |
+413 |                 ("WETH", "WMATIC") => price >= 500.0 && price <= 100_000.0, // ~21k
+    |                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `(500.0..=100_000.0).contains(&price)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_range_contains
+
+error: manual `RangeInclusive::contains` implementation
+   --> src/core/arbitrage.rs:414:39
+    |
+414 |                 ("WMATIC", "WETH") => price >= 0.000001 && price <= 0.01,   // ~0.000047
+    |                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `(0.000001..=0.01).contains(&price)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_range_contains
+
+error: manual `RangeInclusive::contains` implementation
+   --> src/core/arbitrage.rs:415:22
+    |
+415 |                 _ => price >= 0.0000001 && price <= 10_000_000.0,
+    |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `(0.0000001..=10_000_000.0).contains(&price)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_range_contains
+
+error: used consecutive `str::replace` call
+    --> src/core/arbitrage.rs:1862:14
+     |
+1862 |               .replace(' ', "")
+     |  ______________^
+1863 | |             .replace('_', "");
+     | |_____________________________^ help: replace with: `replace([' ', '_'], "")`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#collapsible_str_replace
+     = note: `-D clippy::collapsible-str-replace` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::collapsible_str_replace)]`
+
+error: use of `or_insert_with` to construct default value
+    --> src/core/arbitrage.rs:2175:46
+     |
+2175 |             let entry = graph.entry(token_a).or_insert_with(HashMap::new);
+     |                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `or_default()`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unwrap_or_default
+     = note: `-D clippy::unwrap-or-default` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::unwrap_or_default)]`
+
+error: use of `or_insert_with` to construct default value
+    --> src/core/arbitrage.rs:2280:52
+     |
+2280 |                 let entry_a = graph.entry(token_a).or_insert_with(HashMap::new);
+     |                                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `or_default()`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unwrap_or_default
+
+error: this function has too many arguments (9/7)
+    --> src/core/arbitrage.rs:2437:5
+     |
+2437 | /     async fn calculate_expected_output_with_fees(
+2438 | |         &self,
+2439 | |         amount_in: U256,
+2440 | |         rate: f64,
+...    |
+2446 | |         _price_impact_bps_override: Option<u32>,
+2447 | |     ) -> U256 {
+     | |_____________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#too_many_arguments
+     = note: `-D clippy::too-many-arguments` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::too_many_arguments)]`
+
+error: casting `u64` to `f64` may cause a loss of precision (`u64` is 64 bits wide, but `f64`'s mantissa is only 52 bits wide)
+  --> src/core/economics.rs:63:34
+   |
+63 |     if micros < 1.0 || micros >= u64::MAX as f64 {
+   |                                  ^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#cast_precision_loss
+   = note: `-D clippy::cast-precision-loss` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::cast_precision_loss)]`
+
+error: casting `f64` to `u64` may truncate the value
+  --> src/core/economics.rs:66:36
+   |
+66 |     LAST_LIVE_GAS_USD_MICROS.store(micros as u64, Ordering::Relaxed);
+   |                                    ^^^^^^^^^^^^^
+   |
+   = help: if this is intentional allow the lint with `#[allow(clippy::cast_possible_truncation)]` ...
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#cast_possible_truncation
+   = note: `-D clippy::cast-possible-truncation` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::cast_possible_truncation)]`
+
+error: casting `u64` to `f64` may cause a loss of precision (`u64` is 64 bits wide, but `f64`'s mantissa is only 52 bits wide)
+  --> src/core/economics.rs:77:34
+   |
+77 |     if micros < 1.0 || micros >= u64::MAX as f64 || n_hops == 0 {
+   |                                  ^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#cast_precision_loss
+
+error: casting `usize` to `u32` may truncate the value on targets with 64-bit wide pointers
+  --> src/core/economics.rs:81:16
+   |
+81 |     map.insert(n_hops as u32, micros as u64);
+   |                ^^^^^^^^^^^^^
+   |
+   = help: if this is intentional allow the lint with `#[allow(clippy::cast_possible_truncation)]` ...
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#cast_possible_truncation
+help: ... or use `try_from` and handle the error accordingly
+   |
+81 -     map.insert(n_hops as u32, micros as u64);
+81 +     map.insert(u32::try_from(n_hops), micros as u64);
+   |
+
+error: casting `f64` to `u64` may truncate the value
+  --> src/core/economics.rs:81:31
+   |
+81 |     map.insert(n_hops as u32, micros as u64);
+   |                               ^^^^^^^^^^^^^
+   |
+   = help: if this is intentional allow the lint with `#[allow(clippy::cast_possible_truncation)]` ...
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#cast_possible_truncation
+
+error: casting `u64` to `f64` may cause a loss of precision (`u64` is 64 bits wide, but `f64`'s mantissa is only 52 bits wide)
+  --> src/core/economics.rs:88:19
+   |
+88 |         m => Some(m as f64 / 1e6),
+   |                   ^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#cast_precision_loss
+
+error: casting `usize` to `u32` may truncate the value on targets with 64-bit wide pointers
+  --> src/core/economics.rs:95:14
+   |
+95 |     map.get(&(n_hops as u32)).map(|&m| m as f64 / 1e6)
+   |              ^^^^^^^^^^^^^^^
+   |
+   = help: if this is intentional allow the lint with `#[allow(clippy::cast_possible_truncation)]` ...
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#cast_possible_truncation
+help: ... or use `try_from` and handle the error accordingly
+   |
+95 -     map.get(&(n_hops as u32)).map(|&m| m as f64 / 1e6)
+95 +     map.get(&u32::try_from(n_hops)).map(|&m| m as f64 / 1e6)
+   |
+
+error: casting `u64` to `f64` may cause a loss of precision (`u64` is 64 bits wide, but `f64`'s mantissa is only 52 bits wide)
+  --> src/core/economics.rs:95:40
+   |
+95 |     map.get(&(n_hops as u32)).map(|&m| m as f64 / 1e6)
+   |                                        ^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#cast_precision_loss
+
+error: casting `usize` to `i32` may truncate the value on targets with 64-bit wide pointers
+   --> src/core/economics.rs:188:35
+    |
+188 |     let compounded = per_hop.powi(n_hops as i32);
+    |                                   ^^^^^^^^^^^^^
+    |
+    = help: if this is intentional allow the lint with `#[allow(clippy::cast_possible_truncation)]` ...
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#cast_possible_truncation
+help: ... or use `try_from` and handle the error accordingly
+    |
+188 -     let compounded = per_hop.powi(n_hops as i32);
+188 +     let compounded = per_hop.powi(i32::try_from(n_hops));
+    |
+
+error: casting `usize` to `f64` may cause a loss of precision (`usize` can be up to 64 bits wide depending on the target architecture, but `f64`'s mantissa is only 52 bits wide)
+   --> src/core/economics.rs:226:16
+    |
+226 |     let hops = n_hops.max(1) as f64;
+    |                ^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#cast_precision_loss
+
+error: casting `f64` to `u32` may truncate the value
+   --> src/core/economics.rs:235:5
+    |
+235 |     (per_hop as u32).clamp(MIN_SLIPPAGE_BPS, ceiling_bps.max(MIN_SLIPPAGE_BPS))
+    |     ^^^^^^^^^^^^^^^^
+    |
+    = help: if this is intentional allow the lint with `#[allow(clippy::cast_possible_truncation)]` ...
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#cast_possible_truncation
+
+error: casting `f64` to `i64` may truncate the value
+   --> src/core/economics.rs:262:5
+    |
+262 |     ((net_profit_usd / trade_amount_usd) * 10_000.0).floor() as i64
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: if this is intentional allow the lint with `#[allow(clippy::cast_possible_truncation)]` ...
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#cast_possible_truncation
+
+error: casting `u128` to `f64` may cause a loss of precision (`u128` is 128 bits wide, but `f64`'s mantissa is only 52 bits wide)
+  --> src/core/fixed_usd.rs:45:9
+   |
+45 |         self.0 as f64 / USD_E8_SCALE as f64
+   |         ^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#cast_precision_loss
+
+error: casting `u128` to `f64` may cause a loss of precision (`u128` is 128 bits wide, but `f64`'s mantissa is only 52 bits wide)
+  --> src/core/fixed_usd.rs:45:25
+   |
+45 |         self.0 as f64 / USD_E8_SCALE as f64
+   |                         ^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#cast_precision_loss
+
+error: casting `u128` to `f64` may cause a loss of precision (`u128` is 128 bits wide, but `f64`'s mantissa is only 52 bits wide)
+  --> src/core/fixed_usd.rs:60:25
+   |
+60 |     let scaled = (usd * USD_E8_SCALE as f64).ceil();
+   |                         ^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#cast_precision_loss
+
+error: casting `u128` to `f64` may cause a loss of precision (`u128` is 128 bits wide, but `f64`'s mantissa is only 52 bits wide)
+  --> src/core/fixed_usd.rs:61:40
+   |
+61 |     if !scaled.is_finite() || scaled > u128::MAX as f64 {
+   |                                        ^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#cast_precision_loss
+
+error: casting `f64` to `u128` may truncate the value
+  --> src/core/fixed_usd.rs:64:14
+   |
+64 |     Ok(UsdE8(scaled as u128))
+   |              ^^^^^^^^^^^^^^
+   |
+   = help: if this is intentional allow the lint with `#[allow(clippy::cast_possible_truncation)]` ...
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#cast_possible_truncation
+
+error: casting `f64` to `u64` may truncate the value
+   --> src/core/fixed_usd.rs:175:8
+    |
+175 |     Ok(bps as u64)
+    |        ^^^^^^^^^^
+    |
+    = help: if this is intentional allow the lint with `#[allow(clippy::cast_possible_truncation)]` ...
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#cast_possible_truncation
+
+error: used consecutive `str::replace` call
+   --> src/core/flashloan.rs:592:41
+    |
+592 |         let n = dex_name.to_lowercase().replace(' ', "").replace('_', "");
+    |                                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace with: `replace([' ', '_'], "")`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#collapsible_str_replace
+
+error: field assignment outside of initializer for an instance created with Default::default()
+    --> src/config/mod.rs:3061:9
+     |
+3061 | /         cfg.dex = vec![DexEntry {
+3062 | |             name: "UniswapV3".into(),
+3063 | |             router_address: "0x0000000000000000000000000000000000000001".into(),
+3064 | |             enabled: true,
+3065 | |             liquidity_threshold_usd: Some(10_000.0),
+3066 | |             ..Default::default()
+3067 | |         }];
+     | |___________^
+     |
+note: consider initializing the variable with `config::Config { dex: vec![DexEntry {
+                  name: "UniswapV3".into(),
+                  router_address: "0x0000000000000000000000000000000000000001".into(),
+                  enabled: true,
+                  liquidity_threshold_usd: Some(10_000.0),
+                  ..Default::default()
+              }], ..Default::default() }` and removing relevant reassignments
+    --> src/config/mod.rs:3060:9
+     |
+3060 |         let mut cfg = Config::default();
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#field_reassign_with_default
+     = note: `-D clippy::field-reassign-with-default` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::field_reassign_with_default)]`
+
+error: using `map_err` over `inspect_err`
+    --> src/core/flashloan.rs:1324:81
+     |
+1324 |         let price_e8 = fixed_usd::price_usd_e8_from_option(opp.token_price_usd).map_err(|e| {
+     |                                                                                 ^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_inspect
+     = note: `-D clippy::manual-inspect` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::manual_inspect)]`
+help: try
+     |
+1324 ~         let price_e8 = fixed_usd::price_usd_e8_from_option(opp.token_price_usd).inspect_err(|e| {
+1325 ~             metrics::inc_counter("missing_profit_token_price");
+     |
+
+error: `cfg.execution.max_replace_attempts` is never smaller than `0` and has therefore no effect
+    --> src/core/flashloan.rs:1984:31
+     |
+1984 |             let max_replace = cfg.execution.max_replace_attempts.max(0);
+     |                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `cfg.execution.max_replace_attempts`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unnecessary_min_or_max
+     = note: `-D clippy::unnecessary-min-or-max` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::unnecessary_min_or_max)]`
+
+error: redundant closure
+    --> src/core/flashloan.rs:1990:22
+     |
+1990 |                 .map(|g| crate::core::gas::gwei_f64(g));
+     |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace the closure with the function itself: `crate::core::gas::gwei_f64`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#redundant_closure
+     = note: `-D clippy::redundant-closure` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::redundant_closure)]`
+
+error: redundant closure
+   --> src/core/gas.rs:127:22
+    |
+127 |                 .map(|p| std::path::PathBuf::from(p))
+    |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace the closure with the associated function itself: `std::path::PathBuf::from`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#redundant_closure
+
+error: casting `f64` to `u64` may truncate the value
+   --> src/core/gas.rs:196:29
+    |
+196 |             .unwrap_or(gwei(gas.default_gas_price_gwei as u64));
+    |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: if this is intentional allow the lint with `#[allow(clippy::cast_possible_truncation)]` ...
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#cast_possible_truncation
+
+error: casting `u64` to `f64` may cause a loss of precision (`u64` is 64 bits wide, but `f64`'s mantissa is only 52 bits wide)
+   --> src/core/gas.rs:296:27
+    |
+296 |         if max_fee_gwei > cfg.gas.max_gwei as f64 {
+    |                           ^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#cast_precision_loss
+
+error: casting `u64` to `f64` may cause a loss of precision (`u64` is 64 bits wide, but `f64`'s mantissa is only 52 bits wide)
+   --> src/core/gas.rs:297:28
+    |
+297 |             max_fee_gwei = cfg.gas.max_gwei as f64;
+    |                            ^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#cast_precision_loss
+
+error: casting `f64` to `u64` may truncate the value
+   --> src/core/gas.rs:335:29
+    |
+335 |             .unwrap_or(gwei(gas_cfg.default_gas_price_gwei as u64));
+    |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: if this is intentional allow the lint with `#[allow(clippy::cast_possible_truncation)]` ...
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#cast_possible_truncation
+
+error: casting `u64` to `f64` may cause a loss of precision (`u64` is 64 bits wide, but `f64`'s mantissa is only 52 bits wide)
+   --> src/core/gas.rs:355:13
+    |
+355 |             crate::core::gas_oracle::estimate_gas_units_calibrated(steps, provider, &oracle) as f64;
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#cast_precision_loss
+
+error: casting `u64` to `f64` may cause a loss of precision (`u64` is 64 bits wide, but `f64`'s mantissa is only 52 bits wide)
+   --> src/core/gas.rs:412:22
+    |
+412 |         let actual = actual_units.as_u64() as f64;
+    |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#cast_precision_loss
+
+error: casting `u64` to `f64` may cause a loss of precision (`u64` is 64 bits wide, but `f64`'s mantissa is only 52 bits wide)
+   --> src/core/gas.rs:416:25
+    |
+416 |         let estimated = crate::core::gas_profile::estimate_gas_units(steps, provider) as f64;
+    |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#cast_precision_loss
+
+error: casting `u128` to `f64` may cause a loss of precision (`u128` is 128 bits wide, but `f64`'s mantissa is only 52 bits wide)
+   --> src/core/gas.rs:533:15
+    |
+533 |     if wei >= u128::MAX as f64 {
+    |               ^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#cast_precision_loss
+
+error: casting `f64` to `u128` may truncate the value
+   --> src/core/gas.rs:536:16
+    |
+536 |     U256::from(wei as u128)
+    |                ^^^^^^^^^^^
+    |
+    = help: if this is intentional allow the lint with `#[allow(clippy::cast_possible_truncation)]` ...
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#cast_possible_truncation
+
+error: casting `u64` to `f64` may cause a loss of precision (`u64` is 64 bits wide, but `f64`'s mantissa is only 52 bits wide)
+   --> src/core/gas.rs:545:5
+    |
+545 |     integer.as_u64() as f64 + (fractional.as_u64() as f64 / 10f64.powi(decimals as i32))
+    |     ^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#cast_precision_loss
+
+error: casting `u64` to `f64` may cause a loss of precision (`u64` is 64 bits wide, but `f64`'s mantissa is only 52 bits wide)
+   --> src/core/gas.rs:545:32
+    |
+545 |     integer.as_u64() as f64 + (fractional.as_u64() as f64 / 10f64.powi(decimals as i32))
+    |                                ^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#cast_precision_loss
+
+error: manual saturating arithmetic
+   --> src/core/gas_oracle.rs:228:19
+    |
+228 |         let hop = swap.checked_add(CALLDATA_GAS_PER_HOP).unwrap_or(u64::MAX);
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using `saturating_add`: `swap.saturating_add(CALLDATA_GAS_PER_HOP)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_saturating_arithmetic
+    = note: `-D clippy::manual-saturating-arithmetic` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::manual_saturating_arithmetic)]`
+
+error: manual saturating arithmetic
+   --> src/core/gas_profile.rs:104:19
+    |
+104 |           let hop = swap_gas_units(venue)
+    |  ___________________^
+105 | |             .checked_add(CALLDATA_GAS_PER_HOP)
+106 | |             .unwrap_or(u64::MAX);
+    | |________________________________^ help: consider using `saturating_add`: `swap_gas_units(venue).saturating_add(CALLDATA_GAS_PER_HOP)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_saturating_arithmetic
+
+error: this function has too many arguments (8/7)
+   --> src/core/paper_validation.rs:252:1
+    |
+252 | / pub async fn probe_aave_flashloan_revert(
+253 | |     client: &AppMiddleware,
+254 | |     _paper_from: Address,
+255 | |     executor: Address,
+...   |
+260 | |     state_override: Option<Value>,
+261 | | ) -> String {
+    | |___________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#too_many_arguments
+
+error: used consecutive `str::replace` call
+   --> src/core/paper_validation.rs:365:10
+    |
+365 |           .replace(' ', "")
+    |  __________^
+366 | |         .replace('_', "")
+    | |_________________________^ help: replace with: `replace([' ', '_'], "")`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#collapsible_str_replace
+
+error: manual implementation of `.is_multiple_of()`
+   --> src/core/paper_validation.rs:858:46
+    |
+858 |                     if summary_window > 0 && n as u64 % summary_window == 0 {
+    |                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace with: `(n as u64).is_multiple_of(summary_window)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_is_multiple_of
+    = note: `-D clippy::manual-is-multiple-of` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::manual_is_multiple_of)]`
+
+error: struct `PaperValidationHub` has a public `len` method, but no `is_empty` method
+   --> src/core/paper_validation.rs:903:5
+    |
+903 |     pub fn len(&self) -> u64 {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#len_without_is_empty
+    = note: `-D clippy::len-without-is-empty` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::len_without_is_empty)]`
+
+error: returning the result of a `let` binding from a block
+    --> src/core/paper_validation.rs:1033:5
+     |
+1032 |     let a = resolve_paper_from(cfg, wallet);
+     |     ---------------------------------------- unnecessary `let` binding
+1033 |     a
+     |     ^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#let_and_return
+     = note: `-D clippy::let-and-return` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::let_and_return)]`
+help: return the expression directly
+     |
+1032 ~     
+1033 ~     resolve_paper_from(cfg, wallet)
+     |
+
+error: manual implementation of `.is_multiple_of()`
+   --> src/core/pipeline_obs.rs:606:8
+    |
+606 |     if sample % 100 == 0 {
+    |        ^^^^^^^^^^^^^^^^^ help: replace with: `sample.is_multiple_of(100)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_is_multiple_of
+
+error: this function has too many arguments (9/7)
+   --> src/core/pipeline_obs.rs:617:1
+    |
+617 | / pub fn record_price_feed_attempt(
+618 | |     symbol: &str,
+619 | |     token_address: Option<&str>,
+620 | |     decimals: u8,
+...   |
+626 | |     failure_reason: Option<QuoteRejectReason>,
+627 | | ) {
+    | |_^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#too_many_arguments
+
+error: used consecutive `str::replace` call
+  --> src/core/replay_cross_model.rs:48:38
+   |
+48 |     let n = dex.to_ascii_lowercase().replace(' ', "").replace('_', "");
+   |                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace with: `replace([' ', '_'], "")`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#collapsible_str_replace
+
+error: used consecutive `str::replace` call
+  --> src/core/replay_cross_model.rs:84:18
+   |
+84 |                   .replace(' ', "")
+   |  __________________^
+85 | |                 .replace('_', "")
+   | |_________________________________^ help: replace with: `replace([' ', '_'], "")`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#collapsible_str_replace
+
+error: this function has too many arguments (9/7)
+   --> src/core/replay_scan.rs:229:5
+    |
+229 | /     fn from_rates_and_meta(
+230 | |         rates: &[f64],
+231 | |         n_edge: u64,
+232 | |         n_prof: u64,
+...   |
+238 | |         top10: Vec<(u64, f64, String)>,
+239 | |     ) -> Self {
+    | |_____________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#too_many_arguments
+
+error: this function has too many arguments (15/7)
+    --> src/core/replay_scan.rs:1133:1
+     |
+1133 | / async fn scan_window(
+1134 | |     quoter: &HistQuoter,
+1135 | |     metas: &[PairMeta],
+1136 | |     cfg: &Config,
+...    |
+1148 | |     first_csv: &mut bool,
+1149 | | ) -> Result<(ReplayScanSummary, Vec<ReplayBlockSample>)> {
+     | |________________________________________________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#too_many_arguments
+
+error: explicit call to `.into_iter()` in function argument accepting `IntoIterator`
+    --> src/core/replay_scan.rs:1224:72
+     |
+1224 |                         !replay_cross_model::route_all_legs_executable(cross.venues().into_iter());
+     |                                                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+note: this parameter accepts any `IntoIterator`, so you don't need to call `.into_iter()`
+    --> src/core/replay_cross_model.rs:95:8
+     |
+  95 |     I: IntoIterator<Item = &'a str>,
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#useless_conversion
+     = note: `-D clippy::useless-conversion` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::useless_conversion)]`
+help: consider removing the `.into_iter()`
+     |
+1224 -                         !replay_cross_model::route_all_legs_executable(cross.venues().into_iter());
+1224 +                         !replay_cross_model::route_all_legs_executable(cross.venues());
+     |
+
+error: manual implementation of `.is_multiple_of()`
+    --> src/core/replay_scan.rs:1328:12
+     |
+1328 |         if n_done % THROUGHPUT_LOG_EVERY == 0 || n_done == blocks.len() as u64 {
+     |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace with: `n_done.is_multiple_of(THROUGHPUT_LOG_EVERY)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_is_multiple_of
+
+error: manual implementation of `.is_multiple_of()`
+   --> src/core/risk.rs:392:12
+    |
+392 |         if self.opportunities_analyzed % self.config.adaptive_check_every_ops as u64 == 0
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace with: `self.opportunities_analyzed.is_multiple_of(self.config.adaptive_check_every_ops as u64)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_is_multiple_of
+
+error: arithmetic operation that can potentially result in unexpected side-effects
+   --> src/core/fixed_usd.rs:285:14
+    |
+285 |         Some((num + price - U256::one()) / price)
+    |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#arithmetic_side_effects
+note: the lint level is defined here
+   --> src/core/fixed_usd.rs:6:9
+    |
+  6 | #![deny(clippy::arithmetic_side_effects)]
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: doc list item without indentation
+   --> src/dex/liquidity.rs:499:5
+    |
+499 | /// tipicamente resolve `None` → fail-open).
+    |     ^
+    |
+    = help: if this is supposed to be its own paragraph, add a blank line
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#doc_lazy_continuation
+help: indent this line
+    |
+499 | ///   tipicamente resolve `None` → fail-open).
+    |     ++
+
+error: this function has too many arguments (8/7)
+   --> src/dex/liquidity.rs:504:1
+    |
+504 | / pub async fn read_pool_tvl_usd<F, Fut, G, Gut>(
+505 | |     client: Arc<AppMiddleware>,
+506 | |     token_cache: &TokenCache,
+507 | |     dex_name: &str,
+...   |
+517 | |     G: FnMut(String, Address, Address) -> Gut,
+518 | |     Gut: std::future::Future<Output = Option<(Address, Address)>>,
+    | |__________________________________________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#too_many_arguments
+
+error: accessing first element with `raw.get(0)`
+   --> src/dex/liquidity.rs:582:33
+    |
+582 |     let (bal_a, bal_b) = match (raw.get(0), raw.get(1)) {
+    |                                 ^^^^^^^^^^ help: try: `raw.first()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#get_first
+    = note: `-D clippy::get-first` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::get_first)]`
+
+error: field assignment outside of initializer for an instance created with Default::default()
+    --> src/core/flashloan.rs:2773:9
+     |
+2773 |         opp.token_price_usd = Some(1.0);
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+note: consider initializing the variable with `core::types::ArbitrageOpportunity { token_price_usd: Some(1.0), ..Default::default() }` and removing relevant reassignments
+    --> src/core/flashloan.rs:2772:9
+     |
+2772 |         let mut opp = ArbitrageOpportunity::default();
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#field_reassign_with_default
+
+error: field assignment outside of initializer for an instance created with Default::default()
+    --> src/core/flashloan.rs:2798:9
+     |
+2798 |         opp.token_price_usd = Some(1.0);
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+note: consider initializing the variable with `core::types::ArbitrageOpportunity { token_price_usd: Some(1.0), ..Default::default() }` and removing relevant reassignments
+    --> src/core/flashloan.rs:2797:9
+     |
+2797 |         let mut opp = ArbitrageOpportunity::default();
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#field_reassign_with_default
+
+error: field assignment outside of initializer for an instance created with Default::default()
+    --> src/core/flashloan.rs:3411:9
+     |
+3411 |         opp.id = "t".into();
+     |         ^^^^^^^^^^^^^^^^^^^^
+     |
+note: consider initializing the variable with `core::types::ArbitrageOpportunity { id: "t".into(), amount_in: U256::from(1_000_000u64), gas_cost_usd: gas_usd, token_price_usd: price, ..Default::default() }` and removing relevant reassignments
+    --> src/core/flashloan.rs:3410:9
+     |
+3410 |         let mut opp = ArbitrageOpportunity::default();
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#field_reassign_with_default
+
+error: this call to `clone` can be replaced with `std::slice::from_ref`
+    --> src/core/flashloan.rs:3507:66
+     |
+3507 |                 ArbitrageClient::encode_callback_data(recipient, &[step.clone()], min_profit);
+     |                                                                  ^^^^^^^^^^^^^^^ help: try: `std::slice::from_ref(&step)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#cloned_ref_to_slice_refs
+     = note: `-D clippy::cloned-ref-to-slice-refs` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::cloned_ref_to_slice_refs)]`
+
+error: this call to `clone` can be replaced with `std::slice::from_ref`
+    --> src/core/flashloan.rs:3615:70
+     |
+3615 |                     ArbitrageClient::encode_callback_data(recipient, &[step.clone()], min_profit)
+     |                                                                      ^^^^^^^^^^^^^^^ help: try: `std::slice::from_ref(&step)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#cloned_ref_to_slice_refs
+
+error: this function has too many arguments (8/7)
+   --> src/dex/radar.rs:289:1
+    |
+289 | / async fn collect_dex_prices(
+290 | |     adapter: String,
+291 | |     pairs: Vec<String>,
+292 | |     qf: HighHitRateFilter,
+...   |
+297 | |     quote_block: ethers::types::U64,
+298 | | ) -> Result<(String, HashMap<String, f64>)> {
+    | |___________________________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#too_many_arguments
+
+error: this `impl` can be derived
+   --> src/dex/radar.rs:562:1
+    |
+562 | / impl Default for AdjTracker {
+563 | |     fn default() -> Self {
+564 | |         Self {
+565 | |             map: HashMap::new(),
+...   |
+569 | | }
+    | |_^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#derivable_impls
+help: replace the manual implementation with a derive attribute
+    |
+557 + #[derive(Default)]
+558 | pub struct AdjTracker {
+    |
+
+error: manual `RangeInclusive::contains` implementation
+   --> src/dex/radar.rs:825:12
+    |
+825 |         if spread_pct >= AUDIT_SPREAD_LOW && spread_pct <= AUDIT_SPREAD_HIGH {
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `(AUDIT_SPREAD_LOW..=AUDIT_SPREAD_HIGH).contains(&spread_pct)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_range_contains
+
+error: manual implementation of `.is_multiple_of()`
+    --> src/dex/radar.rs:1006:8
+     |
+1006 |     if v.len() % 2 == 0 {
+     |        ^^^^^^^^^^^^^^^^ help: replace with: `v.len().is_multiple_of(2)`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_is_multiple_of
+
+error: explicit call to `.into_iter()` in function argument accepting `IntoIterator`
+    --> src/dex/radar.rs:1062:60
+     |
+1062 |                 let executable = route_all_legs_executable(venues.into_iter());
+     |                                                            ^^^^^^^^^^^^^^^^^^
+     |
+note: this parameter accepts any `IntoIterator`, so you don't need to call `.into_iter()`
+    --> src/core/replay_cross_model.rs:95:8
+     |
+  95 |     I: IntoIterator<Item = &'a str>,
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#useless_conversion
+help: consider removing the `.into_iter()`
+     |
+1062 -                 let executable = route_all_legs_executable(venues.into_iter());
+1062 +                 let executable = route_all_legs_executable(venues);
+     |
+
+error: this function has too many arguments (9/7)
+    --> src/dex/radar.rs:1472:1
+     |
+1472 | / async fn execute_radar_cycle(
+1473 | |     dm: &Arc<DexManager>,
+1474 | |     cfg: &Arc<Mutex<Config>>,
+1475 | |     adj_cost: &AdjCostParams,
+...    |
+1481 | |     cycle: u64,
+1482 | | ) -> Result<(usize, Vec<EdgeInfo>)> {
+     | |___________________________________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#too_many_arguments
+
+error: consider using `sort_by_key`
+    --> src/dex/radar.rs:1658:9
+     |
+1658 |         cross_dex.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unnecessary_sort_by
+     = note: `-D clippy::unnecessary-sort-by` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::unnecessary_sort_by)]`
+help: try
+     |
+1658 -         cross_dex.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+1658 +         cross_dex.sort_by_key(|b| std::cmp::Reverse(b.1.len()));
+     |
+
+error: this `if` statement can be collapsed
+  --> src/dex/rate_limiter.rs:72:13
+   |
+72 | /             if retry_count > MAX_RETRIES {
+73 | |                 if start.elapsed() > Duration::from_secs(2) {
+74 | |                     warn!(
+75 | |                         "⚡ UltraRateLimiter '{}': forçando limpeza após {:?}",
+...  |
+97 | |             }
+   | |_____________^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#collapsible_if
+   = note: `-D clippy::collapsible-if` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::collapsible_if)]`
+help: collapse nested if block
+   |
+72 ~             if retry_count > MAX_RETRIES
+73 ~                 && start.elapsed() > Duration::from_secs(2) {
+74 |                     warn!(
+...
+95 |                     }
+96 ~                 }
+   |
+
+error: unnecessary use of `get(&12).is_some()`
+   --> src/core/nonce_reaper.rs:224:29
+    |
+224 |         assert!(r.in_flight.get(&12).is_some());
+    |                             ^^^^^^^^^^^^^^^^^^ help: replace it with: `contains_key(&12)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unnecessary_get_then_check
+    = note: `-D clippy::unnecessary-get-then-check` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::unnecessary_get_then_check)]`
+
+error: used consecutive `str::replace` call
+   --> src/execution/execution_engine.rs:144:14
+    |
+144 |               .replace('→', "-")
+    |  ______________^
+145 | |             .replace('|', "-")
+146 | |             .replace('/', "-")
+147 | |             .replace('_', "-")
+    | |______________________________^ help: replace with: `replace(['→', '|', '/', '_'], "-")`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#collapsible_str_replace
+
+error: field assignment outside of initializer for an instance created with Default::default()
+    --> src/core/paper_validation.rs:1268:9
+     |
+1268 |         opp.pair = "USDT-WMATIC".into();
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+note: consider initializing the variable with `core::types::ArbitrageOpportunity { pair: "USDT-WMATIC".into(), net_profit_usd: 0.5, estimated_profit_usd: 1.0, estimated_volume_usd: 100.0, ..Default::default() }` and removing relevant reassignments
+    --> src/core/paper_validation.rs:1267:9
+     |
+1267 |         let mut opp = ArbitrageOpportunity::default();
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#field_reassign_with_default
+
+error: you should consider adding a `Default` implementation for `CachedPriceFeed`
+  --> src/infra/price_feed.rs:80:5
+   |
+80 | /     pub fn new() -> Self {
+81 | |         Self {
+82 | |             client: Client::builder()
+83 | |                 .user_agent("FlashloanBot/1.0")
+...  |
+90 | |     }
+   | |_____^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#new_without_default
+   = note: `-D clippy::new-without-default` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::new_without_default)]`
+help: try adding this
+   |
+78 + impl Default for CachedPriceFeed {
+79 +     fn default() -> Self {
+80 +         Self::new()
+81 +     }
+82 + }
+   |
+
+error: enclosing `Ok` and `?` operator are unneeded
+   --> src/infra/rotating_http_client.rs:133:9
+    |
+133 |         Ok(Self::new(urls, request_timeout).map_err(|e| anyhow::anyhow!(e))?)
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_question_mark
+    = note: `-D clippy::needless-question-mark` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::needless_question_mark)]`
+help: remove the enclosing `Ok` and `?` operator
+    |
+133 -         Ok(Self::new(urls, request_timeout).map_err(|e| anyhow::anyhow!(e))?)
+133 +         Self::new(urls, request_timeout).map_err(|e| anyhow::anyhow!(e))
+    |
+
+error: unnecessary use of `to_vec`
+   --> src/infra/rpc_provider.rs:109:58
+    |
+109 |         let transport = RotatingHttpClient::from_strings(&endpoints.to_vec(), rpc_timeout)
+    |                                                          ^^^^^^^^^^^^^^^^^^^ help: use: `endpoints`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unnecessary_to_owned
+    = note: `-D clippy::unnecessary-to-owned` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::unnecessary_to_owned)]`
+
+error: this `map_or` can be simplified
+  --> src/infra/mod.rs:97:12
+   |
+97 |         if cfg.telegram.as_ref().map_or(false, |tg_cfg| tg_cfg.enabled) {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unnecessary_map_or
+help: use `is_some_and` instead
+   |
+97 -         if cfg.telegram.as_ref().map_or(false, |tg_cfg| tg_cfg.enabled) {
+97 +         if cfg.telegram.as_ref().is_some_and(|tg_cfg| tg_cfg.enabled) {
+   |
+
+error: manual implementation of `.is_multiple_of()`
+   --> src/tui.rs:374:23
+    |
+374 |         let beat = if state.render_tick % 2 == 0 {
+    |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace with: `state.render_tick.is_multiple_of(2)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_is_multiple_of
+
+error: manual implementation of `.is_multiple_of()`
+   --> src/tui.rs:379:29
+    |
+379 |         let beat_color = if state.render_tick % 2 == 0 {
+    |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^ help: replace with: `state.render_tick.is_multiple_of(2)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_is_multiple_of
+
+error: this `map_or` can be simplified
+  --> src/utils/reporting.rs:60:17
+   |
+60 | /                 r.execution_mode
+61 | |                     .as_ref()
+62 | |                     .map_or(false, |m| m.contains("flashloan"))
+   | |_______________________________________________________________^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unnecessary_map_or
+help: use `is_some_and` instead
+   |
+62 -                     .map_or(false, |m| m.contains("flashloan"))
+62 +                     .is_some_and(|m| m.contains("flashloan"))
+   |
+
+error: this `map_or` can be simplified
+  --> src/utils/reporting.rs:91:25
+   |
+91 |             .filter(|r| r.execution_mode.as_ref().map_or(false, |m| m == "wrapper"))
+   |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unnecessary_map_or
+help: use `is_some_and` instead
+   |
+91 -             .filter(|r| r.execution_mode.as_ref().map_or(false, |m| m == "wrapper"))
+91 +             .filter(|r| r.execution_mode.as_ref().is_some_and(|m| m == "wrapper"))
+   |
+
+error: this `map_or` can be simplified
+  --> src/utils/reporting.rs:96:25
+   |
+96 |             .filter(|r| r.execution_mode.as_ref().map_or(false, |m| m == "aave"))
+   |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unnecessary_map_or
+help: use `is_some_and` instead
+   |
+96 -             .filter(|r| r.execution_mode.as_ref().map_or(false, |m| m == "aave"))
+96 +             .filter(|r| r.execution_mode.as_ref().is_some_and(|m| m == "aave"))
+   |
+
+error: field assignment outside of initializer for an instance created with Default::default()
+    --> src/core/replay_scan.rs:1612:9
+     |
+1612 |         cfg.block_from = Some(1);
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+note: consider initializing the variable with `config::ReplayConfig { block_from: Some(1), block_to: Some(10), windows: vec![
+                  ReplayWindow {
+                      from: 50,
+                      to: 52,
+                      label: "a".into(),
+                      profile: "high_vol".into(),
+                  },
+                  ReplayWindow {
+                      from: 90,
+                      to: 91,
+                      label: "b".into(),
+                      profile: "control".into(),
+                  },
+              ], ..Default::default() }` and removing relevant reassignments
+    --> src/core/replay_scan.rs:1611:9
+     |
+1611 |         let mut cfg = ReplayConfig::default();
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#field_reassign_with_default
+
+error: module has the same name as its containing module
+ --> src/utils/mod.rs:7:1
+  |
+7 | pub mod utils; // expÃµe utils.rs
+  | ^^^^^^^^^^^^^^
+  |
+  = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#module_inception
+  = note: `-D clippy::module-inception` implied by `-D warnings`
+  = help: to override `-D warnings` add `#[allow(clippy::module_inception)]`
+
+error: manual `RangeInclusive::contains` implementation
+   --> src/utils/utils.rs:526:16
+    |
+526 |         return price >= 0.8 && price <= 1.2;
+    |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `(0.8..=1.2).contains(&price)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_range_contains
+
+error: manual `RangeInclusive::contains` implementation
+   --> src/utils/utils.rs:533:20
+    |
+533 |             return price >= 1000.0 && price <= 10000.0;
+    |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `(1000.0..=10000.0).contains(&price)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_range_contains
+
+error: manual `RangeInclusive::contains` implementation
+   --> src/utils/utils.rs:538:20
+    |
+538 |             return price >= 1000.0 && price <= 100000.0;
+    |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `(1000.0..=100000.0).contains(&price)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_range_contains
+
+error: this `if` statement can be collapsed
+   --> src/utils/utils.rs:543:5
+    |
+543 | /     if pair_lower.contains("wmatic") || pair_lower.contains("matic") {
+544 | |         if pair_lower.contains("usdt") || pair_lower.contains("usdc") || pair_lower.contains("dai")
+545 | |         {
+546 | |             return price >= 0.05 && price <= 10.0;
+547 | |         }
+548 | |     }
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#collapsible_if
+help: collapse nested if block
+    |
+543 ~     if (pair_lower.contains("wmatic") || pair_lower.contains("matic")) {
+544 ~         && (pair_lower.contains("usdt") || pair_lower.contains("usdc") || pair_lower.contains("dai"))
+545 |         {
+546 |             return price >= 0.05 && price <= 10.0;
+547 ~         }
+    |
+
+error: manual `RangeInclusive::contains` implementation
+   --> src/utils/utils.rs:546:20
+    |
+546 |             return price >= 0.05 && price <= 10.0;
+    |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `(0.05..=10.0).contains(&price)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_range_contains
+
+error: manual `RangeInclusive::contains` implementation
+   --> src/utils/utils.rs:554:16
+    |
+554 |         return price >= 0.0001 && price <= 0.001;
+    |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `(0.0001..=0.001).contains(&price)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_range_contains
+
+error: manual `RangeInclusive::contains` implementation
+   --> src/utils/utils.rs:558:5
+    |
+558 |     price >= 0.00001 && price <= 1000000.0
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `(0.00001..=1000000.0).contains(&price)`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_range_contains
+
+error: could not compile `flashloan-bot` (lib) due to 127 previous errors
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `flashloan-bot` (lib test) due to 136 previous errors
+CARGO_CLIPPY_EXIT_CODE=101
