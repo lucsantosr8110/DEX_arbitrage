@@ -1,0 +1,11 @@
+PHASE=2D-C STAGE=STARTED
+[READ_ONLY_SAFETY] live_trading_enabled=false transaction_broadcast_allowed=false signer_loaded=false broadcaster_initialized=false verdict=PASS
+ROUTES_LOADED=11 ROUTES_FAILED=0
+STAGE=RPC_READY chain_id=137 write_rpc_calls=0 signer_loaded=false
+ROUND=1 ANCHOR_BLOCK=91149850 ANCHOR_HASH=0xb9669e7689e71ef78585d4e2e467e0b9ed7a298a401126bcbf564c0f5a3cbb7b
+ROUND=1 DONE attempted=99 completed=99 failed=0 reorg=false elapsed_s=49.8
+ROUND=2 ANCHOR_BLOCK=91149883 ANCHOR_HASH=0xb46be14f8ede2877070d58c70e2d25cf876f477346f244840d69344ac7c49c26
+ROUND=2 DONE attempted=99 completed=99 failed=0 reorg=false elapsed_s=49.2
+ROUND=3 ANCHOR_BLOCK=91149916 ANCHOR_HASH=0x10db041b7c5fa459dbeb79a8a3d7f47106463fea1381b23fd1d9ca45add0a0a4
+ROUND=3 DONE attempted=99 completed=99 failed=0 reorg=false elapsed_s=49.5
+PHASE=2D-C STAGE=COMPLETE jsonl=diagnostics/phase2d_c_sequential_simulation_20260730T164545Z.jsonl csv=diagnostics/phase2d_c_sequential_simulation_20260730T164545Z.csv md=diagnostics/phase2d_c_sequential_simulation_20260730T164545Z.md gates=diagnostics/phase2d_c_gates_20260730T164545Z.txt
