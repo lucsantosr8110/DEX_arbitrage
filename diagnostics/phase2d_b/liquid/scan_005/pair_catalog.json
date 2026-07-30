@@ -1,0 +1,461 @@
+{
+  "duplicate_pairs_rejected": 0,
+  "pair_policy": "all selected directed pairs, bounded by max_pairs; no synthetic reverse",
+  "pairs": [
+    {
+      "directional": true,
+      "token_in": "USDC",
+      "token_out": "USDT"
+    },
+    {
+      "directional": true,
+      "token_in": "USDC",
+      "token_out": "WMATIC"
+    },
+    {
+      "directional": true,
+      "token_in": "USDC",
+      "token_out": "WETH"
+    },
+    {
+      "directional": true,
+      "token_in": "USDC",
+      "token_out": "WBTC"
+    },
+    {
+      "directional": true,
+      "token_in": "USDC",
+      "token_out": "DAI"
+    },
+    {
+      "directional": true,
+      "token_in": "USDC",
+      "token_out": "LINK"
+    },
+    {
+      "directional": true,
+      "token_in": "USDC",
+      "token_out": "UNI"
+    },
+    {
+      "directional": true,
+      "token_in": "USDC",
+      "token_out": "LDO"
+    },
+    {
+      "directional": true,
+      "token_in": "USDC",
+      "token_out": "AAVE"
+    },
+    {
+      "directional": true,
+      "token_in": "USDT",
+      "token_out": "USDC"
+    },
+    {
+      "directional": true,
+      "token_in": "USDT",
+      "token_out": "WMATIC"
+    },
+    {
+      "directional": true,
+      "token_in": "USDT",
+      "token_out": "WETH"
+    },
+    {
+      "directional": true,
+      "token_in": "USDT",
+      "token_out": "WBTC"
+    },
+    {
+      "directional": true,
+      "token_in": "USDT",
+      "token_out": "DAI"
+    },
+    {
+      "directional": true,
+      "token_in": "USDT",
+      "token_out": "LINK"
+    },
+    {
+      "directional": true,
+      "token_in": "USDT",
+      "token_out": "UNI"
+    },
+    {
+      "directional": true,
+      "token_in": "USDT",
+      "token_out": "LDO"
+    },
+    {
+      "directional": true,
+      "token_in": "USDT",
+      "token_out": "AAVE"
+    },
+    {
+      "directional": true,
+      "token_in": "WMATIC",
+      "token_out": "USDC"
+    },
+    {
+      "directional": true,
+      "token_in": "WMATIC",
+      "token_out": "USDT"
+    },
+    {
+      "directional": true,
+      "token_in": "WMATIC",
+      "token_out": "WETH"
+    },
+    {
+      "directional": true,
+      "token_in": "WMATIC",
+      "token_out": "WBTC"
+    },
+    {
+      "directional": true,
+      "token_in": "WMATIC",
+      "token_out": "DAI"
+    },
+    {
+      "directional": true,
+      "token_in": "WMATIC",
+      "token_out": "LINK"
+    },
+    {
+      "directional": true,
+      "token_in": "WMATIC",
+      "token_out": "UNI"
+    },
+    {
+      "directional": true,
+      "token_in": "WMATIC",
+      "token_out": "LDO"
+    },
+    {
+      "directional": true,
+      "token_in": "WMATIC",
+      "token_out": "AAVE"
+    },
+    {
+      "directional": true,
+      "token_in": "WETH",
+      "token_out": "USDC"
+    },
+    {
+      "directional": true,
+      "token_in": "WETH",
+      "token_out": "USDT"
+    },
+    {
+      "directional": true,
+      "token_in": "WETH",
+      "token_out": "WMATIC"
+    },
+    {
+      "directional": true,
+      "token_in": "WETH",
+      "token_out": "WBTC"
+    },
+    {
+      "directional": true,
+      "token_in": "WETH",
+      "token_out": "DAI"
+    },
+    {
+      "directional": true,
+      "token_in": "WETH",
+      "token_out": "LINK"
+    },
+    {
+      "directional": true,
+      "token_in": "WETH",
+      "token_out": "UNI"
+    },
+    {
+      "directional": true,
+      "token_in": "WETH",
+      "token_out": "LDO"
+    },
+    {
+      "directional": true,
+      "token_in": "WETH",
+      "token_out": "AAVE"
+    },
+    {
+      "directional": true,
+      "token_in": "WBTC",
+      "token_out": "USDC"
+    },
+    {
+      "directional": true,
+      "token_in": "WBTC",
+      "token_out": "USDT"
+    },
+    {
+      "directional": true,
+      "token_in": "WBTC",
+      "token_out": "WMATIC"
+    },
+    {
+      "directional": true,
+      "token_in": "WBTC",
+      "token_out": "WETH"
+    },
+    {
+      "directional": true,
+      "token_in": "WBTC",
+      "token_out": "DAI"
+    },
+    {
+      "directional": true,
+      "token_in": "WBTC",
+      "token_out": "LINK"
+    },
+    {
+      "directional": true,
+      "token_in": "WBTC",
+      "token_out": "UNI"
+    },
+    {
+      "directional": true,
+      "token_in": "WBTC",
+      "token_out": "LDO"
+    },
+    {
+      "directional": true,
+      "token_in": "WBTC",
+      "token_out": "AAVE"
+    },
+    {
+      "directional": true,
+      "token_in": "DAI",
+      "token_out": "USDC"
+    },
+    {
+      "directional": true,
+      "token_in": "DAI",
+      "token_out": "USDT"
+    },
+    {
+      "directional": true,
+      "token_in": "DAI",
+      "token_out": "WMATIC"
+    },
+    {
+      "directional": true,
+      "token_in": "DAI",
+      "token_out": "WETH"
+    },
+    {
+      "directional": true,
+      "token_in": "DAI",
+      "token_out": "WBTC"
+    },
+    {
+      "directional": true,
+      "token_in": "DAI",
+      "token_out": "LINK"
+    },
+    {
+      "directional": true,
+      "token_in": "DAI",
+      "token_out": "UNI"
+    },
+    {
+      "directional": true,
+      "token_in": "DAI",
+      "token_out": "LDO"
+    },
+    {
+      "directional": true,
+      "token_in": "DAI",
+      "token_out": "AAVE"
+    },
+    {
+      "directional": true,
+      "token_in": "LINK",
+      "token_out": "USDC"
+    },
+    {
+      "directional": true,
+      "token_in": "LINK",
+      "token_out": "USDT"
+    },
+    {
+      "directional": true,
+      "token_in": "LINK",
+      "token_out": "WMATIC"
+    },
+    {
+      "directional": true,
+      "token_in": "LINK",
+      "token_out": "WETH"
+    },
+    {
+      "directional": true,
+      "token_in": "LINK",
+      "token_out": "WBTC"
+    },
+    {
+      "directional": true,
+      "token_in": "LINK",
+      "token_out": "DAI"
+    },
+    {
+      "directional": true,
+      "token_in": "LINK",
+      "token_out": "UNI"
+    },
+    {
+      "directional": true,
+      "token_in": "LINK",
+      "token_out": "LDO"
+    },
+    {
+      "directional": true,
+      "token_in": "LINK",
+      "token_out": "AAVE"
+    },
+    {
+      "directional": true,
+      "token_in": "UNI",
+      "token_out": "USDC"
+    },
+    {
+      "directional": true,
+      "token_in": "UNI",
+      "token_out": "USDT"
+    },
+    {
+      "directional": true,
+      "token_in": "UNI",
+      "token_out": "WMATIC"
+    },
+    {
+      "directional": true,
+      "token_in": "UNI",
+      "token_out": "WETH"
+    },
+    {
+      "directional": true,
+      "token_in": "UNI",
+      "token_out": "WBTC"
+    },
+    {
+      "directional": true,
+      "token_in": "UNI",
+      "token_out": "DAI"
+    },
+    {
+      "directional": true,
+      "token_in": "UNI",
+      "token_out": "LINK"
+    },
+    {
+      "directional": true,
+      "token_in": "UNI",
+      "token_out": "LDO"
+    },
+    {
+      "directional": true,
+      "token_in": "UNI",
+      "token_out": "AAVE"
+    },
+    {
+      "directional": true,
+      "token_in": "LDO",
+      "token_out": "USDC"
+    },
+    {
+      "directional": true,
+      "token_in": "LDO",
+      "token_out": "USDT"
+    },
+    {
+      "directional": true,
+      "token_in": "LDO",
+      "token_out": "WMATIC"
+    },
+    {
+      "directional": true,
+      "token_in": "LDO",
+      "token_out": "WETH"
+    },
+    {
+      "directional": true,
+      "token_in": "LDO",
+      "token_out": "WBTC"
+    },
+    {
+      "directional": true,
+      "token_in": "LDO",
+      "token_out": "DAI"
+    },
+    {
+      "directional": true,
+      "token_in": "LDO",
+      "token_out": "LINK"
+    },
+    {
+      "directional": true,
+      "token_in": "LDO",
+      "token_out": "UNI"
+    },
+    {
+      "directional": true,
+      "token_in": "LDO",
+      "token_out": "AAVE"
+    },
+    {
+      "directional": true,
+      "token_in": "AAVE",
+      "token_out": "USDC"
+    },
+    {
+      "directional": true,
+      "token_in": "AAVE",
+      "token_out": "USDT"
+    },
+    {
+      "directional": true,
+      "token_in": "AAVE",
+      "token_out": "WMATIC"
+    },
+    {
+      "directional": true,
+      "token_in": "AAVE",
+      "token_out": "WETH"
+    },
+    {
+      "directional": true,
+      "token_in": "AAVE",
+      "token_out": "WBTC"
+    },
+    {
+      "directional": true,
+      "token_in": "AAVE",
+      "token_out": "DAI"
+    },
+    {
+      "directional": true,
+      "token_in": "AAVE",
+      "token_out": "LINK"
+    },
+    {
+      "directional": true,
+      "token_in": "AAVE",
+      "token_out": "UNI"
+    },
+    {
+      "directional": true,
+      "token_in": "AAVE",
+      "token_out": "LDO"
+    }
+  ],
+  "pairs_after_limit": 90,
+  "pairs_generated": 90,
+  "profile": "liquid",
+  "self_pairs_rejected": 10,
+  "tokens_selected": 10
+}

@@ -1,0 +1,315 @@
+{
+  "profile": "liquid",
+  "scans_included": 5,
+  "schema_version": 1,
+  "venues": {
+    "Curve": {
+      "directions_attempted": {
+        "avg_per_scan": 90.0,
+        "last_scan": 90,
+        "total": 450
+      },
+      "fee_tiers_attempted": {
+        "avg_per_scan": 0.0,
+        "last_scan": 0,
+        "total": 0
+      },
+      "graph_edges": {
+        "avg_per_scan": 6.0,
+        "last_scan": 6,
+        "total": 30
+      },
+      "no_pool": {
+        "avg_per_scan": 84.0,
+        "last_scan": 84,
+        "total": 420
+      },
+      "pinned_calls_attempted": {
+        "avg_per_scan": 90.0,
+        "last_scan": 90,
+        "total": 450
+      },
+      "pinned_calls_failed": {
+        "avg_per_scan": 84.0,
+        "last_scan": 84,
+        "total": 420
+      },
+      "pinned_calls_succeeded": {
+        "avg_per_scan": 6.0,
+        "last_scan": 6,
+        "total": 30
+      },
+      "pools_attempted": {
+        "avg_per_scan": 90.0,
+        "last_scan": 90,
+        "total": 450
+      },
+      "quotes_accepted": {
+        "avg_per_scan": 6.0,
+        "last_scan": 6,
+        "total": 30
+      },
+      "quotes_attempted": {
+        "avg_per_scan": 90.0,
+        "last_scan": 90,
+        "total": 450
+      },
+      "quotes_failed": {
+        "avg_per_scan": 84.0,
+        "last_scan": 84,
+        "total": 420
+      },
+      "quotes_succeeded": {
+        "avg_per_scan": 6.0,
+        "last_scan": 6,
+        "total": 30
+      },
+      "reciprocity_rejected": {
+        "avg_per_scan": 0.0,
+        "last_scan": 0,
+        "total": 0
+      },
+      "rpc_errors": {
+        "avg_per_scan": 0.0,
+        "last_scan": 0,
+        "total": 0
+      },
+      "timeouts": {
+        "avg_per_scan": 0.0,
+        "last_scan": 0,
+        "total": 0
+      }
+    },
+    "QuickSwap": {
+      "directions_attempted": {
+        "avg_per_scan": 0.0,
+        "last_scan": 0,
+        "total": 0
+      },
+      "fee_tiers_attempted": {
+        "avg_per_scan": 0.0,
+        "last_scan": 0,
+        "total": 0
+      },
+      "graph_edges": {
+        "avg_per_scan": 18.0,
+        "last_scan": 18,
+        "total": 90
+      },
+      "no_pool": {
+        "avg_per_scan": 26.0,
+        "last_scan": 26,
+        "total": 130
+      },
+      "pinned_calls_attempted": {
+        "avg_per_scan": 90.0,
+        "last_scan": 90,
+        "total": 450
+      },
+      "pinned_calls_failed": {
+        "avg_per_scan": 26.0,
+        "last_scan": 26,
+        "total": 130
+      },
+      "pinned_calls_succeeded": {
+        "avg_per_scan": 64.0,
+        "last_scan": 64,
+        "total": 320
+      },
+      "pools_attempted": {
+        "avg_per_scan": 0.0,
+        "last_scan": 0,
+        "total": 0
+      },
+      "quotes_accepted": {
+        "avg_per_scan": 18.0,
+        "last_scan": 18,
+        "total": 90
+      },
+      "quotes_attempted": {
+        "avg_per_scan": 90.0,
+        "last_scan": 90,
+        "total": 450
+      },
+      "quotes_failed": {
+        "avg_per_scan": 26.0,
+        "last_scan": 26,
+        "total": 130
+      },
+      "quotes_succeeded": {
+        "avg_per_scan": 64.0,
+        "last_scan": 64,
+        "total": 320
+      },
+      "reciprocity_rejected": {
+        "avg_per_scan": 46.0,
+        "last_scan": 46,
+        "total": 230
+      },
+      "rpc_errors": {
+        "avg_per_scan": 0.0,
+        "last_scan": 0,
+        "total": 0
+      },
+      "timeouts": {
+        "avg_per_scan": 0.0,
+        "last_scan": 0,
+        "total": 0
+      }
+    },
+    "SushiSwap": {
+      "directions_attempted": {
+        "avg_per_scan": 0.0,
+        "last_scan": 0,
+        "total": 0
+      },
+      "fee_tiers_attempted": {
+        "avg_per_scan": 0.0,
+        "last_scan": 0,
+        "total": 0
+      },
+      "graph_edges": {
+        "avg_per_scan": 10.0,
+        "last_scan": 10,
+        "total": 50
+      },
+      "no_pool": {
+        "avg_per_scan": 38.0,
+        "last_scan": 38,
+        "total": 190
+      },
+      "pinned_calls_attempted": {
+        "avg_per_scan": 90.0,
+        "last_scan": 90,
+        "total": 450
+      },
+      "pinned_calls_failed": {
+        "avg_per_scan": 38.0,
+        "last_scan": 38,
+        "total": 190
+      },
+      "pinned_calls_succeeded": {
+        "avg_per_scan": 52.0,
+        "last_scan": 52,
+        "total": 260
+      },
+      "pools_attempted": {
+        "avg_per_scan": 0.0,
+        "last_scan": 0,
+        "total": 0
+      },
+      "quotes_accepted": {
+        "avg_per_scan": 10.0,
+        "last_scan": 10,
+        "total": 50
+      },
+      "quotes_attempted": {
+        "avg_per_scan": 90.0,
+        "last_scan": 90,
+        "total": 450
+      },
+      "quotes_failed": {
+        "avg_per_scan": 38.0,
+        "last_scan": 38,
+        "total": 190
+      },
+      "quotes_succeeded": {
+        "avg_per_scan": 52.0,
+        "last_scan": 52,
+        "total": 260
+      },
+      "reciprocity_rejected": {
+        "avg_per_scan": 42.0,
+        "last_scan": 42,
+        "total": 210
+      },
+      "rpc_errors": {
+        "avg_per_scan": 0.0,
+        "last_scan": 0,
+        "total": 0
+      },
+      "timeouts": {
+        "avg_per_scan": 0.0,
+        "last_scan": 0,
+        "total": 0
+      }
+    },
+    "UniswapV3": {
+      "directions_attempted": {
+        "avg_per_scan": 0.0,
+        "last_scan": 0,
+        "total": 0
+      },
+      "fee_tiers_attempted": {
+        "avg_per_scan": 270.0,
+        "last_scan": 270,
+        "total": 1350
+      },
+      "graph_edges": {
+        "avg_per_scan": 78.0,
+        "last_scan": 78,
+        "total": 390
+      },
+      "no_pool": {
+        "avg_per_scan": 118.0,
+        "last_scan": 118,
+        "total": 590
+      },
+      "pinned_calls_attempted": {
+        "avg_per_scan": 270.0,
+        "last_scan": 270,
+        "total": 1350
+      },
+      "pinned_calls_failed": {
+        "avg_per_scan": 118.0,
+        "last_scan": 118,
+        "total": 590
+      },
+      "pinned_calls_succeeded": {
+        "avg_per_scan": 152.0,
+        "last_scan": 152,
+        "total": 760
+      },
+      "pools_attempted": {
+        "avg_per_scan": 0.0,
+        "last_scan": 0,
+        "total": 0
+      },
+      "quotes_accepted": {
+        "avg_per_scan": 78.0,
+        "last_scan": 78,
+        "total": 390
+      },
+      "quotes_attempted": {
+        "avg_per_scan": 270.0,
+        "last_scan": 270,
+        "total": 1350
+      },
+      "quotes_failed": {
+        "avg_per_scan": 118.0,
+        "last_scan": 118,
+        "total": 590
+      },
+      "quotes_succeeded": {
+        "avg_per_scan": 152.0,
+        "last_scan": 152,
+        "total": 760
+      },
+      "reciprocity_rejected": {
+        "avg_per_scan": 74.0,
+        "last_scan": 74,
+        "total": 370
+      },
+      "rpc_errors": {
+        "avg_per_scan": 0.0,
+        "last_scan": 0,
+        "total": 0
+      },
+      "timeouts": {
+        "avg_per_scan": 0.0,
+        "last_scan": 0,
+        "total": 0
+      }
+    }
+  }
+}

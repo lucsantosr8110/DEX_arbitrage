@@ -2,7 +2,7 @@
 use anyhow::{anyhow, Result};
 use flashloan_bot::core::diagnostic_graph::{
     enumerate_simple_cycles_exact, find_negative_cycles_raw, validate_diagnostic_graph,
-    DiagnosticGraph, EPSILON,
+    DiagnosticEdge, DiagnosticGraph, ExactCycle, EPSILON,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -70,6 +70,57 @@ fn meta(path: &str) -> (&str, &str, &str) {
     (profile, stage, id)
 }
 
+fn scan_key(path: &str) -> String {
+    Path::new(path)
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .and_then(|x| x.to_str())
+        .unwrap_or("scan_unknown")
+        .to_owned()
+}
+
+fn structural_edge_key(edge: &DiagnosticEdge) -> String {
+    format!(
+        "{}>{}|{}|{}|{}|{}",
+        edge.token_in_address.to_ascii_lowercase(),
+        edge.token_out_address.to_ascii_lowercase(),
+        edge.dex_name,
+        edge.protocol_version,
+        edge.pool_address
+            .as_deref()
+            .unwrap_or("")
+            .to_ascii_lowercase(),
+        edge.fee_tier.map(|fee| fee.to_string()).unwrap_or_default()
+    )
+}
+
+fn structural_cycle_key(graph: &DiagnosticGraph, cycle: &ExactCycle) -> String {
+    let edge_by_id = graph
+        .edges
+        .iter()
+        .map(|edge| (edge.id, edge))
+        .collect::<std::collections::HashMap<_, _>>();
+    let parts = cycle
+        .edge_ids
+        .iter()
+        .filter_map(|id| edge_by_id.get(id).map(|edge| structural_edge_key(edge)))
+        .collect::<Vec<_>>();
+    (0..parts.len())
+        .map(|offset| {
+            parts
+                .iter()
+                .cycle()
+                .skip(offset)
+                .take(parts.len())
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("||")
+        })
+        .min()
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 fn accounting_valid(
     exact: usize,
@@ -114,6 +165,7 @@ fn main() -> Result<()> {
         let bf = find_negative_cycles_raw(&g);
         let bf_keys: HashSet<_> = bf.cycles.iter().map(|c| c.canonical_key.clone()).collect();
         let (profile, stage, id) = meta(path);
+        let scan = scan_key(path);
         let primary = neg
             .iter()
             .filter(|c| bf_keys.contains(&c.canonical_key))
@@ -121,9 +173,9 @@ fn main() -> Result<()> {
         let variants = neg.len() - primary;
         for c in &neg {
             let edges: Vec<_> = c.edge_ids.iter().map(|i| &g.edges[*i]).collect();
-            cycles.push(serde_json::json!({"snapshot_id":id,"profile":profile,"graph_stage":stage,"canonical_cycle_key":c.canonical_key,"edge_ids":c.edge_ids,"token_ids":c.token_ids,"token_path":edges.iter().map(|e|e.token_in_symbol.clone()).collect::<Vec<_>>(),"dex_path":edges.iter().map(|e|e.dex_name.clone()).collect::<Vec<_>>(),"protocol_path":edges.iter().map(|e|e.protocol_version.clone()).collect::<Vec<_>>(),"pool_path":edges.iter().map(|e|e.pool_address.clone()).collect::<Vec<_>>(),"fee_tiers":edges.iter().map(|e|e.fee_tier).collect::<Vec<_>>(),"curve_coin_indices":[],"hops":c.edge_ids.len(),"product":c.product,"total_weight":c.total_weight,"spread_pct":c.spread_pct,"bf_region_id":if neg.is_empty(){serde_json::Value::Null}else{serde_json::json!(id)},"matched_bf_witness":bf_keys.contains(&c.canonical_key),"classification":if bf_keys.contains(&c.canonical_key){"BF_PRIMARY_WITNESS"}else{"PARALLEL_EDGE_VARIANT"},"parallel_variant_of":bf.cycles.first().map(|x|x.canonical_key.clone())}));
+            cycles.push(serde_json::json!({"snapshot_id":id,"scan_id":scan,"profile":profile,"graph_stage":stage,"canonical_cycle_key":c.canonical_key,"structural_cycle_key":structural_cycle_key(&g, c),"edge_ids":c.edge_ids,"token_ids":c.token_ids,"token_path":edges.iter().map(|e|e.token_in_symbol.clone()).collect::<Vec<_>>(),"dex_path":edges.iter().map(|e|e.dex_name.clone()).collect::<Vec<_>>(),"protocol_path":edges.iter().map(|e|e.protocol_version.clone()).collect::<Vec<_>>(),"pool_path":edges.iter().map(|e|e.pool_address.clone()).collect::<Vec<_>>(),"fee_tiers":edges.iter().map(|e|e.fee_tier).collect::<Vec<_>>(),"curve_coin_indices":[],"hops":c.edge_ids.len(),"product":c.product,"total_weight":c.total_weight,"spread_pct":c.spread_pct,"bf_region_id":if neg.is_empty(){serde_json::Value::Null}else{serde_json::json!(id)},"matched_bf_witness":bf_keys.contains(&c.canonical_key),"classification":if bf_keys.contains(&c.canonical_key){"BF_PRIMARY_WITNESS"}else{"PARALLEL_EDGE_VARIANT"},"parallel_variant_of":bf.cycles.first().map(|x|x.canonical_key.clone())}));
         }
-        rows.push(serde_json::json!({"snapshot_id":id,"snapshot_path":path,"sha256":sha,"profile":profile,"graph_stage":stage,"token_count":g.tokens.len(),"edge_count":g.edges.len(),"parallel_edge_groups":v.parallel_edge_groups,"exact_negative_cycles":neg.len(),"bf_negative_relaxation_regions":if bf.negative_relaxations>0{1}else{0},"bf_valid_witnesses":bf.cycles.len(),"bf_primary_witnesses":primary,"parallel_edge_variants":variants,"true_bf_detection_misses":0,"bf_reconstruction_failures":bf.reconstruction_failures,"canonicalization_mismatches":0,"exact_invalid_cycles":0,"exact_duplicate_cycles":0,"unclassified_divergences":0,"bf_exact_contract_violations":0,"bf_exact_variant_differences":variants}));
+        rows.push(serde_json::json!({"snapshot_id":id,"scan_id":scan,"snapshot_path":path,"sha256":sha,"profile":profile,"graph_stage":stage,"token_count":g.tokens.len(),"edge_count":g.edges.len(),"parallel_edge_groups":v.parallel_edge_groups,"exact_negative_cycles":neg.len(),"bf_negative_relaxation_regions":if bf.negative_relaxations>0{1}else{0},"bf_valid_witnesses":bf.cycles.len(),"bf_primary_witnesses":primary,"parallel_edge_variants":variants,"true_bf_detection_misses":0,"bf_reconstruction_failures":bf.reconstruction_failures,"canonicalization_mismatches":0,"exact_invalid_cycles":0,"exact_duplicate_cycles":0,"unclassified_divergences":0,"bf_exact_contract_violations":0,"bf_exact_variant_differences":variants}));
     }
     rows.sort_by_key(|x| {
         (

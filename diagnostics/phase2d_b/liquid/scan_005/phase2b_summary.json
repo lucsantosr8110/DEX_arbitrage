@@ -1,0 +1,19 @@
+{
+  "avg_head_advance_during_scan": 47.0,
+  "block_number_per_quote_unavailable": false,
+  "graph_unpinned_edges": 0,
+  "max_head_advance_during_scan": 47,
+  "post_graph_edges_total": 112,
+  "pre_graph_edges_total": 274,
+  "quote_anchor_mismatches": 0,
+  "quote_state_block_span": 0,
+  "quotes_pinned_to_anchor_block": true,
+  "raw_quotes_total": 274,
+  "reciprocity_rejected_total": 162,
+  "reciprocity_rejection_rate": 59.12408759124087,
+  "scans_completed": 1,
+  "scans_started": 1,
+  "temporal_mode": "PINNED_ANCHOR_BLOCK",
+  "unpinned_fallback_attempts": 0,
+  "unpinned_quotes_accepted": 0
+}

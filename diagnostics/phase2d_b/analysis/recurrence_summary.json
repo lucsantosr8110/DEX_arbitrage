@@ -1,0 +1,34 @@
+{
+  "base": {
+    "persistent_all": 3,
+    "persistent_majority": 0,
+    "post_keys": 3,
+    "pre_keys": 3,
+    "repeated": 0,
+    "singleton": 0
+  },
+  "base_cycle_key_survival_rate": 1.0,
+  "cycle_keys_removed_by_reciprocity": 0,
+  "cycle_keys_survived_reciprocity": 11,
+  "liquid": {
+    "persistent_all": 2,
+    "persistent_majority": 1,
+    "post_keys": 8,
+    "pre_keys": 8,
+    "repeated": 4,
+    "singleton": 1
+  },
+  "liquid_cycle_key_survival_rate": 1.0,
+  "persistent_post_survivor_cycles": 11,
+  "persistent_pre_only_cycles": 0,
+  "post_cycle_keys_total": 11,
+  "post_reciprocity_cycle_keys_total": 11,
+  "pre_cycle_keys_total": 11,
+  "return_stability": {
+    "RETURN_MODERATELY_VARIABLE": 0,
+    "RETURN_STABLE": 10,
+    "RETURN_UNSTABLE": 0
+  },
+  "structural_cycle_key_tests": 12,
+  "structural_cycle_keys_total": 11
+}

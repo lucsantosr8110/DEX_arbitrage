@@ -1,0 +1,8 @@
+{
+  "bf_negative_relaxation_regions": 16,
+  "bf_primary_witnesses": 16,
+  "bf_valid_witnesses": 16,
+  "exact_negative_cycles": 62,
+  "offline_audit_deterministic": true,
+  "parallel_edge_variants": 46
+}
