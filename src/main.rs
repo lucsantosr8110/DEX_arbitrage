@@ -186,8 +186,11 @@ fn top_spread_row_from_info(i: TopSpreadInfo) -> tui::TopSpreadRow {
     tui::TopSpreadRow {
         pair: i.pair,
         tui_spread_pct: i.tui_spread_pct,
+        buy_dex: i.buy_dex,
+        sell_dex: i.sell_dex,
         cycle_rate: i.cycle_rate,
         net_usd: i.net_usd,
+        distance_to_profit: i.distance_to_profit,
         executable: i.executable,
         has_curve_leg: i.has_curve_leg,
         outlier: i.outlier,
@@ -324,6 +327,7 @@ async fn main() -> Result<()> {
     }
 
     info!("🚀 Iniciando Flashloan DEX Arbitrage Bot v4.8.4-HYBRID-SAFE...");
+    flashloan_bot::core::pipeline_obs::print_diagnostic_banner();
 
     // ============================================================
     // 2️⃣ Carregamento de Configuração e Variáveis (.env)

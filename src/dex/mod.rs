@@ -357,29 +357,98 @@ pub async fn calculate_price_with_decimals(
 /// fallback heurístico embutido). Ele só dimensiona a cotação — o preço que vale
 /// para lucro é sempre o que o DEX devolve.
 pub async fn quote_amount_for_usd(symbol: &str, decimals: u8, usd_notional: f64) -> Result<U256> {
+    use crate::core::pipeline_obs::{
+        pipeline_counters, record_rejection, record_sizing_attempt, QuoteRejectReason,
+    };
     use crate::infra::price_feed::PRICE_FEED;
 
-    let price_usd = PRICE_FEED.get_price(symbol).await.unwrap_or(0.0);
+    pipeline_counters().inc(&pipeline_counters().sizing_attempted);
 
-    if !price_usd.is_finite()
-        || price_usd <= 0.0
-        || !usd_notional.is_finite()
-        || usd_notional <= 0.0
-    {
-        return Err(anyhow!(
-            "[quote_size] sem preço de referência utilizável para {symbol} (usd={price_usd})"
-        ));
+    let price_usd = match PRICE_FEED.get_price(symbol).await {
+        Ok(price) if price.is_finite() && price > 0.0 => price,
+        Ok(price) => {
+            let reason = if price.is_nan() {
+                QuoteRejectReason::PriceFeedNaN
+            } else if price.is_infinite() {
+                QuoteRejectReason::PriceFeedInfinity
+            } else {
+                QuoteRejectReason::PriceFeedZeroOrNegative
+            };
+            record_sizing_attempt(symbol, false, Some(reason));
+            return Err(anyhow!(
+                "[quote_size] preço de referência inválido para {symbol} (usd={price})"
+            ));
+        }
+        Err(e) => {
+            record_sizing_attempt(symbol, false, Some(QuoteRejectReason::PriceFeedUnavailable));
+            return Err(anyhow!(
+                "[quote_size] sem preço de referência utilizável para {symbol}: {e}"
+            ));
+        }
+    };
+
+    match amount_for_usd_from_price(price_usd, decimals, usd_notional) {
+        Ok(amount) => {
+            debug!(
+                target: "pipeline.price_feed",
+                symbol,
+                token_address = "unresolved",
+                decimals,
+                requested_usd_notional = usd_notional,
+                price_source = "PRICE_FEED",
+                cache_status = "reported_by_feed",
+                price_value = price_usd,
+                amount_raw = %amount,
+                success_or_failure = "success",
+                failure_reason = "none",
+                "quote_amount_for_usd sizing"
+            );
+            record_sizing_attempt(symbol, true, None);
+            Ok(amount)
+        }
+        Err(error) => {
+            let reason = if !price_usd.is_finite() || price_usd <= 0.0 {
+                QuoteRejectReason::PriceFeedInvalid
+            } else if !usd_notional.is_finite() || usd_notional <= 0.0 {
+                QuoteRejectReason::InvalidNotional
+            } else {
+                QuoteRejectReason::InvalidAmountIn
+            };
+            debug!(
+                target: "pipeline.price_feed",
+                symbol,
+                token_address = "unresolved",
+                decimals,
+                requested_usd_notional = usd_notional,
+                price_source = "PRICE_FEED",
+                cache_status = "reported_by_feed",
+                price_value = price_usd,
+                amount_raw = "none",
+                success_or_failure = "failure",
+                failure_reason = reason.as_str(),
+                "quote_amount_for_usd sizing"
+            );
+            record_rejection(reason, "quote_amount_for_usd");
+            record_sizing_attempt(symbol, false, Some(reason));
+            Err(error.context(format!("[quote_size] symbol={symbol}")))
+        }
+    }
+}
+
+/// Converte preço válido e notional USD em unidades raw.
+/// Função pura permite diagnóstico determinístico sem Coingecko/RPC.
+pub fn amount_for_usd_from_price(price_usd: f64, decimals: u8, usd_notional: f64) -> Result<U256> {
+    if !price_usd.is_finite() || price_usd <= 0.0 {
+        return Err(anyhow!("[quote_size] preço inválido: {price_usd}"));
+    }
+    if !usd_notional.is_finite() || usd_notional <= 0.0 {
+        return Err(anyhow!("[quote_size] notional inválido: {usd_notional}"));
     }
 
-    let units = usd_notional / price_usd;
-    let raw = units * 10f64.powi(decimals as i32);
-
+    let raw = (usd_notional / price_usd) * 10f64.powi(decimals as i32);
     if !raw.is_finite() || raw < 1.0 || raw >= u128::MAX as f64 {
-        return Err(anyhow!(
-            "[quote_size] notional ${usd_notional:.2} em {symbol} gerou quantidade fora de faixa ({raw:.3e})"
-        ));
+        return Err(anyhow!("[quote_size] amount raw fora de faixa: {raw:.3e}"));
     }
-
     Ok(U256::from(raw as u128))
 }
 
@@ -688,5 +757,28 @@ mod fee_tier_cache_tests {
             cfg.arbitrage.default_trade_amount.parse::<f64>().unwrap(),
             cfg.executable_trade_notional_usd()
         );
+    }
+
+    #[test]
+    fn price_feed_valid_price_produces_amount_in() {
+        let amount = super::amount_for_usd_from_price(2.0, 6, 10.0).expect("valid price");
+        assert_eq!(amount, U256::from(5_000_000u64));
+    }
+
+    #[test]
+    fn price_feed_zero_nan_and_infinity_are_rejected() {
+        for price in [0.0, f64::NAN, f64::INFINITY] {
+            assert!(
+                super::amount_for_usd_from_price(price, 6, 10.0).is_err(),
+                "price {price:?} must reject sizing"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_error_is_not_converted_to_zero_amount() {
+        let error = anyhow::anyhow!("provider timeout");
+        assert!(!error.to_string().is_empty());
+        assert!(super::amount_for_usd_from_price(0.0, 6, 10.0).is_err());
     }
 }

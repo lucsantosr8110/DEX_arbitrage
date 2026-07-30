@@ -10,6 +10,7 @@
 use crate::{
     config::Config,
     core::{
+        pipeline_obs::{pipeline_counters, ScanCycle},
         replay_cross_model::{route_all_legs_executable, venue_curve_model, CurveModel},
         smart_retry::SmartRetryManager,
     },
@@ -929,14 +930,37 @@ pub struct TopSpreadInfo {
     pub pair: String,
     /// Spread% single-dir do TUI: (max-min)/min*100 das cotações forward.
     pub tui_spread_pct: f64,
+    pub buy_dex: String,
+    pub sell_dex: String,
     pub leg1: Option<TopSpreadLeg>, // forward (buy), None se sem reverse
     pub leg2: Option<TopSpreadLeg>, // reverse (sell), None se sem reverse
     pub cycle_rate: Option<f64>,    // None se não há 2-hop buy≠sell
     pub gross_pct: Option<f64>,
     pub net_usd: Option<f64>,
+    /// Quanto falta para o net projetado virar positivo (0 se já lucrativo).
+    pub distance_to_profit: f64,
     pub outlier: Option<String>, // venue que destoa da mediana forward (suspeito raso)
     pub executable: bool,
     pub has_curve_leg: bool,
+}
+
+/// Chave canônica para dedup de espelhos em TopSpreadInfo. Mesmo round-trip
+/// econômico (A-B/B-A com mesmas venues) colide aqui.
+fn top_spread_canonical_key(info: &TopSpreadInfo) -> Option<String> {
+    let legs = info.leg1.iter().chain(info.leg2.iter()).collect::<Vec<_>>();
+    if legs.is_empty() {
+        return None;
+    }
+    let mut venues: Vec<&str> = legs.iter().map(|l| l.venue.as_str()).collect();
+    venues.sort();
+    venues.dedup();
+    let mut tokens: Vec<&str> = legs
+        .iter()
+        .flat_map(|l| [l.token_in.as_str(), l.token_out.as_str()])
+        .collect();
+    tokens.sort();
+    tokens.dedup();
+    Some(format!("{}|{}", venues.join("|"), tokens.join("|")))
 }
 
 /// Spread% single-dir idêntico à coluna do TUI (`tui.rs:221-224`).
@@ -1015,48 +1039,67 @@ pub fn analyze_pair_spread(
 ) -> TopSpreadInfo {
     let tui_spread_pct = tui_spread_pct(forward);
     let best = best_two_hop(forward, reverse);
-    let (leg1, leg2, cycle_rate, gross_pct, net_usd, executable, has_curve_leg) = match best {
-        Some((bv, bp, sv, sp, rate)) => {
-            let (a, b) = pair.split_once('-').unwrap_or((pair, ""));
-            let leg1 = TopSpreadLeg {
-                venue: bv.clone(),
-                token_in: a.to_string(),
-                token_out: b.to_string(),
-                rate: bp,
-            };
-            let leg2 = TopSpreadLeg {
-                venue: sv.clone(),
-                token_in: b.to_string(),
-                token_out: a.to_string(),
-                rate: sp,
-            };
-            let gross = (rate - 1.0) * 100.0;
-            let net = cost.net_usd(gross);
-            let venues = [leg1.venue.as_str(), leg2.venue.as_str()];
-            let executable = route_all_legs_executable(venues.into_iter());
-            let has_curve = venues
-                .iter()
-                .any(|v| venue_curve_model(v) == CurveModel::StableSwap);
-            (
-                Some(leg1),
-                Some(leg2),
-                Some(rate),
-                Some(gross),
-                Some(net),
-                executable,
-                has_curve,
-            )
-        }
-        None => (None, None, None, None, None, false, false),
-    };
+    let (buy_dex, sell_dex, leg1, leg2, cycle_rate, gross_pct, net_usd, executable, has_curve_leg) =
+        match best {
+            Some((bv, bp, sv, sp, rate)) => {
+                let (a, b) = pair.split_once('-').unwrap_or((pair, ""));
+                let leg1 = TopSpreadLeg {
+                    venue: bv.clone(),
+                    token_in: a.to_string(),
+                    token_out: b.to_string(),
+                    rate: bp,
+                };
+                let leg2 = TopSpreadLeg {
+                    venue: sv.clone(),
+                    token_in: b.to_string(),
+                    token_out: a.to_string(),
+                    rate: sp,
+                };
+                let gross = (rate - 1.0) * 100.0;
+                let net = cost.net_usd(gross);
+                let _distance = if net < 0.0 { -net } else { 0.0 };
+                let venues = [leg1.venue.as_str(), leg2.venue.as_str()];
+                let executable = route_all_legs_executable(venues.into_iter());
+                let has_curve = venues
+                    .iter()
+                    .any(|v| venue_curve_model(v) == CurveModel::StableSwap);
+                (
+                    bv,
+                    sv,
+                    Some(leg1),
+                    Some(leg2),
+                    Some(rate),
+                    Some(gross),
+                    Some(net),
+                    executable,
+                    has_curve,
+                )
+            }
+            None => (
+                String::new(),
+                String::new(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                false,
+            ),
+        };
     TopSpreadInfo {
         pair: pair.to_string(),
         tui_spread_pct,
+        buy_dex,
+        sell_dex,
         leg1,
         leg2,
         cycle_rate,
         gross_pct,
         net_usd,
+        distance_to_profit: net_usd
+            .map(|n| if n < 0.0 { -n } else { 0.0 })
+            .unwrap_or(f64::INFINITY),
         outlier: outlier_venue(forward),
         executable,
         has_curve_leg,
@@ -1118,7 +1161,23 @@ pub fn compute_top_spreads(
             })
     });
 
-    ranked.into_iter().take(n).collect()
+    // Dedup espelhos A-B/B-A: mesmo round-trip econômico vira 1 linha no TUI.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut deduped: Vec<TopSpreadInfo> = Vec::new();
+    for mut info in ranked {
+        if let Some(key) = top_spread_canonical_key(&info) {
+            if !seen.insert(key) {
+                continue;
+            }
+            // Normaliza label do par para forma canônica (direção-agnóstica).
+            if let Some((a, b)) = info.pair.split_once('-') {
+                info.pair = canonical_pair_name(a, b);
+            }
+        }
+        deduped.push(info);
+    }
+
+    deduped.into_iter().take(n).collect()
 }
 
 /// Formata TVL USD compacto: $1.2M / $340k / $123. None/inválido → "tvl=?".
@@ -1192,6 +1251,21 @@ async fn log_top_n_spreads(
             })
     });
 
+    // Dedup espelhos A-B/B-A no log assíncrono também.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut deduped: Vec<TopSpreadInfo> = Vec::new();
+    for mut info in ranked {
+        if let Some(key) = top_spread_canonical_key(&info) {
+            if !seen.insert(key) {
+                continue;
+            }
+            if let Some((a, b)) = info.pair.split_once('-') {
+                info.pair = canonical_pair_name(a, b);
+            }
+        }
+        deduped.push(info);
+    }
+
     let cfg = dm.config_ref();
     // A10: fee_hint por perna. Antes `unwrap_or(0)` quando venue sem `fee_tier` no
     // config — p/ V3 (tiers 100/500/3000/10000) fee=0 resolve pool inexistente ou
@@ -1207,7 +1281,7 @@ async fn log_top_n_spreads(
         })
     };
 
-    for info in ranked.into_iter().take(n) {
+    for info in deduped.into_iter().take(n) {
         let tui_spread = info.tui_spread_pct;
 
         // TVL read-only de cada perna do melhor 2-hop. None = fail-open (Curve, fee
@@ -1406,6 +1480,10 @@ async fn execute_radar_cycle(
     retry: &SmartRetryManager,
     cycle: u64,
 ) -> Result<(usize, Vec<EdgeInfo>)> {
+    // Pipeline observability: start scan cycle
+    let scan_cycle = ScanCycle::new(cycle, 0, 0); // block numbers not available here
+    let counters = pipeline_counters();
+
     let (pairs, qf_enabled, min_spread, top_n) = {
         let cfg = cfg.lock().await;
         (
@@ -1415,6 +1493,9 @@ async fn execute_radar_cycle(
             cfg.log.top_spreads_n,
         )
     };
+
+    // Record configured pairs
+    counters.add(&counters.configured_pairs, pairs.len() as u64);
 
     let adapters = get_healthy_adapters(dm, &cb).await;
     let qf = HighHitRateFilter::new(qf_enabled, min_spread);
@@ -1462,6 +1543,23 @@ async fn execute_radar_cycle(
 
     let total: usize = out.values().map(|m| m.len()).sum();
     let (_signals, edges, economics, adj_cycles) = extract_edges(&out, adj_cost);
+
+    // Pipeline observability: record price map assembly
+    counters.add(&counters.price_map_dexes, out.len() as u64);
+    counters.add(&counters.price_map_pairs, total as u64);
+    counters.add(&counters.raw_quotes, total as u64);
+    counters.add(&counters.accepted_quotes, total as u64);
+
+    // Record graph construction metrics (approximate from price map)
+    let vertex_count = out.values().flat_map(|m| m.keys()).count();
+    counters.add(&counters.graph_vertices, vertex_count as u64);
+    // edges ≈ pairs * avg_dexes_per_pair (rough estimate)
+    let edge_estimate = out.values().map(|m| m.len()).sum::<usize>();
+    counters.add(&counters.graph_edges, edge_estimate as u64);
+
+    // Record Bellman-Ford cycle detection
+    counters.add(&counters.bf_cycles_raw, adj_cycles.len() as u64);
+    counters.add(&counters.bf_cycles_unique, adj_cycles.len() as u64);
 
     log_price_audit(&out, cycle);
     log_edge_summary(&edges, cycle);
@@ -1577,6 +1675,9 @@ async fn execute_radar_cycle(
     if total > 0 {
         price_tx.send(out).await?;
     }
+
+    // Pipeline observability: emit scan summary
+    scan_cycle.finish();
 
     Ok((total, edges))
 }

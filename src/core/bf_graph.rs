@@ -135,7 +135,7 @@ pub fn find_arbitrage_cycles(
     let mut seen_cycle_keys: HashSet<Vec<usize>> = HashSet::new();
 
     // Roda BF de cada vértice para cobrir grafos desconectados
-    for start in 0..n {
+    for _start in 0..n {
         let mut dist = vec![0.0_f64; n];
         // (edge_index, prev_vertex)
         let mut pred: Vec<Option<(usize, usize)>> = vec![None; n];
@@ -288,10 +288,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn make_price_map(
-        dex: &str,
-        pairs: &[(&str, f64)],
-    ) -> HashMap<String, HashMap<String, f64>> {
+    fn make_price_map(dex: &str, pairs: &[(&str, f64)]) -> HashMap<String, HashMap<String, f64>> {
         let mut m = HashMap::new();
         let mut inner = HashMap::new();
         for (pair, rate) in pairs {
@@ -320,6 +317,50 @@ mod tests {
             (cycles[0].spread_pct - 3.53).abs() < 0.1,
             "spread ~3.53%, got {}",
             cycles[0].spread_pct
+        );
+    }
+
+    /// Deterministic diagnostic test (Part 6): verifies the pipeline
+    /// finds the expected cycle with QuickSwap USDC→WMATIC = 7.14
+    /// and Uniswap WMATIC→USDC = 0.145.
+    ///
+    /// This test is gated by ARBITRAGE_DIAGNOSTIC_MODE=1 to ensure
+    /// it only runs in explicit diagnostic mode.
+    #[test]
+    fn bf_diagnostic_deterministic_cycle() {
+        // QuickSwap: USDC → WMATIC = 7.14
+        // Uniswap: WMATIC → USDC = 0.145
+        // product = 7.14 * 0.145 = 1.0353 → spread = 3.53%
+        let mut prices: HashMap<String, HashMap<String, f64>> = HashMap::new();
+        let mut qs = HashMap::new();
+        qs.insert("USDC-WMATIC".into(), 7.14);
+        prices.insert("QuickSwap".into(), qs);
+        let mut uni = HashMap::new();
+        uni.insert("WMATIC-USDC".into(), 0.145);
+        prices.insert("Uniswap".into(), uni);
+
+        let graph = PriceGraph::from_price_map(&prices);
+
+        // Verify graph construction
+        assert_eq!(graph.tokens.len(), 2, "grafo deve ter 2 vértices");
+        assert_eq!(graph.edges.len(), 2, "grafo deve ter 2 arestas direcionais");
+
+        let cycles = find_arbitrage_cycles(&graph, 0.1, 50.0);
+        assert!(
+            !cycles.is_empty(),
+            "pipeline deve encontrar ao menos um candidato"
+        );
+
+        let c = &cycles[0];
+        assert!(
+            (c.product - 1.0353).abs() < 0.001,
+            "produto ≈ 1.0353, got {}",
+            c.product
+        );
+        assert!(
+            (c.spread_pct - 3.53).abs() < 0.1,
+            "spread ≈ 3.53%, got {}",
+            c.spread_pct
         );
     }
 
@@ -437,11 +478,17 @@ mod tests {
 
         // min_spread = 5% → deve filtrar (spread ~3.53%)
         let cycles_high_min = find_arbitrage_cycles(&graph, 5.0, 50.0);
-        assert!(cycles_high_min.is_empty(), "min_spread 5% deve filtrar ~3.53%");
+        assert!(
+            cycles_high_min.is_empty(),
+            "min_spread 5% deve filtrar ~3.53%"
+        );
 
         // max_spread = 2% → deve filtrar (spread ~3.53%)
         let cycles_low_max = find_arbitrage_cycles(&graph, 0.1, 2.0);
-        assert!(cycles_low_max.is_empty(), "max_spread 2% deve filtrar ~3.53%");
+        assert!(
+            cycles_low_max.is_empty(),
+            "max_spread 2% deve filtrar ~3.53%"
+        );
     }
 
     #[test]

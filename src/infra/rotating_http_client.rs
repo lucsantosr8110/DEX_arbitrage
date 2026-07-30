@@ -20,7 +20,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::time::timeout;
-use tracing::{info, warn};
+use tracing::warn;
 
 /// Erros do cliente HTTP rotativo.
 #[derive(Error, Debug)]
