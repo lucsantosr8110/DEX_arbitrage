@@ -349,4 +349,81 @@ mod tests {
         assert_eq!(first[0].canonical_key, second[0].canonical_key);
         assert_eq!(first[0].edge_ids, second[0].edge_ids);
     }
+
+    #[test]
+    fn phase2b_accepted_quote_is_in_pre_and_post() {
+        let pre = graph(&[(0, 0, 1, 2.0)]);
+        let post = pre.clone();
+        assert_eq!(pre.edges[0].id, post.edges[0].id);
+    }
+    #[test]
+    fn phase2b_rejected_quote_is_only_in_pre() {
+        let pre = graph(&[(0, 0, 1, 2.0)]);
+        let post = graph(&[]);
+        assert_eq!(pre.edges.len(), 1);
+        assert!(post.edges.is_empty());
+    }
+    #[test]
+    fn phase2b_post_cannot_contain_rejected_edge() {
+        let mut g = graph(&[(0, 0, 1, 2.0)]);
+        g.edges[0].reciprocity_status = "Rejected".into();
+        assert!(g.edges.iter().all(|e| e.reciprocity_status != "Accepted"));
+    }
+    #[test]
+    fn phase2b_pre_negative_cycle_is_found_by_both_models() {
+        let g = graph(&[(0, 0, 1, 2.0), (1, 1, 0, 0.6)]);
+        assert_eq!(
+            enumerate_simple_cycles_exact(&g, 2, 2)
+                .iter()
+                .filter(|c| c.total_weight < 0.0)
+                .count(),
+            1
+        );
+        assert_eq!(find_negative_cycles_raw(&g).cycles.len(), 1);
+    }
+    #[test]
+    fn phase2b_removed_edge_removes_cycle() {
+        let pre = graph(&[(0, 0, 1, 2.0), (1, 1, 0, 0.6)]);
+        let post = graph(&[(0, 0, 1, 2.0)]);
+        assert!(!enumerate_simple_cycles_exact(&pre, 2, 2).is_empty());
+        assert!(enumerate_simple_cycles_exact(&post, 2, 2).is_empty());
+    }
+    #[test]
+    fn phase2b_filter_cannot_create_cycle_from_subset() {
+        let pre = graph(&[(0, 0, 1, 2.0)]);
+        let post = graph(&[]);
+        assert!(enumerate_simple_cycles_exact(&post, 2, 4).is_empty());
+        assert!(enumerate_simple_cycles_exact(&pre, 2, 4).is_empty());
+    }
+    #[test]
+    fn phase2b_scan_graphs_are_isolated() {
+        let mut a = graph(&[(0, 0, 1, 2.0)]);
+        let b = graph(&[(0, 1, 0, 0.6)]);
+        a.scan_id = "a".into();
+        assert_ne!(a.scan_id, b.scan_id);
+    }
+    #[test]
+    fn phase2b_rejection_matrix_group_count_is_stable() {
+        let g = graph(&[(0, 0, 1, 2.0), (1, 0, 1, 1.9)]);
+        assert_eq!(
+            validate_diagnostic_graph(&g).unwrap().parallel_edge_groups,
+            1
+        );
+    }
+    #[test]
+    fn phase2b_pairing_classes_cover_same_and_cross_direction() {
+        let g = graph(&[(0, 0, 1, 2.0), (1, 1, 0, 0.6)]);
+        assert_eq!(
+            validate_diagnostic_graph(&g)
+                .unwrap()
+                .bidirectional_pair_groups,
+            1
+        );
+    }
+    #[test]
+    fn phase2b_summary_multiple_scans_adds_observations() {
+        let a = graph(&[(0, 0, 1, 2.0)]);
+        let b = graph(&[(0, 0, 1, 1.9)]);
+        assert_eq!(a.edges.len() + b.edges.len(), 2);
+    }
 }

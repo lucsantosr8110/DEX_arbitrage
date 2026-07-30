@@ -35,11 +35,20 @@ const V2_ABI: &str = r#"[{"inputs":[{"internalType":"uint256","name":"amountIn",
 const V3_ABI: &str = r#"[{"inputs":[{"internalType":"address","name":"tokenIn","type":"address"},{"internalType":"address","name":"tokenOut","type":"address"},{"internalType":"uint24","name":"fee","type":"uint24"},{"internalType":"uint256","name":"amountIn","type":"uint256"},{"internalType":"uint160","name":"sqrtPriceLimitX96","type":"uint160"}],"name":"quoteExactInputSingle","outputs":[{"internalType":"uint256","name":"amountOut","type":"uint256"}],"stateMutability":"nonpayable","type":"function"}]"#;
 const UNISWAP_V3_QUOTER: &str = "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6";
 
-fn parse_args() -> Result<(u64, u64, Option<PathBuf>, Option<PathBuf>)> {
+fn parse_args() -> Result<(
+    u64,
+    u64,
+    u64,
+    Option<PathBuf>,
+    Option<PathBuf>,
+    Option<PathBuf>,
+)> {
     let mut scans = 1;
     let mut duration = 120;
     let mut save_graph = None;
     let mut replay_graph = None;
+    let mut phase2b_output = None;
+    let mut inter_scan_delay = 0;
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
     while i < args.len() {
@@ -53,6 +62,12 @@ fn parse_args() -> Result<(u64, u64, Option<PathBuf>, Option<PathBuf>)> {
             }
             "--save-graph" => save_graph = Some(PathBuf::from(value)),
             "--replay-graph" => replay_graph = Some(PathBuf::from(value)),
+            "--phase2b-output" => phase2b_output = Some(PathBuf::from(value)),
+            "--inter-scan-delay-seconds" => {
+                inter_scan_delay = value
+                    .parse()
+                    .context("invalid --inter-scan-delay-seconds")?
+            }
             other => return Err(anyhow!("unknown argument {other}")),
         }
         i += 2;
@@ -60,7 +75,14 @@ fn parse_args() -> Result<(u64, u64, Option<PathBuf>, Option<PathBuf>)> {
     if scans == 0 || duration == 0 {
         return Err(anyhow!("scan limits must be positive"));
     }
-    Ok((scans, duration, save_graph, replay_graph))
+    Ok((
+        scans,
+        duration,
+        inter_scan_delay,
+        save_graph,
+        replay_graph,
+        phase2b_output,
+    ))
 }
 
 fn comparison_path(graph_path: &Path) -> PathBuf {
@@ -232,7 +254,7 @@ async fn scan(
     provider: Arc<Provider<RotatingHttpClient>>,
     cfg: &flashloan_bot::config::Config,
     id: u64,
-) -> Result<(ReadOnlyCounters, DiagnosticGraph)> {
+) -> Result<(ReadOnlyCounters, DiagnosticGraph, DiagnosticGraph)> {
     let started = Instant::now();
     let mut counters = ReadOnlyCounters::default();
     let mut entries = Vec::new();
@@ -358,6 +380,7 @@ async fn scan(
             }
         }
     }
+    let pre_prices = prices.clone();
     for map in prices.values_mut() {
         prune_reciprocity(map, &mut counters);
     }
@@ -380,45 +403,53 @@ async fn scan(
             }
         }
     }
-    let mut edges = Vec::new();
-    for q in captured {
-        if prices
-            .get(&q.dex)
-            .and_then(|m| m.get(&pair_name(&q.a, &q.b)))
-            .is_some()
-        {
-            let id = edges.len();
-            edges.push(DiagnosticEdge {
-                id,
-                from: token_ids[&q.a],
-                to: token_ids[&q.b],
-                token_in_symbol: q.a,
-                token_out_symbol: q.b,
-                token_in_address: format!("{:#x}", q.aa),
-                token_out_address: format!("{:#x}", q.bb),
-                dex_name: q.dex,
-                protocol_version: q.version,
-                pool_address: None,
-                fee_tier: None,
-                rate: q.rate,
-                amount_in_raw: q.input.to_string(),
-                amount_out_raw: q.output.to_string(),
-                block_number: None,
-                quote_source: "eth_call".into(),
-                reciprocity_status: "Accepted".into(),
-            });
+    let make_graph = |accepted_only: bool| {
+        let mut edges = Vec::new();
+        for q in &captured {
+            let accepted = prices
+                .get(&q.dex)
+                .and_then(|m| m.get(&pair_name(&q.a, &q.b)))
+                .is_some();
+            if !accepted_only || accepted {
+                let edge_id = edges.len();
+                edges.push(DiagnosticEdge {
+                    id: edge_id,
+                    from: token_ids[&q.a],
+                    to: token_ids[&q.b],
+                    token_in_symbol: q.a.clone(),
+                    token_out_symbol: q.b.clone(),
+                    token_in_address: format!("{:#x}", q.aa),
+                    token_out_address: format!("{:#x}", q.bb),
+                    dex_name: q.dex.clone(),
+                    protocol_version: q.version.clone(),
+                    pool_address: None,
+                    fee_tier: None,
+                    rate: q.rate,
+                    amount_in_raw: q.input.to_string(),
+                    amount_out_raw: q.output.to_string(),
+                    block_number: None,
+                    quote_source: "eth_call".into(),
+                    reciprocity_status: if accepted {
+                        "Accepted".into()
+                    } else {
+                        "Rejected".into()
+                    },
+                });
+            }
         }
-    }
-    let diagnostic_graph = DiagnosticGraph {
-        schema_version: 1,
-        scan_id: id.to_string(),
-        chain: "polygon".into(),
-        captured_at: chrono::Utc::now().to_rfc3339(),
-        block_start: 0,
-        block_end: 0,
-        tokens,
-        edges,
+        DiagnosticGraph {
+            schema_version: 1,
+            scan_id: id.to_string(),
+            chain: "polygon".into(),
+            captured_at: chrono::Utc::now().to_rfc3339(),
+            block_start: 0,
+            block_end: 0,
+            tokens: tokens.clone(),
+            edges,
+        }
     };
+    let pre_graph = make_graph(false);
+    let diagnostic_graph = make_graph(true);
     let graph = PriceGraph::from_price_map(&prices);
     counters.graph_vertices = graph.tokens.len() as u64;
     counters.graph_edges = graph.edges.len() as u64;
@@ -434,12 +465,14 @@ async fn scan(
         return Err(anyhow!("counter consistency failure"));
     }
     eprintln!("[DIAGNOSTIC_GRAPH] RAW_DIRECTIONAL_QUOTES={} ACCEPTED_DIRECTIONAL_QUOTES={} REJECTED_RECIPROCITY_QUOTES={} DIAGNOSTIC_GRAPH_EDGES={} LEGACY_PRICE_MAP_ENTRIES={} COLLAPSED_EDGE_COUNT={}", counters.raw_quotes, diagnostic_graph.edges.len(), counters.rejected_reciprocity, diagnostic_graph.edges.len(), counters.price_map_pairs, diagnostic_graph.edges.len().saturating_sub(counters.price_map_pairs as usize));
-    Ok((counters, diagnostic_graph))
+    let _ = pre_prices;
+    Ok((counters, pre_graph, diagnostic_graph))
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let (max_scans, duration_seconds, save_graph, replay_graph) = parse_args()?;
+    let (max_scans, duration_seconds, inter_scan_delay, save_graph, replay_graph, phase2b_output) =
+        parse_args()?;
     if let Some(path) = replay_graph {
         let graph: DiagnosticGraph = serde_json::from_slice(&std::fs::read(&path)?)?;
         let comparison = comparison_path(&path);
@@ -476,15 +509,72 @@ async fn main() -> Result<()> {
         return Err(anyhow!("expected Polygon chain 137, got {chain_id}"));
     }
     let deadline = Instant::now() + Duration::from_secs(duration_seconds);
+    let mut phase2b_scans_completed = 0u64;
+    let mut phase2b_raw_quotes = 0u64;
+    let mut phase2b_pre_edges = 0u64;
+    let mut phase2b_post_edges = 0u64;
+    let mut phase2b_rejected = 0u64;
+    let mut phase2b_max_block_span = 0u64;
+    let mut phase2b_total_block_span = 0u64;
     for scan_id in 1..=max_scans {
         if Instant::now() >= deadline {
             break;
         }
-        let (_, graph) = scan(provider.clone(), &cfg, scan_id).await?;
+        let scan_started = Instant::now();
+        let block_start = provider.get_block_number().await?.as_u64();
+        let (counters, pre, graph) = scan(provider.clone(), &cfg, scan_id).await?;
+        let block_end = provider.get_block_number().await?.as_u64();
         if let Some(path) = &save_graph {
             save_snapshot_atomic(&graph, path)?;
             audit_graph(&graph, &comparison_path(path))?;
         }
+        if let Some(root) = &phase2b_output {
+            let snapshots = root.join("snapshots");
+            std::fs::create_dir_all(&snapshots)?;
+            let pre_path = snapshots.join(format!("{scan_id}_pre_reciprocity.json"));
+            let post_path = snapshots.join(format!("{scan_id}_post_reciprocity.json"));
+            save_snapshot_atomic(&pre, &pre_path)?;
+            save_snapshot_atomic(&graph, &post_path)?;
+            let pre_exact = enumerate_simple_cycles_exact(&pre, 2, 4);
+            let post_exact = enumerate_simple_cycles_exact(&graph, 2, 4);
+            let pre_negative: HashSet<_> = pre_exact
+                .iter()
+                .filter(|c| c.total_weight < -flashloan_bot::core::diagnostic_graph::EPSILON)
+                .map(|c| c.canonical_key.clone())
+                .collect();
+            let post_negative: HashSet<_> = post_exact
+                .iter()
+                .filter(|c| c.total_weight < -flashloan_bot::core::diagnostic_graph::EPSILON)
+                .map(|c| c.canonical_key.clone())
+                .collect();
+            let block_span = block_end.saturating_sub(block_start);
+            let scan_duration_ms = scan_started.elapsed().as_millis();
+            let comparison = serde_json::json!({"scan_id": scan_id, "pre_graph_edges": pre.edges.len(), "post_graph_edges": graph.edges.len(), "reciprocity_removed_edges": pre.edges.len() - graph.edges.len(), "pre_negative_cycles": pre_negative.len(), "post_negative_cycles": post_negative.len(), "negative_cycles_removed_by_reciprocity": pre_negative.difference(&post_negative).count(), "negative_cycles_created_by_filter": post_negative.difference(&pre_negative).count(), "scan_block_start":block_start,"scan_block_end":block_end,"scan_block_span":block_span,"scan_duration_ms":scan_duration_ms,"quotes_pinned_to_anchor_block":false,"block_number_per_quote_unavailable":true});
+            std::fs::write(
+                snapshots.join(format!("{scan_id}_comparison.json")),
+                serde_json::to_vec_pretty(&comparison)?,
+            )?;
+            phase2b_scans_completed += 1;
+            phase2b_raw_quotes += counters.raw_quotes;
+            phase2b_pre_edges += pre.edges.len() as u64;
+            phase2b_post_edges += graph.edges.len() as u64;
+            phase2b_rejected += counters.rejected_reciprocity;
+            phase2b_max_block_span = phase2b_max_block_span.max(block_span);
+            phase2b_total_block_span += block_span;
+            eprintln!("[PHASE2B_SCAN] scan_id={scan_id} PRE_GRAPH_EDGES={} POST_GRAPH_EDGES={} RECIPROCITY_REMOVED_EDGES={} PRE_EXACT_NEGATIVE_CYCLES={} POST_EXACT_NEGATIVE_CYCLES={} SCAN_BLOCK_START={block_start} SCAN_BLOCK_END={block_end} SCAN_BLOCK_SPAN={block_span} SCAN_DURATION_MS={scan_duration_ms} BLOCK_NUMBER_PER_QUOTE_UNAVAILABLE=true", pre.edges.len(), graph.edges.len(), pre.edges.len()-graph.edges.len(), pre_negative.len(), post_negative.len());
+        }
+        if inter_scan_delay > 0 && scan_id < max_scans && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_secs(inter_scan_delay)).await;
+        }
+    }
+    if let Some(root) = &phase2b_output {
+        let average_span = phase2b_total_block_span as f64 / phase2b_scans_completed.max(1) as f64;
+        let summary = serde_json::json!({"scans_started":max_scans,"scans_completed":phase2b_scans_completed,"raw_quotes_total":phase2b_raw_quotes,"pre_graph_edges_total":phase2b_pre_edges,"post_graph_edges_total":phase2b_post_edges,"reciprocity_rejected_total":phase2b_rejected,"reciprocity_rejection_rate":if phase2b_raw_quotes==0 {0.0} else {phase2b_rejected as f64*100.0/phase2b_raw_quotes as f64},"quotes_pinned_to_anchor_block":false,"block_number_per_quote_unavailable":true,"max_scan_block_span":phase2b_max_block_span,"avg_scan_block_span":average_span,"reciprocity_block_classification":"UNAVAILABLE"});
+        std::fs::write(
+            root.join("phase2b_summary.json"),
+            serde_json::to_vec_pretty(&summary)?,
+        )?;
+        eprintln!("[PHASE2B_SUMMARY] SCANS_STARTED={max_scans} SCANS_COMPLETED={phase2b_scans_completed} RAW_QUOTES_TOTAL={phase2b_raw_quotes} PRE_GRAPH_EDGES_TOTAL={phase2b_pre_edges} POST_GRAPH_EDGES_TOTAL={phase2b_post_edges} RECIPROCITY_REJECTED_TOTAL={phase2b_rejected} QUOTES_PINNED_TO_ANCHOR_BLOCK=false BLOCK_NUMBER_PER_QUOTE_UNAVAILABLE=true MAX_SCAN_BLOCK_SPAN={phase2b_max_block_span} AVG_SCAN_BLOCK_SPAN={average_span:.2}");
     }
     eprintln!("[PHASE1B_VERDICT] scans_completed=true MAINNET_TRANSACTIONS_SENT=0 LIVE_TRADING_ENABLED=false TRANSACTION_BROADCAST_ALLOWED=false");
     Ok(())
