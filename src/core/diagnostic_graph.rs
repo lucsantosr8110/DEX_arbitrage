@@ -1,5 +1,7 @@
 //! Diagnostic directed multigraph. No execution dependencies.
+use crate::core::phase2d_anchor::AnchorBlock;
 use anyhow::{anyhow, Result};
+use ethers::types::H256;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -31,6 +33,12 @@ pub struct DiagnosticEdge {
     pub amount_in_raw: String,
     pub amount_out_raw: String,
     pub block_number: Option<u64>,
+    #[serde(default)]
+    pub anchor_block_number: Option<u64>,
+    #[serde(default)]
+    pub anchor_block_hash: Option<H256>,
+    #[serde(default)]
+    pub pinned: bool,
     pub quote_source: String,
     pub reciprocity_status: String,
 }
@@ -42,6 +50,24 @@ pub struct DiagnosticGraph {
     pub captured_at: String,
     pub block_start: u64,
     pub block_end: u64,
+    #[serde(default)]
+    pub temporal_mode: Option<String>,
+    #[serde(default)]
+    pub anchor_block: Option<AnchorBlock>,
+    #[serde(default)]
+    pub head_at_scan_start: Option<u64>,
+    #[serde(default)]
+    pub head_at_scan_end: Option<u64>,
+    #[serde(default)]
+    pub head_advance_during_scan: Option<u64>,
+    #[serde(default)]
+    pub anchor_hash_verified_before: Option<bool>,
+    #[serde(default)]
+    pub anchor_hash_verified_after: Option<bool>,
+    #[serde(default)]
+    pub reorg_detected: Option<bool>,
+    #[serde(default)]
+    pub quote_state_block_span: Option<u64>,
     pub tokens: Vec<DiagnosticToken>,
     pub edges: Vec<DiagnosticEdge>,
 }
@@ -282,6 +308,15 @@ mod tests {
             captured_at: "2026-01-01T00:00:00Z".into(),
             block_start: 1,
             block_end: 1,
+            temporal_mode: None,
+            anchor_block: None,
+            head_at_scan_start: None,
+            head_at_scan_end: None,
+            head_advance_during_scan: None,
+            anchor_hash_verified_before: None,
+            anchor_hash_verified_after: None,
+            reorg_detected: None,
+            quote_state_block_span: None,
             edges: edges
                 .iter()
                 .map(|(id, from, to, rate)| DiagnosticEdge {
@@ -300,6 +335,9 @@ mod tests {
                     amount_in_raw: "1000000".into(),
                     amount_out_raw: "1000000".into(),
                     block_number: Some(1),
+                    anchor_block_number: None,
+                    anchor_block_hash: None,
+                    pinned: false,
                     quote_source: "fixture".into(),
                     reciprocity_status: "Accepted".into(),
                 })

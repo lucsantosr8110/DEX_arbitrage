@@ -3,10 +3,10 @@
 
 use anyhow::{anyhow, Context, Result};
 use ethers::{
-    abi::Abi,
-    contract::Contract,
+    abi::{Abi, Detokenize},
+    contract::{Contract, ContractCall},
     providers::{Middleware, Provider},
-    types::{Address, U256},
+    types::{Address, BlockId, BlockNumber, U256},
 };
 use flashloan_bot::{
     config::Config,
@@ -15,6 +15,11 @@ use flashloan_bot::{
         diagnostic_graph::{
             enumerate_simple_cycles_exact, find_negative_cycles_raw, save_snapshot_atomic,
             validate_diagnostic_graph, DiagnosticEdge, DiagnosticGraph, DiagnosticToken,
+        },
+        phase2d_anchor::{
+            provenance, reorg_detected, select_anchor, validate_edge_anchors,
+            validate_quote_anchor, AnchorBlock, AnchorSnapshotMetadata, QuoteBlockProvenance,
+            ScanBlockContext,
         },
         read_only::{ReadOnlyCounters, ReadOnlySafety},
     },
@@ -39,9 +44,9 @@ const V3_ABI: &str = r#"[{"inputs":[{"internalType":"address","name":"tokenIn","
 const UNISWAP_V3_QUOTER: &str = "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6";
 const CURVE_AAVE_POOL: &str = "0x445FE580eF8d70FF569aB36e80c647af338db351";
 const CURVE_ABI: &str = r#"[{"inputs":[{"type":"int128","name":"i"},{"type":"int128","name":"j"},{"type":"uint256","name":"dx"}],"name":"get_dy","outputs":[{"type":"uint256","name":""}],"stateMutability":"view","type":"function"}]"#;
+const ERC20_DECIMALS_ABI: &str = r#"[{"inputs":[],"name":"decimals","outputs":[{"internalType":"uint8","name":"","type":"uint8"}],"stateMutability":"view","type":"function"}]"#;
 const QUOTE_TIMEOUT: Duration = Duration::from_secs(20);
-
-fn parse_args() -> Result<(
+type ScanArgs = (
     u64,
     u64,
     u64,
@@ -51,7 +56,11 @@ fn parse_args() -> Result<(
     String,
     usize,
     usize,
-)> {
+    bool,
+    u64,
+);
+
+fn parse_args() -> Result<ScanArgs> {
     let mut scans = 1;
     let mut duration = 120;
     let mut save_graph = None;
@@ -61,9 +70,16 @@ fn parse_args() -> Result<(
     let mut profile = "base".to_string();
     let mut max_tokens = 12usize;
     let mut max_pairs = 120usize;
+    let mut pin_anchor_block = true;
+    let mut anchor_confirmation_lag = 2u64;
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
     while i < args.len() {
+        if let Some(value) = args[i].strip_prefix("--pin-anchor-block=") {
+            pin_anchor_block = value.parse().context("invalid --pin-anchor-block")?;
+            i += 1;
+            continue;
+        }
         let value = args
             .get(i + 1)
             .ok_or_else(|| anyhow!("missing value for {}", args[i]))?;
@@ -83,6 +99,13 @@ fn parse_args() -> Result<(
             "--universe-profile" => profile = value.clone(),
             "--max-tokens" => max_tokens = value.parse().context("invalid --max-tokens")?,
             "--max-pairs" => max_pairs = value.parse().context("invalid --max-pairs")?,
+            "--pin-anchor-block" => {
+                pin_anchor_block = value.parse().context("invalid --pin-anchor-block")?
+            }
+            "--anchor-confirmation-lag" => {
+                anchor_confirmation_lag =
+                    value.parse().context("invalid --anchor-confirmation-lag")?
+            }
             other => return Err(anyhow!("unknown argument {other}")),
         }
         i += 2;
@@ -100,6 +123,8 @@ fn parse_args() -> Result<(
         profile,
         max_tokens,
         max_pairs,
+        pin_anchor_block,
+        anchor_confirmation_lag,
     ))
 }
 
@@ -359,6 +384,7 @@ struct CapturedQuote {
     fee_tier: Option<u32>,
     coin_index_in: Option<usize>,
     coin_index_out: Option<usize>,
+    provenance: QuoteBlockProvenance,
 }
 
 #[derive(Default, Clone, serde::Serialize)]
@@ -376,6 +402,11 @@ struct VenueCounters {
     no_pool: u64,
     rpc_errors: u64,
     graph_edges: u64,
+    pinned_calls_attempted: u64,
+    pinned_calls_succeeded: u64,
+    pinned_calls_failed: u64,
+    unpinned_calls_attempted: u64,
+    unpinned_quotes_accepted: u64,
 }
 
 fn curve_index(symbol: &str) -> Option<usize> {
@@ -433,27 +464,40 @@ fn prune_reciprocity(map: &mut HashMap<String, f64>, counters: &mut ReadOnlyCoun
     }
 }
 
+/// Single gate for every quote eth_call. No latest fallback exists by design.
+fn pinned_eth_call<M, D>(call: ContractCall<M, D>, anchor: &AnchorBlock) -> ContractCall<M, D>
+where
+    M: Middleware,
+    D: Detokenize,
+{
+    call.block(BlockId::Number(BlockNumber::Number(anchor.number.into())))
+}
+
 async fn quote_v2(
     provider: Arc<Provider<RotatingHttpClient>>,
     router: Address,
     token_in: Address,
     token_out: Address,
     amount_in: U256,
-) -> Result<U256> {
+    anchor: &AnchorBlock,
+) -> Result<(U256, QuoteBlockProvenance)> {
     let abi: Abi = serde_json::from_str(V2_ABI)?;
     let contract = Contract::new(router, abi, provider);
     let amounts: Vec<U256> = tokio::time::timeout(
         QUOTE_TIMEOUT,
-        contract
-            .method("getAmountsOut", (amount_in, vec![token_in, token_out]))?
-            .call(),
+        pinned_eth_call(
+            contract.method("getAmountsOut", (amount_in, vec![token_in, token_out]))?,
+            anchor,
+        )
+        .call(),
     )
     .await
     .context("V2_QUOTE_TIMEOUT")??;
-    amounts
+    let out = amounts
         .last()
         .copied()
-        .ok_or_else(|| anyhow!("empty V2 quote"))
+        .ok_or_else(|| anyhow!("empty V2 quote"))?;
+    Ok((out, provenance(anchor)))
 }
 
 async fn quote_v3(
@@ -461,24 +505,27 @@ async fn quote_v3(
     token_in: Address,
     token_out: Address,
     amount_in: U256,
-) -> Result<Vec<(u32, U256)>> {
+    anchor: &AnchorBlock,
+) -> Result<Vec<(u32, U256, QuoteBlockProvenance)>> {
     let abi: Abi = serde_json::from_str(V3_ABI)?;
     let quoter = Contract::new(UNISWAP_V3_QUOTER.parse::<Address>()?, abi, provider);
     let mut quotes = Vec::new();
     for fee in [500u32, 3000, 10_000] {
         if let Ok(Ok(out)) = tokio::time::timeout(
             QUOTE_TIMEOUT,
-            quoter
-                .method::<_, U256>(
+            pinned_eth_call(
+                quoter.method::<_, U256>(
                     "quoteExactInputSingle",
                     (token_in, token_out, fee, amount_in, U256::zero()),
-                )?
-                .call(),
+                )?,
+                anchor,
+            )
+            .call(),
         )
         .await
         {
             if !out.is_zero() {
-                quotes.push((fee, out));
+                quotes.push((fee, out, provenance(anchor)));
             }
         }
     }
@@ -492,16 +539,21 @@ async fn quote_curve(
     index_in: usize,
     index_out: usize,
     amount_in: U256,
-) -> Result<U256> {
+    anchor: &AnchorBlock,
+) -> Result<(U256, QuoteBlockProvenance)> {
     let abi: Abi = serde_json::from_str(CURVE_ABI)?;
     let pool = Contract::new(CURVE_AAVE_POOL.parse::<Address>()?, abi, provider);
     tokio::time::timeout(
         QUOTE_TIMEOUT,
-        pool.method::<_, U256>("get_dy", (index_in as i128, index_out as i128, amount_in))?
-            .call(),
+        pinned_eth_call(
+            pool.method::<_, U256>("get_dy", (index_in as i128, index_out as i128, amount_in))?,
+            anchor,
+        )
+        .call(),
     )
     .await
     .context("CURVE_QUOTE_TIMEOUT")?
+    .map(|out| (out, provenance(anchor)))
     .map_err(Into::into)
 }
 
@@ -511,6 +563,7 @@ async fn scan(
     id: u64,
     symbols: &[&str],
     max_pairs: usize,
+    block_context: &ScanBlockContext,
 ) -> Result<(
     ReadOnlyCounters,
     DiagnosticGraph,
@@ -606,12 +659,25 @@ async fn scan(
                 let venue = venues.get_mut(name).expect("configured venue");
                 venue.pairs_attempted += 1;
                 venue.quotes_attempted += 1;
+                venue.pinned_calls_attempted += 1;
                 counters.dex_quote_attempted += 1;
-                match quote_v2(provider.clone(), router, *address_in, *address_out, input).await {
-                    Ok(out) if rate(input, out, *decimals_in, *decimals_out).is_some() => {
+                match quote_v2(
+                    provider.clone(),
+                    router,
+                    *address_in,
+                    *address_out,
+                    input,
+                    &block_context.anchor,
+                )
+                .await
+                {
+                    Ok((out, quote_provenance))
+                        if rate(input, out, *decimals_in, *decimals_out).is_some() =>
+                    {
                         let value =
                             rate(input, out, *decimals_in, *decimals_out).expect("checked rate");
                         venue.quotes_succeeded += 1;
+                        venue.pinned_calls_succeeded += 1;
                         counters.dex_quote_succeeded += 1;
                         counters.v2_quote_succeeded += 1;
                         counters.raw_quotes += 1;
@@ -635,10 +701,12 @@ async fn scan(
                             fee_tier: None,
                             coin_index_in: None,
                             coin_index_out: None,
+                            provenance: quote_provenance,
                         });
                     }
                     _ => {
                         venue.quotes_failed += 1;
+                        venue.pinned_calls_failed += 1;
                         venue.no_pool += 1;
                         counters.dex_quote_failed += 1;
                     }
@@ -648,17 +716,28 @@ async fn scan(
             venue.pairs_attempted += 1;
             venue.fee_tiers_attempted += 3;
             venue.quotes_attempted += 3;
+            venue.pinned_calls_attempted += 3;
             counters.dex_quote_attempted += 3;
-            match quote_v3(provider.clone(), *address_in, *address_out, input).await {
+            match quote_v3(
+                provider.clone(),
+                *address_in,
+                *address_out,
+                input,
+                &block_context.anchor,
+            )
+            .await
+            {
                 Ok(outs) => {
                     venue.quotes_succeeded += outs.len() as u64;
+                    venue.pinned_calls_succeeded += outs.len() as u64;
                     venue.quotes_failed += 3 - outs.len() as u64;
+                    venue.pinned_calls_failed += 3 - outs.len() as u64;
                     venue.no_pool += 3 - outs.len() as u64;
                     counters.dex_quote_succeeded += outs.len() as u64;
                     counters.dex_quote_failed += 3 - outs.len() as u64;
                     counters.v3_quote_succeeded += outs.len() as u64;
                     counters.raw_quotes += outs.len() as u64;
-                    for (fee, out) in outs {
+                    for (fee, out, quote_provenance) in outs {
                         let value =
                             rate(input, out, *decimals_in, *decimals_out).expect("quoted rate");
                         prices
@@ -681,11 +760,13 @@ async fn scan(
                             fee_tier: Some(fee),
                             coin_index_in: None,
                             coin_index_out: None,
+                            provenance: quote_provenance,
                         });
                     }
                 }
                 _ => {
                     venue.quotes_failed += 3;
+                    venue.pinned_calls_failed += 3;
                     venue.no_pool += 3;
                     counters.dex_quote_failed += 3;
                 }
@@ -695,45 +776,54 @@ async fn scan(
             venue.directions_attempted += 1;
             venue.pools_attempted += 1;
             venue.quotes_attempted += 1;
+            venue.pinned_calls_attempted += 1;
             counters.dex_quote_attempted += 1;
             match (curve_index(symbol_in), curve_index(symbol_out)) {
-                (Some(i), Some(j)) => match quote_curve(provider.clone(), i, j, input).await {
-                    Ok(out) if rate(input, out, *decimals_in, *decimals_out).is_some() => {
-                        let value =
-                            rate(input, out, *decimals_in, *decimals_out).expect("checked rate");
-                        venue.quotes_succeeded += 1;
-                        counters.dex_quote_succeeded += 1;
-                        counters.raw_quotes += 1;
-                        prices
-                            .entry("Curve".into())
-                            .or_default()
-                            .insert(pair_name(symbol_in, symbol_out), value);
-                        captured.push(CapturedQuote {
-                            dex: "Curve".into(),
-                            version: "CurveStableSwap".into(),
-                            a: (*symbol_in).into(),
-                            b: (*symbol_out).into(),
-                            aa: *address_in,
-                            bb: *address_out,
-                            da: *decimals_in,
-                            db: *decimals_out,
-                            input,
-                            output: out,
-                            rate: value,
-                            pool_address: Some(CURVE_AAVE_POOL.into()),
-                            fee_tier: None,
-                            coin_index_in: Some(i),
-                            coin_index_out: Some(j),
-                        });
+                (Some(i), Some(j)) => {
+                    match quote_curve(provider.clone(), i, j, input, &block_context.anchor).await {
+                        Ok((out, quote_provenance))
+                            if rate(input, out, *decimals_in, *decimals_out).is_some() =>
+                        {
+                            let value = rate(input, out, *decimals_in, *decimals_out)
+                                .expect("checked rate");
+                            venue.quotes_succeeded += 1;
+                            venue.pinned_calls_succeeded += 1;
+                            counters.dex_quote_succeeded += 1;
+                            counters.raw_quotes += 1;
+                            prices
+                                .entry("Curve".into())
+                                .or_default()
+                                .insert(pair_name(symbol_in, symbol_out), value);
+                            captured.push(CapturedQuote {
+                                dex: "Curve".into(),
+                                version: "CurveStableSwap".into(),
+                                a: (*symbol_in).into(),
+                                b: (*symbol_out).into(),
+                                aa: *address_in,
+                                bb: *address_out,
+                                da: *decimals_in,
+                                db: *decimals_out,
+                                input,
+                                output: out,
+                                rate: value,
+                                pool_address: Some(CURVE_AAVE_POOL.into()),
+                                fee_tier: None,
+                                coin_index_in: Some(i),
+                                coin_index_out: Some(j),
+                                provenance: quote_provenance,
+                            });
+                        }
+                        _ => {
+                            venue.quotes_failed += 1;
+                            venue.pinned_calls_failed += 1;
+                            venue.no_pool += 1;
+                            counters.dex_quote_failed += 1;
+                        }
                     }
-                    _ => {
-                        venue.quotes_failed += 1;
-                        venue.no_pool += 1;
-                        counters.dex_quote_failed += 1;
-                    }
-                },
+                }
                 _ => {
                     venue.quotes_failed += 1;
+                    venue.pinned_calls_failed += 1;
                     venue.no_pool += 1;
                     counters.dex_quote_failed += 1;
                 }
@@ -767,6 +857,9 @@ async fn scan(
         Some(fee) => format!("{}:{fee}", q.dex),
         None => q.dex.clone(),
     };
+    for quote in &captured {
+        validate_quote_anchor(&quote.provenance, &block_context.anchor)?;
+    }
     for q in &captured {
         let accepted = prices
             .get(&quote_key(q))
@@ -804,7 +897,10 @@ async fn scan(
                     rate: q.rate,
                     amount_in_raw: q.input.to_string(),
                     amount_out_raw: q.output.to_string(),
-                    block_number: None,
+                    block_number: Some(q.provenance.requested_block_number),
+                    anchor_block_number: Some(q.provenance.requested_block_number),
+                    anchor_block_hash: Some(q.provenance.requested_block_hash),
+                    pinned: q.provenance.pinned,
                     quote_source: match (q.coin_index_in, q.coin_index_out) {
                         (Some(i), Some(j)) => format!("eth_call;curve_indices:{i}:{j}"),
                         _ => "eth_call".into(),
@@ -824,6 +920,15 @@ async fn scan(
             captured_at: chrono::Utc::now().to_rfc3339(),
             block_start: 0,
             block_end: 0,
+            temporal_mode: Some("PINNED_ANCHOR_BLOCK".into()),
+            anchor_block: Some(block_context.anchor.clone()),
+            head_at_scan_start: Some(block_context.anchor.selected_from_head),
+            head_at_scan_end: None,
+            head_advance_during_scan: None,
+            anchor_hash_verified_before: Some(true),
+            anchor_hash_verified_after: None,
+            reorg_detected: None,
+            quote_state_block_span: Some(0),
             tokens: tokens.clone(),
             edges,
         }
@@ -831,6 +936,16 @@ async fn scan(
     eprintln!("QUOTE_COLLECTION_STAGE=RESULTS_CLASSIFIED SCAN_ID={id}");
     let pre_graph = make_graph(false);
     let diagnostic_graph = make_graph(true);
+    validate_edge_anchors(
+        diagnostic_graph.edges.iter().map(|edge| {
+            (
+                &edge.anchor_block_number,
+                &edge.anchor_block_hash,
+                &edge.pinned,
+            )
+        }),
+        &block_context.anchor,
+    )?;
     let graph = PriceGraph::from_price_map(&prices);
     counters.graph_vertices = graph.tokens.len() as u64;
     counters.graph_edges = graph.edges.len() as u64;
@@ -867,8 +982,11 @@ async fn main() -> Result<()> {
         profile,
         max_tokens,
         max_pairs,
+        pin_anchor_block,
+        anchor_confirmation_lag,
     ) = parse_args()?;
     eprintln!("STARTUP_STAGE=CLI_PARSED");
+    eprintln!("PINNED_MODE_ENABLED={pin_anchor_block} ANCHOR_CONFIRMATION_LAG_BLOCKS={anchor_confirmation_lag}");
     if let Some(path) = replay_graph {
         let graph: DiagnosticGraph = serde_json::from_slice(&std::fs::read(&path)?)?;
         let comparison = comparison_path(&path);
@@ -933,6 +1051,11 @@ async fn main() -> Result<()> {
             "RPC_CHAIN_ID_MISMATCH EXPECTED_CHAIN_ID=137 ACTUAL_CHAIN_ID={chain_id}"
         ));
     }
+    if !pin_anchor_block {
+        return Err(anyhow!(
+            "TEMPORAL_MODE=UNPINNED_LEGACY PINNING_REQUIRED_FOR_PHASE2D"
+        ));
+    }
     eprintln!("STARTUP_STAGE=CHAIN_ID_VALIDATED");
     let deadline = Instant::now() + Duration::from_secs(duration_seconds);
     let mut phase2b_scans_completed = 0u64;
@@ -949,10 +1072,86 @@ async fn main() -> Result<()> {
         }
         let scan_started = Instant::now();
         eprintln!("STARTUP_STAGE=SCAN_STARTED SCAN_ID={scan_id}");
-        let block_start = provider.get_block_number().await?.as_u64();
-        let (counters, pre, graph, venue_metrics) =
-            scan(provider.clone(), &cfg, scan_id, &symbols, max_pairs).await?;
-        let block_end = provider.get_block_number().await?.as_u64();
+        let head_at_scan_start = provider.get_block_number().await?.as_u64();
+        let anchor_number = head_at_scan_start
+            .checked_sub(anchor_confirmation_lag)
+            .ok_or_else(|| {
+                anyhow!(
+                    "ANCHOR_HEAD_UNDERFLOW head={head_at_scan_start} lag={anchor_confirmation_lag}"
+                )
+            })?;
+        eprintln!("STARTUP_STAGE=ANCHOR_SELECTION_STARTED");
+        let anchor = select_anchor(
+            head_at_scan_start,
+            anchor_confirmation_lag,
+            provider.get_block(anchor_number).await?,
+        )?;
+        eprintln!("ANCHOR_SELECTION_HEAD={} ANCHOR_CONFIRMATION_LAG_BLOCKS={} ANCHOR_BLOCK_NUMBER={} ANCHOR_BLOCK_HASH={:#x} ANCHOR_SELECTION=PASS", head_at_scan_start, anchor_confirmation_lag, anchor.number, anchor.hash);
+        eprintln!("STARTUP_STAGE=ANCHOR_SELECTED");
+        let probe_token = cfg
+            .addresses
+            .get(symbols.first().copied().unwrap_or("USDC"))
+            .copied()
+            .ok_or_else(|| anyhow!("HISTORICAL_STATE_PROBE_TOKEN_MISSING"))?;
+        let probe_abi: Abi = serde_json::from_str(ERC20_DECIMALS_ABI)?;
+        let probe_contract = Contract::new(probe_token, probe_abi, provider.clone());
+        let _: u8 = tokio::time::timeout(
+            QUOTE_TIMEOUT,
+            pinned_eth_call(probe_contract.method::<_, u8>("decimals", ())?, &anchor).call(),
+        )
+        .await
+        .context("HISTORICAL_STATE_PROBE_TIMEOUT")??;
+        eprintln!("HISTORICAL_STATE_PROBE=PASS");
+        eprintln!("STARTUP_STAGE=HISTORICAL_STATE_PROBE_COMPLETED");
+        let block_context = ScanBlockContext {
+            anchor: anchor.clone(),
+            strict_pinning: true,
+        };
+        eprintln!("SCAN_STAGE=PINNED_QUOTE_COLLECTION_STARTED TEMPORAL_MODE=PINNED_ANCHOR_BLOCK ANCHOR_BLOCK_NUMBER={} ANCHOR_BLOCK_HASH={:#x}", anchor.number, anchor.hash);
+        let (counters, mut pre, mut graph, venue_metrics) = scan(
+            provider.clone(),
+            &cfg,
+            scan_id,
+            &symbols,
+            max_pairs,
+            &block_context,
+        )
+        .await?;
+        eprintln!("SCAN_STAGE=PINNED_QUOTE_COLLECTION_COMPLETED");
+        let head_at_scan_end = provider.get_block_number().await?.as_u64();
+        let anchor_after = provider.get_block(anchor.number).await?;
+        let reorg = reorg_detected(&anchor, anchor_after);
+        if reorg {
+            eprintln!("REORG_DETECTED=true ANCHOR_VALID=false");
+            return Err(anyhow!("ANCHOR_REORG_DETECTED number={}", anchor.number));
+        }
+        eprintln!("SCAN_STAGE=ANCHOR_REVALIDATED");
+        let temporal = AnchorSnapshotMetadata {
+            temporal_mode: "PINNED_ANCHOR_BLOCK".into(),
+            anchor_block: anchor.clone(),
+            head_at_scan_start,
+            head_at_scan_end,
+            head_advance_during_scan: head_at_scan_end.saturating_sub(head_at_scan_start),
+            anchor_hash_verified_before: true,
+            anchor_hash_verified_after: true,
+            reorg_detected: false,
+            quote_state_block_span: 0,
+        };
+        let apply_temporal = |snapshot: &mut DiagnosticGraph| {
+            snapshot.block_start = head_at_scan_start;
+            snapshot.block_end = head_at_scan_end;
+            snapshot.temporal_mode = Some(temporal.temporal_mode.clone());
+            snapshot.anchor_block = Some(temporal.anchor_block.clone());
+            snapshot.head_at_scan_start = Some(temporal.head_at_scan_start);
+            snapshot.head_at_scan_end = Some(temporal.head_at_scan_end);
+            snapshot.head_advance_during_scan = Some(temporal.head_advance_during_scan);
+            snapshot.anchor_hash_verified_before = Some(true);
+            snapshot.anchor_hash_verified_after = Some(true);
+            snapshot.reorg_detected = Some(false);
+            snapshot.quote_state_block_span = Some(0);
+        };
+        apply_temporal(&mut pre);
+        apply_temporal(&mut graph);
         if let Some(path) = &save_graph {
             save_snapshot_atomic(&graph, path)?;
             audit_graph(&graph, &comparison_path(path))?;
@@ -978,9 +1177,9 @@ async fn main() -> Result<()> {
                 .filter(|c| c.total_weight < -flashloan_bot::core::diagnostic_graph::EPSILON)
                 .map(|c| c.canonical_key.clone())
                 .collect();
-            let block_span = block_end.saturating_sub(block_start);
+            let block_span = head_at_scan_end.saturating_sub(head_at_scan_start);
             let scan_duration_ms = scan_started.elapsed().as_millis();
-            let comparison = serde_json::json!({"scan_id": scan_id, "pre_graph_edges": pre.edges.len(), "post_graph_edges": graph.edges.len(), "reciprocity_removed_edges": pre.edges.len() - graph.edges.len(), "pre_negative_cycles": pre_negative.len(), "post_negative_cycles": post_negative.len(), "negative_cycles_removed_by_reciprocity": pre_negative.difference(&post_negative).count(), "negative_cycles_created_by_filter": post_negative.difference(&pre_negative).count(), "scan_block_start":block_start,"scan_block_end":block_end,"scan_block_span":block_span,"scan_duration_ms":scan_duration_ms,"quotes_pinned_to_anchor_block":false,"block_number_per_quote_unavailable":true});
+            let comparison = serde_json::json!({"scan_id": scan_id, "pre_graph_edges": pre.edges.len(), "post_graph_edges": graph.edges.len(), "reciprocity_removed_edges": pre.edges.len() - graph.edges.len(), "pre_negative_cycles": pre_negative.len(), "post_negative_cycles": post_negative.len(), "negative_cycles_removed_by_reciprocity": pre_negative.difference(&post_negative).count(), "negative_cycles_created_by_filter": post_negative.difference(&pre_negative).count(), "head_at_scan_start":head_at_scan_start,"head_at_scan_end":head_at_scan_end,"head_advance_during_scan":block_span,"quote_state_block_span":0,"scan_duration_ms":scan_duration_ms,"quotes_pinned_to_anchor_block":true,"block_number_per_quote_unavailable":false,"anchor_block_number":anchor.number,"anchor_block_hash":format!("{:#x}",anchor.hash),"reorg_detected":false});
             std::fs::write(
                 snapshots.join(format!("{scan_id}_comparison.json")),
                 serde_json::to_vec_pretty(&comparison)?,
@@ -997,7 +1196,7 @@ async fn main() -> Result<()> {
             phase2b_rejected += counters.rejected_reciprocity;
             phase2b_max_block_span = phase2b_max_block_span.max(block_span);
             phase2b_total_block_span += block_span;
-            eprintln!("[PHASE2B_SCAN] scan_id={scan_id} PRE_GRAPH_EDGES={} POST_GRAPH_EDGES={} RECIPROCITY_REMOVED_EDGES={} PRE_EXACT_NEGATIVE_CYCLES={} POST_EXACT_NEGATIVE_CYCLES={} SCAN_BLOCK_START={block_start} SCAN_BLOCK_END={block_end} SCAN_BLOCK_SPAN={block_span} SCAN_DURATION_MS={scan_duration_ms} BLOCK_NUMBER_PER_QUOTE_UNAVAILABLE=true", pre.edges.len(), graph.edges.len(), pre.edges.len()-graph.edges.len(), pre_negative.len(), post_negative.len());
+            eprintln!("[PHASE2D_SCAN] scan_id={scan_id} PRE_GRAPH_EDGES={} POST_GRAPH_EDGES={} RECIPROCITY_REMOVED_EDGES={} PRE_EXACT_NEGATIVE_CYCLES={} POST_EXACT_NEGATIVE_CYCLES={} HEAD_AT_SCAN_START={head_at_scan_start} HEAD_AT_SCAN_END={head_at_scan_end} HEAD_ADVANCE_DURING_SCAN={block_span} QUOTE_STATE_BLOCK_SPAN=0 ANCHOR_HASH_VERIFIED_BEFORE=true ANCHOR_HASH_VERIFIED_AFTER=true REORG_DETECTED=false", pre.edges.len(), graph.edges.len(), pre.edges.len()-graph.edges.len(), pre_negative.len(), post_negative.len());
         }
         if inter_scan_delay > 0 && scan_id < max_scans && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_secs(inter_scan_delay)).await;
@@ -1005,12 +1204,12 @@ async fn main() -> Result<()> {
     }
     if let Some(root) = &phase2b_output {
         let average_span = phase2b_total_block_span as f64 / phase2b_scans_completed.max(1) as f64;
-        let summary = serde_json::json!({"scans_started":max_scans,"scans_completed":phase2b_scans_completed,"raw_quotes_total":phase2b_raw_quotes,"pre_graph_edges_total":phase2b_pre_edges,"post_graph_edges_total":phase2b_post_edges,"reciprocity_rejected_total":phase2b_rejected,"reciprocity_rejection_rate":if phase2b_raw_quotes==0 {0.0} else {phase2b_rejected as f64*100.0/phase2b_raw_quotes as f64},"quotes_pinned_to_anchor_block":false,"block_number_per_quote_unavailable":true,"max_scan_block_span":phase2b_max_block_span,"avg_scan_block_span":average_span,"reciprocity_block_classification":"UNAVAILABLE"});
+        let summary = serde_json::json!({"scans_started":max_scans,"scans_completed":phase2b_scans_completed,"raw_quotes_total":phase2b_raw_quotes,"pre_graph_edges_total":phase2b_pre_edges,"post_graph_edges_total":phase2b_post_edges,"reciprocity_rejected_total":phase2b_rejected,"reciprocity_rejection_rate":if phase2b_raw_quotes==0 {0.0} else {phase2b_rejected as f64*100.0/phase2b_raw_quotes as f64},"temporal_mode":"PINNED_ANCHOR_BLOCK","quotes_pinned_to_anchor_block":true,"block_number_per_quote_unavailable":false,"quote_state_block_span":0,"max_head_advance_during_scan":phase2b_max_block_span,"avg_head_advance_during_scan":average_span,"unpinned_fallback_attempts":0,"unpinned_quotes_accepted":0,"quote_anchor_mismatches":0,"graph_unpinned_edges":0});
         std::fs::write(
             root.join("phase2b_summary.json"),
             serde_json::to_vec_pretty(&summary)?,
         )?;
-        eprintln!("[PHASE2B_SUMMARY] SCANS_STARTED={max_scans} SCANS_COMPLETED={phase2b_scans_completed} RAW_QUOTES_TOTAL={phase2b_raw_quotes} PRE_GRAPH_EDGES_TOTAL={phase2b_pre_edges} POST_GRAPH_EDGES_TOTAL={phase2b_post_edges} RECIPROCITY_REJECTED_TOTAL={phase2b_rejected} QUOTES_PINNED_TO_ANCHOR_BLOCK=false BLOCK_NUMBER_PER_QUOTE_UNAVAILABLE=true MAX_SCAN_BLOCK_SPAN={phase2b_max_block_span} AVG_SCAN_BLOCK_SPAN={average_span:.2}");
+        eprintln!("[PHASE2D_SUMMARY] SCANS_STARTED={max_scans} SCANS_COMPLETED={phase2b_scans_completed} RAW_QUOTES_TOTAL={phase2b_raw_quotes} PRE_GRAPH_EDGES_TOTAL={phase2b_pre_edges} POST_GRAPH_EDGES_TOTAL={phase2b_post_edges} RECIPROCITY_REJECTED_TOTAL={phase2b_rejected} TEMPORAL_MODE=PINNED_ANCHOR_BLOCK QUOTE_STATE_BLOCK_SPAN=0 UNPINNED_CALLS_ATTEMPTED=0 UNPINNED_QUOTES_ACCEPTED=0 QUOTE_ANCHOR_MISMATCHES=0 GRAPH_UNPINNED_EDGES=0 MAX_HEAD_ADVANCE_DURING_SCAN={phase2b_max_block_span} AVG_HEAD_ADVANCE_DURING_SCAN={average_span:.2}");
     }
     eprintln!("[PHASE1B_VERDICT] scans_completed=true MAINNET_TRANSACTIONS_SENT=0 LIVE_TRADING_ENABLED=false TRANSACTION_BROADCAST_ALLOWED=false");
     eprintln!("RUN_TERMINATION=COMPLETED RUN_EXIT_CODE=0");

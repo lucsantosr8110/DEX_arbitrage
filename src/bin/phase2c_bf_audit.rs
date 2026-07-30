@@ -52,7 +52,10 @@ fn meta(path: &str) -> (&str, &str, &str) {
     } else {
         "post"
     };
-    let profile = if path.contains("/base_regenerated/") || path.contains("/base/") {
+    let profile = if path.contains("/base_regenerated/")
+        || path.contains("/base/")
+        || path.contains("canary_base")
+    {
         "base"
     } else {
         "liquid"
