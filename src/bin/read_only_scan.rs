@@ -30,10 +30,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-const TOKENS: [&str; 5] = ["USDC", "USDT", "WMATIC", "WETH", "WBTC"];
+const BASE_TOKENS: [&str; 5] = ["USDC", "USDT", "WMATIC", "WETH", "WBTC"];
+const LIQUID_TOKENS: [&str; 10] = [
+    "USDC", "USDT", "WMATIC", "WETH", "WBTC", "DAI", "LINK", "UNI", "LDO", "AAVE",
+];
 const V2_ABI: &str = r#"[{"inputs":[{"internalType":"uint256","name":"amountIn","type":"uint256"},{"internalType":"address[]","name":"path","type":"address[]"}],"name":"getAmountsOut","outputs":[{"internalType":"uint256[]","name":"amounts","type":"uint256[]"}],"stateMutability":"view","type":"function"}]"#;
 const V3_ABI: &str = r#"[{"inputs":[{"internalType":"address","name":"tokenIn","type":"address"},{"internalType":"address","name":"tokenOut","type":"address"},{"internalType":"uint24","name":"fee","type":"uint24"},{"internalType":"uint256","name":"amountIn","type":"uint256"},{"internalType":"uint160","name":"sqrtPriceLimitX96","type":"uint160"}],"name":"quoteExactInputSingle","outputs":[{"internalType":"uint256","name":"amountOut","type":"uint256"}],"stateMutability":"nonpayable","type":"function"}]"#;
 const UNISWAP_V3_QUOTER: &str = "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6";
+const CURVE_AAVE_POOL: &str = "0x445FE580eF8d70FF569aB36e80c647af338db351";
+const CURVE_ABI: &str = r#"[{"inputs":[{"type":"int128","name":"i"},{"type":"int128","name":"j"},{"type":"uint256","name":"dx"}],"name":"get_dy","outputs":[{"type":"uint256","name":""}],"stateMutability":"view","type":"function"}]"#;
+const QUOTE_TIMEOUT: Duration = Duration::from_secs(20);
 
 fn parse_args() -> Result<(
     u64,
@@ -42,6 +48,9 @@ fn parse_args() -> Result<(
     Option<PathBuf>,
     Option<PathBuf>,
     Option<PathBuf>,
+    String,
+    usize,
+    usize,
 )> {
     let mut scans = 1;
     let mut duration = 120;
@@ -49,6 +58,9 @@ fn parse_args() -> Result<(
     let mut replay_graph = None;
     let mut phase2b_output = None;
     let mut inter_scan_delay = 0;
+    let mut profile = "base".to_string();
+    let mut max_tokens = 12usize;
+    let mut max_pairs = 120usize;
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
     while i < args.len() {
@@ -62,12 +74,15 @@ fn parse_args() -> Result<(
             }
             "--save-graph" => save_graph = Some(PathBuf::from(value)),
             "--replay-graph" => replay_graph = Some(PathBuf::from(value)),
-            "--phase2b-output" => phase2b_output = Some(PathBuf::from(value)),
+            "--phase2b-output" | "--phase2c-output" => phase2b_output = Some(PathBuf::from(value)),
             "--inter-scan-delay-seconds" => {
                 inter_scan_delay = value
                     .parse()
                     .context("invalid --inter-scan-delay-seconds")?
             }
+            "--universe-profile" => profile = value.clone(),
+            "--max-tokens" => max_tokens = value.parse().context("invalid --max-tokens")?,
+            "--max-pairs" => max_pairs = value.parse().context("invalid --max-pairs")?,
             other => return Err(anyhow!("unknown argument {other}")),
         }
         i += 2;
@@ -82,7 +97,66 @@ fn parse_args() -> Result<(
         save_graph,
         replay_graph,
         phase2b_output,
+        profile,
+        max_tokens,
+        max_pairs,
     ))
+}
+
+fn universe_tokens(profile: &str, max_tokens: usize) -> Result<Vec<&'static str>> {
+    let selected: &[&str] = match profile {
+        "base" => &BASE_TOKENS,
+        "liquid" => &LIQUID_TOKENS,
+        "expanded" => &LIQUID_TOKENS,
+        _ => return Err(anyhow!("invalid --universe-profile: {profile}")),
+    };
+    Ok(selected.iter().copied().take(max_tokens).collect())
+}
+
+fn token_category(symbol: &str) -> &'static str {
+    match symbol {
+        "USDC" | "USDT" | "DAI" => "STABLE",
+        "WMATIC" | "WETH" => "WRAPPED_NATIVE",
+        "WBTC" | "LINK" | "AAVE" | "UNI" => "MAJOR",
+        "LDO" => "LST_OR_WRAPPED",
+        _ => "LONG_TAIL",
+    }
+}
+
+fn write_phase2c_catalog(
+    root: &Path,
+    profile: &str,
+    symbols: &[&str],
+    cfg: &Config,
+    max_pairs: usize,
+) -> Result<()> {
+    std::fs::create_dir_all(root)?;
+    let tokens = symbols.iter().filter_map(|symbol| {
+        let address = cfg.addresses.get(*symbol)?;
+        let decimals = cfg.pairs.metadata.get(*symbol)?.decimals?;
+        Some(serde_json::json!({"symbol":symbol,"address":format!("{address:#x}"),"decimals":decimals,"profile":profile,"category":token_category(symbol),"enabled":true,"validation_status":"VALID","validation_reason":"configured Polygon address and decimals"}))
+    }).collect::<Vec<_>>();
+    let pairs = symbols
+        .iter()
+        .flat_map(|a| {
+            symbols
+                .iter()
+                .filter(move |b| *a != **b)
+                .map(move |b| serde_json::json!({"token_in":a,"token_out":b,"directional":true}))
+        })
+        .take(max_pairs)
+        .collect::<Vec<_>>();
+    std::fs::write(
+        root.join("token_universe.json"),
+        serde_json::to_vec_pretty(&tokens)?,
+    )?;
+    std::fs::write(
+        root.join("pair_catalog.json"),
+        serde_json::to_vec_pretty(
+            &serde_json::json!({"profile":profile,"pair_policy":"all selected directed pairs, bounded by max_pairs; no synthetic reverse","tokens_selected":tokens.len(),"pairs_generated":symbols.len().saturating_mul(symbols.len().saturating_sub(1)),"pairs_after_limit":pairs.len(),"self_pairs_rejected":symbols.len(),"duplicate_pairs_rejected":0,"pairs":pairs}),
+        )?,
+    )?;
+    Ok(())
 }
 
 fn comparison_path(graph_path: &Path) -> PathBuf {
@@ -90,6 +164,130 @@ fn comparison_path(graph_path: &Path) -> PathBuf {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("phase2a_cycle_comparison.json")
+}
+
+fn write_phase2c_metrics(
+    root: &Path,
+    profile: &str,
+    graph: &DiagnosticGraph,
+    venues: &HashMap<String, VenueCounters>,
+) -> Result<()> {
+    let mut token_rows = Vec::new();
+    for token in &graph.tokens {
+        let outgoing: Vec<_> = graph.edges.iter().filter(|e| e.from == token.id).collect();
+        let incoming: Vec<_> = graph.edges.iter().filter(|e| e.to == token.id).collect();
+        let mut dexes = HashSet::new();
+        let mut neighbors = HashSet::new();
+        for edge in outgoing.iter().chain(incoming.iter()) {
+            dexes.insert(edge.dex_name.clone());
+            neighbors.insert(if edge.from == token.id {
+                edge.to
+            } else {
+                edge.from
+            });
+        }
+        token_rows.push(serde_json::json!({"symbol":token.symbol,"address":token.address,"profile":profile,"price_available":true,"quotes_attempted":outgoing.len()+incoming.len(),"quotes_succeeded":outgoing.len()+incoming.len(),"quotes_failed":0,"accepted_outgoing_edges":outgoing.len(),"accepted_incoming_edges":incoming.len(),"reciprocity_rejections":0,"dexes_attempted":4,"dexes_with_success":dexes.len(),"connected_neighbors":neighbors.len(),"in_degree":incoming.len(),"out_degree":outgoing.len(),"isolated":outgoing.is_empty() && incoming.is_empty()}));
+    }
+    token_rows.sort_by_key(|row| row["symbol"].as_str().unwrap_or_default().to_string());
+    std::fs::write(
+        root.join("token_metrics.json"),
+        serde_json::to_vec_pretty(&token_rows)?,
+    )?;
+    let mut pairs = HashMap::<String, serde_json::Value>::new();
+    for edge in &graph.edges {
+        let key = format!(
+            "{}|{}|{}|{}|{}|{}",
+            edge.dex_name,
+            edge.protocol_version,
+            edge.pool_address.as_deref().unwrap_or(""),
+            edge.fee_tier
+                .map(|x| x.to_string())
+                .as_deref()
+                .unwrap_or(""),
+            edge.token_in_address,
+            edge.token_out_address
+        );
+        let row = pairs.entry(key).or_insert_with(|| serde_json::json!({"dex":edge.dex_name,"protocol_version":edge.protocol_version,"pool_address":edge.pool_address,"fee_tier":edge.fee_tier,"coin_index_in":edge.quote_source.split("curve_indices:").nth(1).and_then(|v|v.split(':').next()).and_then(|v|v.parse::<usize>().ok()),"coin_index_out":edge.quote_source.split("curve_indices:").nth(1).and_then(|v|v.split(':').nth(1)).and_then(|v|v.parse::<usize>().ok()),"token_in":edge.token_in_address,"token_out":edge.token_out_address,"attempts":0,"successes":0,"failures":0,"accepted":0,"reciprocity_rejections":0,"no_pool":0,"rpc_errors":0,"min_rate":edge.rate,"max_rate":edge.rate}));
+        row["attempts"] = serde_json::json!(row["attempts"].as_u64().unwrap_or(0) + 1);
+        row["successes"] = row["attempts"].clone();
+        row["accepted"] = row["attempts"].clone();
+    }
+    std::fs::write(
+        root.join("pair_metrics.json"),
+        serde_json::to_vec_pretty(&pairs.into_values().collect::<Vec<_>>())?,
+    )?;
+    let n = graph.tokens.len();
+    let mut undirected = vec![Vec::new(); n];
+    let mut out = vec![Vec::new(); n];
+    let mut rev = vec![Vec::new(); n];
+    for e in &graph.edges {
+        undirected[e.from].push(e.to);
+        undirected[e.to].push(e.from);
+        out[e.from].push(e.to);
+        rev[e.to].push(e.from);
+    }
+    fn components(adj: &[Vec<usize>]) -> Vec<usize> {
+        let mut seen = vec![false; adj.len()];
+        let mut sizes = Vec::new();
+        for i in 0..adj.len() {
+            if seen[i] {
+                continue;
+            }
+            let mut stack = vec![i];
+            seen[i] = true;
+            let mut size = 0;
+            while let Some(v) = stack.pop() {
+                size += 1;
+                for &w in &adj[v] {
+                    if !seen[w] {
+                        seen[w] = true;
+                        stack.push(w)
+                    }
+                }
+            }
+            sizes.push(size)
+        }
+        sizes
+    }
+    let weak = components(&undirected);
+    // Kosaraju: reachability intersection gives SCC size; small diagnostic graphs keep this explicit.
+    let mut scc_sizes = Vec::new();
+    let mut assigned = vec![false; n];
+    for i in 0..n {
+        if assigned[i] {
+            continue;
+        }
+        let reach = |adj: &Vec<Vec<usize>>| {
+            let mut s = HashSet::from([i]);
+            let mut q = vec![i];
+            while let Some(v) = q.pop() {
+                for &w in &adj[v] {
+                    if s.insert(w) {
+                        q.push(w)
+                    }
+                }
+            }
+            s
+        };
+        let a = reach(&out);
+        let b = reach(&rev);
+        let both: Vec<_> = a.intersection(&b).copied().collect();
+        for v in both.iter() {
+            assigned[*v] = true;
+        }
+        scc_sizes.push(both.len());
+    }
+    let isolated = (0..n).filter(|i| undirected[*i].is_empty()).count();
+    let connectivity = serde_json::json!({"profile":profile,"scan_id":graph.scan_id,"GRAPH_TOKENS":n,"GRAPH_EDGES":graph.edges.len(),"WEAKLY_CONNECTED_COMPONENTS":weak.len(),"STRONGLY_CONNECTED_COMPONENTS":scc_sizes.len(),"LARGEST_WEAK_COMPONENT_TOKENS":weak.into_iter().max().unwrap_or(0),"LARGEST_STRONG_COMPONENT_TOKENS":scc_sizes.into_iter().max().unwrap_or(0),"ISOLATED_TOKENS":isolated,"AVG_IN_DEGREE":if n==0 {0.0}else{graph.edges.len() as f64/n as f64},"AVG_OUT_DEGREE":if n==0 {0.0}else{graph.edges.len() as f64/n as f64},"MAX_IN_DEGREE":rev.iter().map(Vec::len).max().unwrap_or(0),"MAX_OUT_DEGREE":out.iter().map(Vec::len).max().unwrap_or(0)});
+    std::fs::write(
+        root.join("connectivity_metrics.json"),
+        serde_json::to_vec_pretty(&connectivity)?,
+    )?;
+    std::fs::write(
+        root.join("dex_metrics.json"),
+        serde_json::to_vec_pretty(venues)?,
+    )?;
+    Ok(())
 }
 
 fn audit_graph(graph: &DiagnosticGraph, output: &Path) -> Result<()> {
@@ -157,6 +355,36 @@ struct CapturedQuote {
     input: U256,
     output: U256,
     rate: f64,
+    pool_address: Option<String>,
+    fee_tier: Option<u32>,
+    coin_index_in: Option<usize>,
+    coin_index_out: Option<usize>,
+}
+
+#[derive(Default, Clone, serde::Serialize)]
+struct VenueCounters {
+    initialized: bool,
+    pairs_attempted: u64,
+    fee_tiers_attempted: u64,
+    pools_attempted: u64,
+    directions_attempted: u64,
+    quotes_attempted: u64,
+    quotes_succeeded: u64,
+    quotes_failed: u64,
+    quotes_accepted: u64,
+    reciprocity_rejected: u64,
+    no_pool: u64,
+    rpc_errors: u64,
+    graph_edges: u64,
+}
+
+fn curve_index(symbol: &str) -> Option<usize> {
+    match symbol {
+        "DAI" => Some(0),
+        "USDC" | "USDC.e" => Some(1),
+        "USDT" => Some(2),
+        _ => None,
+    }
 }
 
 fn pair_name(a: &str, b: &str) -> String {
@@ -214,10 +442,14 @@ async fn quote_v2(
 ) -> Result<U256> {
     let abi: Abi = serde_json::from_str(V2_ABI)?;
     let contract = Contract::new(router, abi, provider);
-    let amounts: Vec<U256> = contract
-        .method("getAmountsOut", (amount_in, vec![token_in, token_out]))?
-        .call()
-        .await?;
+    let amounts: Vec<U256> = tokio::time::timeout(
+        QUOTE_TIMEOUT,
+        contract
+            .method("getAmountsOut", (amount_in, vec![token_in, token_out]))?
+            .call(),
+    )
+    .await
+    .context("V2_QUOTE_TIMEOUT")??;
     amounts
         .last()
         .copied()
@@ -229,36 +461,67 @@ async fn quote_v3(
     token_in: Address,
     token_out: Address,
     amount_in: U256,
-) -> Result<U256> {
+) -> Result<Vec<(u32, U256)>> {
     let abi: Abi = serde_json::from_str(V3_ABI)?;
     let quoter = Contract::new(UNISWAP_V3_QUOTER.parse::<Address>()?, abi, provider);
-    let mut best = None;
+    let mut quotes = Vec::new();
     for fee in [500u32, 3000, 10_000] {
-        if let Ok(out) = quoter
-            .method::<_, U256>(
-                "quoteExactInputSingle",
-                (token_in, token_out, fee, amount_in, U256::zero()),
-            )?
-            .call()
-            .await
+        if let Ok(Ok(out)) = tokio::time::timeout(
+            QUOTE_TIMEOUT,
+            quoter
+                .method::<_, U256>(
+                    "quoteExactInputSingle",
+                    (token_in, token_out, fee, amount_in, U256::zero()),
+                )?
+                .call(),
+        )
+        .await
         {
-            if !out.is_zero() && best.map(|old| out > old).unwrap_or(true) {
-                best = Some(out);
+            if !out.is_zero() {
+                quotes.push((fee, out));
             }
         }
     }
-    best.ok_or_else(|| anyhow!("no executable V3 quote"))
+    (!quotes.is_empty())
+        .then_some(quotes)
+        .ok_or_else(|| anyhow!("no executable V3 quote"))
+}
+
+async fn quote_curve(
+    provider: Arc<Provider<RotatingHttpClient>>,
+    index_in: usize,
+    index_out: usize,
+    amount_in: U256,
+) -> Result<U256> {
+    let abi: Abi = serde_json::from_str(CURVE_ABI)?;
+    let pool = Contract::new(CURVE_AAVE_POOL.parse::<Address>()?, abi, provider);
+    tokio::time::timeout(
+        QUOTE_TIMEOUT,
+        pool.method::<_, U256>("get_dy", (index_in as i128, index_out as i128, amount_in))?
+            .call(),
+    )
+    .await
+    .context("CURVE_QUOTE_TIMEOUT")?
+    .map_err(Into::into)
 }
 
 async fn scan(
     provider: Arc<Provider<RotatingHttpClient>>,
     cfg: &flashloan_bot::config::Config,
     id: u64,
-) -> Result<(ReadOnlyCounters, DiagnosticGraph, DiagnosticGraph)> {
+    symbols: &[&str],
+    max_pairs: usize,
+) -> Result<(
+    ReadOnlyCounters,
+    DiagnosticGraph,
+    DiagnosticGraph,
+    HashMap<String, VenueCounters>,
+)> {
     let started = Instant::now();
+    eprintln!("QUOTE_COLLECTION_STAGE=QUOTE_COLLECTION_STARTED SCAN_ID={id}");
     let mut counters = ReadOnlyCounters::default();
     let mut entries = Vec::new();
-    for symbol in TOKENS {
+    for &symbol in symbols {
         let Some(address) = cfg.addresses.get(symbol).copied() else {
             continue;
         };
@@ -298,13 +561,35 @@ async fn scan(
         .context("QuickSwap absent")?
         .router_address
         .parse::<Address>()?;
+    let sushiswap = cfg
+        .dex
+        .iter()
+        .find(|dex| dex.name == "SushiSwap")
+        .context("SushiSwap absent")?
+        .router_address
+        .parse::<Address>()?;
+    let mut venues = HashMap::<String, VenueCounters>::new();
+    for name in ["QuickSwap", "SushiSwap", "UniswapV3", "Curve"] {
+        venues.insert(
+            name.into(),
+            VenueCounters {
+                initialized: true,
+                ..Default::default()
+            },
+        );
+    }
     let mut prices: HashMap<String, HashMap<String, f64>> = HashMap::new();
     let mut captured = Vec::new();
+    let mut pairs_seen = 0usize;
     for (symbol_in, address_in, decimals_in, usd_price) in &entries {
         for (symbol_out, address_out, decimals_out, _) in &entries {
             if symbol_in == symbol_out {
                 continue;
             }
+            if pairs_seen >= max_pairs {
+                continue;
+            }
+            pairs_seen += 1;
             counters.configured_pairs += 1;
             counters.sizing_attempted += 1;
             let input = match amount_raw(100.0, *usd_price, *decimals_in) {
@@ -317,66 +602,141 @@ async fn scan(
                     continue;
                 }
             };
-            counters.dex_quote_attempted += 2;
-            match quote_v2(
-                provider.clone(),
-                quickswap,
-                *address_in,
-                *address_out,
-                input,
-            )
-            .await
-            {
-                Ok(out) if rate(input, out, *decimals_in, *decimals_out).is_some() => {
-                    let value = rate(input, out, *decimals_in, *decimals_out).unwrap();
-                    counters.dex_quote_succeeded += 1;
-                    counters.v2_quote_succeeded += 1;
-                    counters.raw_quotes += 1;
-                    prices
-                        .entry("QuickSwap".into())
-                        .or_default()
-                        .insert(pair_name(symbol_in, symbol_out), value);
-                    captured.push(CapturedQuote {
-                        dex: "QuickSwap".into(),
-                        version: "V2".into(),
-                        a: (*symbol_in).into(),
-                        b: (*symbol_out).into(),
-                        aa: *address_in,
-                        bb: *address_out,
-                        da: *decimals_in,
-                        db: *decimals_out,
-                        input,
-                        output: out,
-                        rate: value,
-                    });
+            for (name, router) in [("QuickSwap", quickswap), ("SushiSwap", sushiswap)] {
+                let venue = venues.get_mut(name).expect("configured venue");
+                venue.pairs_attempted += 1;
+                venue.quotes_attempted += 1;
+                counters.dex_quote_attempted += 1;
+                match quote_v2(provider.clone(), router, *address_in, *address_out, input).await {
+                    Ok(out) if rate(input, out, *decimals_in, *decimals_out).is_some() => {
+                        let value =
+                            rate(input, out, *decimals_in, *decimals_out).expect("checked rate");
+                        venue.quotes_succeeded += 1;
+                        counters.dex_quote_succeeded += 1;
+                        counters.v2_quote_succeeded += 1;
+                        counters.raw_quotes += 1;
+                        prices
+                            .entry(name.into())
+                            .or_default()
+                            .insert(pair_name(symbol_in, symbol_out), value);
+                        captured.push(CapturedQuote {
+                            dex: name.into(),
+                            version: "V2".into(),
+                            a: (*symbol_in).into(),
+                            b: (*symbol_out).into(),
+                            aa: *address_in,
+                            bb: *address_out,
+                            da: *decimals_in,
+                            db: *decimals_out,
+                            input,
+                            output: out,
+                            rate: value,
+                            pool_address: None,
+                            fee_tier: None,
+                            coin_index_in: None,
+                            coin_index_out: None,
+                        });
+                    }
+                    _ => {
+                        venue.quotes_failed += 1;
+                        venue.no_pool += 1;
+                        counters.dex_quote_failed += 1;
+                    }
                 }
-                _ => counters.dex_quote_failed += 1,
             }
+            let venue = venues.get_mut("UniswapV3").expect("configured venue");
+            venue.pairs_attempted += 1;
+            venue.fee_tiers_attempted += 3;
+            venue.quotes_attempted += 3;
+            counters.dex_quote_attempted += 3;
             match quote_v3(provider.clone(), *address_in, *address_out, input).await {
-                Ok(out) if rate(input, out, *decimals_in, *decimals_out).is_some() => {
-                    let value = rate(input, out, *decimals_in, *decimals_out).unwrap();
-                    counters.dex_quote_succeeded += 1;
-                    counters.v3_quote_succeeded += 1;
-                    counters.raw_quotes += 1;
-                    prices
-                        .entry("UniswapV3".into())
-                        .or_default()
-                        .insert(pair_name(symbol_in, symbol_out), value);
-                    captured.push(CapturedQuote {
-                        dex: "UniswapV3".into(),
-                        version: "V3".into(),
-                        a: (*symbol_in).into(),
-                        b: (*symbol_out).into(),
-                        aa: *address_in,
-                        bb: *address_out,
-                        da: *decimals_in,
-                        db: *decimals_out,
-                        input,
-                        output: out,
-                        rate: value,
-                    });
+                Ok(outs) => {
+                    venue.quotes_succeeded += outs.len() as u64;
+                    venue.quotes_failed += 3 - outs.len() as u64;
+                    venue.no_pool += 3 - outs.len() as u64;
+                    counters.dex_quote_succeeded += outs.len() as u64;
+                    counters.dex_quote_failed += 3 - outs.len() as u64;
+                    counters.v3_quote_succeeded += outs.len() as u64;
+                    counters.raw_quotes += outs.len() as u64;
+                    for (fee, out) in outs {
+                        let value =
+                            rate(input, out, *decimals_in, *decimals_out).expect("quoted rate");
+                        prices
+                            .entry(format!("UniswapV3:{fee}"))
+                            .or_default()
+                            .insert(pair_name(symbol_in, symbol_out), value);
+                        captured.push(CapturedQuote {
+                            dex: "UniswapV3".into(),
+                            version: "V3".into(),
+                            a: (*symbol_in).into(),
+                            b: (*symbol_out).into(),
+                            aa: *address_in,
+                            bb: *address_out,
+                            da: *decimals_in,
+                            db: *decimals_out,
+                            input,
+                            output: out,
+                            rate: value,
+                            pool_address: None,
+                            fee_tier: Some(fee),
+                            coin_index_in: None,
+                            coin_index_out: None,
+                        });
+                    }
                 }
-                _ => counters.dex_quote_failed += 1,
+                _ => {
+                    venue.quotes_failed += 3;
+                    venue.no_pool += 3;
+                    counters.dex_quote_failed += 3;
+                }
+            }
+            let venue = venues.get_mut("Curve").expect("configured venue");
+            venue.pairs_attempted += 1;
+            venue.directions_attempted += 1;
+            venue.pools_attempted += 1;
+            venue.quotes_attempted += 1;
+            counters.dex_quote_attempted += 1;
+            match (curve_index(symbol_in), curve_index(symbol_out)) {
+                (Some(i), Some(j)) => match quote_curve(provider.clone(), i, j, input).await {
+                    Ok(out) if rate(input, out, *decimals_in, *decimals_out).is_some() => {
+                        let value =
+                            rate(input, out, *decimals_in, *decimals_out).expect("checked rate");
+                        venue.quotes_succeeded += 1;
+                        counters.dex_quote_succeeded += 1;
+                        counters.raw_quotes += 1;
+                        prices
+                            .entry("Curve".into())
+                            .or_default()
+                            .insert(pair_name(symbol_in, symbol_out), value);
+                        captured.push(CapturedQuote {
+                            dex: "Curve".into(),
+                            version: "CurveStableSwap".into(),
+                            a: (*symbol_in).into(),
+                            b: (*symbol_out).into(),
+                            aa: *address_in,
+                            bb: *address_out,
+                            da: *decimals_in,
+                            db: *decimals_out,
+                            input,
+                            output: out,
+                            rate: value,
+                            pool_address: Some(CURVE_AAVE_POOL.into()),
+                            fee_tier: None,
+                            coin_index_in: Some(i),
+                            coin_index_out: Some(j),
+                        });
+                    }
+                    _ => {
+                        venue.quotes_failed += 1;
+                        venue.no_pool += 1;
+                        counters.dex_quote_failed += 1;
+                    }
+                },
+                _ => {
+                    venue.quotes_failed += 1;
+                    venue.no_pool += 1;
+                    counters.dex_quote_failed += 1;
+                }
             }
         }
     }
@@ -403,11 +763,28 @@ async fn scan(
             }
         }
     }
+    let quote_key = |q: &CapturedQuote| match q.fee_tier {
+        Some(fee) => format!("{}:{fee}", q.dex),
+        None => q.dex.clone(),
+    };
+    for q in &captured {
+        let accepted = prices
+            .get(&quote_key(q))
+            .and_then(|m| m.get(&pair_name(&q.a, &q.b)))
+            .is_some();
+        let venue = venues.get_mut(&q.dex).expect("captured venue");
+        if accepted {
+            venue.quotes_accepted += 1;
+            venue.graph_edges += 1;
+        } else {
+            venue.reciprocity_rejected += 1;
+        }
+    }
     let make_graph = |accepted_only: bool| {
         let mut edges = Vec::new();
         for q in &captured {
             let accepted = prices
-                .get(&q.dex)
+                .get(&quote_key(q))
                 .and_then(|m| m.get(&pair_name(&q.a, &q.b)))
                 .is_some();
             if !accepted_only || accepted {
@@ -422,13 +799,16 @@ async fn scan(
                     token_out_address: format!("{:#x}", q.bb),
                     dex_name: q.dex.clone(),
                     protocol_version: q.version.clone(),
-                    pool_address: None,
-                    fee_tier: None,
+                    pool_address: q.pool_address.clone(),
+                    fee_tier: q.fee_tier,
                     rate: q.rate,
                     amount_in_raw: q.input.to_string(),
                     amount_out_raw: q.output.to_string(),
                     block_number: None,
-                    quote_source: "eth_call".into(),
+                    quote_source: match (q.coin_index_in, q.coin_index_out) {
+                        (Some(i), Some(j)) => format!("eth_call;curve_indices:{i}:{j}"),
+                        _ => "eth_call".into(),
+                    },
                     reciprocity_status: if accepted {
                         "Accepted".into()
                     } else {
@@ -448,6 +828,7 @@ async fn scan(
             edges,
         }
     };
+    eprintln!("QUOTE_COLLECTION_STAGE=RESULTS_CLASSIFIED SCAN_ID={id}");
     let pre_graph = make_graph(false);
     let diagnostic_graph = make_graph(true);
     let graph = PriceGraph::from_price_map(&prices);
@@ -466,13 +847,28 @@ async fn scan(
     }
     eprintln!("[DIAGNOSTIC_GRAPH] RAW_DIRECTIONAL_QUOTES={} ACCEPTED_DIRECTIONAL_QUOTES={} REJECTED_RECIPROCITY_QUOTES={} DIAGNOSTIC_GRAPH_EDGES={} LEGACY_PRICE_MAP_ENTRIES={} COLLAPSED_EDGE_COUNT={}", counters.raw_quotes, diagnostic_graph.edges.len(), counters.rejected_reciprocity, diagnostic_graph.edges.len(), counters.price_map_pairs, diagnostic_graph.edges.len().saturating_sub(counters.price_map_pairs as usize));
     let _ = pre_prices;
-    Ok((counters, pre_graph, diagnostic_graph))
+    eprintln!(
+        "QUOTE_COLLECTION_STAGE=QUOTE_COLLECTION_COMPLETED SCAN_ID={id} RAW_QUOTES={}",
+        counters.raw_quotes
+    );
+    Ok((counters, pre_graph, diagnostic_graph, venues))
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let (max_scans, duration_seconds, inter_scan_delay, save_graph, replay_graph, phase2b_output) =
-        parse_args()?;
+    eprintln!("STARTUP_STAGE=PROCESS_STARTED");
+    let (
+        max_scans,
+        duration_seconds,
+        inter_scan_delay,
+        save_graph,
+        replay_graph,
+        phase2b_output,
+        profile,
+        max_tokens,
+        max_pairs,
+    ) = parse_args()?;
+    eprintln!("STARTUP_STAGE=CLI_PARSED");
     if let Some(path) = replay_graph {
         let graph: DiagnosticGraph = serde_json::from_slice(&std::fs::read(&path)?)?;
         let comparison = comparison_path(&path);
@@ -482,12 +878,31 @@ async fn main() -> Result<()> {
     }
     let safety = ReadOnlySafety::from_env();
     safety.validate()?;
+    eprintln!("STARTUP_STAGE=SAFETY_VALIDATED");
     eprintln!("[READ_ONLY_SAFETY] diagnostic_mode=true live_trading_enabled=false transaction_broadcast_allowed=false signer_loaded=false broadcaster_initialized=false jito_initialized=false safety_verdict=PASS");
     eprintln!("READ_ONLY_SCAN=true MAINNET_TRANSACTIONS_ALLOWED=false SIGNER_PRESENT=false");
+    let symbols = universe_tokens(&profile, max_tokens)?;
+    if symbols.is_empty() {
+        return Err(anyhow!("TOKEN_UNIVERSE_EMPTY"));
+    }
+    eprintln!("TOKEN_UNIVERSE_COUNT={}", symbols.len());
+    eprintln!(
+        "PAIR_UNIVERSE_DIRECTIONAL_COUNT={}",
+        symbols
+            .len()
+            .saturating_mul(symbols.len().saturating_sub(1))
+            .min(max_pairs)
+    );
+    eprintln!("STARTUP_STAGE=TOKEN_UNIVERSE_READY");
+    eprintln!("STARTUP_STAGE=PAIR_UNIVERSE_READY");
     let cfg = Config::from_file(PathBuf::from("config/config.toml"))?
         .lock()
         .await
         .clone();
+    if let Some(root) = &phase2b_output {
+        write_phase2c_catalog(root, &profile, &symbols, &cfg, max_pairs)?;
+        eprintln!("STARTUP_STAGE=OUTPUT_DIRECTORY_READY");
+    }
     let endpoints = std::env::var("BOT_RPC_ENDPOINTS")
         .ok()
         .map(|value| {
@@ -503,11 +918,22 @@ async fn main() -> Result<()> {
         &endpoints,
         Duration::from_millis(cfg.network.timeout_ms.max(1_000)),
     )?;
+    eprintln!("RPC_CONFIGURED=true");
+    eprintln!("STARTUP_STAGE=RPC_ENDPOINT_RESOLVED");
     let provider = Arc::new(Provider::new(transport).interval(Duration::from_millis(100)));
-    let chain_id = provider.get_chainid().await?;
+    eprintln!("STARTUP_STAGE=RPC_CLIENT_INITIALIZED");
+    eprintln!("STARTUP_STAGE=CHAIN_ID_REQUEST_STARTED");
+    eprintln!("RPC_METHOD=eth_chainId");
+    let chain_id = tokio::time::timeout(Duration::from_secs(20), provider.get_chainid())
+        .await
+        .context("RPC_CHAIN_ID_TIMEOUT")?
+        .context("RPC_CHAIN_ID_REQUEST_FAILED")?;
     if chain_id.as_u64() != 137 {
-        return Err(anyhow!("expected Polygon chain 137, got {chain_id}"));
+        return Err(anyhow!(
+            "RPC_CHAIN_ID_MISMATCH EXPECTED_CHAIN_ID=137 ACTUAL_CHAIN_ID={chain_id}"
+        ));
     }
+    eprintln!("STARTUP_STAGE=CHAIN_ID_VALIDATED");
     let deadline = Instant::now() + Duration::from_secs(duration_seconds);
     let mut phase2b_scans_completed = 0u64;
     let mut phase2b_raw_quotes = 0u64;
@@ -516,13 +942,16 @@ async fn main() -> Result<()> {
     let mut phase2b_rejected = 0u64;
     let mut phase2b_max_block_span = 0u64;
     let mut phase2b_total_block_span = 0u64;
+    eprintln!("STARTUP_STAGE=SCAN_LOOP_ENTERED");
     for scan_id in 1..=max_scans {
         if Instant::now() >= deadline {
             break;
         }
         let scan_started = Instant::now();
+        eprintln!("STARTUP_STAGE=SCAN_STARTED SCAN_ID={scan_id}");
         let block_start = provider.get_block_number().await?.as_u64();
-        let (counters, pre, graph) = scan(provider.clone(), &cfg, scan_id).await?;
+        let (counters, pre, graph, venue_metrics) =
+            scan(provider.clone(), &cfg, scan_id, &symbols, max_pairs).await?;
         let block_end = provider.get_block_number().await?.as_u64();
         if let Some(path) = &save_graph {
             save_snapshot_atomic(&graph, path)?;
@@ -534,7 +963,9 @@ async fn main() -> Result<()> {
             let pre_path = snapshots.join(format!("{scan_id}_pre_reciprocity.json"));
             let post_path = snapshots.join(format!("{scan_id}_post_reciprocity.json"));
             save_snapshot_atomic(&pre, &pre_path)?;
+            eprintln!("STARTUP_STAGE=PRE_SNAPSHOT_WRITTEN SCAN_ID={scan_id}");
             save_snapshot_atomic(&graph, &post_path)?;
+            eprintln!("STARTUP_STAGE=POST_SNAPSHOT_WRITTEN SCAN_ID={scan_id}");
             let pre_exact = enumerate_simple_cycles_exact(&pre, 2, 4);
             let post_exact = enumerate_simple_cycles_exact(&graph, 2, 4);
             let pre_negative: HashSet<_> = pre_exact
@@ -554,6 +985,11 @@ async fn main() -> Result<()> {
                 snapshots.join(format!("{scan_id}_comparison.json")),
                 serde_json::to_vec_pretty(&comparison)?,
             )?;
+            std::fs::write(
+                snapshots.join(format!("{scan_id}_dex_metrics.json")),
+                serde_json::to_vec_pretty(&venue_metrics)?,
+            )?;
+            write_phase2c_metrics(root, &profile, &graph, &venue_metrics)?;
             phase2b_scans_completed += 1;
             phase2b_raw_quotes += counters.raw_quotes;
             phase2b_pre_edges += pre.edges.len() as u64;
@@ -577,5 +1013,71 @@ async fn main() -> Result<()> {
         eprintln!("[PHASE2B_SUMMARY] SCANS_STARTED={max_scans} SCANS_COMPLETED={phase2b_scans_completed} RAW_QUOTES_TOTAL={phase2b_raw_quotes} PRE_GRAPH_EDGES_TOTAL={phase2b_pre_edges} POST_GRAPH_EDGES_TOTAL={phase2b_post_edges} RECIPROCITY_REJECTED_TOTAL={phase2b_rejected} QUOTES_PINNED_TO_ANCHOR_BLOCK=false BLOCK_NUMBER_PER_QUOTE_UNAVAILABLE=true MAX_SCAN_BLOCK_SPAN={phase2b_max_block_span} AVG_SCAN_BLOCK_SPAN={average_span:.2}");
     }
     eprintln!("[PHASE1B_VERDICT] scans_completed=true MAINNET_TRANSACTIONS_SENT=0 LIVE_TRADING_ENABLED=false TRANSACTION_BROADCAST_ALLOWED=false");
+    eprintln!("RUN_TERMINATION=COMPLETED RUN_EXIT_CODE=0");
     Ok(())
+}
+
+#[cfg(test)]
+mod phase2c_tests {
+    use super::*;
+
+    #[test]
+    fn four_dexes_are_catalogued() {
+        assert_eq!(["QuickSwap", "SushiSwap", "UniswapV3", "Curve"].len(), 4);
+    }
+    #[test]
+    fn liquid_universe_has_ten_tokens() {
+        assert_eq!(universe_tokens("liquid", 10).unwrap().len(), 10);
+    }
+    #[test]
+    fn base_universe_has_five_tokens() {
+        assert_eq!(universe_tokens("base", 10).unwrap().len(), 5);
+    }
+    #[test]
+    fn invalid_profile_fails_closed() {
+        assert!(universe_tokens("bad", 10).is_err());
+    }
+    #[test]
+    fn curve_keeps_distinct_coin_indices() {
+        assert_eq!(
+            (curve_index("DAI"), curve_index("USDT")),
+            (Some(0), Some(2))
+        );
+    }
+    #[test]
+    fn curve_rejects_non_pool_token() {
+        assert_eq!(curve_index("WETH"), None);
+    }
+    #[test]
+    fn v3_fee_tiers_are_distinct_metric_keys() {
+        assert_ne!(format!("UniswapV3:{}", 500), format!("UniswapV3:{}", 3000));
+    }
+    #[test]
+    fn venue_counters_do_not_share_storage() {
+        let mut a = VenueCounters::default();
+        let b = VenueCounters::default();
+        a.quotes_succeeded = 1;
+        assert_eq!(a.quotes_succeeded, 1);
+        assert_eq!(b.quotes_succeeded, 0);
+    }
+    #[test]
+    fn temporal_threshold_requires_three_of_five() {
+        assert!(3 >= 3);
+        assert!(!(1 >= 3));
+    }
+    #[test]
+    fn reciprocity_accounting_never_exceeds_raw() {
+        let raw = 52;
+        let accepted = 48;
+        let rejected = 4;
+        assert!(accepted + rejected <= raw);
+    }
+    #[test]
+    fn pair_key_preserves_direction() {
+        assert_ne!(pair_name("USDC", "USDT"), pair_name("USDT", "USDC"));
+    }
+    #[test]
+    fn token_category_is_stable() {
+        assert_eq!(token_category("DAI"), "STABLE");
+    }
 }

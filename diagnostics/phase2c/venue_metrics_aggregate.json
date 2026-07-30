@@ -1,0 +1,277 @@
+{
+  "schema_version": 1,
+  "venue_metrics_duplicate_scans": 0,
+  "venue_metrics_scans_included": 5,
+  "venue_metrics_source": "liquid_regenerated/snapshots/*_dex_metrics.json",
+  "venue_metrics_unit": "EXPLICIT_TOTAL_AVG_LAST_SCAN",
+  "venues": {
+    "curve": {
+      "directions_attempted": {
+        "avg_per_scan": 90.0,
+        "last_scan": 90,
+        "total": 450
+      },
+      "fee_tiers_attempted": {
+        "avg_per_scan": 0.0,
+        "last_scan": 0,
+        "total": 0
+      },
+      "graph_edges": {
+        "avg_per_scan": 6.0,
+        "last_scan": 6,
+        "total": 30
+      },
+      "no_pool": {
+        "avg_per_scan": 84.0,
+        "last_scan": 84,
+        "total": 420
+      },
+      "pools_attempted": {
+        "avg_per_scan": 90.0,
+        "last_scan": 90,
+        "total": 450
+      },
+      "quotes_accepted": {
+        "avg_per_scan": 6.0,
+        "last_scan": 6,
+        "total": 30
+      },
+      "quotes_attempted": {
+        "avg_per_scan": 90.0,
+        "last_scan": 90,
+        "total": 450
+      },
+      "quotes_failed": {
+        "avg_per_scan": 84.0,
+        "last_scan": 84,
+        "total": 420
+      },
+      "quotes_rejected": {
+        "avg_per_scan": null,
+        "last_scan": null,
+        "total": 0
+      },
+      "quotes_succeeded": {
+        "avg_per_scan": 6.0,
+        "last_scan": 6,
+        "total": 30
+      },
+      "reciprocity_rejected": {
+        "avg_per_scan": 0.0,
+        "last_scan": 0,
+        "total": 0
+      },
+      "rpc_errors": {
+        "avg_per_scan": 0.0,
+        "last_scan": 0,
+        "total": 0
+      },
+      "timeouts": {
+        "avg_per_scan": null,
+        "last_scan": null,
+        "total": 0
+      }
+    },
+    "quickswap": {
+      "directions_attempted": {
+        "avg_per_scan": 0.0,
+        "last_scan": 0,
+        "total": 0
+      },
+      "fee_tiers_attempted": {
+        "avg_per_scan": 0.0,
+        "last_scan": 0,
+        "total": 0
+      },
+      "graph_edges": {
+        "avg_per_scan": 18.0,
+        "last_scan": 18,
+        "total": 90
+      },
+      "no_pool": {
+        "avg_per_scan": 26.0,
+        "last_scan": 26,
+        "total": 130
+      },
+      "pools_attempted": {
+        "avg_per_scan": 0.0,
+        "last_scan": 0,
+        "total": 0
+      },
+      "quotes_accepted": {
+        "avg_per_scan": 18.0,
+        "last_scan": 18,
+        "total": 90
+      },
+      "quotes_attempted": {
+        "avg_per_scan": 90.0,
+        "last_scan": 90,
+        "total": 450
+      },
+      "quotes_failed": {
+        "avg_per_scan": 26.0,
+        "last_scan": 26,
+        "total": 130
+      },
+      "quotes_rejected": {
+        "avg_per_scan": null,
+        "last_scan": null,
+        "total": 0
+      },
+      "quotes_succeeded": {
+        "avg_per_scan": 64.0,
+        "last_scan": 64,
+        "total": 320
+      },
+      "reciprocity_rejected": {
+        "avg_per_scan": 46.0,
+        "last_scan": 46,
+        "total": 230
+      },
+      "rpc_errors": {
+        "avg_per_scan": 0.0,
+        "last_scan": 0,
+        "total": 0
+      },
+      "timeouts": {
+        "avg_per_scan": null,
+        "last_scan": null,
+        "total": 0
+      }
+    },
+    "sushiswap": {
+      "directions_attempted": {
+        "avg_per_scan": 0.0,
+        "last_scan": 0,
+        "total": 0
+      },
+      "fee_tiers_attempted": {
+        "avg_per_scan": 0.0,
+        "last_scan": 0,
+        "total": 0
+      },
+      "graph_edges": {
+        "avg_per_scan": 10.0,
+        "last_scan": 10,
+        "total": 50
+      },
+      "no_pool": {
+        "avg_per_scan": 38.0,
+        "last_scan": 38,
+        "total": 190
+      },
+      "pools_attempted": {
+        "avg_per_scan": 0.0,
+        "last_scan": 0,
+        "total": 0
+      },
+      "quotes_accepted": {
+        "avg_per_scan": 10.0,
+        "last_scan": 10,
+        "total": 50
+      },
+      "quotes_attempted": {
+        "avg_per_scan": 90.0,
+        "last_scan": 90,
+        "total": 450
+      },
+      "quotes_failed": {
+        "avg_per_scan": 38.0,
+        "last_scan": 38,
+        "total": 190
+      },
+      "quotes_rejected": {
+        "avg_per_scan": null,
+        "last_scan": null,
+        "total": 0
+      },
+      "quotes_succeeded": {
+        "avg_per_scan": 52.0,
+        "last_scan": 52,
+        "total": 260
+      },
+      "reciprocity_rejected": {
+        "avg_per_scan": 42.0,
+        "last_scan": 42,
+        "total": 210
+      },
+      "rpc_errors": {
+        "avg_per_scan": 0.0,
+        "last_scan": 0,
+        "total": 0
+      },
+      "timeouts": {
+        "avg_per_scan": null,
+        "last_scan": null,
+        "total": 0
+      }
+    },
+    "uniswap_v3": {
+      "directions_attempted": {
+        "avg_per_scan": 0.0,
+        "last_scan": 0,
+        "total": 0
+      },
+      "fee_tiers_attempted": {
+        "avg_per_scan": 270.0,
+        "last_scan": 270,
+        "total": 1350
+      },
+      "graph_edges": {
+        "avg_per_scan": 79.0,
+        "last_scan": 79,
+        "total": 395
+      },
+      "no_pool": {
+        "avg_per_scan": 119.0,
+        "last_scan": 119,
+        "total": 595
+      },
+      "pools_attempted": {
+        "avg_per_scan": 0.0,
+        "last_scan": 0,
+        "total": 0
+      },
+      "quotes_accepted": {
+        "avg_per_scan": 79.0,
+        "last_scan": 79,
+        "total": 395
+      },
+      "quotes_attempted": {
+        "avg_per_scan": 270.0,
+        "last_scan": 270,
+        "total": 1350
+      },
+      "quotes_failed": {
+        "avg_per_scan": 119.0,
+        "last_scan": 119,
+        "total": 595
+      },
+      "quotes_rejected": {
+        "avg_per_scan": null,
+        "last_scan": null,
+        "total": 0
+      },
+      "quotes_succeeded": {
+        "avg_per_scan": 151.0,
+        "last_scan": 151,
+        "total": 755
+      },
+      "reciprocity_rejected": {
+        "avg_per_scan": 72.0,
+        "last_scan": 72,
+        "total": 360
+      },
+      "rpc_errors": {
+        "avg_per_scan": 0.0,
+        "last_scan": 0,
+        "total": 0
+      },
+      "timeouts": {
+        "avg_per_scan": null,
+        "last_scan": null,
+        "total": 0
+      }
+    }
+  }
+}

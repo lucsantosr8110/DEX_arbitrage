@@ -85,10 +85,14 @@ pub struct PriceRow {
 pub struct TopSpreadRow {
     pub pair: String,
     pub tui_spread_pct: f64,
+    pub buy_dex: String,
+    pub sell_dex: String,
     /// None = sem reverse cotado (cycle_rate indisponível).
     pub cycle_rate: Option<f64>,
     /// None = sem 2-hop.
     pub net_usd: Option<f64>,
+    /// Quanto falta para o net projetado virar positivo (0 se já lucrativo).
+    pub distance_to_profit: f64,
     pub executable: bool,
     pub has_curve_leg: bool,
     pub outlier: Option<String>,
@@ -576,22 +580,36 @@ impl TuiApp {
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
-            Cell::from("Spread%").style(Style::default().fg(Color::Red)),
-            Cell::from("cyc").style(Style::default().fg(Color::Yellow)),
+            Cell::from("Legs").style(Style::default().fg(Color::Yellow)),
+            Cell::from("Gross%").style(Style::default().fg(Color::Red)),
             Cell::from("Net$").style(Style::default().fg(Color::Green)),
-            Cell::from("exec").style(Style::default().fg(Color::Gray)),
+            Cell::from("Dist$").style(Style::default().fg(Color::Gray)),
+            Cell::from("E").style(Style::default().fg(Color::Gray)),
         ]);
 
+        // Ordena por proximidade do lucro: positivos no topo, depois menor distância.
+        let mut sorted: Vec<&TopSpreadRow> = state.top_spreads.iter().collect();
+        sorted.sort_by(|a, b| {
+            a.distance_to_profit
+                .partial_cmp(&b.distance_to_profit)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    let na = a.net_usd.unwrap_or(f64::NEG_INFINITY);
+                    let nb = b.net_usd.unwrap_or(f64::NEG_INFINITY);
+                    nb.partial_cmp(&na).unwrap_or(std::cmp::Ordering::Equal)
+                })
+        });
+
         let mut rows: Vec<Row> = Vec::new();
-        for t in &state.top_spreads {
+        for t in sorted {
             let pair_display = if t.pair.chars().count() > 10 {
                 format!("{}..", t.pair.chars().take(10).collect::<String>())
             } else {
                 t.pair.clone()
             };
-            let cyc = match t.cycle_rate {
-                Some(c) if c.is_finite() => format!("{:.4}", c),
-                _ => "N/A".to_string(),
+            let gross = match t.cycle_rate {
+                Some(c) if c.is_finite() => (c - 1.0) * 100.0,
+                _ => 0.0,
             };
             let exec = if t.has_curve_leg {
                 "C".to_string() // perna Curve (vitrine)
@@ -600,27 +618,48 @@ impl TuiApp {
             } else {
                 "n".to_string()
             };
+            let net_color = if t.net_usd.map(|n| n > 0.0).unwrap_or(false) {
+                Color::Green
+            } else if t.net_usd.map(|n| n < 0.0).unwrap_or(false) {
+                Color::Red
+            } else {
+                Color::Gray
+            };
+            let dist_color = if t.distance_to_profit <= 0.0 {
+                Color::Green
+            } else if t.distance_to_profit < 0.5 {
+                Color::Yellow
+            } else {
+                Color::Red
+            };
             rows.push(Row::new(vec![
                 Cell::from(pair_display),
-                Cell::from(format!("{:.2}%", t.tui_spread_pct)),
-                Cell::from(cyc),
-                Cell::from(fmt_opt_net(t.net_usd)),
+                Cell::from(format!(
+                    "{}→{}",
+                    abbrev_venue(&t.buy_dex),
+                    abbrev_venue(&t.sell_dex)
+                )),
+                Cell::from(format!("{:.2}%", gross)),
+                Cell::from(fmt_opt_net(t.net_usd)).style(Style::default().fg(net_color)),
+                Cell::from(format!("{:.3}", t.distance_to_profit))
+                    .style(Style::default().fg(dist_color)),
                 Cell::from(exec),
             ]));
         }
 
         let widths = [
-            Constraint::Length(13), // Pair
-            Constraint::Length(9),  // Spread%
-            Constraint::Length(9),  // cyc
-            Constraint::Length(9),  // Net$
-            Constraint::Length(6),  // exec
+            Constraint::Length(12), // Pair
+            Constraint::Length(9),  // Legs
+            Constraint::Length(7),  // Gross%
+            Constraint::Length(7),  // Net$
+            Constraint::Length(7),  // Dist$
+            Constraint::Length(3),  // E
         ];
 
         let table = Table::new(rows, widths).header(header).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Top Spreads ")
+                .title(" Top Combos (dist p/ lucro) ")
                 .border_style(Style::default().fg(Color::Magenta)),
         );
 
@@ -754,6 +793,22 @@ fn fmt_opt_net(v: Option<f64>) -> String {
     match v {
         Some(n) if n.is_finite() => format!("${:.2}", n),
         _ => "-".to_string(),
+    }
+}
+
+/// Abrevia nome de DEX para caber na coluna Legs.
+fn abbrev_venue(v: &str) -> String {
+    let s = v.to_ascii_lowercase();
+    if s.contains("quickswap") {
+        "Q".to_string()
+    } else if s.contains("sushiswap") {
+        "S".to_string()
+    } else if s.contains("uniswap_v3") || s.contains("uniswap") {
+        "U".to_string()
+    } else if s.contains("curve") {
+        "C".to_string()
+    } else {
+        v.chars().take(3).collect::<String>()
     }
 }
 

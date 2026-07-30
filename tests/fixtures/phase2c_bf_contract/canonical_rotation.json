@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "scan_id": "fixture-single",
+  "chain": "polygon",
+  "captured_at": "2026-07-30T00:00:00Z",
+  "block_start": 1,
+  "block_end": 1,
+  "tokens": [
+    {"id": 0, "symbol": "USDC", "address": "0x0000000000000000000000000000000000000001", "decimals": 6},
+    {"id": 1, "symbol": "USDT", "address": "0x0000000000000000000000000000000000000002", "decimals": 6}
+  ],
+  "edges": [
+    {"id": 0, "from": 0, "to": 1, "token_in_symbol": "USDC", "token_out_symbol": "USDT", "token_in_address": "0x0000000000000000000000000000000000000001", "token_out_address": "0x0000000000000000000000000000000000000002", "dex_name": "QuickSwap", "protocol_version": "V2", "pool_address": null, "fee_tier": null, "rate": 1.1, "amount_in_raw": "1000000", "amount_out_raw": "1100000", "block_number": 1, "quote_source": "fixture", "reciprocity_status": "Accepted"},
+    {"id": 1, "from": 1, "to": 0, "token_in_symbol": "USDT", "token_out_symbol": "USDC", "token_in_address": "0x0000000000000000000000000000000000000002", "token_out_address": "0x0000000000000000000000000000000000000001", "dex_name": "SushiSwap", "protocol_version": "V2", "pool_address": null, "fee_tier": null, "rate": 1.0, "amount_in_raw": "1000000", "amount_out_raw": "1000000", "block_number": 1, "quote_source": "fixture", "reciprocity_status": "Accepted"}
+  ]
+}

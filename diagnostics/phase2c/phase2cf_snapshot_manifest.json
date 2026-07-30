@@ -1,0 +1,149 @@
+{
+  "schema_version": 1,
+  "snapshots": [
+    {
+      "graph_stage": "post",
+      "path": "diagnostics/phase2c/base_regenerated/snapshots/1_post_reciprocity.json",
+      "profile": "base",
+      "scan_id": 1,
+      "scan_sequence": 1,
+      "sha256": "b985a2fd45e5421f478d970b0b81c69e685fea8978e2386d2fc08fde0f292f8b",
+      "size_bytes": 34858
+    },
+    {
+      "graph_stage": "pre",
+      "path": "diagnostics/phase2c/base_regenerated/snapshots/1_pre_reciprocity.json",
+      "profile": "base",
+      "scan_id": 1,
+      "scan_sequence": 1,
+      "sha256": "21c5acfe85600eda9e45ffe7823adc9cc192bbbd7d113a91cec31caeca0c77b6",
+      "size_bytes": 60185
+    },
+    {
+      "graph_stage": "post",
+      "path": "diagnostics/phase2c/base_regenerated/snapshots/2_post_reciprocity.json",
+      "profile": "base",
+      "scan_id": 2,
+      "scan_sequence": 2,
+      "sha256": "c3e55baacd7c80cda0234923af48502e15a738be7de69df6d54dbda5cc7515a9",
+      "size_bytes": 34859
+    },
+    {
+      "graph_stage": "pre",
+      "path": "diagnostics/phase2c/base_regenerated/snapshots/2_pre_reciprocity.json",
+      "profile": "base",
+      "scan_id": 2,
+      "scan_sequence": 2,
+      "sha256": "c677015cae5775fde7396e9d3c0eef72b594bb8ee70aece0c95f24b8e4f604aa",
+      "size_bytes": 60186
+    },
+    {
+      "graph_stage": "post",
+      "path": "diagnostics/phase2c/base_regenerated/snapshots/3_post_reciprocity.json",
+      "profile": "base",
+      "scan_id": 3,
+      "scan_sequence": 3,
+      "sha256": "3528dfb17e7d6abc390858497ae707920ff681e299d51fce8d35563445be699c",
+      "size_bytes": 34857
+    },
+    {
+      "graph_stage": "pre",
+      "path": "diagnostics/phase2c/base_regenerated/snapshots/3_pre_reciprocity.json",
+      "profile": "base",
+      "scan_id": 3,
+      "scan_sequence": 3,
+      "sha256": "45340e21d9acca7b195931de5d8b203da6240b9f9479925e6b0187aa707b8115",
+      "size_bytes": 60182
+    },
+    {
+      "graph_stage": "post",
+      "path": "diagnostics/phase2c/liquid_regenerated/snapshots/1_post_reciprocity.json",
+      "profile": "liquid",
+      "scan_id": 1,
+      "scan_sequence": 1,
+      "sha256": "631b5811d9809b35f7f8e5ec23b8ee29b78036a1963a7837d449a75b7ed5084b",
+      "size_bytes": 70566
+    },
+    {
+      "graph_stage": "pre",
+      "path": "diagnostics/phase2c/liquid_regenerated/snapshots/1_pre_reciprocity.json",
+      "profile": "liquid",
+      "scan_id": 1,
+      "scan_sequence": 1,
+      "sha256": "cab40eb5af82d591e15f6f938d5bb4deb1b7d18fa2db55b39c47a30308f3e66b",
+      "size_bytes": 168146
+    },
+    {
+      "graph_stage": "post",
+      "path": "diagnostics/phase2c/liquid_regenerated/snapshots/2_post_reciprocity.json",
+      "profile": "liquid",
+      "scan_id": 2,
+      "scan_sequence": 2,
+      "sha256": "68283c78fad6d5c364e0174e1bb00d837f3f432d0353691eaf25268afa9f15ff",
+      "size_bytes": 70569
+    },
+    {
+      "graph_stage": "pre",
+      "path": "diagnostics/phase2c/liquid_regenerated/snapshots/2_pre_reciprocity.json",
+      "profile": "liquid",
+      "scan_id": 2,
+      "scan_sequence": 2,
+      "sha256": "c0b58fcb7d8803a53816a02cda9fb19efc5684b542be9f1007b7dbfb944ecf20",
+      "size_bytes": 168215
+    },
+    {
+      "graph_stage": "post",
+      "path": "diagnostics/phase2c/liquid_regenerated/snapshots/3_post_reciprocity.json",
+      "profile": "liquid",
+      "scan_id": 3,
+      "scan_sequence": 3,
+      "sha256": "5a68a5813fc4c4c9c1cba5995cbec2dd50ae2b06703b61160773572d572c3d85",
+      "size_bytes": 70548
+    },
+    {
+      "graph_stage": "pre",
+      "path": "diagnostics/phase2c/liquid_regenerated/snapshots/3_pre_reciprocity.json",
+      "profile": "liquid",
+      "scan_id": 3,
+      "scan_sequence": 3,
+      "sha256": "4f16b5618037052deea84bdc26b896d60fb01eef5e1d9beeb82d8f804a4f7663",
+      "size_bytes": 168203
+    },
+    {
+      "graph_stage": "post",
+      "path": "diagnostics/phase2c/liquid_regenerated/snapshots/4_post_reciprocity.json",
+      "profile": "liquid",
+      "scan_id": 4,
+      "scan_sequence": 4,
+      "sha256": "8069ab9daad1c05d8c3526b80eb11f81566902efe97ed9aade2830329e0eee50",
+      "size_bytes": 70546
+    },
+    {
+      "graph_stage": "pre",
+      "path": "diagnostics/phase2c/liquid_regenerated/snapshots/4_pre_reciprocity.json",
+      "profile": "liquid",
+      "scan_id": 4,
+      "scan_sequence": 4,
+      "sha256": "ab0c4c43934c3a834b389cb69405bdc88cff4a4b1fed8aaa0b07ed06d3cbeea4",
+      "size_bytes": 168224
+    },
+    {
+      "graph_stage": "post",
+      "path": "diagnostics/phase2c/liquid_regenerated/snapshots/5_post_reciprocity.json",
+      "profile": "liquid",
+      "scan_id": 5,
+      "scan_sequence": 5,
+      "sha256": "b261c9dad50333018c08b9df39803649878fc13602b059351bae2f362cf54f94",
+      "size_bytes": 70551
+    },
+    {
+      "graph_stage": "pre",
+      "path": "diagnostics/phase2c/liquid_regenerated/snapshots/5_pre_reciprocity.json",
+      "profile": "liquid",
+      "scan_id": 5,
+      "scan_sequence": 5,
+      "sha256": "978a8ee6a305a0e77dcf0f18fb6b8a0af4b6872661116f02ece82253c35f8327",
+      "size_bytes": 168209
+    }
+  ]
+}
