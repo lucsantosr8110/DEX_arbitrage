@@ -16,7 +16,7 @@ use ethers::types::U256;
 use std::collections::HashMap;
 use thiserror::Error;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PoolKind {
     /// x*y=k with a flat fee taken from `amount_in`. Exact reuse mutation
     /// supported.
@@ -53,7 +53,7 @@ impl PoolKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SimulatedPoolState {
     ConstantProduct {
         reserve_in: U256,

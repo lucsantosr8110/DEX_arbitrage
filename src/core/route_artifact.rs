@@ -14,12 +14,14 @@
 //! empty) — never a naive `split("||")`, which is ambiguous whenever a leg's
 //! own field (pool_address, fee_tier) is itself empty.
 
+use crate::core::executable_call::Venue;
 use anyhow::Result;
+use ethers::types::{Address, H256, U256};
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::Path;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RouteLeg {
     pub token_in: String,
     pub token_out: String,
@@ -29,7 +31,19 @@ pub struct RouteLeg {
     pub fee_tier: Option<u32>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StructuralRouteLeg {
+    pub leg_index: usize,
+    pub venue: Venue,
+    pub token_in: Address,
+    pub token_out: Address,
+    pub pool: Address,
+    pub router: Address,
+    pub spender: Address,
+    pub fee: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RouteReturnClass {
     /// Observed in >=2 independent Phase 2D-B scans of its profile.
     ReturnStable,
@@ -38,7 +52,7 @@ pub enum RouteReturnClass {
     ReturnInsufficientObservations,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StructuralRoute {
     /// Unique campaign identity: `"{profile}:{structural_cycle_key}"`. The
     /// same physical route can be independently observed and persisted under
@@ -58,6 +72,10 @@ pub struct StructuralRoute {
     pub pools: Vec<String>,
     pub venues: Vec<String>,
     pub gross_multiplier_avg: f64,
+    pub anchor_block: u64,
+    pub anchor_block_hash: H256,
+    pub route_input: U256,
+    pub executable_legs: Option<Vec<StructuralRouteLeg>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, serde::Serialize)]
@@ -245,6 +263,10 @@ pub fn load_structural_routes(path: &Path) -> Result<RouteLoadReport, RouteLoadE
                     pools: cycle.pools,
                     venues: cycle.venues,
                     gross_multiplier_avg: cycle.gross_multiplier_avg,
+                    anchor_block: 0,
+                    anchor_block_hash: H256::zero(),
+                    route_input: U256::zero(),
+                    executable_legs: None,
                 });
             }
             Err(error) => report.failures.push(RouteFailure { route_id, error }),
