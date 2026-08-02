@@ -3,7 +3,10 @@
 // ============================================================
 
 use anyhow::{Context, Result};
-use ethers::providers::{Middleware, Provider, Ws};
+use ethers::{
+    providers::{Http, Middleware, Provider, Ws},
+    types::{Address, H256, U256},
+};
 use futures::future;
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 #[cfg(unix)]
@@ -17,9 +20,19 @@ use tracing_subscriber::{
 };
 
 use flashloan_bot::{
-    config::Config,
-    core::bot::{execute_opportunity_standalone, should_try_next_opp, Bot},
+    config::{Config, DiscoveryEngine},
     core::flashloan::ArbitrageClient,
+    core::{
+        bot::{execute_opportunity_standalone, should_try_next_opp, Bot},
+        c2b_shadow_service::{should_schedule_anchor, CanonicalC2BOpportunitySource},
+        canonical_discovery::{
+            CanonicalDiscoveryConfig, CanonicalDiscoveryProfile, CanonicalDiscoveryService,
+        },
+        canonical_simulation::CanonicalSimulationClient,
+        execution_profile::{ExecutionProfile, MAIN_PENDING_DRY_RUN_PROFILE},
+        phase2d_anchor::AnchorBlock,
+        risk::{CanonicalRiskConfig, RiskManager},
+    },
     dex::{
         circuit_breaker::DexCircuitBreaker,
         manager::DexManager,
@@ -249,6 +262,140 @@ fn graceful_startup_cleanup(
     }
     tui_guard.join_with_timeout(Duration::from_secs(3));
     Ok(())
+}
+
+/// Canonical branch: no wallet, signer middleware, ArbitrageClient,
+/// broadcaster, approval, or transaction sender is ever constructed here.
+/// This is the *sole* execution authority when `DISCOVERY_ENGINE=canonical`:
+/// `main()` returns straight into this loop before the legacy
+/// `PRIVATE_KEY`/`ArbitrageEngine`/`select_opportunities`/execution path is
+/// ever reached, so there is no route back into legacy from here — a
+/// rejected or failed canonical round is logged and dropped, never
+/// retried against the legacy engine.
+async fn run_canonical_mode(
+    provider: Arc<Provider<Http>>,
+    cfg: Arc<Config>,
+    every_n_blocks: u64,
+    round_timeout: Duration,
+    mut shutdown_rx: broadcast::Receiver<()>,
+) -> Result<()> {
+    let profile = match cfg.c2b_shadow.canonical_discovery_profile.as_str() {
+        "liquid" => CanonicalDiscoveryProfile::Liquid,
+        _ => CanonicalDiscoveryProfile::Base,
+    };
+    let discovery_config = CanonicalDiscoveryConfig::from_config(
+        &cfg,
+        profile,
+        ExecutionProfile {
+            chain_id: 137,
+            profile_label: MAIN_PENDING_DRY_RUN_PROFILE.into(),
+        },
+    )
+    .context("CANONICAL_DISCOVERY_CONFIG_INVALID")?;
+    info!(
+        profile = discovery_config.profile.label(),
+        token_count = discovery_config.token_count(),
+        "CANONICAL_DISCOVERY_PROFILE_RESOLVED"
+    );
+    let service = CanonicalDiscoveryService::new(provider.clone(), 137, discovery_config);
+
+    // Dry-run-only thresholds. This phase never reaches a send/broadcast
+    // call under any strategy decision, so a mis-tuned economic threshold
+    // here only ever gates a pending `eth_call` simulation, never funds.
+    let risk_manager = RiskManager::new(cfg.risk.clone());
+    let canonical_risk_cfg = CanonicalRiskConfig {
+        absolute_min_profit_floor_raw: U256::zero(),
+        retention_bps: 0,
+        max_gas_raw: U256::from(50_000_000u64),
+        max_slippage_bps: 500,
+        max_anchor_age_blocks: 256,
+    };
+    // `executor_address` is a plain configured contract/EOA address used
+    // only as the pending `eth_call` `from` — never a wallet, never derived
+    // from a private key.
+    let executor_address: Address = cfg
+        .flashloan
+        .executor_address
+        .clone()
+        .unwrap_or_default()
+        .parse()
+        .unwrap_or_default();
+    let simulation_client = CanonicalSimulationClient::new(provider.clone(), executor_address);
+    let mut opportunity_source =
+        CanonicalC2BOpportunitySource::new(risk_manager, simulation_client, canonical_risk_cfg);
+
+    let mut last_scheduled: Option<(u64, H256)> = None;
+    let mut ticks = tokio::time::interval(Duration::from_secs(2));
+    let mut rounds_completed = 0u64;
+    info!(
+        "CANONICAL_STARTUP_WITHOUT_SIGNER=true CANONICAL_STARTUP_WITHOUT_BROADCASTER=true \
+         CANONICAL_MAX_CONCURRENT_ROUNDS=1 CANONICAL_PENDING_ANCHORS_MAX=1"
+    );
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => return Ok(()),
+            _ = shutdown_rx.recv() => {
+                info!("CANONICAL_SHUTDOWN_CANCELS_WORKER=true");
+                return Ok(());
+            }
+            _ = ticks.tick() => {
+                let number = match provider.get_block_number().await {
+                    Ok(number) => number.as_u64(),
+                    Err(error) => { warn!(error = %error, "canonical block poll failed"); continue; }
+                };
+                let block = match provider.get_block(number).await {
+                    Ok(Some(block)) => block,
+                    Ok(None) => continue,
+                    Err(error) => { warn!(error = %error, "canonical get_block failed"); continue; }
+                };
+                let Some(hash) = block.hash else { continue; };
+
+                // A reorg at the last-scheduled block number invalidates
+                // any anchor we might otherwise re-derive from it.
+                let reorg_detected = last_scheduled
+                    .is_some_and(|(last_number, last_hash)| number == last_number && hash != last_hash);
+                if reorg_detected {
+                    warn!(block = number, "CANONICAL_REORG_DETECTED");
+                }
+
+                let anchor = AnchorBlock { number, hash, selected_from_head: number, confirmation_lag: 0 };
+                if !should_schedule_anchor(
+                    last_scheduled.map(|(scheduled_number, _)| scheduled_number),
+                    &anchor,
+                    every_n_blocks.max(1),
+                    reorg_detected,
+                ) {
+                    debug!(block = number, "CANONICAL_SKIP_REASON=PREVIOUS_ANCHOR_TOO_RECENT_OR_REORG");
+                    continue;
+                }
+                last_scheduled = Some((number, hash));
+
+                match tokio::time::timeout(round_timeout, service.discover_at(anchor.clone())).await {
+                    Ok(Ok(result)) => {
+                        rounds_completed += 1;
+                        let round_evidence_count = result.round_evidence.len();
+                        let economically_positive = result.economically_positive.len();
+                        let shadow_result = opportunity_source
+                            .run_evidence_round(anchor, result.round_evidence, &cfg, number, true)
+                            .await;
+                        info!(
+                            round = rounds_completed,
+                            anchor = number,
+                            round_evidence = round_evidence_count,
+                            economically_positive,
+                            stable_opportunities = shadow_result.stable_opportunities.len(),
+                            risk_approved = shadow_result.risk_approvals.iter().filter(|(_, r)| r.is_ok()).count(),
+                            strategies_selected = shadow_result.strategy_decisions.len(),
+                            dry_run_results = shadow_result.execution_results.len(),
+                            "CANONICAL_ROUND_COMPLETE"
+                        );
+                    }
+                    Ok(Err(error)) => warn!(error = %error, "canonical round rejected; no legacy fallback"),
+                    Err(_) => warn!("canonical round timed out; no legacy fallback"),
+                }
+            }
+        }
+    }
 }
 
 // ============================================================
@@ -505,6 +652,34 @@ async fn main() -> Result<()> {
             "❌ Nenhum endpoint RPC utilizável. Defina BOT_RPC_ENDPOINTS no .env ou \
              [network].rpc_endpoints no config (placeholders ${{VAR}} não resolvidos não contam)."
         );
+    }
+
+    // Incompatible canonical configuration fails startup outright — never a
+    // silent downgrade to a smaller scope or a silent fallback to legacy.
+    // A no-op when the resolved engine is `Legacy`.
+    cfg_unlocked
+        .c2b_shadow
+        .validate_canonical_startup()
+        .context("❌ CANONICAL_STARTUP_CONFIG_INVALID")?;
+
+    // Decide engine before touching PRIVATE_KEY. Canonical has no route to
+    // the legacy SignerMiddleware bootstrap below.
+    if DiscoveryEngine::resolve(&cfg_unlocked.c2b_shadow.discovery_engine)
+        == DiscoveryEngine::Canonical
+    {
+        let endpoint = rpc_endpoints
+            .iter()
+            .find(|endpoint| is_usable_endpoint(endpoint))
+            .ok_or_else(|| anyhow::anyhow!("canonical mode has no usable read-only RPC"))?;
+        let provider = Arc::new(Provider::<Http>::try_from(endpoint.as_str())?);
+        return run_canonical_mode(
+            provider,
+            cfg_unlocked.clone(),
+            cfg_unlocked.c2b_shadow.shadow_every_n_blocks,
+            Duration::from_secs(cfg_unlocked.c2b_shadow.round_timeout_secs.max(1)),
+            shutdown_tx.subscribe(),
+        )
+        .await;
     }
 
     let private_key = std::env::var("PRIVATE_KEY").context("❌ PRIVATE_KEY ausente no .env")?;

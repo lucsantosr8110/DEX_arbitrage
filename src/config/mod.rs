@@ -92,6 +92,156 @@ pub struct WrapperConfig {
     pub contract_type: String,
 }
 
+/// Opt-in-only configuration for the isolated canonical C2B shadow service.
+/// Primary execution and broadcast are deliberately ignored by this phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscoveryEngine {
+    Canonical,
+    Legacy,
+}
+
+impl DiscoveryEngine {
+    pub fn resolve(configured: &str) -> Self {
+        match std::env::var("DISCOVERY_ENGINE")
+            .ok()
+            .as_deref()
+            .unwrap_or(configured)
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "legacy" => Self::Legacy,
+            _ => Self::Canonical,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct C2bShadowConfig {
+    /// `canonical` is production discovery authority for dry-run only.
+    /// `legacy` is explicit rollback; no automatic fallback is permitted.
+    #[serde(default = "default_discovery_engine")]
+    pub discovery_engine: String,
+    #[serde(default)]
+    pub shadow_enabled: bool,
+    #[serde(default)]
+    pub primary_enabled: bool,
+    #[serde(default)]
+    pub broadcast_enabled: bool,
+    #[serde(default = "default_shadow_every_n_blocks")]
+    pub shadow_every_n_blocks: u64,
+    #[serde(default = "default_round_timeout_secs")]
+    pub round_timeout_secs: u64,
+    #[serde(default)]
+    pub dedicated_rpc_url: Option<String>,
+    /// Token universe the live canonical-primary loop scans: `base` or
+    /// `liquid`. The diagnostic binary has its own `--profile` flag and
+    /// does not read this field.
+    #[serde(default = "default_canonical_discovery_profile")]
+    pub canonical_discovery_profile: String,
+    /// Structural invariant, not a tuning knob: canonical scheduling never
+    /// starts a new round while one is in flight. Any value other than `1`
+    /// fails startup rather than silently being ignored.
+    #[serde(default = "default_canonical_max_concurrent_rounds")]
+    pub canonical_max_concurrent_rounds: u32,
+    /// Same invariant for the pending-anchor queue: capacity is exactly
+    /// one by design (`CANONICAL_SKIP_REASON=PREVIOUS_ROUND_IN_FLIGHT`
+    /// covers everything beyond that), never a backlog.
+    #[serde(default = "default_canonical_pending_anchors_max")]
+    pub canonical_pending_anchors_max: u32,
+}
+
+fn default_discovery_engine() -> String {
+    "canonical".to_string()
+}
+
+fn default_shadow_every_n_blocks() -> u64 {
+    32
+}
+fn default_round_timeout_secs() -> u64 {
+    60
+}
+fn default_canonical_discovery_profile() -> String {
+    "base".to_string()
+}
+fn default_canonical_max_concurrent_rounds() -> u32 {
+    1
+}
+fn default_canonical_pending_anchors_max() -> u32 {
+    1
+}
+
+impl Default for C2bShadowConfig {
+    fn default() -> Self {
+        Self {
+            discovery_engine: default_discovery_engine(),
+            shadow_enabled: false,
+            primary_enabled: false,
+            broadcast_enabled: false,
+            shadow_every_n_blocks: default_shadow_every_n_blocks(),
+            round_timeout_secs: default_round_timeout_secs(),
+            dedicated_rpc_url: None,
+            canonical_discovery_profile: default_canonical_discovery_profile(),
+            canonical_max_concurrent_rounds: default_canonical_max_concurrent_rounds(),
+            canonical_pending_anchors_max: default_canonical_pending_anchors_max(),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum CanonicalStartupError {
+    #[error("CANONICAL_BROADCAST_ENABLED_INCOMPATIBLE: c2b_shadow.broadcast_enabled must be false in canonical mode")]
+    BroadcastEnabled,
+    #[error("CANONICAL_MAX_CONCURRENT_ROUNDS_INVALID: must be 1, got {0}")]
+    MaxConcurrentRounds(u32),
+    #[error("CANONICAL_PENDING_ANCHORS_MAX_INVALID: must be 1, got {0}")]
+    PendingAnchorsMax(u32),
+    #[error("CANONICAL_DISCOVERY_PROFILE_INVALID: {0:?} (expected \"base\" or \"liquid\")")]
+    UnknownProfile(String),
+}
+
+impl C2bShadowConfig {
+    /// C2C has no primary or broadcast mode. A config requesting either is
+    /// treated as disabled rather than as an escalation request.
+    pub fn shadow_runtime_enabled(&self) -> bool {
+        self.shadow_enabled && !self.primary_enabled && !self.broadcast_enabled
+    }
+
+    pub fn canonical_primary_enabled(&self) -> bool {
+        DiscoveryEngine::resolve(&self.discovery_engine) == DiscoveryEngine::Canonical
+            && !self.broadcast_enabled
+    }
+
+    /// Fails startup on any canonical-mode misconfiguration instead of
+    /// silently downgrading to a smaller scope or falling back to legacy.
+    /// Only runs when `DISCOVERY_ENGINE` actually resolves to `Canonical` —
+    /// legacy mode is unaffected by these invariants.
+    pub fn validate_canonical_startup(&self) -> Result<(), CanonicalStartupError> {
+        if DiscoveryEngine::resolve(&self.discovery_engine) != DiscoveryEngine::Canonical {
+            return Ok(());
+        }
+        if self.broadcast_enabled {
+            return Err(CanonicalStartupError::BroadcastEnabled);
+        }
+        if self.canonical_max_concurrent_rounds != 1 {
+            return Err(CanonicalStartupError::MaxConcurrentRounds(
+                self.canonical_max_concurrent_rounds,
+            ));
+        }
+        if self.canonical_pending_anchors_max != 1 {
+            return Err(CanonicalStartupError::PendingAnchorsMax(
+                self.canonical_pending_anchors_max,
+            ));
+        }
+        if !matches!(self.canonical_discovery_profile.as_str(), "base" | "liquid") {
+            return Err(CanonicalStartupError::UnknownProfile(
+                self.canonical_discovery_profile.clone(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ValidationConfig {
     /// Ativa paper validation (eth_call + balance delta, sem envio).
@@ -1323,7 +1473,7 @@ impl Default for ArbitrageConfig {
         Self {
             enabled: true,
             executor_address: None,
-            min_profit_threshold_usd: Some(0.10),
+            min_profit_threshold_usd: Some(0.0015),
             min_profit_percent: Some("0.05".to_string()),
             min_profit_absolute: "0.10".to_string(),
             min_spread_percent: "0.05".to_string(),
@@ -2558,6 +2708,8 @@ pub struct Config {
     #[serde(default)]
     pub wrapper: WrapperConfig,
     #[serde(default)]
+    pub c2b_shadow: C2bShadowConfig,
+    #[serde(default)]
     pub analytics: AnalyticsConfig,
     #[serde(default)]
     pub validation: ValidationConfig,
@@ -3003,6 +3155,7 @@ impl Default for Config {
             detection: DetectionConfig::default(),
             radar: RadarConfig::default(),
             wrapper: WrapperConfig::default(),
+            c2b_shadow: C2bShadowConfig::default(),
             analytics: AnalyticsConfig::default(),
             validation: ValidationConfig::default(),
             alerts: AlertsConfig::default(),
@@ -3023,6 +3176,95 @@ mod config_parser_tests {
     /// TOML completo e válido, a partir do default do próprio código.
     fn base_toml() -> String {
         toml::to_string(&Config::default()).expect("serialize default")
+    }
+
+    #[test]
+    fn c2b_shadow_defaults_to_fully_disabled() {
+        let cfg = C2bShadowConfig::default();
+        assert!(!cfg.shadow_enabled);
+        assert!(!cfg.primary_enabled);
+        assert!(!cfg.broadcast_enabled);
+        assert_eq!(cfg.shadow_every_n_blocks, 32);
+        assert_eq!(cfg.round_timeout_secs, 60);
+    }
+
+    #[test]
+    fn c2b_shadow_refuses_primary_or_broadcast_configuration() {
+        let mut cfg = C2bShadowConfig {
+            shadow_enabled: true,
+            ..Default::default()
+        };
+        assert!(cfg.shadow_runtime_enabled());
+        cfg.primary_enabled = true;
+        assert!(!cfg.shadow_runtime_enabled());
+        cfg.primary_enabled = false;
+        cfg.broadcast_enabled = true;
+        assert!(!cfg.shadow_runtime_enabled());
+    }
+
+    #[test]
+    fn canonical_defaults_pass_startup_validation() {
+        let cfg = C2bShadowConfig::default();
+        assert!(cfg.validate_canonical_startup().is_ok());
+    }
+
+    #[test]
+    fn canonical_broadcast_enabled_fails_startup() {
+        let cfg = C2bShadowConfig {
+            broadcast_enabled: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.validate_canonical_startup(),
+            Err(CanonicalStartupError::BroadcastEnabled)
+        );
+    }
+
+    #[test]
+    fn canonical_max_concurrent_rounds_above_one_fails_startup() {
+        let cfg = C2bShadowConfig {
+            canonical_max_concurrent_rounds: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.validate_canonical_startup(),
+            Err(CanonicalStartupError::MaxConcurrentRounds(2))
+        );
+    }
+
+    #[test]
+    fn canonical_pending_anchors_max_above_one_fails_startup() {
+        let cfg = C2bShadowConfig {
+            canonical_pending_anchors_max: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.validate_canonical_startup(),
+            Err(CanonicalStartupError::PendingAnchorsMax(2))
+        );
+    }
+
+    #[test]
+    fn canonical_unknown_profile_fails_startup() {
+        let cfg = C2bShadowConfig {
+            canonical_discovery_profile: "exotic".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.validate_canonical_startup(),
+            Err(CanonicalStartupError::UnknownProfile("exotic".into()))
+        );
+    }
+
+    #[test]
+    fn legacy_engine_skips_canonical_startup_validation() {
+        let cfg = C2bShadowConfig {
+            discovery_engine: "legacy".into(),
+            broadcast_enabled: true,
+            canonical_max_concurrent_rounds: 99,
+            ..Default::default()
+        };
+        assert!(cfg.validate_canonical_startup().is_ok());
     }
 
     #[test]

@@ -40,24 +40,197 @@ use ethers::{
 };
 use std::{
     collections::{BTreeMap, HashMap},
-    path::PathBuf,
     sync::Arc,
     time::Duration,
 };
+use thiserror::Error;
 
 pub type PinnedAnchor = AnchorBlock;
 
 // ============================================================
-// Operational pipeline constants (token universe, venue defaults)
+// Operational pipeline constants
 // ============================================================
 
-const BASE_TOKENS: &[&str] = &["USDC", "USDT", "WMATIC", "WETH", "WBTC"];
-const DISCOVERY_PROFILE: &str = "base";
 const UNISWAP_V3_QUOTER: &str = "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6";
 const QUOTE_TIMEOUT: Duration = Duration::from_secs(20);
 const NOTIONAL_USD: f64 = 100.0;
 const V3_FEE_TIERS: [u32; 3] = [500, 3000, 10_000];
 const CANONICAL_CALLER: fn() -> Address = || Address::from_low_u64_be(1);
+
+// ============================================================
+// Typed discovery-universe configuration. Resolved once, from real
+// `Config` data, before any RPC call — `discover_at` never resolves an
+// address from a symbol or picks a venue by string match.
+// ============================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanonicalDiscoveryProfile {
+    Base,
+    Liquid,
+}
+
+impl CanonicalDiscoveryProfile {
+    /// Diagnostic/route-id label only — never used to resolve an address.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Base => "base",
+            Self::Liquid => "liquid",
+        }
+    }
+}
+
+/// `Address` is the executable identity; `symbol` exists for diagnostics
+/// and presentation only and is never used to resolve execution state.
+#[derive(Debug, Clone)]
+pub struct CanonicalToken {
+    pub address: Address,
+    pub decimals: u8,
+    pub symbol: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CanonicalVenueConfig {
+    pub venue: Venue,
+    pub router: Address,
+    pub factory: Address,
+    /// `Some` only for `Venue::UniswapV3`.
+    pub quoter: Option<Address>,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum CanonicalDiscoveryConfigError {
+    #[error("CANONICAL_CONFIG_TOKEN_MISSING_ADDRESS: {0}")]
+    MissingAddress(String),
+    #[error("CANONICAL_CONFIG_TOKEN_MISSING_DECIMALS: {0}")]
+    MissingDecimals(String),
+    #[error("CANONICAL_CONFIG_EMPTY_TOKEN_UNIVERSE")]
+    EmptyUniverse,
+    #[error("CANONICAL_CONFIG_NO_VENUES_RESOLVED")]
+    NoVenues,
+}
+
+/// Immutable, fully-typed discovery-universe configuration. Built once
+/// (typically at process startup) from real `Config` data; `discover_at`
+/// only ever reads from this, never from `Config` or a raw symbol again.
+#[derive(Debug, Clone)]
+pub struct CanonicalDiscoveryConfig {
+    pub profile: CanonicalDiscoveryProfile,
+    pub tokens: Vec<CanonicalToken>,
+    pub venues: Vec<CanonicalVenueConfig>,
+    pub execution_profile: ExecutionProfile,
+}
+
+impl CanonicalDiscoveryConfig {
+    const BASE_TOKENS: &'static [&'static str] = &["USDC", "USDT", "WMATIC", "WETH", "WBTC"];
+    // `UNI`/`LDO` are listed as intended midcap tokens elsewhere in
+    // `config.toml` (`[arbitrage.triangular].midcaps`) but have no resolved
+    // `[pairs.tokens]` address there yet — an existing config gap, not
+    // something this service fabricates an address for. `Liquid` stays
+    // real and strictly a superset of `Base` using only tokens with a
+    // genuine on-chain address already configured.
+    const LIQUID_TOKENS: &'static [&'static str] = &[
+        "USDC", "USDT", "WMATIC", "WETH", "WBTC", "DAI", "LINK", "AAVE",
+    ];
+    const KNOWN_VENUES: &'static [(&'static str, Venue)] = &[
+        ("QuickSwap", Venue::QuickSwap),
+        ("SushiSwap", Venue::SushiSwap),
+        ("UniswapV3", Venue::UniswapV3),
+    ];
+
+    /// The only place a token symbol is ever resolved to an `Address`. Runs
+    /// once against static `Config` data — no RPC, no per-round lookup.
+    /// Fails closed: an incomplete/invalid universe never silently falls
+    /// back to a smaller or different one.
+    pub fn from_config(
+        cfg: &Config,
+        profile: CanonicalDiscoveryProfile,
+        execution_profile: ExecutionProfile,
+    ) -> Result<Self, CanonicalDiscoveryConfigError> {
+        let symbols: &[&str] = match profile {
+            CanonicalDiscoveryProfile::Base => Self::BASE_TOKENS,
+            CanonicalDiscoveryProfile::Liquid => Self::LIQUID_TOKENS,
+        };
+        let mut tokens = Vec::with_capacity(symbols.len());
+        for symbol in symbols {
+            let address = cfg.addresses.get(*symbol).copied().ok_or_else(|| {
+                CanonicalDiscoveryConfigError::MissingAddress((*symbol).to_string())
+            })?;
+            let decimals = cfg
+                .pairs
+                .metadata
+                .get(*symbol)
+                .and_then(|m| m.decimals)
+                .ok_or_else(|| {
+                    CanonicalDiscoveryConfigError::MissingDecimals((*symbol).to_string())
+                })?;
+            tokens.push(CanonicalToken {
+                address,
+                decimals,
+                symbol: (*symbol).to_string(),
+            });
+        }
+        if tokens.is_empty() {
+            return Err(CanonicalDiscoveryConfigError::EmptyUniverse);
+        }
+
+        let mut venues = Vec::new();
+        for (name, venue) in Self::KNOWN_VENUES.iter().copied() {
+            let Some(dex) = cfg.dex.iter().find(|d| d.name == name) else {
+                continue;
+            };
+            let Ok(router) = dex.router_address.parse::<Address>() else {
+                continue;
+            };
+            let Some(factory) = dex
+                .factory_address
+                .clone()
+                .and_then(|s| s.parse::<Address>().ok())
+            else {
+                continue;
+            };
+            let quoter = (venue == Venue::UniswapV3).then(|| {
+                dex.quoter_address
+                    .clone()
+                    .and_then(|s| s.parse::<Address>().ok())
+                    .or_else(|| UNISWAP_V3_QUOTER.parse::<Address>().ok())
+            });
+            venues.push(CanonicalVenueConfig {
+                venue,
+                router,
+                factory,
+                quoter: quoter.flatten(),
+            });
+        }
+        if venues.is_empty() {
+            return Err(CanonicalDiscoveryConfigError::NoVenues);
+        }
+
+        Ok(Self {
+            profile,
+            tokens,
+            venues,
+            execution_profile,
+        })
+    }
+
+    pub fn token_count(&self) -> usize {
+        self.tokens.len()
+    }
+
+    /// Deterministic diagnostic fingerprint of the resolved token universe.
+    /// Safe to print/persist: it is a hash, never a raw RPC endpoint.
+    pub fn token_addresses_hash(&self) -> H256 {
+        let mut addresses: Vec<Address> = self.tokens.iter().map(|t| t.address).collect();
+        addresses.sort();
+        H256::from(ethers::utils::keccak256(
+            format!("{addresses:?}").as_bytes(),
+        ))
+    }
+
+    fn venue_config(&self, venue: Venue) -> Option<&CanonicalVenueConfig> {
+        self.venues.iter().find(|v| v.venue == venue)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalRejection {
@@ -371,6 +544,7 @@ async fn requote_leg<M: Middleware>(
 pub struct CanonicalDiscoveryService<M> {
     provider: Arc<M>,
     expected_chain_id: u64,
+    config: CanonicalDiscoveryConfig,
 }
 
 impl<M> CanonicalDiscoveryService<M>
@@ -378,11 +552,16 @@ where
     M: Middleware,
     M::Error: 'static,
 {
-    pub fn new(provider: Arc<M>, expected_chain_id: u64) -> Self {
+    pub fn new(provider: Arc<M>, expected_chain_id: u64, config: CanonicalDiscoveryConfig) -> Self {
         Self {
             provider,
             expected_chain_id,
+            config,
         }
+    }
+
+    pub fn config(&self) -> &CanonicalDiscoveryConfig {
+        &self.config
     }
 
     pub async fn discover_at(&self, anchor: PinnedAnchor) -> Result<CanonicalDiscoveryResult> {
@@ -402,12 +581,7 @@ where
             return Err(anyhow!("CANONICAL_ANCHOR_HASH_MISMATCH"));
         }
 
-        let cfg = Config::from_file(PathBuf::from("config/config.toml"))?
-            .lock()
-            .await
-            .clone();
-        let symbols: Vec<String> = BASE_TOKENS.iter().map(|s| s.to_string()).collect();
-        let profile = DISCOVERY_PROFILE;
+        let profile = self.config.profile.label();
 
         let mut stats = DiscoveryStats::default();
         let mut rejections: Vec<CanonicalRejection> = Vec::new();
@@ -415,20 +589,16 @@ where
         let mut executable_routes = Vec::new();
         let mut economically_positive = Vec::new();
 
-        // ---- Pool/token metadata: real on-chain code hash + decimals,
-        // pinned to the anchor block. ----
+        // ---- Pool/token metadata: real on-chain code hash, pinned to the
+        // anchor block. Address/decimals/symbol are already resolved and
+        // typed in `self.config.tokens` — no symbol/address lookup happens
+        // here or anywhere else in this method. ----
         let mut token_meta: HashMap<String, TokenMetadata> = HashMap::new();
-        for symbol in &symbols {
-            let Some(addr) = cfg.addresses.get(symbol).copied() else {
-                continue;
-            };
-            let Some(decimals) = cfg.pairs.metadata.get(symbol).and_then(|m| m.decimals) else {
-                continue;
-            };
+        for token in &self.config.tokens {
             let Ok(code) = self
                 .provider
                 .get_code(
-                    addr,
+                    token.address,
                     Some(BlockId::Number(BlockNumber::Number(anchor.number.into()))),
                 )
                 .await
@@ -439,11 +609,11 @@ where
                 continue;
             };
             token_meta.insert(
-                symbol.clone(),
+                token.symbol.clone(),
                 TokenMetadata {
-                    address: addr,
-                    symbol: symbol.clone(),
-                    decimals,
+                    address: token.address,
+                    symbol: token.symbol.clone(),
+                    decimals: token.decimals,
                     code_hash: hash,
                     anchor_block: anchor.number,
                 },
@@ -453,26 +623,16 @@ where
             .values()
             .map(|t| (t.address, t.clone()))
             .collect();
+        let symbols: Vec<String> = self
+            .config
+            .tokens
+            .iter()
+            .map(|t| t.symbol.clone())
+            .collect();
 
-        let quickswap_dex = cfg.dex.iter().find(|d| d.name == "QuickSwap");
-        let sushiswap_dex = cfg.dex.iter().find(|d| d.name == "SushiSwap");
-        let v3_dex = cfg.dex.iter().find(|d| d.name == "UniswapV3");
-        let quickswap_router = quickswap_dex.and_then(|d| d.router_address.parse::<Address>().ok());
-        let quickswap_factory = quickswap_dex
-            .and_then(|d| d.factory_address.clone())
-            .and_then(|s| s.parse::<Address>().ok());
-        let sushiswap_router = sushiswap_dex.and_then(|d| d.router_address.parse::<Address>().ok());
-        let sushiswap_factory = sushiswap_dex
-            .and_then(|d| d.factory_address.clone())
-            .and_then(|s| s.parse::<Address>().ok());
-        let v3_router = v3_dex.and_then(|d| d.router_address.parse::<Address>().ok());
-        let v3_factory = v3_dex
-            .and_then(|d| d.factory_address.clone())
-            .and_then(|s| s.parse::<Address>().ok());
-        let v3_quoter = v3_dex
-            .and_then(|d| d.quoter_address.clone())
-            .and_then(|s| s.parse::<Address>().ok())
-            .or_else(|| UNISWAP_V3_QUOTER.parse::<Address>().ok());
+        let quickswap = self.config.venue_config(Venue::QuickSwap);
+        let sushiswap = self.config.venue_config(Venue::SushiSwap);
+        let v3 = self.config.venue_config(Venue::UniswapV3);
 
         // ---- Phase A: independent single-leg quotes -> typed edges.
         // Curve is intentionally never quoted here. ----
@@ -493,12 +653,12 @@ where
                 stats.quotes_attempted += 1;
                 let amount_in = human_to_atomic(NOTIONAL_USD, meta_in.decimals);
 
-                if let (Some(router), Some(factory)) = (quickswap_router, quickswap_factory) {
+                if let Some(cfg) = quickswap {
                     if let Some(edge) = quote_v2_edge(
                         &self.provider,
                         Venue::QuickSwap,
-                        router,
-                        factory,
+                        cfg.router,
+                        cfg.factory,
                         &meta_in,
                         &meta_out,
                         amount_in,
@@ -511,12 +671,12 @@ where
                         graph.push(edge);
                     }
                 }
-                if let (Some(router), Some(factory)) = (sushiswap_router, sushiswap_factory) {
+                if let Some(cfg) = sushiswap {
                     if let Some(edge) = quote_v2_edge(
                         &self.provider,
                         Venue::SushiSwap,
-                        router,
-                        factory,
+                        cfg.router,
+                        cfg.factory,
                         &meta_in,
                         &meta_out,
                         amount_in,
@@ -529,14 +689,13 @@ where
                         graph.push(edge);
                     }
                 }
-                if let (Some(router), Some(factory), Some(quoter)) =
-                    (v3_router, v3_factory, v3_quoter)
-                {
+                if let Some(cfg) = v3.filter(|cfg| cfg.quoter.is_some()) {
+                    let quoter = cfg.quoter.expect("filtered on Some");
                     for fee in V3_FEE_TIERS {
                         if let Some(edge) = quote_v3_edge(
                             &self.provider,
-                            router,
-                            factory,
+                            cfg.router,
+                            cfg.factory,
                             quoter,
                             fee,
                             &meta_in,
@@ -868,15 +1027,13 @@ where
                         context_hash: context.context_hash,
                         route_plan: plan.clone(),
                         amount_in: route.route_input,
-                        execution_profile: ExecutionProfile {
-                            chain_id: self.expected_chain_id,
-                            profile_label: profile.to_string(),
-                        },
+                        execution_profile: self.config.execution_profile.clone(),
                         gross_pnl_atomic: Some(result.gross_pnl_atomic),
                         gas_used_total: 0,
                         orchestrator_evidence: None,
                         rejected_registry_hit: false,
                         economics: Some(result.clone()),
+                        leg_quotes: leg_quotes.clone(),
                     };
                     let is_positive = result.net_pnl_atomic > 0;
                     round_evidence.push(evidence);
@@ -913,6 +1070,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DexEntry;
+
     #[test]
     fn pinned_anchor_is_core_api() {
         let anchor = PinnedAnchor {
@@ -922,5 +1081,174 @@ mod tests {
             confirmation_lag: 0,
         };
         assert_ne!(anchor.hash, H256::zero());
+    }
+
+    fn a(n: u64) -> Address {
+        Address::from_low_u64_be(n)
+    }
+
+    fn exec_profile() -> ExecutionProfile {
+        ExecutionProfile {
+            chain_id: 137,
+            profile_label: "test".into(),
+        }
+    }
+
+    /// Builds a config with real (distinct) addresses for every
+    /// `Base`/`Liquid` symbol plus one resolvable venue, so `from_config`
+    /// can succeed for both profiles without touching disk.
+    fn config_fixture() -> Config {
+        let mut cfg = Config::default();
+        let symbols = [
+            "USDC", "USDT", "WMATIC", "WETH", "WBTC", "DAI", "LINK", "AAVE",
+        ];
+        for (i, symbol) in symbols.iter().enumerate() {
+            cfg.addresses
+                .insert((*symbol).to_string(), a(100 + i as u64));
+            cfg.pairs.metadata.insert(
+                (*symbol).to_string(),
+                crate::config::TokenMetadata {
+                    symbol: (*symbol).to_string(),
+                    name: None,
+                    decimals: Some(18),
+                    coingecko_id: None,
+                    category: None,
+                },
+            );
+        }
+        cfg.dex.push(DexEntry {
+            name: "QuickSwap".into(),
+            router_address: format!("{:#x}", a(1)),
+            factory_address: Some(format!("{:#x}", a(2))),
+            enabled: true,
+            ..Default::default()
+        });
+        cfg
+    }
+
+    #[test]
+    fn base_profile_builds_base_universe() {
+        let cfg = config_fixture();
+        let config = CanonicalDiscoveryConfig::from_config(
+            &cfg,
+            CanonicalDiscoveryProfile::Base,
+            exec_profile(),
+        )
+        .unwrap();
+        assert_eq!(config.token_count(), 5);
+        let symbols: std::collections::BTreeSet<_> =
+            config.tokens.iter().map(|t| t.symbol.as_str()).collect();
+        assert_eq!(
+            symbols,
+            ["USDC", "USDT", "WMATIC", "WETH", "WBTC"]
+                .into_iter()
+                .collect()
+        );
+    }
+
+    #[test]
+    fn liquid_profile_builds_liquid_universe() {
+        let cfg = config_fixture();
+        let config = CanonicalDiscoveryConfig::from_config(
+            &cfg,
+            CanonicalDiscoveryProfile::Liquid,
+            exec_profile(),
+        )
+        .unwrap();
+        assert_eq!(config.token_count(), 8);
+    }
+
+    #[test]
+    fn base_and_liquid_profiles_are_not_cosmetic() {
+        let cfg = config_fixture();
+        let base = CanonicalDiscoveryConfig::from_config(
+            &cfg,
+            CanonicalDiscoveryProfile::Base,
+            exec_profile(),
+        )
+        .unwrap();
+        let liquid = CanonicalDiscoveryConfig::from_config(
+            &cfg,
+            CanonicalDiscoveryProfile::Liquid,
+            exec_profile(),
+        )
+        .unwrap();
+        // Materially different token counts and address sets, not just a
+        // different label on the same underlying universe.
+        assert_ne!(base.token_count(), liquid.token_count());
+        assert_ne!(base.token_addresses_hash(), liquid.token_addresses_hash());
+        let base_addrs: std::collections::BTreeSet<_> =
+            base.tokens.iter().map(|t| t.address).collect();
+        let liquid_addrs: std::collections::BTreeSet<_> =
+            liquid.tokens.iter().map(|t| t.address).collect();
+        assert!(liquid_addrs.is_superset(&base_addrs));
+        assert!(liquid_addrs.len() > base_addrs.len());
+    }
+
+    #[test]
+    fn base_profile_is_not_hardcoded() {
+        // Same symbol, different configured address -> the resolved
+        // CanonicalToken follows the real config, proving the universe is
+        // read from `Config`, not compiled in as a fixed address.
+        let mut cfg = config_fixture();
+        cfg.addresses.insert("USDC".to_string(), a(999));
+        let config = CanonicalDiscoveryConfig::from_config(
+            &cfg,
+            CanonicalDiscoveryProfile::Base,
+            exec_profile(),
+        )
+        .unwrap();
+        let usdc = config.tokens.iter().find(|t| t.symbol == "USDC").unwrap();
+        assert_eq!(usdc.address, a(999));
+    }
+
+    #[test]
+    fn discover_at_does_not_fallback_to_base_on_incomplete_liquid_config() {
+        let mut cfg = config_fixture();
+        cfg.addresses.remove("LINK");
+        let result = CanonicalDiscoveryConfig::from_config(
+            &cfg,
+            CanonicalDiscoveryProfile::Liquid,
+            exec_profile(),
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            CanonicalDiscoveryConfigError::MissingAddress("LINK".to_string())
+        );
+    }
+
+    #[test]
+    fn empty_dex_config_fails_closed_with_no_silent_venue_fallback() {
+        let mut cfg = config_fixture();
+        cfg.dex.clear();
+        let result = CanonicalDiscoveryConfig::from_config(
+            &cfg,
+            CanonicalDiscoveryProfile::Base,
+            exec_profile(),
+        );
+        assert_eq!(result.unwrap_err(), CanonicalDiscoveryConfigError::NoVenues);
+    }
+
+    #[test]
+    fn token_symbol_is_not_execution_identity() {
+        // `symbol` is presentation-only: the resolved `Address` — not the
+        // string — is what a caller must use to reason about identity.
+        let cfg = config_fixture();
+        let config = CanonicalDiscoveryConfig::from_config(
+            &cfg,
+            CanonicalDiscoveryProfile::Base,
+            exec_profile(),
+        )
+        .unwrap();
+        let mut poisoned = config.clone();
+        for token in &mut poisoned.tokens {
+            token.symbol = "NOT_A_REAL_SYMBOL".into();
+        }
+        // Corrupting every symbol string leaves the address-derived
+        // fingerprint (the only thing execution can key off of) unchanged.
+        assert_eq!(
+            config.token_addresses_hash(),
+            poisoned.token_addresses_hash()
+        );
     }
 }

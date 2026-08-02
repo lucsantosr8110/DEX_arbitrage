@@ -8,17 +8,18 @@ use crate::{
     core::{
         arbitrage::ArbitrageEngine,
         economics,
+        executable_call::Venue,
+        executable_opportunity::ExecutableOpportunity,
         fixed_usd::{self, UsdE8},
         gas::{GasEstimator, GasStrategyKind},
         paper_validation::{self, PaperValidationHub},
+        risk::RiskApproval,
         types::{ArbitrageOpportunity, BundleResult, ExecutionOutcome},
     },
     infra::metrics,
     utils::u256_to_f64,
     AppMiddleware,
 };
-use ethers::abi::Tokenizable;
-
 use anyhow::{anyhow, bail, Context, Result};
 use ethers::{
     abi::{encode, Detokenize, Token},
@@ -45,6 +46,53 @@ pub enum ExecutionStrategy {
     Flashloan,
     WrapperFlashloan,
     Skip,
+}
+
+/// Decision made by the canonical shadow path. It is intentionally separate
+/// from the legacy `ExecutionStrategy`, whose paths may ultimately broadcast.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CanonicalStrategyDecision {
+    Direct,
+    Flashloan,
+    WrapperFlashloan,
+    Skip(CanonicalSkipReason),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CanonicalSkipReason {
+    UnsupportedVenue,
+    FlashloanDisabled,
+    WrapperDisabled,
+    InsufficientRiskApproval,
+}
+
+/// Pure strategy selection for canonical opportunities. This function only
+/// classifies a route; it has no client, signer, RPC, or broadcaster access.
+pub fn determine_execution_strategy_canonical(
+    opportunity: &ExecutableOpportunity,
+    approval: &RiskApproval,
+    cfg: &Config,
+) -> CanonicalStrategyDecision {
+    if approval.min_profit_raw.is_zero() || approval.max_gas_raw.is_zero() {
+        return CanonicalStrategyDecision::Skip(CanonicalSkipReason::InsufficientRiskApproval);
+    }
+    if opportunity.route_plan.legs.iter().any(|leg| {
+        !matches!(
+            leg.venue,
+            Venue::QuickSwap | Venue::SushiSwap | Venue::UniswapV3
+        )
+    }) {
+        return CanonicalStrategyDecision::Skip(CanonicalSkipReason::UnsupportedVenue);
+    }
+    if cfg.flashloan.enabled && cfg.execution.use_flashloan {
+        if cfg.wrapper.enabled {
+            CanonicalStrategyDecision::WrapperFlashloan
+        } else {
+            CanonicalStrategyDecision::Flashloan
+        }
+    } else {
+        CanonicalStrategyDecision::Direct
+    }
 }
 
 impl std::fmt::Display for ExecutionStrategy {

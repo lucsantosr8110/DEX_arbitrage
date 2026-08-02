@@ -14,9 +14,14 @@
 
 use ethers::providers::{Http, Middleware, Provider};
 use ethers::types::H256;
-use flashloan_bot::core::canonical_discovery::CanonicalDiscoveryService;
+use flashloan_bot::config::Config;
+use flashloan_bot::core::canonical_discovery::{
+    CanonicalDiscoveryConfig, CanonicalDiscoveryProfile, CanonicalDiscoveryService,
+};
+use flashloan_bot::core::execution_profile::{ExecutionProfile, MAIN_PENDING_DRY_RUN_PROFILE};
 use flashloan_bot::core::fork_route_executor::{spawn_anvil, wait_for_anvil_ready};
 use flashloan_bot::core::phase2d_anchor::AnchorBlock;
+use std::path::PathBuf;
 use std::time::Duration;
 
 const ANCHOR_BLOCK: u64 = 91_149_850;
@@ -65,7 +70,21 @@ async fn discover_at_runs_the_real_operational_pipeline() {
         confirmation_lag: 0,
     };
 
-    let service = CanonicalDiscoveryService::new(provider, CHAIN_ID);
+    let cfg = Config::from_file(PathBuf::from("config/config.toml"))
+        .expect("config/config.toml must load")
+        .lock()
+        .await
+        .clone();
+    let discovery_config = CanonicalDiscoveryConfig::from_config(
+        &cfg,
+        CanonicalDiscoveryProfile::Base,
+        ExecutionProfile {
+            chain_id: CHAIN_ID,
+            profile_label: MAIN_PENDING_DRY_RUN_PROFILE.into(),
+        },
+    )
+    .expect("base profile must resolve a real token/venue universe");
+    let service = CanonicalDiscoveryService::new(provider, CHAIN_ID, discovery_config);
     let result = service
         .discover_at(anchor)
         .await

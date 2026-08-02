@@ -6,17 +6,52 @@
 // ============================================================
 
 use crate::core::economics;
+use crate::core::executable_opportunity::ExecutableOpportunity;
 use crate::core::types::{
     ArbitrageOpportunity, FlashloanOpportunity, RiskAssessment, RiskConfig, RiskFactor,
 };
 use crate::infra::metrics;
 use crate::utils::validate_price;
+use ethers::types::U256;
 use once_cell::sync::OnceCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, info};
+
+/// Integer-only controls for the canonical shadow decision path.
+#[derive(Debug, Clone)]
+pub struct CanonicalRiskConfig {
+    pub absolute_min_profit_floor_raw: U256,
+    pub retention_bps: u32,
+    pub max_gas_raw: U256,
+    pub max_slippage_bps: u32,
+    pub max_anchor_age_blocks: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RiskApproval {
+    pub min_profit_raw: U256,
+    pub max_gas_raw: U256,
+    pub max_slippage_bps: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CanonicalRiskRejection {
+    StaleAnchor,
+    InvalidContextHash,
+    UnstableRoute,
+    NonPositiveNetPnl,
+    GasExceedsLimit,
+    SlippageExceedsLimit,
+    EthCallFailed,
+    PreflightFailed,
+    TraceFailed,
+    IncompleteQuotes,
+    RouteDiscontinuity,
+    RejectedRegistryHit,
+}
 
 // ============================================================
 // 🔒 RISK_MANAGER Global
@@ -431,6 +466,65 @@ impl RiskManager {
             adaptive_mode: self.adaptive_mode.load(Ordering::Relaxed),
             config: self.config.clone(),
         }
+    }
+
+    /// Fail-closed canonical approval. This path is purely an assessment: it
+    /// cannot sign or broadcast a transaction.
+    pub fn assess_executable_opportunity(
+        &self,
+        opportunity: &ExecutableOpportunity,
+        cfg: &CanonicalRiskConfig,
+        current_head_block: u64,
+    ) -> Result<RiskApproval, Vec<CanonicalRiskRejection>> {
+        let mut rejections = Vec::new();
+        if current_head_block.saturating_sub(opportunity.anchor_block) > cfg.max_anchor_age_blocks {
+            rejections.push(CanonicalRiskRejection::StaleAnchor);
+        }
+        if opportunity.context_hash.is_zero() || opportunity.evidence_hash.is_zero() {
+            rejections.push(CanonicalRiskRejection::InvalidContextHash);
+        }
+        let [first, second, third] = opportunity.stability.anchor_blocks;
+        if !(first < second && second < third) {
+            rejections.push(CanonicalRiskRejection::UnstableRoute);
+        }
+        if opportunity.net_pnl <= 0 {
+            rejections.push(CanonicalRiskRejection::NonPositiveNetPnl);
+        }
+        if opportunity.gas_estimate > cfg.max_gas_raw {
+            rejections.push(CanonicalRiskRejection::GasExceedsLimit);
+        }
+        // Pending dry-run obtains its eth_call evidence only after risk and
+        // strategy select a bounded route. Fork-only receipt/trace gates do
+        // not apply to this operational profile and must never be fabricated.
+        if opportunity.execution_profile.requires_fork_evidence() {
+            if !opportunity.evidence.eth_call_pass {
+                rejections.push(CanonicalRiskRejection::EthCallFailed);
+            }
+            if !opportunity.evidence.preflight_pass {
+                rejections.push(CanonicalRiskRejection::PreflightFailed);
+            }
+            if !opportunity.evidence.trace_validated {
+                rejections.push(CanonicalRiskRejection::TraceFailed);
+            }
+        }
+        if opportunity.route_plan.legs.is_empty() {
+            rejections.push(CanonicalRiskRejection::RouteDiscontinuity);
+        }
+        if opportunity.rejected_registry_hit {
+            rejections.push(CanonicalRiskRejection::RejectedRegistryHit);
+        }
+        if !rejections.is_empty() {
+            return Err(rejections);
+        }
+
+        let retention_floor = U256::from(opportunity.net_pnl as u128)
+            .saturating_mul(U256::from(cfg.retention_bps))
+            / U256::from(10_000u64);
+        Ok(RiskApproval {
+            min_profit_raw: cfg.absolute_min_profit_floor_raw.max(retention_floor),
+            max_gas_raw: cfg.max_gas_raw,
+            max_slippage_bps: cfg.max_slippage_bps,
+        })
     }
 }
 

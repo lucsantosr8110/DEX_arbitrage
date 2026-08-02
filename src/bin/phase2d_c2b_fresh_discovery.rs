@@ -43,9 +43,12 @@ use flashloan_bot::{
         c2b_fork_stages::{RealForkStages, RouteExecutionRecord, RoutePlan},
         c2b_orchestrator::{execute_route, OrchestratorError},
         canonical_adapters::PinnedQuoteRecord,
-        canonical_discovery::CanonicalDiscoveryService,
+        canonical_discovery::{
+            CanonicalDiscoveryConfig, CanonicalDiscoveryProfile, CanonicalDiscoveryService,
+        },
         executable_price_graph::verify_leg_parity,
         executable_readonly::ExecutableReadOnlyStatus,
+        execution_profile::{ExecutionProfile, FORK_TRACE_AUDIT_PROFILE},
         execution_viability::{
             is_fork_candidate_eligible, ExecutionEvidenceLevel, RejectedRoute,
             RejectedRouteRegistry, RouteRejectionReason,
@@ -93,10 +96,6 @@ struct Cli {
 // Constants
 // ============================================================
 
-const BASE_TOKENS: &[&str] = &["USDC", "USDT", "WMATIC", "WETH", "WBTC"];
-const LIQUID_TOKENS: &[&str] = &[
-    "USDC", "USDT", "WMATIC", "WETH", "WBTC", "DAI", "LINK", "UNI", "LDO", "AAVE",
-];
 /// Diagnostic display label only (matches the notional amount the canonical
 /// service quotes internally) — never fed back into the operational path.
 const NOTIONAL_USD: f64 = 100.0;
@@ -205,6 +204,11 @@ async fn run_fork_audit_round(
     archive_rpc: &str,
 ) -> Result<DiscoveryRound> {
     let result = service.discover_at(anchor.clone()).await?;
+    eprintln!(
+        "ROUND={round_id} DISCOVERY_PROFILE={} POOLS_RESOLVED={}",
+        service.config().profile.label(),
+        result.pool_states.len()
+    );
 
     // ---- Pre-audit route results: one per structural route the canonical
     // service discovered this round, regardless of whether it went on to
@@ -888,12 +892,30 @@ async fn main() -> Result<()> {
         .await
         .clone();
 
-    let symbols: Vec<String> = match cli.profile.as_str() {
-        "base" => BASE_TOKENS.iter().map(|s| s.to_string()).collect(),
-        "liquid" => LIQUID_TOKENS.iter().map(|s| s.to_string()).collect(),
+    let discovery_profile = match cli.profile.as_str() {
+        "base" => CanonicalDiscoveryProfile::Base,
+        "liquid" => CanonicalDiscoveryProfile::Liquid,
         other => return Err(anyhow!("invalid profile: {other}")),
     };
-    eprintln!("TOKEN_UNIVERSE={}", symbols.len());
+    // The diagnostic binary is the only caller that ever produces
+    // `fork-trace-audit` evidence — the live bot's canonical-primary loop
+    // uses `main-pending-dry-run` and never reaches this binary.
+    let discovery_config = CanonicalDiscoveryConfig::from_config(
+        &cfg,
+        discovery_profile,
+        ExecutionProfile {
+            chain_id: 137,
+            profile_label: FORK_TRACE_AUDIT_PROFILE.into(),
+        },
+    )
+    .map_err(|e| anyhow!("CANONICAL_DISCOVERY_CONFIG_INVALID: {e}"))?;
+    eprintln!("DISCOVERY_PROFILE={}", discovery_profile.label());
+    eprintln!("DISCOVERY_TOKEN_COUNT={}", discovery_config.token_count());
+    eprintln!(
+        "DISCOVERY_TOKEN_ADDRESSES_HASH={:#x}",
+        discovery_config.token_addresses_hash()
+    );
+    eprintln!("TOKEN_UNIVERSE={}", discovery_config.token_count());
 
     let route_report = load_structural_routes(&cli.route_artifact)
         .map_err(|e| anyhow!("MISSING_ROUTE_ARTIFACT_PIPELINE: {e}"))?;
@@ -917,7 +939,7 @@ async fn main() -> Result<()> {
 
     let provider =
         Arc::new(timed_http_provider(&cli.rpc_url)?.interval(Duration::from_millis(100)));
-    let discovery_service = CanonicalDiscoveryService::new(provider.clone(), 137);
+    let discovery_service = CanonicalDiscoveryService::new(provider.clone(), 137, discovery_config);
 
     // Get chain ID
     let chain_id = provider.get_chainid().await?;
