@@ -5,12 +5,7 @@ use crate::core::{
     pool_state_sim::SimulatedPoolState,
 };
 use ethers::types::{Address, H256, U256};
-use ethers::{
-    abi::Abi,
-    contract::Contract,
-    providers::{Http, Middleware, Provider},
-    types::BlockId,
-};
+use ethers::{abi::Abi, contract::Contract, providers::Middleware, types::BlockId};
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -255,8 +250,8 @@ pub struct OnlinePoolRead {
 const V2_READ_ABI: &str = r#"[{"name":"getReserves","outputs":[{"name":"reserve0","type":"uint112"},{"name":"reserve1","type":"uint112"},{"name":"blockTimestampLast","type":"uint32"}],"inputs":[],"stateMutability":"view","type":"function"},{"name":"token0","outputs":[{"name":"","type":"address"}],"inputs":[],"stateMutability":"view","type":"function"},{"name":"token1","outputs":[{"name":"","type":"address"}],"inputs":[],"stateMutability":"view","type":"function"}]"#;
 const V3_READ_ABI: &str = r#"[{"name":"slot0","outputs":[{"name":"sqrtPriceX96","type":"uint160"},{"name":"tick","type":"int24"},{"name":"observationIndex","type":"uint16"},{"name":"observationCardinality","type":"uint16"},{"name":"observationCardinalityNext","type":"uint16"},{"name":"feeProtocol","type":"uint8"},{"name":"unlocked","type":"bool"}],"inputs":[],"stateMutability":"view","type":"function"},{"name":"liquidity","outputs":[{"name":"","type":"uint128"}],"inputs":[],"stateMutability":"view","type":"function"},{"name":"token0","outputs":[{"name":"","type":"address"}],"inputs":[],"stateMutability":"view","type":"function"},{"name":"token1","outputs":[{"name":"","type":"address"}],"inputs":[],"stateMutability":"view","type":"function"},{"name":"fee","outputs":[{"name":"","type":"uint24"}],"inputs":[],"stateMutability":"view","type":"function"}]"#;
 
-pub async fn read_v2_pool(
-    provider: Arc<Provider<Http>>,
+pub async fn read_v2_pool<M: Middleware>(
+    provider: Arc<M>,
     pool: Address,
     router: Address,
     anchor_block: u64,
@@ -308,8 +303,8 @@ pub async fn read_v2_pool(
     })
 }
 
-pub async fn read_v3_pool(
-    provider: Arc<Provider<Http>>,
+pub async fn read_v3_pool<M: Middleware>(
+    provider: Arc<M>,
     pool: Address,
     router: Address,
     anchor_block: u64,
@@ -381,8 +376,8 @@ const V3_FACTORY_READ_ABI: &str = r#"[{"inputs":[{"internalType":"address","name
 /// Resolves a V2 pair address via the venue's factory, pinned to
 /// `anchor_block`. Returns `None` (not an error) when no pair exists for
 /// this token combination at this venue.
-pub async fn resolve_v2_pool_address(
-    provider: Arc<Provider<Http>>,
+pub async fn resolve_v2_pool_address<M: Middleware>(
+    provider: Arc<M>,
     factory: Address,
     token_a: Address,
     token_b: Address,
@@ -404,8 +399,8 @@ pub async fn resolve_v2_pool_address(
 /// Resolves a V3 pool address for a given fee tier via the venue's factory,
 /// pinned to `anchor_block`. Returns `None` (not an error) when no pool
 /// exists for this token/fee combination.
-pub async fn resolve_v3_pool_address(
-    provider: Arc<Provider<Http>>,
+pub async fn resolve_v3_pool_address<M: Middleware>(
+    provider: Arc<M>,
     factory: Address,
     token_a: Address,
     token_b: Address,
@@ -426,8 +421,8 @@ pub async fn resolve_v3_pool_address(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn quote_v2_leg(
-    provider: Arc<Provider<Http>>,
+pub async fn quote_v2_leg<M: Middleware>(
+    provider: Arc<M>,
     venue: crate::core::executable_call::Venue,
     router: Address,
     pool: Address,
@@ -489,8 +484,8 @@ pub async fn quote_v2_leg(
     ))
 }
 
-pub async fn quote_v3_leg(
-    provider: Arc<Provider<Http>>,
+pub async fn quote_v3_leg<M: Middleware>(
+    provider: Arc<M>,
     quoter: Address,
     pool: Address,
     token_in: Address,
