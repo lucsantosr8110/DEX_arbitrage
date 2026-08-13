@@ -59,6 +59,11 @@ Antes de iniciar, certifique-se de ter instalado:
 
 ## ⚙️ Configuração e Execução
 
+### Console do operador em Docker
+
+Para subir frontend, backend, API e métricas em portas alternativas, consulte
+[`docs/DOCKER_OPERATOR_CONSOLE.md`](docs/DOCKER_OPERATOR_CONSOLE.md).
+
 ### 1. Clonar e Instalar Dependências
 
 ```bash

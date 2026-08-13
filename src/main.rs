@@ -1082,6 +1082,11 @@ async fn main() -> Result<()> {
     // operador via uma tela preta por segundos (ou indefinidamente se RPC
     // travasse). Agora mostramos splash screen com a fase de inicialização.
     let tui_state = Arc::new(std::sync::RwLock::new(tui::TuiState::default()));
+    {
+        let api_state = tui_state.clone();
+        let api_shutdown = shutdown_tx.clone();
+        tokio::spawn(async move { flashloan_bot::operator_api::serve(api_state, api_shutdown).await; });
+    }
     let tui_enabled = !headless;
     let mut tui_handle = TuiGuard {
         handle: if tui_enabled {

@@ -1,6 +1,7 @@
 // src/lib.rs
 
 pub mod api;
+pub mod operator_api;
 pub mod config;
 pub mod contracts;
 pub mod core;
