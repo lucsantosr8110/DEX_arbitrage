@@ -36,17 +36,19 @@ function useOperatorData() {
 
   useEffect(() => {
     let source;
-    fetch("/api/v1/snapshot")
+    const refresh = () => fetch("/api/v1/snapshot")
       .then((response) => { if (!response.ok) throw new Error("snapshot unavailable"); return response.json(); })
       .then((data) => { setSnapshot(normalizeSnapshot(data)); setConnection("live"); })
       .catch(() => setConnection("offline"));
+    refresh();
+    const poll = window.setInterval(refresh, 5000);
     try {
       source = new EventSource("/api/v1/events");
       source.addEventListener("snapshot", (event) => { setSnapshot(normalizeSnapshot(JSON.parse(event.data))); setConnection("live"); });
       source.onopen = () => setConnection("live");
       source.onerror = () => setConnection("reconnecting");
     } catch { setConnection("offline"); }
-    return () => source?.close();
+    return () => { source?.close(); window.clearInterval(poll); };
   }, []);
   return { snapshot, connection };
 }
