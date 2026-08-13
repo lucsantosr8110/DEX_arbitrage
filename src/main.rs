@@ -464,7 +464,15 @@ fn canonical_route_economics(
                 .parse::<f64>()
                 .unwrap_or(f64::INFINITY);
         let net_usd = net_fraction * cost.notional_usd;
-        if !net_usd.is_finite() {
+        if !net_usd.is_finite() || !sane_route_economics(cycle_rate, gross_pct, net_usd, cost.notional_usd) {
+            warn!(
+                target: "canonical_discovery",
+                structural_cycle_key = %evidence.structural_cycle_key,
+                cycle_rate,
+                gross_pct,
+                net_usd,
+                "canonical route rejected from operator metrics: economics outside sanity bounds"
+            );
             continue;
         }
 
@@ -575,6 +583,19 @@ fn canonical_route_economics(
         net_positive,
         negative_cycles,
     )
+}
+
+/// Presentation/risk guard for malformed quotes or decimal mismatches.
+/// These limits do not authorize execution; they prevent impossible economics
+/// from becoming operator KPIs or actionable-looking dashboard rows.
+fn sane_route_economics(cycle_rate: f64, gross_pct: f64, net_usd: f64, notional_usd: f64) -> bool {
+    cycle_rate.is_finite()
+        && gross_pct.is_finite()
+        && net_usd.is_finite()
+        && cycle_rate > 0.5
+        && cycle_rate < 1.5
+        && gross_pct.abs() <= 50.0
+        && net_usd.abs() <= notional_usd.abs().max(1.0) * 0.5
 }
 
 fn combine_top_combo_rows(

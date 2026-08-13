@@ -15,6 +15,8 @@ const pct = (value) => `${value < 0 ? "−" : ""}${Math.abs(value).toFixed(2)}%`
 const ageLabel = (ms) => ms == null ? "—" : (ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`);
 const formatPrice = (value) => value == null ? "—" : Number(value).toLocaleString("en-US", { maximumFractionDigits: 8 });
 const formatNumber = (value) => value == null ? "—" : Number(value).toLocaleString("pt-BR");
+const saneGross = (value) => Number.isFinite(value) && Math.abs(value) <= 50;
+const saneNet = (value) => Number.isFinite(value) && Math.abs(value) <= 500;
 
 function normalizeSnapshot(data) {
   return {
@@ -58,8 +60,8 @@ function App() {
   const [section, setSection] = useState("overview");
   const [onlyAuthoritative, setOnlyAuthoritative] = useState(false);
   const age = snapshot.chain?.data_age_ms;
-  const routes = useMemo(() => (snapshot.routes || []).filter((route) => !onlyAuthoritative || route.authoritative), [snapshot.routes, onlyAuthoritative]);
-  const bestRoute = [...(snapshot.routes || [])].sort((a, b) => b.net - a.net)[0];
+  const routes = useMemo(() => (snapshot.routes || []).filter((route) => saneGross(route.gross) && saneNet(route.net) && (!onlyAuthoritative || route.authoritative)), [snapshot.routes, onlyAuthoritative]);
+  const bestRoute = [...(snapshot.routes || [])].filter((route) => saneGross(route.gross) && saneNet(route.net)).sort((a, b) => (b.net ?? -Infinity) - (a.net ?? -Infinity))[0];
   const nav = [{ id: "overview", label: "Visão geral" }, { id: "market", label: "Mercado" }, { id: "routes", label: "Rotas" }, { id: "pipeline", label: "Pipeline" }, { id: "infra", label: "Infraestrutura" }, { id: "safety", label: "Segurança" }];
 
   return <div className="app-shell">
