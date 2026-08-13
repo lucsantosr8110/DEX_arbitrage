@@ -83,6 +83,8 @@ pub struct PriceRow {
 /// Linha do painel Top Spreads (sem TVL — TVL só no log `[TOPSPREAD]`).
 #[derive(Clone, Debug)]
 pub struct TopSpreadRow {
+    /// Number of executable legs represented by this row (2L or 3L).
+    pub hop_count: usize,
     pub pair: String,
     pub tui_spread_pct: f64,
     pub buy_dex: String,
@@ -91,7 +93,7 @@ pub struct TopSpreadRow {
     pub legs_label: Option<String>,
     /// None = sem reverse cotado (cycle_rate indisponível).
     pub cycle_rate: Option<f64>,
-    /// None = sem 2-hop.
+    /// None = route economics unavailable.
     pub net_usd: Option<f64>,
     /// Quanto falta para o net projetado virar positivo (0 se já lucrativo).
     pub distance_to_profit: f64,
@@ -577,6 +579,7 @@ impl TuiApp {
         let state = self.blocking_read();
 
         let header = Row::new(vec![
+            Cell::from("Tipo").style(Style::default().fg(Color::Magenta)),
             Cell::from("Pair").style(
                 Style::default()
                     .fg(Color::Cyan)
@@ -635,6 +638,7 @@ impl TuiApp {
                 Color::Red
             };
             rows.push(Row::new(vec![
+                Cell::from(format!("{}L", t.hop_count)),
                 Cell::from(pair_display),
                 Cell::from(t.legs_label.clone().unwrap_or_else(|| {
                     format!("{}→{}", abbrev_venue(&t.buy_dex), abbrev_venue(&t.sell_dex))
@@ -648,6 +652,7 @@ impl TuiApp {
         }
 
         let widths = [
+            Constraint::Length(5),  // Tipo
             Constraint::Length(12), // Pair
             Constraint::Length(9),  // Legs
             Constraint::Length(7),  // Gross%

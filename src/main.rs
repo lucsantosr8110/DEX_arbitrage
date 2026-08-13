@@ -502,6 +502,7 @@ fn canonical_route_economics(
 
         ranked.push((
             tui::TopSpreadRow {
+                hop_count: route.legs.len(),
                 pair,
                 tui_spread_pct: gross_pct,
                 buy_dex: venues.first().cloned().unwrap_or_default(),
@@ -576,9 +577,26 @@ fn canonical_route_economics(
     )
 }
 
+fn combine_top_combo_rows(
+    mut two_leg: Vec<tui::TopSpreadRow>,
+    triangular: Vec<tui::TopSpreadRow>,
+) -> Vec<tui::TopSpreadRow> {
+    two_leg.extend(triangular);
+    two_leg.sort_by(|a, b| {
+        b.net_usd
+            .unwrap_or(f64::NEG_INFINITY)
+            .partial_cmp(&a.net_usd.unwrap_or(f64::NEG_INFINITY))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.hop_count.cmp(&b.hop_count))
+            .then_with(|| a.pair.cmp(&b.pair))
+    });
+    two_leg
+}
+
 /// Mapeia `TopSpreadInfo` (radar, sync) → `TopSpreadRow` (TUI, subset sem TVL).
 fn top_spread_row_from_info(i: TopSpreadInfo) -> tui::TopSpreadRow {
     tui::TopSpreadRow {
+        hop_count: 2,
         pair: i.pair,
         tui_spread_pct: i.tui_spread_pct,
         buy_dex: i.buy_dex,
@@ -799,8 +817,18 @@ async fn run_canonical_mode(
                         // Preserve direct-pair net on price rows as a diagnostic,
                         // but source Top Combo and counters from authoritative
                         // sequential canonical route evidence.
-                        let _ = canonical_tui_economics(&mut last_prices, &adj_cost, top_n);
-                        let (top_spreads, net_usd_total, net_positive, negative_cycles) =
+                        let (
+                            two_leg_spreads,
+                            two_leg_net_usd_total,
+                            two_leg_net_positive,
+                            two_leg_negative_cycles,
+                        ) = canonical_tui_economics(&mut last_prices, &adj_cost, top_n);
+                        let (
+                            triangular_spreads,
+                            canonical_net_usd_total,
+                            canonical_net_positive,
+                            canonical_negative_cycles,
+                        ) =
                             canonical_route_economics(
                                 &result.round_evidence,
                                 &result.structural_routes,
@@ -808,14 +836,31 @@ async fn run_canonical_mode(
                                 &adj_cost,
                                 top_n,
                             );
-                        let economics_consistent = economically_positive == net_positive as usize;
+                        let two_leg_displayed = two_leg_spreads.len();
+                        let triangular_displayed = triangular_spreads.len();
+                        let top_spreads =
+                            combine_top_combo_rows(two_leg_spreads, triangular_spreads);
+                        let net_usd_total =
+                            two_leg_net_usd_total + canonical_net_usd_total;
+                        let net_positive =
+                            two_leg_net_positive.saturating_add(canonical_net_positive);
+                        let negative_cycles =
+                            two_leg_negative_cycles.saturating_add(canonical_negative_cycles);
+                        let economics_consistent =
+                            economically_positive == canonical_net_positive as usize;
                         if !economics_consistent {
                             error!(
                                 discovery_net_positive = economically_positive,
-                                presentation_net_positive = net_positive,
+                                canonical_projection_net_positive = canonical_net_positive,
                                 "CANONICAL_ECONOMICS_DIVERGENCE_FAIL_CLOSED"
                             );
                         }
+                        info!(
+                            two_leg_displayed,
+                            triangular_displayed,
+                            combined_displayed = top_spreads.len(),
+                            "CANONICAL_TUI_ROUTE_TYPES_READY"
+                        );
                         if let Ok(mut state) = tui_state.write() {
                             state.running = true;
                             state.cycle_count = rounds_completed;
@@ -1701,7 +1746,36 @@ mod canonical_tui_tests {
 
         let (top, _, _, _) = canonical_tui_economics(&mut rows, &AdjCostParams::default(), 8);
         assert!(!top.is_empty());
+        assert!(top.iter().all(|combo| combo.hop_count == 2));
         assert!(top.iter().all(|combo| combo.net_usd.is_some()));
         assert!(rows.iter().any(|row| row.net_usd.is_some()));
+    }
+
+    #[test]
+    fn combined_top_combo_keeps_two_leg_and_triangular_routes() {
+        let base = tui::TopSpreadRow {
+            hop_count: 2,
+            pair: "USDT-WMATIC".into(),
+            tui_spread_pct: 0.1,
+            buy_dex: "QuickSwap".into(),
+            sell_dex: "UniswapV3".into(),
+            legs_label: Some("Q→U".into()),
+            cycle_rate: Some(1.001),
+            net_usd: Some(0.04),
+            distance_to_profit: 0.0,
+            executable: true,
+            has_curve_leg: false,
+            outlier: None,
+        };
+        let mut triangular = base.clone();
+        triangular.hop_count = 3;
+        triangular.pair = "USDT>USDC>WMATIC>USDT".into();
+        triangular.legs_label = Some("U→Q→S".into());
+        triangular.net_usd = Some(0.02);
+
+        let combined = combine_top_combo_rows(vec![base], vec![triangular]);
+        assert_eq!(combined.len(), 2);
+        assert_eq!(combined[0].hop_count, 2);
+        assert_eq!(combined[1].hop_count, 3);
     }
 }
