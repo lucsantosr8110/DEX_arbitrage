@@ -277,6 +277,7 @@ async fn run_canonical_mode(
     cfg: Arc<Config>,
     every_n_blocks: u64,
     round_timeout: Duration,
+    tui_state: Arc<std::sync::RwLock<tui::TuiState>>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) -> Result<()> {
     let profile = match cfg.c2b_shadow.canonical_discovery_profile.as_str() {
@@ -297,6 +298,7 @@ async fn run_canonical_mode(
         token_count = discovery_config.token_count(),
         "CANONICAL_DISCOVERY_PROFILE_RESOLVED"
     );
+    let venue_count = discovery_config.venues.len();
     let service = CanonicalDiscoveryService::new(provider.clone(), 137, discovery_config);
 
     // Dry-run-only thresholds. This phase never reaches a send/broadcast
@@ -375,6 +377,19 @@ async fn run_canonical_mode(
                         rounds_completed += 1;
                         let round_evidence_count = result.round_evidence.len();
                         let economically_positive = result.economically_positive.len();
+                        if let Ok(mut state) = tui_state.write() {
+                            state.running = true;
+                            state.cycle_count = rounds_completed;
+                            state.dex_count = venue_count;
+                            state.pairs_count = result.stats.quotes_attempted as usize;
+                            state.gross_positive = economically_positive as u32;
+                            state.net_positive = economically_positive as u32;
+                            state.negative_cycles = result.rejections.len() as u32;
+                            state.net_usd_total = 0.0;
+                            state.last_prices.clear();
+                            state.top_spreads.clear();
+                            state.last_update = Some(std::time::Instant::now());
+                        }
                         let shadow_result = opportunity_source
                             .run_evidence_round(anchor, result.round_evidence, &cfg, number, true)
                             .await;
@@ -672,11 +687,16 @@ async fn main() -> Result<()> {
             .find(|endpoint| is_usable_endpoint(endpoint))
             .ok_or_else(|| anyhow::anyhow!("canonical mode has no usable read-only RPC"))?;
         let provider = Arc::new(Provider::<Http>::try_from(endpoint.as_str())?);
+        if let Ok(mut state) = tui_state.write() {
+            state.set_startup_phase("descoberta canônica em execução...");
+            state.mark_startup_done();
+        }
         return run_canonical_mode(
             provider,
             cfg_unlocked.clone(),
             cfg_unlocked.c2b_shadow.shadow_every_n_blocks,
             Duration::from_secs(cfg_unlocked.c2b_shadow.round_timeout_secs.max(1)),
+            tui_state.clone(),
             shutdown_tx.subscribe(),
         )
         .await;

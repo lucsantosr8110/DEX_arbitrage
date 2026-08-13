@@ -278,6 +278,7 @@ pub struct DiscoveryStats {
     /// same physical cycle can surface more than once here).
     pub cycles_detected: u64,
     pub routes_discovered: u64,
+    pub routes_pruned: u64,
     pub routes_materialized: u64,
     pub economics_evaluated: u64,
 }
@@ -867,12 +868,24 @@ where
                 .entry(route.structural_cycle_key.clone())
                 .or_insert(route);
         }
+        let max_routes = std::env::var("CANONICAL_MAX_ROUTES_PER_ROUND")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(128);
+        let discovered_routes = route_map.len();
+        if discovered_routes > max_routes {
+            route_map = route_map.into_iter().take(max_routes).collect();
+        }
         stats.routes_discovered = route_map.len() as u64;
+        stats.routes_pruned = (discovered_routes - route_map.len()) as u64;
         tracing::info!(
             target: "canonical_discovery",
             anchor = anchor.number,
             cycles_detected = stats.cycles_detected,
             routes_discovered = stats.routes_discovered,
+            routes_pruned = stats.routes_pruned,
+            max_routes,
             "canonical structural stage complete"
         );
 
