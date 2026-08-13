@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import "./styles.css";
 
 const demoSnapshot = {
@@ -34,6 +34,21 @@ const money = (value) => `${value < 0 ? "−" : ""}$${Math.abs(value).toFixed(2)
 const pct = (value) => `${value < 0 ? "−" : ""}${Math.abs(value).toFixed(2)}%`;
 const ageLabel = (ms) => (ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`);
 
+function normalizeSnapshot(data) {
+  return {
+    ...demoSnapshot,
+    ...data,
+    runtime: { ...demoSnapshot.runtime, ...(data.runtime || {}) },
+    safety: { ...demoSnapshot.safety, ...(data.safety || {}) },
+    chain: { ...demoSnapshot.chain, ...(data.chain || {}) },
+    round: { ...demoSnapshot.round, ...(data.round || {}) },
+    prices: data.prices || demoSnapshot.prices,
+    routes: data.routes || demoSnapshot.routes,
+    rpc: data.rpc || demoSnapshot.rpc,
+    alerts: data.alerts || demoSnapshot.alerts,
+  };
+}
+
 function useOperatorData() {
   const [snapshot, setSnapshot] = useState(demoSnapshot);
   const [connection, setConnection] = useState("demo");
@@ -42,11 +57,11 @@ function useOperatorData() {
     let source;
     fetch("/api/v1/snapshot")
       .then((response) => { if (!response.ok) throw new Error("snapshot unavailable"); return response.json(); })
-      .then((data) => { setSnapshot(data); setConnection("live"); })
+      .then((data) => { setSnapshot(normalizeSnapshot(data)); setConnection("live"); })
       .catch(() => setConnection("demo"));
     try {
       source = new EventSource("/api/v1/events");
-      source.addEventListener("snapshot", (event) => { setSnapshot(JSON.parse(event.data)); setConnection("live"); });
+      source.addEventListener("snapshot", (event) => { setSnapshot(normalizeSnapshot(JSON.parse(event.data))); setConnection("live"); });
       source.onopen = () => setConnection("live");
       source.onerror = () => setConnection("reconnecting");
     } catch { setConnection("demo"); }
@@ -83,12 +98,25 @@ function App() {
   </div>;
 }
 
+class ConsoleErrorBoundary extends React.Component {
+  state = { hasError: false };
+
+  static getDerivedStateFromError() { return { hasError: true }; }
+
+  render() {
+    if (this.state.hasError) {
+      return <div className="fatal-state"><strong>ARGUS não conseguiu montar o console</strong><span>Atualize a página para tentar novamente.</span><button onClick={() => window.location.reload()}>Atualizar</button></div>;
+    }
+    return this.props.children;
+  }
+}
+
 function Overview({ snapshot, bestRoute }) { const r = snapshot.round; return <><div className="kpi-grid"><Kpi label="Rodadas" value={snapshot.sequence.toLocaleString("pt-BR")} note="última sequência" /><Kpi label="Melhor net" value={bestRoute ? money(bestRoute.net) : "unknown"} note="após custos" tone={bestRoute?.net > 0 ? "green" : "amber"} /><Kpi label="Gross positivas" value={r.gross_positive} note={`${r.economically_positive} economicamente positivas`} /><Kpi label="Latência p95" value={`${r.latency_p95_ms}ms`} note={`p50 ${r.latency_p50_ms}ms`} tone="cyan" /></div><div className="overview-grid"><Section title="Economia da melhor rota" eyebrow="WATERFALL" action={<Badge tone={bestRoute?.authoritative ? "green" : "amber"}>{bestRoute?.authoritative ? "AUTHORITATIVE" : "DIAGNOSTIC"}</Badge>}><div className="route-title"><strong>{bestRoute?.path}</strong><span>{bestRoute?.venues}</span></div><div className="waterfall">{[["Gross", bestRoute?.gross, "cyan"], ["Flashloan fee", -bestRoute?.flash, "neutral"], ["Gas estimate", -bestRoute?.gas, "neutral"], ["Buffers", -bestRoute?.buffers, "neutral"], ["Net", bestRoute?.net, bestRoute?.net > 0 ? "green" : "red"]].map(([label, value, tone]) => <div className={`water-row ${tone}`} key={label}><span>{label}</span><div className="water-track"><i style={{ width: `${Math.min(100, Math.max(8, Math.abs(value) * 90))}%` }} /></div><b>{money(value || 0)}</b></div>)}</div></Section><Section title="Estado dos gates" eyebrow="SAFETY GATES"><div className="gates"><Gate label="Economics consistent" value="evidência sequencial" good /><Gate label="Simulate before execute" value="obrigatório" good /><Gate label="Signer" value="ausente · bloqueado" /><Gate label="Broadcaster" value="ausente · bloqueado" /><Gate label="Mainnet execution" value="bloqueado por política" /></div></Section></div><div className="bottom-grid"><Section title="Atividade de 1 hora" eyebrow="ROUND PERFORMANCE"><div className="chart"><div className="chart-labels"><span>gross / net USD</span><span>últimas 12 rodadas</span></div><div className="bars">{[24, 42, 38, 61, 52, 68, 48, 78, 60, 84, 72, 91].map((height, i) => <div className="bar-group" key={i}><i style={{ height: `${height}%` }} /><b style={{ height: `${Math.max(8, height - 18)}%` }} /></div>)}</div><div className="break-even"><span /> break-even <span className="mono">$0.00</span></div></div></Section><Section title="Alertas recentes" eyebrow="ACTIONABLE"><div className="alerts">{(snapshot.alerts || []).map((alert) => <div className="alert" key={alert.title}><span className={`alert-icon ${alert.severity}`}>{alert.severity === "warning" ? "!" : "i"}</span><div><strong>{alert.title}</strong><small>{alert.detail}</small></div><time>{alert.time}</time></div>)}</div></Section></div></>; }
 function Kpi({ label, value, note, tone = "" }) { return <div className="kpi"><span>{label}</span><strong className={tone ? `text-${tone}` : ""}>{value}</strong><small>{note}</small></div>; }
 function Market({ prices }) { return <Section title="Matriz de preços" eyebrow="MARKET / FRESHNESS" action={<div className="filters"><button className="filter active">Todos os tokens</button><button className="filter">Fresh &lt; 2s</button></div>}><div className="table-wrap"><table><thead><tr><th>Token / par</th><th>QuickSwap</th><th>SushiSwap</th><th>Curve</th><th>Uniswap V3</th><th>Direção</th><th>Idade</th></tr></thead><tbody>{prices.map((price) => <tr key={price.pair}><td><strong>{price.pair}</strong><small>{price.fee_tier}</small></td>{["quickswap", "sushiswap", "curve", "uniswap_v3"].map((dex) => <td className={price[dex] !== "—" ? "mono" : "muted"} key={dex}>{price[dex]}</td>)}<td><Badge tone="outline">{price.direction}</Badge></td><td className={price.age_ms > 2000 ? "text-amber mono" : "mono"}>{ageLabel(price.age_ms)}</td></tr>)}</tbody></table></div><div className="table-foot"><span>Spread bruto é informativo e não representa executabilidade.</span><span><i className="legend-dot cyan" /> quote disponível <i className="legend-dot amber" /> stale / outlier</span></div></Section>; }
 function Routes({ routes, onlyAuthoritative, setOnlyAuthoritative }) { return <Section title="Rotas avaliadas" eyebrow="ROUTE RANKING" action={<label className="toggle"><input type="checkbox" checked={onlyAuthoritative} onChange={(e) => setOnlyAuthoritative(e.target.checked)} /><span /> somente autoritativas</label>}><div className="table-wrap"><table className="routes-table"><thead><tr><th>Rota</th><th>Tipo</th><th>Gross</th><th>Custos</th><th>Net</th><th>Distância</th><th>Anchor</th><th>Estado</th></tr></thead><tbody>{routes.map((route) => <tr key={route.id}><td><strong>{route.path}</strong><small>{route.id} · {route.venues}</small></td><td><Badge tone={route.route_kind === "triangular" ? "cyan" : "outline"}>{route.route_kind === "triangular" ? "3L" : "2L"}</Badge>{!route.authoritative && <Badge tone="amber">diag</Badge>}</td><td className="mono">{pct(route.gross)}</td><td className="mono muted">{money(route.flash + route.gas + route.buffers)}</td><td className={`mono ${route.net > 0 ? "text-green" : "text-red"}`}>{money(route.net)}</td><td className="mono">{money(route.distance)}</td><td className="mono">{route.anchor}<small>{route.age}</small></td><td><Badge tone={route.status === "rejected" ? "red" : route.status === "blocked" ? "amber" : "green"}>{route.status}</Badge><small className="reason">{route.reason}</small></td></tr>)}</tbody></table></div></Section>; }
 function Pipeline({ snapshot }) { const steps = [["Quotes", snapshot.round.quotes, "100%"], ["Edges", snapshot.round.edges, "77%"], ["Ciclos detectados", snapshot.round.cycles_detected, "60%"], ["Top ranked", snapshot.round.routes_ranked, "750 / 750"], ["Re-quote / evaluated", snapshot.round.routes_evaluated, "32 / 750"], ["Econ. / stable", snapshot.round.economically_positive, `${snapshot.round.stable} stable`], ["Risk approved", snapshot.round.risk_approved, "bloqueado"]]; return <div className="pipeline-layout"><Section title="Funil canônico" eyebrow="ROUND #{snapshot.sequence}"><div className="funnel">{steps.map(([label, value, note], i) => <div className="funnel-row" key={label}><span className="funnel-index">0{i + 1}</span><div className="funnel-name"><strong>{label}</strong><small>{note}</small></div><b>{value.toLocaleString("pt-BR")}</b><div className="funnel-bar"><i style={{ width: `${Math.max(5, 100 - i * 12)}%` }} /></div></div>)}</div></Section><Section title="Rejeições" eyebrow="WHY NOT SELECTED"><div className="rejections"><div><strong>Net abaixo do mínimo</strong><b>14</b></div><div><strong>Instabilidade de quote</strong><b>9</b></div><div><strong>Risk gate / broadcaster</strong><b>3</b></div><div><strong>Timeout</strong><b>{snapshot.round.timeouts}</b></div></div></Section></div>; }
-function Infrastructure({ snapshot }) { return <div className="infra-grid"><Section title="RPC providers" eyebrow="HEALTH"><div className="rpc-list">{snapshot.rpc.map((rpc) => <div className="rpc-row" key={rpc.alias}><span className={`status-dot ${rpc.status === "healthy" ? "live" : "warn"}`} /><div><strong>{rpc.alias}</strong><small>{rpc.hash}</small></div><b>{rpc.latency}ms</b><Badge tone={rpc.status === "healthy" ? "green" : "amber"}>{rpc.status}</Badge><small>{rpc.error} errors · {rpc.last_success}</small></div>)}</div></Section><Section title="Runtime telemetry" eyebrow="PROCESS"><div className="telemetry"><Kpi label="Worker" value="running" note="canonical loop" tone="green" /><Kpi label="Uptime" value={snapshot.runtime.uptime} note="desde startup" /><Kpi label="Prometheus" value="ready" note="aggregated metrics" tone="cyan" /><Kpi label="Queue" value="0" note="backpressure clear" /></div></Section></div>; }
+function Infrastructure({ snapshot }) { return <div className="infra-grid"><Section title="RPC providers" eyebrow="HEALTH"><div className="rpc-list">{(snapshot.rpc || []).map((rpc) => <div className="rpc-row" key={rpc.alias}><span className={`status-dot ${rpc.status === "healthy" ? "live" : "warn"}`} /><div><strong>{rpc.alias}</strong><small>{rpc.hash}</small></div><b>{rpc.latency}ms</b><Badge tone={rpc.status === "healthy" ? "green" : "amber"}>{rpc.status}</Badge><small>{rpc.error} errors · {rpc.last_success}</small></div>)}</div></Section><Section title="Runtime telemetry" eyebrow="PROCESS"><div className="telemetry"><Kpi label="Worker" value="running" note="canonical loop" tone="green" /><Kpi label="Uptime" value={snapshot.runtime.uptime || `${snapshot.runtime.uptime_secs || 0}s`} note="desde startup" /><Kpi label="Prometheus" value="ready" note="aggregated metrics" tone="cyan" /><Kpi label="Queue" value="0" note="backpressure clear" /></div></Section></div>; }
 function Safety({ snapshot }) { return <div className="safety-layout"><Section title="Checklist permanente" eyebrow="FAIL-CLOSED"><div className="safety-list"><Gate label="Dry run" value={snapshot.runtime.dry_run ? "ativo" : "inativo"} good={snapshot.runtime.dry_run} /><Gate label="Signer" value={snapshot.safety.signer_present ? "configured" : "not configured"} good={snapshot.safety.signer_present} /><Gate label="Broadcaster" value={snapshot.safety.broadcaster_present ? "configured" : "not configured"} good={snapshot.safety.broadcaster_present} /><Gate label="Wrapper" value={snapshot.safety.wrapper_enabled ? "enabled" : "disabled"} good={snapshot.safety.wrapper_enabled} /><Gate label="Simulação pré-execução" value={snapshot.safety.simulate_before_execute ? "obrigatória" : "desligada"} good={snapshot.safety.simulate_before_execute} /><Gate label="Chain ID" value={`${snapshot.chain.network} · ${snapshot.chain.chain_id}`} good /></div></Section><Section title="Configuração pública" eyebrow="REDACTED / READ ONLY"><div className="config-grid">{[["Runtime mode", "PAPER"], ["Discovery timeout", "2,000 ms"], ["Route limit", "32"], ["Quote concurrency", "24"], ["RPC credentials", "not configured"], ["Execution controls", "locked by policy"]].map(([label, value]) => <div key={label}><small>{label}</small><strong>{value}</strong></div>)}</div><div className="security-note">Segredos, RPCs, chaves e tokens nunca são serializados neste console.</div></Section></div>; }
 
-export default App;
+export default function ConsoleRoot() { return <ConsoleErrorBoundary><App /></ConsoleErrorBoundary>; }
