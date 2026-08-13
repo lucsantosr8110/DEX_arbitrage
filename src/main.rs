@@ -203,17 +203,41 @@ fn canonical_price_rows(
     quotes: &[PinnedQuoteRecord],
     tokens: &[CanonicalToken],
 ) -> Vec<tui::PriceRow> {
+    let min_roundtrip = std::env::var("CANONICAL_TUI_MIN_ROUNDTRIP_BPS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value <= 10_000)
+        .unwrap_or(9_000) as f64
+        / 10_000.0;
+    let max_roundtrip = std::env::var("CANONICAL_TUI_MAX_ROUNDTRIP_BPS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value >= 10_000)
+        .unwrap_or(10_500) as f64
+        / 10_000.0;
+    canonical_price_rows_with_bounds(quotes, tokens, min_roundtrip, max_roundtrip)
+}
+
+fn canonical_price_rows_with_bounds(
+    quotes: &[PinnedQuoteRecord],
+    tokens: &[CanonicalToken],
+    min_roundtrip: f64,
+    max_roundtrip: f64,
+) -> Vec<tui::PriceRow> {
     let token_meta: HashMap<Address, (&str, u8)> = tokens
         .iter()
         .map(|token| (token.address, (token.symbol.as_str(), token.decimals)))
         .collect();
-    let mut rows: HashMap<String, tui::PriceRow> = HashMap::new();
+    // Multiple V3 fee tiers may exist for the same directed pair. Keep the
+    // executable quote with the greatest output instead of whichever tier
+    // happened to be inserted first.
+    let mut best_rates: HashMap<(Address, Address, Venue), f64> = HashMap::new();
 
     for quote in quotes {
-        let Some((symbol_in, decimals_in)) = token_meta.get(&quote.token_in) else {
+        let Some((_, decimals_in)) = token_meta.get(&quote.token_in) else {
             continue;
         };
-        let Some((symbol_out, decimals_out)) = token_meta.get(&quote.token_out) else {
+        let Some((_, decimals_out)) = token_meta.get(&quote.token_out) else {
             continue;
         };
         let Ok(amount_in) = quote.amount_in.to_string().parse::<f64>() else {
@@ -227,6 +251,37 @@ fn canonical_price_rows(
         if amount_in <= 0.0 || !amount_in.is_finite() || !amount_out.is_finite() {
             continue;
         }
+        let price = amount_out / amount_in;
+        if price > 0.0 && price.is_finite() {
+            best_rates
+                .entry((quote.token_in, quote.token_out, quote.venue))
+                .and_modify(|current| *current = current.max(price))
+                .or_insert(price);
+        }
+    }
+
+    // A single-direction quote from a dust pool can be technically valid
+    // while being useless as a market price. Require its best reverse quote
+    // on the same venue to produce a sane round-trip ratio. Presentation
+    // only: execution/economics continue to use exact integer quote chains.
+    let mut rows: HashMap<String, tui::PriceRow> = HashMap::new();
+    let mut filtered_outliers = 0usize;
+    for ((token_in, token_out, venue), price) in &best_rates {
+        let Some(reverse) = best_rates.get(&(*token_out, *token_in, *venue)) else {
+            filtered_outliers += 1;
+            continue;
+        };
+        let roundtrip = price * reverse;
+        if !roundtrip.is_finite() || roundtrip < min_roundtrip || roundtrip > max_roundtrip {
+            filtered_outliers += 1;
+            continue;
+        }
+        let Some((symbol_in, _)) = token_meta.get(token_in) else {
+            continue;
+        };
+        let Some((symbol_out, _)) = token_meta.get(token_out) else {
+            continue;
+        };
         let pair = format!("{}/{}", symbol_in, symbol_out);
         let row = rows.entry(pair.clone()).or_insert_with(|| tui::PriceRow {
             pair,
@@ -236,15 +291,22 @@ fn canonical_price_rows(
             uniswap_v3: None,
             net_usd: None,
         });
-        let price = amount_out / amount_in;
-        match quote.venue {
-            Venue::QuickSwap if row.quickswap.is_none() => row.quickswap = Some(price),
-            Venue::SushiSwap if row.sushiswap.is_none() => row.sushiswap = Some(price),
-            Venue::Curve if row.curve.is_none() => row.curve = Some(price),
-            Venue::UniswapV3 if row.uniswap_v3.is_none() => row.uniswap_v3 = Some(price),
-            _ => {}
+        match venue {
+            Venue::QuickSwap => row.quickswap = Some(*price),
+            Venue::SushiSwap => row.sushiswap = Some(*price),
+            Venue::Curve => row.curve = Some(*price),
+            Venue::UniswapV3 => row.uniswap_v3 = Some(*price),
         }
     }
+    tracing::info!(
+        target: "canonical_discovery",
+        raw_quotes = quotes.len(),
+        best_directed_rates = best_rates.len(),
+        filtered_outliers,
+        min_roundtrip,
+        max_roundtrip,
+        "canonical TUI quote normalization complete"
+    );
 
     let mut rows: Vec<_> = rows.into_values().collect();
     rows.sort_by(|a, b| a.pair.cmp(&b.pair));
@@ -1233,4 +1295,65 @@ async fn main() -> Result<()> {
         .await;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod canonical_tui_tests {
+    use super::*;
+
+    fn quote(
+        venue: Venue,
+        token_in: Address,
+        token_out: Address,
+        amount_out: u64,
+    ) -> PinnedQuoteRecord {
+        PinnedQuoteRecord {
+            quote_id: H256::zero(),
+            anchor_block: 1,
+            anchor_hash: H256::zero(),
+            venue,
+            pool: Address::from_low_u64_be(99),
+            token_in,
+            token_out,
+            amount_in: U256::from(100_000_000u64),
+            amount_out: U256::from(amount_out),
+            pool_state_id: H256::zero(),
+            execution_metadata_id: H256::zero(),
+            adapter_version: "test".into(),
+            provenance_hash: H256::zero(),
+        }
+    }
+
+    #[test]
+    fn canonical_tui_selects_best_tier_and_filters_dust_pool() {
+        let token_a = Address::from_low_u64_be(1);
+        let token_b = Address::from_low_u64_be(2);
+        let tokens = vec![
+            CanonicalToken {
+                address: token_a,
+                decimals: 6,
+                symbol: "A".into(),
+            },
+            CanonicalToken {
+                address: token_b,
+                decimals: 6,
+                symbol: "B".into(),
+            },
+        ];
+        let quotes = vec![
+            quote(Venue::QuickSwap, token_a, token_b, 100_000_000),
+            quote(Venue::QuickSwap, token_b, token_a, 99_000_000),
+            quote(Venue::SushiSwap, token_a, token_b, 200_000),
+            quote(Venue::SushiSwap, token_b, token_a, 300_000),
+            quote(Venue::UniswapV3, token_a, token_b, 50_000_000),
+            quote(Venue::UniswapV3, token_a, token_b, 101_000_000),
+            quote(Venue::UniswapV3, token_b, token_a, 98_000_000),
+        ];
+
+        let rows = canonical_price_rows_with_bounds(&quotes, &tokens, 0.9, 1.05);
+        let forward = rows.iter().find(|row| row.pair == "A/B").unwrap();
+        assert_eq!(forward.quickswap, Some(1.0));
+        assert_eq!(forward.sushiswap, None);
+        assert_eq!(forward.uniswap_v3, Some(1.01));
+    }
 }
