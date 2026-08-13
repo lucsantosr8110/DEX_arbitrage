@@ -354,6 +354,31 @@ fn canonical_tui_economics(
             .copied();
     }
 
+    for (rank, combo) in ranked.iter().enumerate() {
+        let leg1 = combo.leg1.as_ref();
+        let leg2 = combo.leg2.as_ref();
+        tracing::info!(
+            target: "canonical_discovery",
+            rank = rank + 1,
+            pair = %combo.pair,
+            buy_dex = %combo.buy_dex,
+            sell_dex = %combo.sell_dex,
+            leg1 = %leg1.map(|leg| format!(
+                "{}:{}>{}@{:.12}",
+                leg.venue, leg.token_in, leg.token_out, leg.rate
+            )).unwrap_or_default(),
+            leg2 = %leg2.map(|leg| format!(
+                "{}:{}>{}@{:.12}",
+                leg.venue, leg.token_in, leg.token_out, leg.rate
+            )).unwrap_or_default(),
+            cycle_rate = combo.cycle_rate.unwrap_or_default(),
+            gross_pct = combo.gross_pct.unwrap_or_default(),
+            net_usd = combo.net_usd.unwrap_or_default(),
+            distance_to_profit = combo.distance_to_profit,
+            executable = combo.executable,
+            "CANONICAL_TOP_COMBO"
+        );
+    }
     let top_spreads: Vec<tui::TopSpreadRow> =
         ranked.into_iter().map(top_spread_row_from_info).collect();
     let net_usd_total = adj_cycles

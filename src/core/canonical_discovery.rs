@@ -892,10 +892,49 @@ where
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(128);
+        let rank_min_multiplier = std::env::var("CANONICAL_ROUTE_RANK_MIN_MULTIPLIER")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .unwrap_or(0.5);
+        let rank_max_multiplier = std::env::var("CANONICAL_ROUTE_RANK_MAX_MULTIPLIER")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value >= 1.0)
+            .unwrap_or(1.2);
         let discovered_routes = route_map.len();
-        if discovered_routes > max_routes {
-            route_map = route_map.into_iter().take(max_routes).collect();
-        }
+        let mut ranked_routes: Vec<_> = route_map.into_iter().collect();
+        ranked_routes.sort_by(|(key_a, route_a), (key_b, route_b)| {
+            let sane_a = route_a.gross_multiplier_avg >= rank_min_multiplier
+                && route_a.gross_multiplier_avg <= rank_max_multiplier;
+            let sane_b = route_b.gross_multiplier_avg >= rank_min_multiplier
+                && route_b.gross_multiplier_avg <= rank_max_multiplier;
+            sane_b
+                .cmp(&sane_a)
+                .then_with(|| {
+                    route_b
+                        .gross_multiplier_avg
+                        .total_cmp(&route_a.gross_multiplier_avg)
+                })
+                .then_with(|| key_a.cmp(key_b))
+        });
+        let rank_outliers = ranked_routes
+            .iter()
+            .filter(|(_, route)| {
+                route.gross_multiplier_avg < rank_min_multiplier
+                    || route.gross_multiplier_avg > rank_max_multiplier
+            })
+            .count();
+        let top_rank_score = ranked_routes
+            .first()
+            .map(|(_, route)| route.gross_multiplier_avg)
+            .unwrap_or_default();
+        ranked_routes.truncate(max_routes);
+        let cutoff_rank_score = ranked_routes
+            .last()
+            .map(|(_, route)| route.gross_multiplier_avg)
+            .unwrap_or_default();
+        route_map = ranked_routes.into_iter().collect();
         stats.routes_discovered = route_map.len() as u64;
         stats.routes_pruned = (discovered_routes - route_map.len()) as u64;
         tracing::info!(
@@ -904,8 +943,14 @@ where
             cycles_detected = stats.cycles_detected,
             routes_discovered = stats.routes_discovered,
             routes_pruned = stats.routes_pruned,
+            routes_ranked = discovered_routes,
+            rank_outliers,
+            top_rank_score,
+            cutoff_rank_score,
+            rank_min_multiplier,
+            rank_max_multiplier,
             max_routes,
-            "canonical structural stage complete"
+            "canonical structural ranking stage complete"
         );
 
         // ---- Phase B: sequential re-quote per structural route so

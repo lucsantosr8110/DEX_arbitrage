@@ -214,11 +214,22 @@ fn build_route(
     let structural_cycle_key = key_parts.join("||");
     let route_id = format!("{profile}:{structural_cycle_key}");
 
-    let final_out = edges.last()?.amount_out;
     if route_input.is_zero() {
         return None;
     }
-    let gross_multiplier_avg = final_out.as_u128() as f64 / route_input.as_u128() as f64;
+    // Phase-A quotes are independent, so the route's preliminary ranking
+    // score is the product of each edge rate. Raw token decimals telescope
+    // around a closed cycle. This score is presentation/scheduling only;
+    // final economics still uses the sequential Phase-B requote chain.
+    let gross_multiplier_avg = edges.iter().try_fold(1.0_f64, |acc, edge| {
+        let amount_in = edge.amount_in.to_string().parse::<f64>().ok()?;
+        let amount_out = edge.amount_out.to_string().parse::<f64>().ok()?;
+        let rate = amount_out / amount_in;
+        (rate.is_finite() && rate > 0.0).then_some(acc * rate)
+    })?;
+    if !gross_multiplier_avg.is_finite() || gross_multiplier_avg <= 0.0 {
+        return None;
+    }
 
     let route = StructuralRoute {
         route_id,
