@@ -5,9 +5,7 @@ use flashloan_bot::core::{
         materialize, materialize_canonical, CurveMethod, MaterializationError, PoolRecord,
         TokenRecord, VenueRecord,
     },
-    fresh_economics::{
-        FreshEconomicEvaluator, PinnedStateSnapshot, SimulationContext, StatefulRouteEvaluator,
-    },
+    fresh_economics::{FreshEconomicEvaluator, SimulationContext, StatefulRouteEvaluator},
     pool_state_sim::SimulatedPoolState,
     route_artifact::{RouteLeg, RouteReturnClass, StructuralRoute, StructuralRouteLeg},
 };

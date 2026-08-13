@@ -71,9 +71,9 @@ struct PolygonGasTier {
 #[derive(Deserialize, Debug, Clone)]
 struct PolygonGasOracle {
     #[serde(rename = "safeLow")]
-    safe_low: PolygonGasTier,
+    _safe_low: PolygonGasTier,
     standard: PolygonGasTier,
-    fast: PolygonGasTier,
+    _fast: PolygonGasTier,
 }
 
 // ============================================================

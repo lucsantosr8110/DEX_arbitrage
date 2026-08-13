@@ -4,6 +4,51 @@
 **Commit auditado:** `0d87fa6` (branch `master`, working tree limpo)
 **Objetivo:** destravar desenvolvimento e habilitar dry run confiável.
 
+## Atualização pós-Phase 2D — 2026-08-12
+
+Esta seção substitui o retrato de 2026-07-24 para o estado atual do código.
+
+| Dimensão | Estado atual | Evidência |
+|---|---|---|
+| Branch | ✅ `phase2d/fresh-executable-discovery` | commit `c3aaf35` |
+| Tree Git | ✅ limpa | verificado em 2026-08-12 |
+| Engine primária | ✅ descoberta canônica Phase 2D | commits `977f6a8`, `20124c9` |
+| Materialização executável | ✅ integrada | `src/core/executable_route_materializer.rs` |
+| Testes Rust compiláveis | ✅ `cargo test --no-run` | `CARGO_TARGET_DIR=/tmp/dex-arbitrage-target` |
+| Testes completos | ⏳ executar após esta atualização | comando no § Próximos passos |
+| Fork Polygon | ⏳ ainda não validado nesta sessão | depende de RPC/fork disponível |
+| Mainnet | 🚫 bloqueada | simulação on-chain, saldo e fork ainda não certificados |
+
+### Segurança operacional atual
+
+- `config/config.dryrun.toml`: `execution.dry_run = true`; usar este arquivo para testes locais.
+- `config/config.toml`: `execution.dry_run = false`; tratar como configuração de risco e não executar sem revisão explícita.
+- `wrapper.enabled = false` em ambas as configurações; fluxo pretendido usa executor direto.
+- `flashloan.simulate_before_execute = true`, mas isso não prova simulação segura: o retorno `false` do contrato precisa ser tratado como falha, não como sucesso.
+- RPCs pagos, `PRIVATE_KEY` e demais credenciais devem vir de `.env`, nunca de TOML versionado. `.env` permanece ignorado pelo Git.
+- Endereço de carteira não é segredo, mas expõe identidade operacional; mover para variável de ambiente antes de operação pública.
+- `wallet.min_balance_eth = "0.5"` é gate de configuração, não prova de saldo on-chain. Confirmar saldo real antes de qualquer envio.
+- Mainnet permanece bloqueada até: simulação on-chain confiável, saldo suficiente, contrato/endereço verificados e teste em fork Polygon aprovado.
+
+### Verificação read-only Polygon — 2026-08-12
+
+Consulta feita contra `https://polygon-bor-rpc.publicnode.com`, chain ID `137`:
+
+- Executor configurado `0x384b...FF9068`: bytecode presente.
+- Wrapper configurado `0xa7bb...CA5C1`: bytecode presente; permanece desabilitado.
+- Aave Pool configurado `0x794a...814aD`: bytecode presente.
+- Carteira configurada `0x152A...9eFFf`: saldo observado `3.846070 POL`, acima do gate local de `0.5 POL` naquele instante.
+
+Essa consulta confirma existência de código e saldo observado; não confirma ownership, permissões, parâmetros internos, rentabilidade ou segurança para broadcast. Esses itens exigem chamadas ABI específicas e teste fork.
+
+`POLYGON_ARCHIVE_RPC_URL` não está definido no `.env`; os testes foram executados com `ALCHEMY_RPC_URL` atribuído temporariamente a essa variável no processo. RPC respondeu, mas o Anvil local não ficou pronto em 30 s. Os três testes Phase 2D-D falharam com `ANVIL_NOT_READY`; fork segue não certificado.
+
+### Resultado de build e warnings
+
+`cargo test --no-run` passou usando target gravável em `/tmp/dex-arbitrage-target`. Warnings de imports, campos JSON-RPC não usados e helpers legados foram corrigidos ou marcados explicitamente como código legado de teste.
+
+O ambiente define `CARGO_TARGET_DIR=/home/lucas/.cache/kamino-flashloan/target`, caminho somente leitura neste workspace. Usar `CARGO_TARGET_DIR=/tmp/dex-arbitrage-target` até corrigir essa configuração local.
+
 Todas as afirmações abaixo foram **verificadas por execução** (build, testes, run real com
 RPC público) ou por **chamada on-chain direta** à Polygon mainnet. Nada aqui é suposição.
 

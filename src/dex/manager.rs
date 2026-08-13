@@ -55,6 +55,7 @@ pub struct DexManager {
     health: Arc<RwLock<HashMap<String, bool>>>,
     error_count: Arc<RwLock<HashMap<String, u32>>>,
     token_cache: Arc<TokenCache>,
+    #[allow(dead_code)]
     last_health_check: Arc<RwLock<Instant>>,
 }
 
@@ -242,6 +243,7 @@ impl DexManager {
         Ok(Some(flash_opp))
     }
 
+    #[allow(dead_code)]
     fn is_valid_flashloan_route(&self, opp: &ArbitrageOpportunity) -> bool {
         // A função foi mantida por compatibilidade.
         if let (Some(first), Some(last)) = (opp.path.first(), opp.path.last()) {

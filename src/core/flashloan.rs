@@ -482,6 +482,7 @@ impl ArbitrageClient {
     /// Fee do flashloan em unidades de token.
     /// `fee_pct` vem de `config.flashloan.fee_pct` (ex.: 0.0005 = 5 bps Aave V3).
     /// TODO: opcionalmente ler `FLASHLOAN_PREMIUM_TOTAL` on-chain do Aave Pool.
+    #[allow(dead_code)]
     fn calculate_flashloan_fee(&self, amount: U256, fee_pct: f64) -> U256 {
         if amount.is_zero() || !fee_pct.is_finite() || fee_pct <= 0.0 {
             return U256::zero();
@@ -507,6 +508,7 @@ impl ArbitrageClient {
     /// onde `flashloan_fee_usd` já foi derivado de `config.flashloan.fee_pct`.
     /// NÃO recebe net pré-descontado — evita dupla dedução de gas/Aave.
     /// Slippage continua filtrada no engine (`recalculate_profitability`).
+    #[allow(dead_code)]
     fn validate_profit_after_fees(
         &self,
         gross_profit_usd: f64,

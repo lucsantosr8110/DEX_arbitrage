@@ -149,7 +149,7 @@ pub fn classify_step(s: &ArbitrageStep) -> VenueKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::types::{ArbitrageStep, SerializableSteps};
+    use crate::core::types::ArbitrageStep;
     use ethers::types::U256;
 
     fn step(dex: &str, v3: Option<u32>) -> ArbitrageStep {

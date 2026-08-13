@@ -71,8 +71,10 @@ impl RpcError for RotatingClientError {
 /// Resposta JSON-RPC generica usada para decidir entre resultado/erro.
 #[derive(Debug, serde::Deserialize)]
 struct JsonRpcResponse<R> {
-    jsonrpc: Option<String>,
-    id: Option<Value>,
+    #[serde(rename = "jsonrpc")]
+    _jsonrpc: Option<String>,
+    #[serde(rename = "id")]
+    _id: Option<Value>,
     result: Option<R>,
     error: Option<JsonRpcError>,
 }

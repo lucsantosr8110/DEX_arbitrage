@@ -152,11 +152,6 @@ fn next_opp_id(prefix: &str) -> String {
     format!("{}_{}_{}", prefix, ts, seq)
 }
 
-/// Taxas de swap por DEX (em fração, ex: 0.003 = 0.3%).
-/// V2 pools (QuickSwap, SushiSwap) cobram 0.3%.
-/// V3 pools (UniswapV3) variam — usamos 0.3% como default conservador.
-const DEX_FEE_DEFAULT: f64 = 0.003;
-
 // ------------------------------------------------------------
 // 🧠 Estrutura principal
 // ------------------------------------------------------------
@@ -316,6 +311,7 @@ impl ArbitrageEngine {
     // ------------------------------------------------------------
 
     /// Normaliza amount considerando decimals
+    #[allow(dead_code)]
     fn normalize_amount(amount: U256, decimals: u32) -> f64 {
         if amount.is_zero() {
             return 0.0;
@@ -2257,6 +2253,7 @@ impl ArbitrageEngine {
     /// Fabricar o inverso cria “lucros fantasmas” que revertam on-chain com "Not profitable".
     ///
     /// Semântica: graph[A][B] = rate significa "quantos B se obtém por 1 unidade de A" (token_out per token_in)
+    #[allow(dead_code)]
     fn build_price_graph(
         prices: &HashMap<String, HashMap<String, f64>>,
     ) -> HashMap<String, HashMap<String, (f64, String)>> {
@@ -2320,6 +2317,7 @@ impl ArbitrageEngine {
     }
 
     #[inline]
+    #[allow(dead_code)]
     fn is_usdt_centric(path: &[String]) -> bool {
         // Compat: USDT-only; preferir is_stable_flashloan_centric.
         path.first().map(|s| s.as_str()) == Some(TARGET_BASE_TOKEN)
@@ -2454,6 +2452,7 @@ impl ArbitrageEngine {
     }
 
     /// Versão simples que delega para a versão com fees usando placeholder dex (se necessário)
+    #[allow(dead_code)]
     async fn calculate_expected_output(
         &self,
         amount_in: U256,
@@ -2507,6 +2506,7 @@ impl ArbitrageEngine {
         )
     }
 
+    #[allow(dead_code)]
     fn estimate_stable_step(
         &self,
         base_token: &str,
@@ -2580,6 +2580,7 @@ impl ArbitrageEngine {
     /// V3 pools (UniswapV3) = fee tier real do pool / 1_000_000 (unidade uint24).
     /// Se o fee tier não estiver no cache, usa 0.3% como default.
     #[inline]
+    #[allow(dead_code)]
     fn dex_fee(dex_name: &str, pair: &str) -> f64 {
         match dex_name {
             "QuickSwap" | "SushiSwap" => 0.003, // V2: sempre 0.3%
@@ -2592,7 +2593,7 @@ impl ArbitrageEngine {
                     0.003 // Default: 0.3% (fee tier mais comum)
                 }
             }
-            _ => DEX_FEE_DEFAULT,
+            _ => 0.003,
         }
     }
 
@@ -2785,10 +2786,7 @@ mod tests {
         assert_eq!(ArbitrageEngine::dex_fee("SushiSwap", pair), 0.003);
         // UniswapV3 retorna 0.003 se não houver cache (default)
         assert_eq!(ArbitrageEngine::dex_fee("UniswapV3", pair), 0.003);
-        assert_eq!(
-            ArbitrageEngine::dex_fee("UnknownDex", pair),
-            DEX_FEE_DEFAULT
-        );
+        assert_eq!(ArbitrageEngine::dex_fee("UnknownDex", pair), 0.003);
     }
 
     /// Valida que UniswapV3 usa fee tier do cache quando disponível.

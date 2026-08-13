@@ -198,7 +198,7 @@ fn route_result_contains_all_leg_quotes() {
 }
 #[test]
 fn next_leg_uses_previous_leg_output() {
-    let (mut a, _, _, _, _) = pinned_record();
+    let (a, _, _, _, _) = pinned_record();
     let (mut b, _, _, _, _) = pinned_record();
     b.quote_id = H256::from_low_u64_be(9);
     b.amount_in = a.amount_out;
@@ -257,7 +257,7 @@ fn route_result_collects_all_pinned_leg_quotes() {
 }
 #[test]
 fn next_leg_receives_exact_previous_output() {
-    let (mut a, _, _, _, _) = pinned_record();
+    let (a, _, _, _, _) = pinned_record();
     let (mut b, _, _, _, _) = pinned_record();
     b.quote_id = H256::from_low_u64_be(9);
     b.amount_in = a.amount_out;
@@ -283,7 +283,7 @@ fn aggregated_only_route_is_not_c2b_eligible() {
 }
 #[test]
 fn rejected_curve_never_reaches_quote_adapter() {
-    let (mut r, a, b, mut p, s) = pinned_record();
+    let (r, a, b, mut p, s) = pinned_record();
     p.venue = "Curve".into();
     assert!(r.into_canonical(a, b, p, s).is_err())
 }

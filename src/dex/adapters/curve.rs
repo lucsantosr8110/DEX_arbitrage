@@ -74,6 +74,7 @@ pub struct CurveDex {
     client: Arc<AppMiddleware>,
     pool_address: Address,
     config: Arc<Config>,
+    #[allow(dead_code)]
     token_cache: Arc<TokenCache>,
     pool_tokens: Vec<(Address, u8, String)>, // (am_address, decimals, original_symbol)
 }
@@ -144,6 +145,7 @@ impl CurveDex {
         stable_symbol_for_address(addr)
     }
 
+    #[allow(dead_code)]
     fn symbol_from_pair(&self, pair: &str) -> Option<String> {
         // "USDC-USDT" → Some("USDC"), etc.
         let sym = pair.split('-').next()?;
