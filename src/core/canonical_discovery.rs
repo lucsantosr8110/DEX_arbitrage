@@ -293,6 +293,9 @@ pub struct CanonicalDiscoveryResult {
     pub economically_positive: Vec<crate::core::executable_route_materializer::ExecutableRoutePlan>,
     pub rejections: Vec<CanonicalRejection>,
     pub stats: DiscoveryStats,
+    /// All successful single-leg quotes from Phase A, retained for
+    /// presentation consumers even when route pruning limits Phase B.
+    pub initial_quotes: Vec<PinnedQuoteRecord>,
     /// Leg-quote-complete structural routes keyed by `structural_cycle_key`,
     /// with the real Phase-B re-quote chain and the pinned pool states used
     /// to produce them. Exposed so a caller's own fork-audit stage (Anvil
@@ -638,6 +641,7 @@ where
         let mut round_evidence: Vec<RoundEvidence> = Vec::new();
         let mut executable_routes = Vec::new();
         let mut economically_positive = Vec::new();
+        let mut initial_quotes: Vec<PinnedQuoteRecord> = Vec::new();
 
         // ---- Pool/token metadata: real on-chain code hash, pinned to the
         // anchor block. Address/decimals/symbol are already resolved and
@@ -826,6 +830,21 @@ where
         for (_, edges, local_pools) in quote_results {
             stats.quotes_succeeded += edges.len() as u64;
             for edge in edges {
+                initial_quotes.push(PinnedQuoteRecord {
+                    quote_id: edge.quote_id,
+                    anchor_block: edge.anchor_block,
+                    anchor_hash: edge.anchor_block_hash,
+                    venue: edge.venue,
+                    pool: edge.pool,
+                    token_in: edge.token_in,
+                    token_out: edge.token_out,
+                    amount_in: edge.amount_in,
+                    amount_out: edge.amount_out,
+                    pool_state_id: edge.pool_state_id,
+                    execution_metadata_id: edge.execution_metadata_id,
+                    adapter_version: "canonical-edge".into(),
+                    provenance_hash: edge.provenance_hash,
+                });
                 graph.push(edge);
             }
             pools.meta.extend(local_pools.meta);
@@ -999,6 +1018,7 @@ where
                 economically_positive,
                 rejections,
                 stats,
+                initial_quotes,
                 structural_routes: route_map,
                 leg_quotes: route_leg_quotes,
                 pool_states,
@@ -1071,6 +1091,7 @@ where
                     economically_positive,
                     rejections,
                     stats,
+                    initial_quotes,
                     structural_routes: route_map,
                     leg_quotes: route_leg_quotes,
                     pool_states,
@@ -1237,6 +1258,7 @@ where
             economically_positive,
             rejections,
             stats,
+            initial_quotes,
             structural_routes: route_map,
             leg_quotes: route_leg_quotes,
             pool_states,
