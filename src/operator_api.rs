@@ -16,13 +16,18 @@ struct Health { status: &'static str, api: &'static str, worker: &'static str, s
 #[derive(Serialize)]
 struct Snapshot {
     schema_version: &'static str, sequence: u64, generated_at: String,
-    runtime: Runtime, safety: Safety, chain: Chain, round: Round,
+    data_source: &'static str, runtime: Runtime, safety: Safety, chain: Chain, round: Round,
+    prices: Vec<Price>, routes: Vec<Route>, rpc: Vec<Rpc>, alerts: Vec<Alert>,
 }
 
 #[derive(Serialize)] struct Runtime { mode: &'static str, dry_run: bool, phase: String, uptime_secs: u64, shutdown_state: &'static str }
-#[derive(Serialize)] struct Safety { signer_present: bool, broadcaster_present: bool, wrapper_enabled: bool, simulate_before_execute: bool, economics_consistent: bool, mainnet_blocked: bool }
-#[derive(Serialize)] struct Chain { network: &'static str, chain_id: u64, head_block: u64, anchor_block: u64, anchor_hash: &'static str, confirmations: u64, data_age_ms: Option<u128> }
-#[derive(Serialize)] struct Round { duration_ms: u64, quotes: u64, edges: u64, cycles_detected: u64, routes_ranked: u64, routes_evaluated: u64, gross_positive: u64, economically_positive: u64, stable: u64, risk_approved: u64, selected: u64, timeouts: u64, latency_p50_ms: u64, latency_p95_ms: u64 }
+#[derive(Serialize)] struct Safety { signer_present: bool, broadcaster_present: bool, wrapper_enabled: bool, simulate_before_execute: bool, economics_consistent: Option<bool>, mainnet_blocked: bool }
+#[derive(Serialize)] struct Chain { network: &'static str, chain_id: u64, head_block: Option<u64>, anchor_block: Option<u64>, anchor_hash: Option<&'static str>, confirmations: Option<u64>, data_age_ms: Option<u128> }
+#[derive(Serialize)] struct Round { duration_ms: Option<u64>, quotes: u64, edges: Option<u64>, cycles_detected: u64, routes_ranked: u64, routes_evaluated: Option<u64>, gross_positive: u64, economically_positive: u64, stable: Option<u64>, risk_approved: Option<u64>, selected: Option<u64>, timeouts: Option<u64>, latency_p50_ms: Option<u64>, latency_p95_ms: Option<u64> }
+#[derive(Serialize)] struct Price { pair: String, quickswap: Option<f64>, sushiswap: Option<f64>, curve: Option<f64>, uniswap_v3: Option<f64>, net_usd: Option<f64> }
+#[derive(Serialize)] struct Route { id: String, route_kind: &'static str, path: String, venues: String, gross: f64, net: Option<f64>, distance: f64, status: &'static str, authoritative: bool, executable: bool, reason: Option<String> }
+#[derive(Serialize)] struct Rpc { alias: &'static str, status: &'static str, latency_ms: Option<u64> }
+#[derive(Serialize)] struct Alert { severity: &'static str, title: String, detail: String }
 
 pub async fn serve(tui: Arc<RwLock<TuiState>>, shutdown_tx: broadcast::Sender<()>) {
     let (events, _) = broadcast::channel(32);
@@ -41,7 +46,7 @@ pub async fn serve(tui: Arc<RwLock<TuiState>>, shutdown_tx: broadcast::Sender<()
 
 async fn health(State(state): State<ApiState>) -> Json<Health> {
     let snapshot = build_snapshot(&state.tui);
-    Json(Health { status: "ok", api: "ready", worker: if snapshot.round.quotes > 0 { "running" } else { "starting" }, sequence: snapshot.sequence, data_age_ms: state.tui.read().ok().and_then(|s| s.last_update.map(|i| i.elapsed().as_millis())) })
+    Json(Health { status: "ok", api: "ready", worker: if snapshot.sequence > 0 { "running" } else { "starting" }, sequence: snapshot.sequence, data_age_ms: state.tui.read().ok().and_then(|s| s.last_update.map(|i| i.elapsed().as_millis())) })
 }
 
 async fn snapshot(State(state): State<ApiState>) -> Json<Snapshot> { Json(build_snapshot(&state.tui)) }
@@ -55,10 +60,13 @@ fn build_snapshot(tui: &Arc<RwLock<TuiState>>) -> Snapshot {
     let state = tui.read().expect("TUI state poisoned");
     let age = state.last_update.map(|instant| instant.elapsed().as_millis());
     Snapshot {
-        schema_version: "operator.v1", sequence: state.cycle_count, generated_at: chrono::Utc::now().to_rfc3339(),
-        runtime: Runtime { mode: "PAPER", dry_run: true, phase: state.startup_phase.clone(), uptime_secs: state.start.elapsed().as_secs(), shutdown_state: "armed" },
-        safety: Safety { signer_present: false, broadcaster_present: false, wrapper_enabled: false, simulate_before_execute: true, economics_consistent: true, mainnet_blocked: true },
-        chain: Chain { network: "Polygon", chain_id: 137, head_block: 0, anchor_block: 0, anchor_hash: "redacted", confirmations: 0, data_age_ms: age },
-        round: Round { duration_ms: state.last_update.map(|i| i.elapsed().as_millis() as u64).unwrap_or(0), quotes: state.pairs_count as u64, edges: state.dex_count as u64, cycles_detected: state.negative_cycles as u64, routes_ranked: state.top_spreads.len() as u64, routes_evaluated: state.top_spreads.len() as u64, gross_positive: state.gross_positive as u64, economically_positive: state.net_positive as u64, stable: 0, risk_approved: 0, selected: 0, timeouts: 0, latency_p50_ms: 0, latency_p95_ms: 0 },
+        schema_version: "operator.v1", sequence: state.cycle_count, generated_at: chrono::Utc::now().to_rfc3339(), data_source: "tui_state",
+        runtime: Runtime { mode: "PAPER", dry_run: std::env::var("CONFIG_FILE").map(|v| v.contains("dryrun")).unwrap_or(true), phase: state.startup_phase.clone(), uptime_secs: state.start.elapsed().as_secs(), shutdown_state: "armed" },
+        safety: Safety { signer_present: false, broadcaster_present: false, wrapper_enabled: false, simulate_before_execute: true, economics_consistent: None, mainnet_blocked: true },
+        chain: Chain { network: "Polygon", chain_id: 137, head_block: None, anchor_block: None, anchor_hash: None, confirmations: None, data_age_ms: age },
+        round: Round { duration_ms: None, quotes: state.pairs_count as u64, edges: None, cycles_detected: state.negative_cycles as u64, routes_ranked: state.top_spreads.len() as u64, routes_evaluated: None, gross_positive: state.gross_positive as u64, economically_positive: state.net_positive as u64, stable: None, risk_approved: None, selected: None, timeouts: None, latency_p50_ms: None, latency_p95_ms: None },
+        prices: state.last_prices.iter().map(|price| Price { pair: price.pair.clone(), quickswap: price.quickswap, sushiswap: price.sushiswap, curve: price.curve, uniswap_v3: price.uniswap_v3, net_usd: price.net_usd }).collect(),
+        routes: state.top_spreads.iter().enumerate().map(|(index, route)| Route { id: format!("{}-{:02}", state.cycle_count, index + 1), route_kind: if route.hop_count >= 3 { "triangular" } else { "two_leg" }, path: route.legs_label.clone().unwrap_or_else(|| route.pair.clone()), venues: format!("{} / {}", route.buy_dex, route.sell_dex), gross: route.tui_spread_pct, net: route.net_usd, distance: route.distance_to_profit, status: if route.executable { "executable" } else { "observed" }, authoritative: route.executable, executable: route.executable, reason: route.outlier.clone() }).collect(),
+        rpc: Vec::new(), alerts: Vec::new(),
     }
 }
