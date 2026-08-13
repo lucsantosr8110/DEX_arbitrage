@@ -24,11 +24,14 @@ use flashloan_bot::{
     core::flashloan::ArbitrageClient,
     core::{
         bot::{execute_opportunity_standalone, should_try_next_opp, Bot},
+        c2b_round::RoundEvidence,
         c2b_shadow_service::{should_schedule_anchor, CanonicalC2BOpportunitySource},
         canonical_discovery::{
             CanonicalDiscoveryConfig, CanonicalDiscoveryProfile, CanonicalDiscoveryService,
+            CanonicalToken,
         },
         canonical_simulation::CanonicalSimulationClient,
+        executable_call::Venue,
         execution_profile::{ExecutionProfile, MAIN_PENDING_DRY_RUN_PROFILE},
         phase2d_anchor::AnchorBlock,
         risk::{CanonicalRiskConfig, RiskManager},
@@ -194,6 +197,62 @@ fn update_tui_state(
     }
 }
 
+/// Converte quotes canônicos reais em linhas de preço para a TUI.
+/// A TUI é apresentação בלבד: nenhuma decisão de execução é tomada aqui.
+fn canonical_price_rows(
+    evidence: &[RoundEvidence],
+    tokens: &[CanonicalToken],
+) -> Vec<tui::PriceRow> {
+    let token_meta: HashMap<Address, (&str, u8)> = tokens
+        .iter()
+        .map(|token| (token.address, (token.symbol.as_str(), token.decimals)))
+        .collect();
+    let mut rows: HashMap<String, tui::PriceRow> = HashMap::new();
+
+    for round in evidence {
+        for quote in &round.leg_quotes {
+            let Some((symbol_in, decimals_in)) = token_meta.get(&quote.token_in) else {
+                continue;
+            };
+            let Some((symbol_out, decimals_out)) = token_meta.get(&quote.token_out) else {
+                continue;
+            };
+            let Ok(amount_in) = quote.amount_in.to_string().parse::<f64>() else {
+                continue;
+            };
+            let Ok(amount_out) = quote.amount_out.to_string().parse::<f64>() else {
+                continue;
+            };
+            let amount_in = amount_in / 10f64.powi(*decimals_in as i32);
+            let amount_out = amount_out / 10f64.powi(*decimals_out as i32);
+            if amount_in <= 0.0 || !amount_in.is_finite() || !amount_out.is_finite() {
+                continue;
+            }
+            let pair = format!("{}/{}", symbol_in, symbol_out);
+            let row = rows.entry(pair.clone()).or_insert_with(|| tui::PriceRow {
+                pair,
+                quickswap: None,
+                sushiswap: None,
+                curve: None,
+                uniswap_v3: None,
+                net_usd: None,
+            });
+            let price = amount_out / amount_in;
+            match quote.venue {
+                Venue::QuickSwap if row.quickswap.is_none() => row.quickswap = Some(price),
+                Venue::SushiSwap if row.sushiswap.is_none() => row.sushiswap = Some(price),
+                Venue::Curve if row.curve.is_none() => row.curve = Some(price),
+                Venue::UniswapV3 if row.uniswap_v3.is_none() => row.uniswap_v3 = Some(price),
+                _ => {}
+            }
+        }
+    }
+
+    let mut rows: Vec<_> = rows.into_values().collect();
+    rows.sort_by(|a, b| a.pair.cmp(&b.pair));
+    rows
+}
+
 /// Mapeia `TopSpreadInfo` (radar, sync) → `TopSpreadRow` (TUI, subset sem TVL).
 fn top_spread_row_from_info(i: TopSpreadInfo) -> tui::TopSpreadRow {
     tui::TopSpreadRow {
@@ -299,6 +358,7 @@ async fn run_canonical_mode(
         "CANONICAL_DISCOVERY_PROFILE_RESOLVED"
     );
     let venue_count = discovery_config.venues.len();
+    let canonical_tokens = discovery_config.tokens.clone();
     let service = CanonicalDiscoveryService::new(provider.clone(), 137, discovery_config);
 
     // Dry-run-only thresholds. This phase never reaches a send/broadcast
@@ -377,16 +437,17 @@ async fn run_canonical_mode(
                         rounds_completed += 1;
                         let round_evidence_count = result.round_evidence.len();
                         let economically_positive = result.economically_positive.len();
+                        let last_prices = canonical_price_rows(&result.round_evidence, &canonical_tokens);
                         if let Ok(mut state) = tui_state.write() {
                             state.running = true;
                             state.cycle_count = rounds_completed;
                             state.dex_count = venue_count;
-                            state.pairs_count = result.stats.quotes_attempted as usize;
+                            state.pairs_count = last_prices.len();
                             state.gross_positive = economically_positive as u32;
                             state.net_positive = economically_positive as u32;
                             state.negative_cycles = result.rejections.len() as u32;
                             state.net_usd_total = 0.0;
-                            state.last_prices.clear();
+                            state.last_prices = last_prices;
                             state.top_spreads.clear();
                             state.last_update = Some(std::time::Instant::now());
                         }
