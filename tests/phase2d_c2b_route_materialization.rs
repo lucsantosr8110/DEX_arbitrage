@@ -211,6 +211,7 @@ fn materialized_route_is_accepted_by_economics_and_builders() {
             &SimulationContext {
                 start_decimals: 6,
                 gas_cost_atomic: U256::from(1),
+                flashloan_cost_atomic: U256::zero(),
             },
             &[U256::from(1900)],
         )

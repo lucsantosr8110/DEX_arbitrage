@@ -87,6 +87,8 @@ pub struct TopSpreadRow {
     pub tui_spread_pct: f64,
     pub buy_dex: String,
     pub sell_dex: String,
+    /// Optional complete venue chain for canonical routes (for example U→Q→S).
+    pub legs_label: Option<String>,
     /// None = sem reverse cotado (cycle_rate indisponível).
     pub cycle_rate: Option<f64>,
     /// None = sem 2-hop.
@@ -634,11 +636,9 @@ impl TuiApp {
             };
             rows.push(Row::new(vec![
                 Cell::from(pair_display),
-                Cell::from(format!(
-                    "{}→{}",
-                    abbrev_venue(&t.buy_dex),
-                    abbrev_venue(&t.sell_dex)
-                )),
+                Cell::from(t.legs_label.clone().unwrap_or_else(|| {
+                    format!("{}→{}", abbrev_venue(&t.buy_dex), abbrev_venue(&t.sell_dex))
+                })),
                 Cell::from(format!("{:.2}%", gross)),
                 Cell::from(fmt_opt_net(t.net_usd)).style(Style::default().fg(net_color)),
                 Cell::from(format!("{:.3}", t.distance_to_profit))

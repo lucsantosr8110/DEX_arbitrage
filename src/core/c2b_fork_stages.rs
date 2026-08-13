@@ -180,6 +180,7 @@ impl OrchestratorStages for RealForkStages {
             // reported separately once the preflight stage has real
             // receipts.
             gas_cost_atomic: U256::zero(),
+            flashloan_cost_atomic: U256::zero(),
         };
         let record = self.evidence.entry(key.to_string()).or_default();
         match StatefulRouteEvaluator.evaluate(

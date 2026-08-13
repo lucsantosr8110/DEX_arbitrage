@@ -109,6 +109,7 @@ fn evidence(
             final_amount_atomic: U256::from(1_100u64),
             gross_pnl_atomic: 100,
             gas_cost_atomic: U256::one(),
+            flashloan_cost_atomic: U256::zero(),
             net_pnl_atomic,
             pool_reuse_detected: false,
             all_models_supported: true,

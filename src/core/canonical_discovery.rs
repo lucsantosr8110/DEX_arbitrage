@@ -119,6 +119,10 @@ pub struct CanonicalDiscoveryConfig {
     pub tokens: Vec<CanonicalToken>,
     pub venues: Vec<CanonicalVenueConfig>,
     pub execution_profile: ExecutionProfile,
+    /// Route-external costs as parts-per-billion of the configured notional.
+    /// Adapter quotes already include pool fees and price impact.
+    pub flashloan_cost_ppb: u64,
+    pub gas_cost_ppb: u64,
 }
 
 impl CanonicalDiscoveryConfig {
@@ -231,11 +235,35 @@ impl CanonicalDiscoveryConfig {
             return Err(CanonicalDiscoveryConfigError::NoVenues);
         }
 
+        let notional_usd = cfg
+            .arbitrage
+            .default_trade_amount
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .unwrap_or(NOTIONAL_USD);
+        let flashloan_fraction = cfg
+            .flashloan
+            .fee_pct
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .unwrap_or(0.0005);
+        let gas_fraction = if cfg.execution.estimate_base_gas_usd.is_finite()
+            && cfg.execution.estimate_base_gas_usd >= 0.0
+        {
+            cfg.execution.estimate_base_gas_usd / notional_usd
+        } else {
+            0.0
+        };
+        let fraction_to_ppb =
+            |fraction: f64| -> u64 { (fraction.clamp(0.0, 1.0) * 1_000_000_000.0).round() as u64 };
+
         Ok(Self {
             profile,
             tokens,
             venues,
             execution_profile,
+            flashloan_cost_ppb: fraction_to_ppb(flashloan_fraction),
+            gas_cost_ppb: fraction_to_ppb(gas_fraction),
         })
     }
 
@@ -322,6 +350,13 @@ struct PoolContext {
 fn human_to_atomic(amount: f64, decimals: u8) -> U256 {
     let scaled = (amount * 10f64.powi(decimals as i32)).round();
     U256::from_dec_str(&format!("{}", scaled as u128)).unwrap_or(U256::zero())
+}
+
+fn proportional_cost_atomic(amount: U256, cost_ppb: u64) -> U256 {
+    amount
+        .checked_mul(U256::from(cost_ppb))
+        .map(|scaled| scaled / U256::from(1_000_000_000u64))
+        .unwrap_or(U256::MAX)
 }
 
 fn venue_str(venue: Venue) -> &'static str {
@@ -1245,7 +1280,14 @@ where
                 &plan.snapshot,
                 &SimulationContext {
                     start_decimals,
-                    gas_cost_atomic: U256::zero(),
+                    gas_cost_atomic: proportional_cost_atomic(
+                        route.route_input,
+                        self.config.gas_cost_ppb,
+                    ),
+                    flashloan_cost_atomic: proportional_cost_atomic(
+                        route.route_input,
+                        self.config.flashloan_cost_ppb,
+                    ),
                 },
                 &first_touch_quotes,
             );
@@ -1387,6 +1429,32 @@ mod tests {
             ["USDC", "USDT", "WMATIC", "WETH", "WBTC"]
                 .into_iter()
                 .collect()
+        );
+    }
+
+    #[test]
+    fn configured_flashloan_and_gas_costs_are_applied_atomically() {
+        let mut cfg = config_fixture();
+        cfg.arbitrage.default_trade_amount = "100.0".into();
+        cfg.flashloan.fee_pct = Some(0.0005);
+        cfg.execution.estimate_base_gas_usd = 0.008;
+        let config = CanonicalDiscoveryConfig::from_config(
+            &cfg,
+            CanonicalDiscoveryProfile::Base,
+            exec_profile(),
+        )
+        .unwrap();
+
+        assert_eq!(config.flashloan_cost_ppb, 500_000);
+        assert_eq!(config.gas_cost_ppb, 80_000);
+        let amount = U256::from(100_000_000u64); // 100 USDC
+        assert_eq!(
+            proportional_cost_atomic(amount, config.flashloan_cost_ppb),
+            U256::from(50_000u64)
+        );
+        assert_eq!(
+            proportional_cost_atomic(amount, config.gas_cost_ppb),
+            U256::from(8_000u64)
         );
     }
 

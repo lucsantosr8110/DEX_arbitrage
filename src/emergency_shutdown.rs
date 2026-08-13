@@ -28,15 +28,18 @@ fn emergency_terminal_cleanup() {
     let _ = execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
 }
 
-pub fn spawn_emergency_watchdog() {
+pub fn spawn_emergency_watchdog(grace: Duration) {
     std::thread::spawn(move || {
         while !EMERGENCY_SHUTDOWN.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(200));
         }
-        // Janela maior (8s) para dar tempo do shutdown gracioso drenar a TUI
-        // e restaurar o terminal naturalmente. Se ainda travado, forçamos.
-        std::thread::sleep(Duration::from_secs(8));
-        eprintln!("🛑 Saída de emergência: runtime tokio não respondeu em 8s.");
+        // A flag is armed as soon as shutdown is requested. Give the normal
+        // runtime the configured grace period before forcing termination.
+        std::thread::sleep(grace);
+        eprintln!(
+            "🛑 Saída de emergência: runtime tokio não respondeu em {}s.",
+            grace.as_secs()
+        );
         emergency_terminal_cleanup();
         std::process::exit(130);
     });

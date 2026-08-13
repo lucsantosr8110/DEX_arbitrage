@@ -8,7 +8,12 @@ use ethers::{
     types::{Address, H256, U256},
 };
 use futures::future;
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{broadcast, mpsc, Mutex};
@@ -24,6 +29,7 @@ use flashloan_bot::{
     core::flashloan::ArbitrageClient,
     core::{
         bot::{execute_opportunity_standalone, should_try_next_opp, Bot},
+        c2b_round::RoundEvidence,
         c2b_shadow_service::{should_schedule_anchor, CanonicalC2BOpportunitySource},
         canonical_adapters::PinnedQuoteRecord,
         canonical_discovery::{
@@ -35,6 +41,7 @@ use flashloan_bot::{
         execution_profile::{ExecutionProfile, MAIN_PENDING_DRY_RUN_PROFILE},
         phase2d_anchor::AnchorBlock,
         risk::{CanonicalRiskConfig, RiskManager},
+        route_artifact::StructuralRoute,
     },
     dex::{
         circuit_breaker::DexCircuitBreaker,
@@ -376,7 +383,7 @@ fn canonical_tui_economics(
             net_usd = combo.net_usd.unwrap_or_default(),
             distance_to_profit = combo.distance_to_profit,
             executable = combo.executable,
-            "CANONICAL_TOP_COMBO"
+            "CANONICAL_DIRECT_PAIR_COMBO"
         );
     }
     let top_spreads: Vec<tui::TopSpreadRow> =
@@ -393,13 +400,179 @@ fn canonical_tui_economics(
         net_usd_total,
         net_positive = economics.net_positive,
         negative_cycles = economics.negative_cycles_found,
-        "canonical TUI economics complete"
+        "canonical direct-pair TUI economics complete"
     );
     (
         top_spreads,
         net_usd_total,
         economics.net_positive as u32,
         economics.negative_cycles_found as u32,
+    )
+}
+
+fn u256_ratio(numerator: U256, denominator: U256) -> Option<f64> {
+    if denominator.is_zero() {
+        return None;
+    }
+    let numerator = numerator.to_string().parse::<f64>().ok()?;
+    let denominator = denominator.to_string().parse::<f64>().ok()?;
+    let ratio = numerator / denominator;
+    ratio.is_finite().then_some(ratio)
+}
+
+fn venue_abbreviation(venue: &str) -> &'static str {
+    match venue {
+        "QuickSwap" => "Q",
+        "SushiSwap" => "S",
+        "UniswapV3" => "U",
+        "Curve" => "C",
+        _ => "?",
+    }
+}
+
+/// Authoritative canonical Top Combo projection. Unlike the direct-pair
+/// diagnostic above, this consumes the same sequential Phase-B evidence and
+/// cost-adjusted net used by stability/risk gates.
+fn canonical_route_economics(
+    evidences: &[RoundEvidence],
+    routes: &BTreeMap<String, StructuralRoute>,
+    tokens: &[CanonicalToken],
+    cost: &AdjCostParams,
+    top_n: usize,
+) -> (Vec<tui::TopSpreadRow>, f64, u32, u32) {
+    let token_meta: HashMap<Address, (&str, u8)> = tokens
+        .iter()
+        .map(|token| (token.address, (token.symbol.as_str(), token.decimals)))
+        .collect();
+    let mut ranked = Vec::new();
+
+    for evidence in evidences {
+        let Some(economics) = evidence.economics.as_ref() else {
+            continue;
+        };
+        let Some(route) = routes.get(&evidence.structural_cycle_key) else {
+            continue;
+        };
+        let Some(cycle_rate) = u256_ratio(economics.final_amount_atomic, evidence.amount_in) else {
+            continue;
+        };
+        let gross_pct = (cycle_rate - 1.0) * 100.0;
+        let net_fraction = economics.net_pnl_atomic as f64
+            / evidence
+                .amount_in
+                .to_string()
+                .parse::<f64>()
+                .unwrap_or(f64::INFINITY);
+        let net_usd = net_fraction * cost.notional_usd;
+        if !net_usd.is_finite() {
+            continue;
+        }
+
+        let mut token_path = Vec::new();
+        if let Some(first) = route.legs.first() {
+            token_path.push(first.token_in.clone());
+            token_path.extend(route.legs.iter().map(|leg| leg.token_out.clone()));
+        }
+        let pair = token_path.join(">");
+        let venues: Vec<String> = route.legs.iter().map(|leg| leg.venue.clone()).collect();
+        let legs_label = venues
+            .iter()
+            .map(|venue| venue_abbreviation(venue))
+            .collect::<Vec<_>>()
+            .join("→");
+        let exact_legs = route
+            .legs
+            .iter()
+            .zip(&evidence.leg_quotes)
+            .map(|(leg, quote)| {
+                let (_, decimals_in) = token_meta.get(&quote.token_in).copied().unwrap_or(("?", 0));
+                let (_, decimals_out) = token_meta
+                    .get(&quote.token_out)
+                    .copied()
+                    .unwrap_or(("?", 0));
+                let atomic_rate = u256_ratio(quote.amount_out, quote.amount_in).unwrap_or_default();
+                let rate = atomic_rate * 10f64.powi(decimals_in as i32 - decimals_out as i32);
+                format!(
+                    "{}:{}>{}@{:.12}",
+                    leg.venue, leg.token_in, leg.token_out, rate
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+
+        ranked.push((
+            tui::TopSpreadRow {
+                pair,
+                tui_spread_pct: gross_pct,
+                buy_dex: venues.first().cloned().unwrap_or_default(),
+                sell_dex: venues.last().cloned().unwrap_or_default(),
+                legs_label: Some(legs_label),
+                cycle_rate: Some(cycle_rate),
+                net_usd: Some(net_usd),
+                distance_to_profit: (-net_usd).max(0.0),
+                executable: true,
+                has_curve_leg: venues.iter().any(|venue| venue == "Curve"),
+                outlier: None,
+            },
+            evidence.structural_cycle_key.clone(),
+            exact_legs,
+            economics.gross_pnl_atomic,
+            economics.net_pnl_atomic,
+        ));
+    }
+
+    ranked.sort_by(|a, b| {
+        b.0.net_usd
+            .unwrap_or(f64::NEG_INFINITY)
+            .partial_cmp(&a.0.net_usd.unwrap_or(f64::NEG_INFINITY))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.cmp(&b.1))
+    });
+    let net_positive = ranked
+        .iter()
+        .filter(|(row, ..)| row.net_usd.is_some_and(|net| net > 0.0))
+        .count() as u32;
+    let negative_cycles = ranked.len() as u32 - net_positive;
+    let net_usd_total = ranked
+        .iter()
+        .filter_map(|(row, ..)| row.net_usd.filter(|net| *net > 0.0))
+        .sum();
+
+    for (rank, (row, key, legs, gross_atomic, net_atomic)) in ranked.iter().take(top_n).enumerate()
+    {
+        info!(
+            target: "canonical_discovery",
+            rank = rank + 1,
+            structural_cycle_key = %key,
+            route = %row.pair,
+            legs = %legs,
+            cycle_rate = row.cycle_rate.unwrap_or_default(),
+            gross_pct = row.tui_spread_pct,
+            net_usd = row.net_usd.unwrap_or_default(),
+            gross_pnl_atomic = gross_atomic,
+            net_pnl_atomic = net_atomic,
+            executable = row.executable,
+            "CANONICAL_TOP_COMBO"
+        );
+    }
+    info!(
+        target: "canonical_discovery",
+        routes_evaluated = ranked.len(),
+        net_positive,
+        negative_cycles,
+        net_usd_total,
+        "canonical route economics projection complete"
+    );
+
+    (
+        ranked
+            .into_iter()
+            .take(top_n)
+            .map(|(row, ..)| row)
+            .collect(),
+        net_usd_total,
+        net_positive,
+        negative_cycles,
     )
 }
 
@@ -410,6 +583,7 @@ fn top_spread_row_from_info(i: TopSpreadInfo) -> tui::TopSpreadRow {
         tui_spread_pct: i.tui_spread_pct,
         buy_dex: i.buy_dex,
         sell_dex: i.sell_dex,
+        legs_label: None,
         cycle_rate: i.cycle_rate,
         net_usd: i.net_usd,
         distance_to_profit: i.distance_to_profit,
@@ -489,6 +663,7 @@ async fn run_canonical_mode(
     round_timeout: Duration,
     tui_state: Arc<std::sync::RwLock<tui::TuiState>>,
     mut shutdown_rx: broadcast::Receiver<()>,
+    tui_guard: &mut TuiGuard,
 ) -> Result<()> {
     let profile = match cfg.c2b_shadow.canonical_discovery_profile.as_str() {
         "liquid" => CanonicalDiscoveryProfile::Liquid,
@@ -545,19 +720,34 @@ async fn run_canonical_mode(
         "CANONICAL_STARTUP_WITHOUT_SIGNER=true CANONICAL_STARTUP_WITHOUT_BROADCASTER=true \
          CANONICAL_MAX_CONCURRENT_ROUNDS=1 CANONICAL_PENDING_ANCHORS_MAX=1"
     );
-    loop {
+    let result = 'worker: loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => return Ok(()),
             _ = shutdown_rx.recv() => {
                 info!("CANONICAL_SHUTDOWN_CANCELS_WORKER=true");
-                return Ok(());
+                break 'worker Ok(());
             }
             _ = ticks.tick() => {
-                let number = match provider.get_block_number().await {
+                let block_number_result = tokio::select! {
+                    biased;
+                    _ = shutdown_rx.recv() => {
+                        info!("CANONICAL_SHUTDOWN_CANCELS_BLOCK_POLL=true");
+                        break 'worker Ok(());
+                    }
+                    result = provider.get_block_number() => result,
+                };
+                let number = match block_number_result {
                     Ok(number) => number.as_u64(),
                     Err(error) => { warn!(error = %error, "canonical block poll failed"); continue; }
                 };
-                let block = match provider.get_block(number).await {
+                let block_result = tokio::select! {
+                    biased;
+                    _ = shutdown_rx.recv() => {
+                        info!("CANONICAL_SHUTDOWN_CANCELS_BLOCK_READ=true");
+                        break 'worker Ok(());
+                    }
+                    result = provider.get_block(number) => result,
+                };
+                let block = match block_result {
                     Ok(Some(block)) => block,
                     Ok(None) => continue,
                     Err(error) => { warn!(error = %error, "canonical get_block failed"); continue; }
@@ -584,20 +774,60 @@ async fn run_canonical_mode(
                 }
                 last_scheduled = Some((number, hash));
 
-                match tokio::time::timeout(round_timeout, service.discover_at(anchor.clone())).await {
+                // Once a `select!` branch is chosen, its handler runs to
+                // completion; the outer shutdown branch cannot interrupt an
+                // in-flight discovery. Keep shutdown in the same select as
+                // the round future so all pending RPC/quote work is dropped
+                // immediately when the broadcast arrives.
+                let discovery_result = tokio::select! {
+                    biased;
+                    _ = shutdown_rx.recv() => {
+                        info!("CANONICAL_SHUTDOWN_CANCELS_IN_FLIGHT_ROUND=true");
+                        break 'worker Ok(());
+                    }
+                    result = tokio::time::timeout(
+                        round_timeout,
+                        service.discover_at(anchor.clone()),
+                    ) => result,
+                };
+                match discovery_result {
                     Ok(Ok(result)) => {
                         rounds_completed += 1;
                         let round_evidence_count = result.round_evidence.len();
                         let economically_positive = result.economically_positive.len();
                         let mut last_prices = canonical_price_rows(&result.initial_quotes, &canonical_tokens);
+                        // Preserve direct-pair net on price rows as a diagnostic,
+                        // but source Top Combo and counters from authoritative
+                        // sequential canonical route evidence.
+                        let _ = canonical_tui_economics(&mut last_prices, &adj_cost, top_n);
                         let (top_spreads, net_usd_total, net_positive, negative_cycles) =
-                            canonical_tui_economics(&mut last_prices, &adj_cost, top_n);
+                            canonical_route_economics(
+                                &result.round_evidence,
+                                &result.structural_routes,
+                                &canonical_tokens,
+                                &adj_cost,
+                                top_n,
+                            );
+                        let economics_consistent = economically_positive == net_positive as usize;
+                        if !economics_consistent {
+                            error!(
+                                discovery_net_positive = economically_positive,
+                                presentation_net_positive = net_positive,
+                                "CANONICAL_ECONOMICS_DIVERGENCE_FAIL_CLOSED"
+                            );
+                        }
                         if let Ok(mut state) = tui_state.write() {
                             state.running = true;
                             state.cycle_count = rounds_completed;
                             state.dex_count = venue_count;
                             state.pairs_count = last_prices.len();
-                            state.gross_positive = economically_positive as u32;
+                            state.gross_positive = result
+                                .round_evidence
+                                .iter()
+                                .filter(|evidence| {
+                                    evidence.gross_pnl_atomic.is_some_and(|gross| gross > 0)
+                                })
+                                .count() as u32;
                             state.net_positive = net_positive;
                             state.negative_cycles = negative_cycles;
                             state.net_usd_total = net_usd_total;
@@ -605,14 +835,20 @@ async fn run_canonical_mode(
                             state.top_spreads = top_spreads;
                             state.last_update = Some(std::time::Instant::now());
                         }
+                        let evidence_for_shadow = if economics_consistent {
+                            result.round_evidence
+                        } else {
+                            Vec::new()
+                        };
                         let shadow_result = opportunity_source
-                            .run_evidence_round(anchor, result.round_evidence, &cfg, number, true)
+                            .run_evidence_round(anchor, evidence_for_shadow, &cfg, number, true)
                             .await;
                         info!(
                             round = rounds_completed,
                             anchor = number,
                             round_evidence = round_evidence_count,
                             economically_positive,
+                            economics_consistent,
                             stable_opportunities = shadow_result.stable_opportunities.len(),
                             risk_approved = shadow_result.risk_approvals.iter().filter(|(_, r)| r.is_ok()).count(),
                             strategies_selected = shadow_result.strategy_decisions.len(),
@@ -625,7 +861,12 @@ async fn run_canonical_mode(
                 }
             }
         }
-    }
+    };
+    info!("CANONICAL_WORKER_STOPPED=true");
+    tui_guard.join_with_timeout(Duration::from_secs(3));
+    metrics::set_bot_status(0);
+    info!("CANONICAL_SHUTDOWN_COMPLETE=true");
+    result
 }
 
 // ============================================================
@@ -782,7 +1023,14 @@ async fn main() -> Result<()> {
     // listener Ctrl+C independente possam se inscrever.
     let (shutdown_tx, _) = broadcast::channel::<()>(4);
     let _shutdown_on_drop = ShutdownOnDrop(shutdown_tx.clone());
-    emergency_shutdown::spawn_emergency_watchdog();
+    let emergency_grace = Duration::from_secs(
+        std::env::var("BOT_EMERGENCY_SHUTDOWN_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value >= 5)
+            .unwrap_or(30),
+    );
+    emergency_shutdown::spawn_emergency_watchdog(emergency_grace);
 
     // ── TUI sobe o mais cedo possível para dar feedback de startup ──
     // Antes a TUI só aparecia depois de HTTP/WS/DexManager/Bot, então o
@@ -820,9 +1068,8 @@ async fn main() -> Result<()> {
                     let _ = tokio::signal::ctrl_c().await;
                     warn!("🛑 Ctrl+C antecipado — solicitando shutdown gracioso.");
                     let _ = shutdown_tx.send(());
-                    // Se o runtime principal estiver realmente preso, o shutdown
-                    // gracioso não finaliza. Depois de 8s forçamos emergência.
-                    tokio::time::sleep(Duration::from_secs(8)).await;
+                    // Arm immediately; the watchdog itself owns the grace
+                    // window, so there is a single, observable timeout.
                     emergency_shutdown::request_emergency_shutdown();
                 });
             }
@@ -914,6 +1161,7 @@ async fn main() -> Result<()> {
             Duration::from_secs(cfg_unlocked.c2b_shadow.round_timeout_secs.max(1)),
             tui_state.clone(),
             shutdown_tx.subscribe(),
+            &mut tui_handle,
         )
         .await;
     }

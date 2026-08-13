@@ -19,6 +19,7 @@ pub struct PinnedStateSnapshot {
 pub struct SimulationContext {
     pub start_decimals: u8,
     pub gas_cost_atomic: U256,
+    pub flashloan_cost_atomic: U256,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +27,7 @@ pub struct RouteSimulationResult {
     pub final_amount_atomic: U256,
     pub gross_pnl_atomic: i128,
     pub gas_cost_atomic: U256,
+    pub flashloan_cost_atomic: U256,
     pub net_pnl_atomic: i128,
     pub pool_reuse_detected: bool,
     pub all_models_supported: bool,
@@ -106,11 +108,14 @@ impl FreshEconomicEvaluator for StatefulRouteEvaluator {
             .unwrap_or(i128::MAX)
             .saturating_sub(i128::try_from(amount_in.as_u128()).unwrap_or(i128::MAX));
         let gas = i128::try_from(context.gas_cost_atomic.as_u128()).unwrap_or(i128::MAX);
+        let flashloan =
+            i128::try_from(context.flashloan_cost_atomic.as_u128()).unwrap_or(i128::MAX);
         Ok(RouteSimulationResult {
             final_amount_atomic: amount,
             gross_pnl_atomic: gross,
             gas_cost_atomic: context.gas_cost_atomic,
-            net_pnl_atomic: gross.saturating_sub(gas),
+            flashloan_cost_atomic: context.flashloan_cost_atomic,
+            net_pnl_atomic: gross.saturating_sub(gas).saturating_sub(flashloan),
             pool_reuse_detected: reused,
             all_models_supported: true,
         })
@@ -154,12 +159,13 @@ mod tests {
                 &SimulationContext {
                     start_decimals: 6,
                     gas_cost_atomic: U256::from(1u64),
+                    flashloan_cost_atomic: U256::from(2u64),
                 },
                 &[U256::from(1_900u64)],
             )
             .unwrap();
         assert_eq!(result.final_amount_atomic, U256::from(1_900u64));
         assert_eq!(result.gross_pnl_atomic, 900);
-        assert_eq!(result.net_pnl_atomic, 899);
+        assert_eq!(result.net_pnl_atomic, 897);
     }
 }
