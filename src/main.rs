@@ -313,6 +313,71 @@ fn canonical_price_rows_with_bounds(
     rows
 }
 
+fn canonical_tui_economics(
+    rows: &mut [tui::PriceRow],
+    cost: &AdjCostParams,
+    top_n: usize,
+) -> (Vec<tui::TopSpreadRow>, f64, u32, u32) {
+    let mut prices: HashMap<String, HashMap<String, f64>> = HashMap::new();
+    for row in rows.iter() {
+        let pair = row.pair.replace('/', "-");
+        for (venue, price) in [
+            ("QuickSwap", row.quickswap),
+            ("SushiSwap", row.sushiswap),
+            ("Curve", row.curve),
+            ("UniswapV3", row.uniswap_v3),
+        ] {
+            if let Some(price) = price.filter(|value| value.is_finite() && *value > 0.0) {
+                prices
+                    .entry(venue.to_string())
+                    .or_default()
+                    .insert(pair.clone(), price);
+            }
+        }
+    }
+
+    let (_, _, economics, adj_cycles) = extract_edges(&prices, cost);
+    let ranked = compute_top_spreads(&prices, cost, top_n);
+    let mut net_by_pair: HashMap<String, f64> = HashMap::new();
+    for combo in &ranked {
+        if let Some(net) = combo.net_usd {
+            let key = tui::norm_pair(&combo.pair);
+            net_by_pair
+                .entry(key)
+                .and_modify(|current| *current = current.max(net))
+                .or_insert(net);
+        }
+    }
+    for row in rows {
+        row.net_usd = net_by_pair
+            .get(&tui::norm_pair(&row.pair.replace('/', "-")))
+            .copied();
+    }
+
+    let top_spreads: Vec<tui::TopSpreadRow> =
+        ranked.into_iter().map(top_spread_row_from_info).collect();
+    let net_usd_total = adj_cycles
+        .iter()
+        .map(|cycle| cycle.net_profit_usd)
+        .filter(|net| *net > 0.0)
+        .sum();
+    tracing::info!(
+        target: "canonical_discovery",
+        top_combos = top_spreads.len(),
+        rows_with_net = net_by_pair.len(),
+        net_usd_total,
+        net_positive = economics.net_positive,
+        negative_cycles = economics.negative_cycles_found,
+        "canonical TUI economics complete"
+    );
+    (
+        top_spreads,
+        net_usd_total,
+        economics.net_positive as u32,
+        economics.negative_cycles_found as u32,
+    )
+}
+
 /// Mapeia `TopSpreadInfo` (radar, sync) → `TopSpreadRow` (TUI, subset sem TVL).
 fn top_spread_row_from_info(i: TopSpreadInfo) -> tui::TopSpreadRow {
     tui::TopSpreadRow {
@@ -394,6 +459,7 @@ fn graceful_startup_cleanup(
 async fn run_canonical_mode(
     provider: Arc<Provider<Http>>,
     cfg: Arc<Config>,
+    adj_cost: Arc<AdjCostParams>,
     every_n_blocks: u64,
     round_timeout: Duration,
     tui_state: Arc<std::sync::RwLock<tui::TuiState>>,
@@ -419,6 +485,7 @@ async fn run_canonical_mode(
     );
     let venue_count = discovery_config.venues.len();
     let canonical_tokens = discovery_config.tokens.clone();
+    let top_n = cfg.log.top_spreads_n;
     let service = CanonicalDiscoveryService::new(provider.clone(), 137, discovery_config);
 
     // Dry-run-only thresholds. This phase never reaches a send/broadcast
@@ -497,18 +564,20 @@ async fn run_canonical_mode(
                         rounds_completed += 1;
                         let round_evidence_count = result.round_evidence.len();
                         let economically_positive = result.economically_positive.len();
-                        let last_prices = canonical_price_rows(&result.initial_quotes, &canonical_tokens);
+                        let mut last_prices = canonical_price_rows(&result.initial_quotes, &canonical_tokens);
+                        let (top_spreads, net_usd_total, net_positive, negative_cycles) =
+                            canonical_tui_economics(&mut last_prices, &adj_cost, top_n);
                         if let Ok(mut state) = tui_state.write() {
                             state.running = true;
                             state.cycle_count = rounds_completed;
                             state.dex_count = venue_count;
                             state.pairs_count = last_prices.len();
                             state.gross_positive = economically_positive as u32;
-                            state.net_positive = economically_positive as u32;
-                            state.negative_cycles = result.rejections.len() as u32;
-                            state.net_usd_total = 0.0;
+                            state.net_positive = net_positive;
+                            state.negative_cycles = negative_cycles;
+                            state.net_usd_total = net_usd_total;
                             state.last_prices = last_prices;
-                            state.top_spreads.clear();
+                            state.top_spreads = top_spreads;
                             state.last_update = Some(std::time::Instant::now());
                         }
                         let shadow_result = opportunity_source
@@ -815,6 +884,7 @@ async fn main() -> Result<()> {
         return run_canonical_mode(
             provider,
             cfg_unlocked.clone(),
+            adj_cost.clone(),
             cfg_unlocked.c2b_shadow.shadow_every_n_blocks,
             Duration::from_secs(cfg_unlocked.c2b_shadow.round_timeout_secs.max(1)),
             tui_state.clone(),
@@ -1350,10 +1420,15 @@ mod canonical_tui_tests {
             quote(Venue::UniswapV3, token_b, token_a, 98_000_000),
         ];
 
-        let rows = canonical_price_rows_with_bounds(&quotes, &tokens, 0.9, 1.05);
+        let mut rows = canonical_price_rows_with_bounds(&quotes, &tokens, 0.9, 1.05);
         let forward = rows.iter().find(|row| row.pair == "A/B").unwrap();
         assert_eq!(forward.quickswap, Some(1.0));
         assert_eq!(forward.sushiswap, None);
         assert_eq!(forward.uniswap_v3, Some(1.01));
+
+        let (top, _, _, _) = canonical_tui_economics(&mut rows, &AdjCostParams::default(), 8);
+        assert!(!top.is_empty());
+        assert!(top.iter().all(|combo| combo.net_usd.is_some()));
+        assert!(rows.iter().any(|row| row.net_usd.is_some()));
     }
 }
