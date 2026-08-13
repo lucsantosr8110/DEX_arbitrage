@@ -21,6 +21,7 @@ use flashloan_bot::core::canonical_discovery::{
 use flashloan_bot::core::execution_profile::{ExecutionProfile, MAIN_PENDING_DRY_RUN_PROFILE};
 use flashloan_bot::core::fork_route_executor::{spawn_anvil, wait_for_anvil_ready};
 use flashloan_bot::core::phase2d_anchor::AnchorBlock;
+use serial_test::serial;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -41,6 +42,7 @@ impl Drop for Guard {
 }
 
 #[tokio::test]
+#[serial(polygon_fork)]
 async fn discover_at_runs_the_real_operational_pipeline() {
     let archive = archive_rpc();
     let port = 8647u16;
@@ -51,7 +53,7 @@ async fn discover_at_runs_the_real_operational_pipeline() {
         Provider::<Http>::try_from(format!("http://127.0.0.1:{port}"))
             .expect("provider construction failed"),
     );
-    wait_for_anvil_ready(&provider, Duration::from_secs(30))
+    wait_for_anvil_ready(&provider, Duration::from_secs(180))
         .await
         .expect("anvil never became ready");
 

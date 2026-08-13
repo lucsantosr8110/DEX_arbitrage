@@ -50,6 +50,12 @@ pub fn spawn_anvil(archive_rpc: &str, fork_block: u64, chain_id: u64, port: u16)
             "--port",
             &port.to_string(),
             "--silent",
+            "--fork-retry-backoff",
+            "1000",
+            "--retries",
+            "10",
+            "--timeout",
+            "30000",
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())

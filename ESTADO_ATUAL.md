@@ -41,7 +41,7 @@ Consulta feita contra `https://polygon-bor-rpc.publicnode.com`, chain ID `137`:
 
 Essa consulta confirma existência de código e saldo observado; não confirma ownership, permissões, parâmetros internos, rentabilidade ou segurança para broadcast. Esses itens exigem chamadas ABI específicas e teste fork.
 
-`POLYGON_ARCHIVE_RPC_URL` não está definido no `.env`; os testes foram executados com `ALCHEMY_RPC_URL` atribuído temporariamente a essa variável no processo. RPC respondeu, mas o Anvil local não ficou pronto em 30 s. Os três testes Phase 2D-D falharam com `ANVIL_NOT_READY`; fork segue não certificado.
+`POLYGON_ARCHIVE_RPC_URL` não está definido no `.env`; os testes usam `INFURA_RPC_URL` atribuído temporariamente a essa variável no processo. Com testes serializados e retry/backoff do Anvil, os três testes Phase 2D-D passaram em 2026-08-12. O teste operacional completo de descoberta canônica inicia o fork, mas pode exceder vários minutos por causa do volume de chamadas RPC; ainda requer execução dedicada com limite operacional apropriado.
 
 ### Resultado de build e warnings
 

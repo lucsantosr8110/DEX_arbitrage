@@ -12,6 +12,7 @@ use ethers::types::{Address, U256};
 use flashloan_bot::core::fork_route_executor::{
     anvil_reset_to_block, anvil_set_balance, spawn_anvil, wait_for_anvil_ready,
 };
+use serial_test::serial;
 use std::time::Duration;
 
 const ANCHOR_BLOCK: u64 = 91_149_850;
@@ -38,6 +39,7 @@ impl Drop for Guard {
 }
 
 #[tokio::test]
+#[serial(polygon_fork)]
 async fn phase2d_d_smoke_fork_has_real_contract_bytecode_at_anchor_block() {
     let archive = archive_rpc();
     let port = 8646u16;
@@ -46,7 +48,7 @@ async fn phase2d_d_smoke_fork_has_real_contract_bytecode_at_anchor_block() {
 
     let provider = Provider::<Http>::try_from(format!("http://127.0.0.1:{port}"))
         .expect("provider construction failed");
-    wait_for_anvil_ready(&provider, Duration::from_secs(30))
+    wait_for_anvil_ready(&provider, Duration::from_secs(180))
         .await
         .expect("anvil never became ready");
 
@@ -77,6 +79,7 @@ async fn phase2d_d_smoke_fork_has_real_contract_bytecode_at_anchor_block() {
 }
 
 #[tokio::test]
+#[serial(polygon_fork)]
 async fn phase2d_d_reset_restores_anchor_state() {
     let archive = archive_rpc();
     let port = 8647u16;
@@ -85,7 +88,7 @@ async fn phase2d_d_reset_restores_anchor_state() {
 
     let provider = Provider::<Http>::try_from(format!("http://127.0.0.1:{port}"))
         .expect("provider construction failed");
-    wait_for_anvil_ready(&provider, Duration::from_secs(30))
+    wait_for_anvil_ready(&provider, Duration::from_secs(180))
         .await
         .expect("anvil never became ready");
 
@@ -125,6 +128,7 @@ async fn phase2d_d_reset_restores_anchor_state() {
 }
 
 #[tokio::test]
+#[serial(polygon_fork)]
 async fn phase2d_d_two_resets_to_same_block_produce_identical_state() {
     // Determinism companion to the isolation test: resetting to the same
     // anchor block twice, with different mutations in between, must yield
@@ -136,7 +140,7 @@ async fn phase2d_d_two_resets_to_same_block_produce_identical_state() {
 
     let provider = Provider::<Http>::try_from(format!("http://127.0.0.1:{port}"))
         .expect("provider construction failed");
-    wait_for_anvil_ready(&provider, Duration::from_secs(30))
+    wait_for_anvil_ready(&provider, Duration::from_secs(180))
         .await
         .expect("anvil never became ready");
 
