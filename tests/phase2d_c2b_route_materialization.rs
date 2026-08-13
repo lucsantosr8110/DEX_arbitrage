@@ -2,13 +2,14 @@ use ethers::types::{Address, U256};
 use flashloan_bot::core::{
     executable_call::{ExecutableCallBuilderRegistry, ExecutionCallContext, Venue},
     executable_route_materializer::{
-        materialize, CurveMethod, MaterializationError, PoolRecord, TokenRecord, VenueRecord,
+        materialize, materialize_canonical, CurveMethod, MaterializationError, PoolRecord,
+        TokenRecord, VenueRecord,
     },
     fresh_economics::{
         FreshEconomicEvaluator, PinnedStateSnapshot, SimulationContext, StatefulRouteEvaluator,
     },
     pool_state_sim::SimulatedPoolState,
-    route_artifact::{RouteLeg, RouteReturnClass, StructuralRoute},
+    route_artifact::{RouteLeg, RouteReturnClass, StructuralRoute, StructuralRouteLeg},
 };
 use std::collections::HashMap;
 
@@ -105,6 +106,43 @@ fn materializer_resolves_real_token_addresses() {
     let p = plan();
     assert_eq!(p.legs[0].token_in, a(1));
     assert_eq!(p.legs[0].token_out, a(2));
+}
+
+#[test]
+fn canonical_builder_ignores_human_route_symbols() {
+    let (mut tokens, pools, venues) = registries();
+    // Deliberately poison presentation strings and symbol registry. Typed legs
+    // remain sole canonical identity source.
+    tokens.clear();
+    let mut r = route();
+    r.legs[0].token_in = "USDC".into();
+    r.legs[0].token_out = "WMATIC".into();
+    r.executable_legs = Some(vec![StructuralRouteLeg {
+        leg_index: 0,
+        venue: Venue::QuickSwap,
+        token_in: a(1),
+        token_out: a(2),
+        pool: a(30),
+        router: a(40),
+        spender: a(40),
+        fee: None,
+    }]);
+    let plan = materialize_canonical(&r, 123, a(99), &pools, false, U256::from(1000)).unwrap();
+    assert_eq!(plan.legs[0].token_in, a(1));
+    assert_eq!(plan.legs[0].token_out, a(2));
+    assert!(tokens.is_empty());
+    assert!(venues.contains_key("QuickSwap"));
+}
+
+#[test]
+fn canonical_builder_rejects_missing_typed_addresses() {
+    let (_, pools, _) = registries();
+    let mut r = route();
+    r.executable_legs = None;
+    assert!(matches!(
+        materialize_canonical(&r, 1, a(9), &pools, false, U256::one()),
+        Err(MaterializationError::MissingTypedLegs)
+    ));
 }
 #[test]
 fn materializer_resolves_real_pool_and_router() {

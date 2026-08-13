@@ -90,6 +90,105 @@ pub enum MaterializationError {
     InvalidMetadata(&'static str),
     #[error("MATERIALIZATION_TOKEN_DISCONTINUITY")]
     TokenDiscontinuity,
+    #[error("MATERIALIZATION_MISSING_TYPED_LEGS")]
+    MissingTypedLegs,
+}
+
+/// Canonical materialization entry point.  Unlike the compatibility
+/// `materialize` below, it never reads `RouteLeg::token_in` or
+/// `RouteLeg::token_out`: those fields are presentation strings and must not
+/// participate in executable identity.
+pub fn materialize_canonical(
+    route: &StructuralRoute,
+    anchor_block: u64,
+    caller: Address,
+    pools: &HashMap<String, PoolRecord>,
+    rejected: bool,
+    amount_in: U256,
+) -> Result<ExecutableRoutePlan, MaterializationError> {
+    if rejected {
+        return Err(MaterializationError::RejectedRoute);
+    }
+    if amount_in.is_zero() {
+        return Err(MaterializationError::InvalidMetadata("amount"));
+    }
+    let typed_legs = route
+        .executable_legs
+        .as_ref()
+        .ok_or(MaterializationError::MissingTypedLegs)?;
+    if typed_legs.is_empty() {
+        return Err(MaterializationError::MissingTypedLegs);
+    }
+
+    let mut snapshot = PinnedStateSnapshot::default();
+    let mut legs: Vec<ExecutableLegPlan> = Vec::with_capacity(typed_legs.len());
+    let mut token_addresses = Vec::with_capacity(typed_legs.len() * 2);
+    let mut approvals = Vec::with_capacity(typed_legs.len());
+    let mut targets = Vec::with_capacity(typed_legs.len());
+    let mut funding = Vec::with_capacity(typed_legs.len());
+
+    for (index, typed) in typed_legs.iter().enumerate() {
+        if typed.token_in.is_zero()
+            || typed.token_out.is_zero()
+            || typed.token_in == typed.token_out
+        {
+            return Err(MaterializationError::InvalidMetadata("typed token"));
+        }
+        if index > 0 && legs[index - 1].token_out != typed.token_in {
+            return Err(MaterializationError::TokenDiscontinuity);
+        }
+        let key = format!("{:?}", typed.pool);
+        let pool = pools.get(&key).ok_or(MaterializationError::MissingPool)?;
+        if pool.address != typed.pool || pool.router != typed.router || !pool.bytecode_present {
+            return Err(MaterializationError::InvalidMetadata("typed pool metadata"));
+        }
+        if typed.router.is_zero() || typed.spender.is_zero() {
+            return Err(MaterializationError::MissingRouter);
+        }
+        if typed.venue == Venue::UniswapV3 && typed.fee.is_none() {
+            return Err(MaterializationError::InvalidMetadata("V3 fee"));
+        }
+        if typed.venue == Venue::Curve {
+            return Err(MaterializationError::InvalidMetadata("Curve metadata"));
+        }
+        snapshot.pools.insert(key, pool.state);
+        legs.push(ExecutableLegPlan {
+            venue: typed.venue,
+            token_in: typed.token_in,
+            token_out: typed.token_out,
+            pool: typed.pool,
+            router: typed.router,
+            fee: typed.fee,
+            curve_method: None,
+            token_in_index: None,
+            token_out_index: None,
+            spender: typed.spender,
+        });
+        approvals.push((typed.token_in, typed.spender, amount_in));
+        funding.push((typed.token_in, amount_in));
+        targets.push(typed.router);
+        token_addresses.extend([typed.token_in, typed.token_out]);
+    }
+    token_addresses.sort();
+    token_addresses.dedup();
+    targets.sort();
+    targets.dedup();
+    Ok(ExecutableRoutePlan {
+        structural_cycle_key: route.structural_cycle_key.clone(),
+        anchor_block,
+        start_token: legs[0].token_in,
+        legs,
+        snapshot,
+        fork_setup: ForkSetupPlan {
+            anchor_block,
+            caller,
+            tokens: token_addresses,
+            funding,
+            approvals,
+            targets: targets.clone(),
+            balance_checks: targets,
+        },
+    })
 }
 
 pub fn materialize(

@@ -87,6 +87,7 @@ impl Bot {
             .unwrap_or_else(|| "0xb391aEebB4Db4e99A456B28d29d3AF50193F078F".into());
 
         let executor_address: Address = executor_address_str.parse().unwrap_or_default();
+        drop(cfg_guard);
 
         // ✅ ArbitrageClient sem execution_engine
         let arbitrage_client =
@@ -96,23 +97,24 @@ impl Bot {
         // B7: ajusta threshold do circuit breaker de perda via config.
         arbitrage_client.init_profit_ledger().await;
 
-        let execution_mode = if cfg_guard.flashloan.enabled {
-            if cfg_guard
-                .arbitrage
-                .default_trade_amount
-                .parse::<f64>()
-                .unwrap_or(0.0)
-                > 0.0
-            {
-                ExecutionMode::Hybrid
+        let execution_mode = {
+            let cfg_guard = config.lock().await;
+            if cfg_guard.flashloan.enabled {
+                if cfg_guard
+                    .arbitrage
+                    .default_trade_amount
+                    .parse::<f64>()
+                    .unwrap_or(0.0)
+                    > 0.0
+                {
+                    ExecutionMode::Hybrid
+                } else {
+                    ExecutionMode::Flashloan
+                }
             } else {
-                ExecutionMode::Flashloan
+                ExecutionMode::Direct
             }
-        } else {
-            ExecutionMode::Direct
         };
-
-        drop(cfg_guard);
 
         // M5: sincroniza prêmio Aave antes da primeira descoberta/ranking.
         arbitrage_client.refresh_flashloan_premium().await;

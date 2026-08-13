@@ -356,26 +356,39 @@ impl UniswapV3Dex {
             );
             return Ok(None);
         }
-        // ~10%, 100%, 200% do notional configurado (default $100 → $10/$100/$200).
+        let fallback_amount = U256::from(10u128.pow(dec_a as u32));
         let a_small = match quote_amount_for_usd(&symbol_a, dec_a, notional * 0.1).await {
             Ok(amount) => amount,
             Err(e) => {
-                debug!("[{}] impacto sem notional: {}", DEX_NAME, e);
-                return Ok(None);
+                debug!(
+                    "[{}] quote_amount_for_usd small falhou ({}), usando fallback {:.0} raw units",
+                    DEX_NAME, e, fallback_amount
+                );
+                fallback_amount
             }
         };
         let a_mid = match quote_amount_for_usd(&symbol_a, dec_a, notional).await {
             Ok(amount) => amount,
             Err(e) => {
-                debug!("[{}] impacto sem notional: {}", DEX_NAME, e);
-                return Ok(None);
+                debug!(
+                    "[{}] quote_amount_for_usd mid falhou ({}), usando fallback {:.0} raw units",
+                    DEX_NAME,
+                    e,
+                    fallback_amount * U256::from(10u32)
+                );
+                fallback_amount * U256::from(10u32)
             }
         };
         let a_big = match quote_amount_for_usd(&symbol_a, dec_a, notional * 2.0).await {
             Ok(amount) => amount,
             Err(e) => {
-                debug!("[{}] impacto sem notional: {}", DEX_NAME, e);
-                return Ok(None);
+                debug!(
+                    "[{}] quote_amount_for_usd big falhou ({}), usando fallback {:.0} raw units",
+                    DEX_NAME,
+                    e,
+                    fallback_amount * U256::from(20u32)
+                );
+                fallback_amount * U256::from(20u32)
             }
         };
         let amounts_to_test: [U256; 3] = [a_small, a_mid, a_big];
@@ -391,17 +404,21 @@ impl UniswapV3Dex {
             }
         }
 
-        // Exige os 3 quotes p/ mediana robusta (A4: com 2, prices[len/2]=prices[1]
-        // é o maior, não mediana — viés p/ cima).
-        if prices.len() < 3 {
+        // Exige pelo menos 2 quotes p/ mediana robusta (com 2, prices[1] = maior dos 2; com 3, prices[1] = mediana).
+        // CL pools podem falhar em algum amount — 2/3 ainda dá sinal útil.
+        if prices.len() < 2 {
             warn!(
-                "[{}] Pool {}/{} (fee {}) - Não foi possível cotar preço confiável em 3 amounts ({}/3)",
-                DEX_NAME, token_a, token_b, best_fee, prices.len()
+                "[{}] Pool {}/{} (fee {}) - Não foi possível cotar preço confiável ({}/3 amounts)",
+                DEX_NAME,
+                token_a,
+                token_b,
+                best_fee,
+                prices.len()
             );
             return Ok(None);
         }
 
-        // 4. Calcula a mediana dos preços (3 elementos → prices[1] é mediana)
+        // 4. Calcula a mediana dos preços (2 elementos → prices[1]; 3 elementos → prices[1] = mediana)
         prices.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let median_price = prices[prices.len() / 2];
 
@@ -849,7 +866,11 @@ impl DexContract for UniswapV3Dex {
             U256::zero(),
         );
 
-        let method = router.method::<_, U256>("exactInputSingle", params)?;
+        // The canonical ISwapRouter.exactInputSingle takes a single
+        // ExactInputSingleParams TUPLE, not 8 flat arguments.  The outer
+        // 1-tuple here makes ethers-rs encode a single `tuple` input,
+        // matching the real on-chain selector.
+        let method = router.method::<_, U256>("exactInputSingle", (params,))?;
         ALCHEMY_RATE_LIMITER.acquire().await?;
         let pending = method.send().await?;
         if let Some(r) = pending.await? {

@@ -327,9 +327,7 @@ impl ArbitrageEngine {
     /// presentes no price_map. Expansão dinâmica: qualquer token que apareça
     /// em alguma cotação é considerado conhecido, evitando falsos negativos
     /// em novos pares.
-    fn known_tokens(
-        price_map: &HashMap<String, HashMap<String, f64>>,
-    ) -> Vec<String> {
+    fn known_tokens(price_map: &HashMap<String, HashMap<String, f64>>) -> Vec<String> {
         let mut tokens: Vec<String> = Vec::new();
         let mut seen = std::collections::HashSet::new();
 
@@ -366,7 +364,12 @@ impl ArbitrageEngine {
     /// destinado a WMATIC-USDT).
     ///
     /// `known_tokens`: lista dinâmica de tokens conhecidos (estáticos + price_map).
-    fn is_realistic_price(price: f64, token_in: &str, token_out: &str, known_tokens: &[String]) -> bool {
+    fn is_realistic_price(
+        price: f64,
+        token_in: &str,
+        token_out: &str,
+        known_tokens: &[String],
+    ) -> bool {
         if !price.is_finite() || price <= 0.0 {
             return false;
         }
@@ -1648,7 +1651,13 @@ impl ArbitrageEngine {
                     }
                     evaluated += 1;
                     match Self::try_cross_dex_cycle_exhaustive(
-                        start, mid, hop, prices, &venues, min_spread, &known_tokens,
+                        start,
+                        mid,
+                        hop,
+                        prices,
+                        &venues,
+                        min_spread,
+                        &known_tokens,
                     ) {
                         IntraCycleResult::MissingLeg => {
                             note_triangular_leg_low_liquidity_discarded(1);
@@ -1957,8 +1966,15 @@ impl ArbitrageEngine {
                             [(mid.as_str(), hop.as_str()), (hop.as_str(), mid.as_str())];
                         for (a, b) in orderings {
                             evaluated += 1;
-                            match Self::try_intra_dex_cycle(venue, start, a, b, &graph, min_spread, &known_tokens)
-                            {
+                            match Self::try_intra_dex_cycle(
+                                venue,
+                                start,
+                                a,
+                                b,
+                                &graph,
+                                min_spread,
+                                &known_tokens,
+                            ) {
                                 IntraCycleResult::MissingLeg => {
                                     note_triangular_leg_low_liquidity_discarded(1);
                                 }
@@ -3314,8 +3330,15 @@ mod tests {
         uni.insert("LINK-USDC".into(), 18.0);
         let graph = ArbitrageEngine::build_price_graph_for_dex("UniswapV3", &uni);
 
-        let r =
-            ArbitrageEngine::try_intra_dex_cycle("UniswapV3", "USDC", "LINK", "WETH", &graph, 0.01, &test_known_tokens());
+        let r = ArbitrageEngine::try_intra_dex_cycle(
+            "UniswapV3",
+            "USDC",
+            "LINK",
+            "WETH",
+            &graph,
+            0.01,
+            &test_known_tokens(),
+        );
         assert!(matches!(r, IntraCycleResult::MissingLeg));
 
         // Simula o finder: MissingLeg → note
@@ -3390,7 +3413,13 @@ mod tests {
 
         let venues: Vec<String> = prices.keys().cloned().collect();
         let r = ArbitrageEngine::try_cross_dex_cycle_exhaustive(
-            "USDC", "LINK", "WETH", &prices, &venues, 0.1, &test_known_tokens(),
+            "USDC",
+            "LINK",
+            "WETH",
+            &prices,
+            &venues,
+            0.1,
+            &test_known_tokens(),
         );
         match r {
             IntraCycleResult::Ok { steps, .. } => {
@@ -3423,7 +3452,13 @@ mod tests {
         // falta LINK→WETH e WETH→USDC
         let venues: Vec<String> = prices.keys().cloned().collect();
         let r = ArbitrageEngine::try_cross_dex_cycle_exhaustive(
-            "USDC", "LINK", "WETH", &prices, &venues, 0.01, &test_known_tokens(),
+            "USDC",
+            "LINK",
+            "WETH",
+            &prices,
+            &venues,
+            0.01,
+            &test_known_tokens(),
         );
         assert!(matches!(r, IntraCycleResult::MissingLeg));
         note_triangular_leg_low_liquidity_discarded(1);
@@ -3478,8 +3513,18 @@ mod tests {
 
     #[test]
     fn realistic_price_rejects_unknown_token_fallback() {
-        assert!(!ArbitrageEngine::is_realistic_price(1.0, "UNKNOWN", "USDC", &test_known_tokens()));
-        assert!(ArbitrageEngine::is_realistic_price(1.0, "USDC.E", "USDT", &test_known_tokens()));
+        assert!(!ArbitrageEngine::is_realistic_price(
+            1.0,
+            "UNKNOWN",
+            "USDC",
+            &test_known_tokens()
+        ));
+        assert!(ArbitrageEngine::is_realistic_price(
+            1.0,
+            "USDC.E",
+            "USDT",
+            &test_known_tokens()
+        ));
     }
 
     /// B3: degradado (mev.enabled=false) + allow_public_mempool=false → Err
