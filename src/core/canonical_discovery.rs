@@ -38,6 +38,7 @@ use ethers::{
     providers::Middleware,
     types::{Address, BlockId, BlockNumber, H256, U256},
 };
+use futures::{stream, StreamExt};
 use std::{
     collections::{BTreeMap, HashMap},
     sync::Arc,
@@ -146,35 +147,60 @@ impl CanonicalDiscoveryConfig {
         profile: CanonicalDiscoveryProfile,
         execution_profile: ExecutionProfile,
     ) -> Result<Self, CanonicalDiscoveryConfigError> {
-        let symbols: &[&str] = match profile {
+        let default_symbols: &[&str] = match profile {
             CanonicalDiscoveryProfile::Base => Self::BASE_TOKENS,
             CanonicalDiscoveryProfile::Liquid => Self::LIQUID_TOKENS,
         };
+        let token_override = std::env::var("CANONICAL_TOKEN_UNIVERSE").ok();
+        let symbols: Vec<String> = token_override
+            .as_deref()
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|symbol| !symbol.is_empty())
+                    .map(str::to_uppercase)
+                    .collect()
+            })
+            .unwrap_or_else(|| default_symbols.iter().map(|s| (*s).to_string()).collect());
         let mut tokens = Vec::with_capacity(symbols.len());
         for symbol in symbols {
-            let address = cfg.addresses.get(*symbol).copied().ok_or_else(|| {
-                CanonicalDiscoveryConfigError::MissingAddress((*symbol).to_string())
-            })?;
+            let address = cfg
+                .addresses
+                .get(&symbol)
+                .copied()
+                .ok_or_else(|| CanonicalDiscoveryConfigError::MissingAddress(symbol.clone()))?;
             let decimals = cfg
                 .pairs
                 .metadata
-                .get(*symbol)
+                .get(&symbol)
                 .and_then(|m| m.decimals)
-                .ok_or_else(|| {
-                    CanonicalDiscoveryConfigError::MissingDecimals((*symbol).to_string())
-                })?;
+                .ok_or_else(|| CanonicalDiscoveryConfigError::MissingDecimals(symbol.clone()))?;
             tokens.push(CanonicalToken {
                 address,
                 decimals,
-                symbol: (*symbol).to_string(),
+                symbol,
             });
         }
         if tokens.is_empty() {
             return Err(CanonicalDiscoveryConfigError::EmptyUniverse);
         }
 
+        let venue_override = std::env::var("CANONICAL_VENUES").ok().map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_ascii_lowercase)
+                .collect::<std::collections::HashSet<_>>()
+        });
         let mut venues = Vec::new();
         for (name, venue) in Self::KNOWN_VENUES.iter().copied() {
+            if let Some(allowed) = &venue_override {
+                if !allowed.contains(&name.to_ascii_lowercase()) {
+                    continue;
+                }
+            }
             let Some(dex) = cfg.dex.iter().find(|d| d.name == name) else {
                 continue;
             };
@@ -565,6 +591,29 @@ where
     }
 
     pub async fn discover_at(&self, anchor: PinnedAnchor) -> Result<CanonicalDiscoveryResult> {
+        let timeout_secs = std::env::var("CANONICAL_DISCOVERY_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(900);
+        tracing::info!(
+            target: "canonical_discovery",
+            anchor = anchor.number,
+            timeout_secs,
+            "canonical discovery started"
+        );
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            self.discover_at_inner(anchor),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!("CANONICAL_DISCOVERY_TIMEOUT after {timeout_secs}s")),
+        }
+    }
+
+    async fn discover_at_inner(&self, anchor: PinnedAnchor) -> Result<CanonicalDiscoveryResult> {
         if anchor.hash == H256::zero() {
             return Err(anyhow!("CANONICAL_ANCHOR_ZERO_HASH"));
         }
@@ -623,6 +672,13 @@ where
             .values()
             .map(|t| (t.address, t.clone()))
             .collect();
+        tracing::info!(
+            target: "canonical_discovery",
+            anchor = anchor.number,
+            tokens_configured = self.config.tokens.len(),
+            tokens_with_code = token_meta.len(),
+            "canonical metadata stage complete"
+        );
         let symbols: Vec<String> = self
             .config
             .tokens
@@ -639,81 +695,152 @@ where
         let mut graph = ExecutableEdgeGraph::new();
         let mut pools = PoolContext::default();
 
+        let quote_concurrency = std::env::var("CANONICAL_QUOTE_CONCURRENCY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(4);
+        let mut pair_inputs = Vec::new();
         for symbol_in in &symbols {
-            let Some(meta_in) = token_meta.get(symbol_in).cloned() else {
-                continue;
-            };
             for symbol_out in &symbols {
                 if symbol_in == symbol_out {
                     continue;
                 }
-                let Some(meta_out) = token_meta.get(symbol_out).cloned() else {
+                let (Some(meta_in), Some(meta_out)) =
+                    (token_meta.get(symbol_in), token_meta.get(symbol_out))
+                else {
                     continue;
                 };
-                stats.quotes_attempted += 1;
-                let amount_in = human_to_atomic(NOTIONAL_USD, meta_in.decimals);
+                pair_inputs.push((
+                    symbol_in.clone(),
+                    symbol_out.clone(),
+                    meta_in.clone(),
+                    meta_out.clone(),
+                ));
+            }
+        }
+        let pair_inputs: Vec<_> = pair_inputs.into_iter().enumerate().collect();
+        stats.quotes_attempted = pair_inputs.len() as u64;
+        tracing::info!(
+            target: "canonical_discovery",
+            anchor = anchor.number,
+            pairs = pair_inputs.len(),
+            quote_concurrency,
+            "canonical quote stage started"
+        );
 
-                if let Some(cfg) = quickswap {
-                    if let Some(edge) = quote_v2_edge(
-                        &self.provider,
-                        Venue::QuickSwap,
-                        cfg.router,
-                        cfg.factory,
-                        &meta_in,
-                        &meta_out,
-                        amount_in,
-                        &anchor,
-                        &mut pools,
-                    )
-                    .await
-                    {
-                        stats.quotes_succeeded += 1;
-                        graph.push(edge);
-                    }
-                }
-                if let Some(cfg) = sushiswap {
-                    if let Some(edge) = quote_v2_edge(
-                        &self.provider,
-                        Venue::SushiSwap,
-                        cfg.router,
-                        cfg.factory,
-                        &meta_in,
-                        &meta_out,
-                        amount_in,
-                        &anchor,
-                        &mut pools,
-                    )
-                    .await
-                    {
-                        stats.quotes_succeeded += 1;
-                        graph.push(edge);
-                    }
-                }
-                if let Some(cfg) = v3.filter(|cfg| cfg.quoter.is_some()) {
-                    let quoter = cfg.quoter.expect("filtered on Some");
-                    for fee in V3_FEE_TIERS {
-                        if let Some(edge) = quote_v3_edge(
-                            &self.provider,
+        let provider = self.provider.clone();
+        let anchor_for_quotes = anchor.clone();
+        let quote_results = stream::iter(pair_inputs.into_iter().map(
+            |(pair_index, (symbol_in, symbol_out, meta_in, meta_out))| {
+                let provider = provider.clone();
+                let anchor = anchor_for_quotes.clone();
+                let quickswap = quickswap.cloned();
+                let sushiswap = sushiswap.cloned();
+                let v3 = v3.cloned();
+                async move {
+                    tracing::info!(
+                        target: "canonical_discovery",
+                        anchor = anchor.number,
+                        token_in = %symbol_in,
+                        token_out = %symbol_out,
+                        "canonical quote pair started"
+                    );
+                    let mut local_pools = PoolContext::default();
+                    let mut edges = Vec::new();
+                    let amount_in = human_to_atomic(NOTIONAL_USD, meta_in.decimals);
+                    if let Some(cfg) = quickswap {
+                        if let Some(edge) = quote_v2_edge(
+                            &provider,
+                            Venue::QuickSwap,
                             cfg.router,
                             cfg.factory,
-                            quoter,
-                            fee,
                             &meta_in,
                             &meta_out,
                             amount_in,
                             &anchor,
-                            &mut pools,
+                            &mut local_pools,
                         )
                         .await
                         {
-                            stats.quotes_succeeded += 1;
-                            graph.push(edge);
+                            edges.push(edge);
                         }
                     }
+                    if let Some(cfg) = sushiswap {
+                        if let Some(edge) = quote_v2_edge(
+                            &provider,
+                            Venue::SushiSwap,
+                            cfg.router,
+                            cfg.factory,
+                            &meta_in,
+                            &meta_out,
+                            amount_in,
+                            &anchor,
+                            &mut local_pools,
+                        )
+                        .await
+                        {
+                            edges.push(edge);
+                        }
+                    }
+                    if let Some(cfg) = v3.filter(|cfg| cfg.quoter.is_some()) {
+                        let quoter = cfg.quoter.expect("filtered on Some");
+                        for fee in V3_FEE_TIERS {
+                            if let Some(edge) = quote_v3_edge(
+                                &provider,
+                                cfg.router,
+                                cfg.factory,
+                                quoter,
+                                fee,
+                                &meta_in,
+                                &meta_out,
+                                amount_in,
+                                &anchor,
+                                &mut local_pools,
+                            )
+                            .await
+                            {
+                                edges.push(edge);
+                            }
+                        }
+                    }
+                    tracing::info!(
+                        target: "canonical_discovery",
+                        anchor = anchor.number,
+                        token_in = %symbol_in,
+                        token_out = %symbol_out,
+                        quotes_succeeded = edges.len(),
+                        "canonical quote pair complete"
+                    );
+                    (pair_index, edges, local_pools)
                 }
+            },
+        ))
+        .buffer_unordered(quote_concurrency)
+        .collect::<Vec<_>>()
+        .await;
+
+        let mut quote_results = quote_results;
+        quote_results.sort_by_key(|(pair_index, _, _)| *pair_index);
+        for (_, edges, local_pools) in quote_results {
+            stats.quotes_succeeded += edges.len() as u64;
+            for edge in edges {
+                graph.push(edge);
             }
+            pools.meta.extend(local_pools.meta);
+            pools.state.extend(local_pools.state);
+            pools.quote_target.extend(local_pools.quote_target);
         }
         stats.edges_created = graph.edges.len() as u64;
+        tracing::info!(
+            target: "canonical_discovery",
+            anchor = anchor.number,
+            quotes_attempted = stats.quotes_attempted,
+            quotes_succeeded = stats.quotes_succeeded,
+            edges_created = stats.edges_created,
+            pools_observed = pools.meta.len(),
+            "canonical quote stage complete"
+        );
 
         // ---- Structural cycle discovery: one DFS pass per start token,
         // since route_input is decimal-scaled per starting token.
@@ -741,6 +868,13 @@ where
                 .or_insert(route);
         }
         stats.routes_discovered = route_map.len() as u64;
+        tracing::info!(
+            target: "canonical_discovery",
+            anchor = anchor.number,
+            cycles_detected = stats.cycles_detected,
+            routes_discovered = stats.routes_discovered,
+            "canonical structural stage complete"
+        );
 
         // ---- Phase B: sequential re-quote per structural route so
         // leg[n].amount_in == leg[n-1].amount_out with real adapter output.
@@ -826,6 +960,14 @@ where
                 }
             }
         }
+        tracing::info!(
+            target: "canonical_discovery",
+            anchor = anchor.number,
+            routes_discovered = route_map.len(),
+            routes_requoted = route_leg_quotes.len(),
+            rejections = rejections.len(),
+            "canonical sequential requote stage complete"
+        );
 
         let pool_states: HashMap<Address, SimulatedPoolState> = pools
             .state
@@ -890,6 +1032,9 @@ where
             );
         }
 
+        let context_pools = ctx_pools.len();
+        let context_states = ctx_states.len();
+        let context_routes = ctx_setup.len();
         let context = match CanonicalExecutionContext::build(
             anchor.number,
             anchor.hash,
@@ -919,6 +1064,14 @@ where
                 });
             }
         };
+        tracing::info!(
+            target: "canonical_discovery",
+            anchor = anchor.number,
+            context_pools,
+            context_states,
+            context_routes,
+            "canonical execution context stage complete"
+        );
 
         let mut token_records: HashMap<String, TokenRecord> = HashMap::new();
         for (sym, t) in &token_meta {
@@ -1052,6 +1205,17 @@ where
                 }
             }
         }
+
+        tracing::info!(
+            target: "canonical_discovery",
+            anchor = anchor.number,
+            routes_materialized = stats.routes_materialized,
+            economics_evaluated = stats.economics_evaluated,
+            executable_routes = executable_routes.len(),
+            economically_positive = economically_positive.len(),
+            rejections = rejections.len(),
+            "canonical discovery complete"
+        );
 
         Ok(CanonicalDiscoveryResult {
             anchor,

@@ -44,6 +44,10 @@ impl Drop for Guard {
 #[tokio::test]
 #[serial(polygon_fork)]
 async fn discover_at_runs_the_real_operational_pipeline() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_test_writer()
+        .try_init();
     let archive = archive_rpc();
     let port = 8647u16;
     let child = spawn_anvil(&archive, ANCHOR_BLOCK, CHAIN_ID, port).expect("anvil spawn failed");
