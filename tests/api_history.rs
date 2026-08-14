@@ -15,6 +15,8 @@ fn record(sequence: u64) -> RoundRecord {
         sequence,
         completed_at: format!("2026-08-14T12:00:{:02}Z", sequence % 60),
         duration_ms: Some(1_000),
+        discovery_ms: Some(600),
+        shadow_ms: Some(300),
         quotes: 8,
         edges: None,
         cycles_detected: 121,
@@ -82,6 +84,12 @@ async fn rounds_and_stats_endpoints_serve_persisted_history() {
     );
     assert!(stats_body.contains("\"best_net_usd\":0.42"));
     assert!(stats_body.contains("\"history_enabled\":true"));
+    assert!(
+        stats_body.contains("\"duration_p50_ms\":1000"),
+        "stats latency p50: {stats_body}"
+    );
+    assert!(stats_body.contains("\"duration_p95_ms\":1000"));
+    assert!(stats_body.contains("\"discovery_p50_ms\":600"));
 
     let _ = std::fs::remove_file(&db_path);
 }

@@ -213,6 +213,8 @@ fn persist_round(
     sequence: u64,
     anchor_block: u64,
     round_started: std::time::Instant,
+    discovery_ms: u64,
+    shadow_ms: u64,
     top_spreads: &[tui::TopSpreadRow],
     quotes: usize,
     cycles_detected: u64,
@@ -227,6 +229,8 @@ fn persist_round(
         sequence,
         completed_at: chrono::Utc::now().to_rfc3339(),
         duration_ms: Some(round_started.elapsed().as_millis() as u64),
+        discovery_ms: Some(discovery_ms),
+        shadow_ms: Some(shadow_ms),
         quotes: quotes as u64,
         edges: None,
         cycles_detected,
@@ -881,6 +885,7 @@ async fn run_canonical_mode(
                 // in-flight discovery. Keep shutdown in the same select as
                 // the round future so all pending RPC/quote work is dropped
                 // immediately when the broadcast arrives.
+                let discovery_started = std::time::Instant::now();
                 let discovery_result = tokio::select! {
                     biased;
                     _ = shutdown_rx.recv() => {
@@ -892,6 +897,7 @@ async fn run_canonical_mode(
                         service.discover_at(anchor.clone()),
                     ) => result,
                 };
+                let discovery_ms = discovery_started.elapsed().as_millis() as u64;
                 match discovery_result {
                     Ok(Ok(result)) => {
                         rounds_completed += 1;
@@ -982,9 +988,11 @@ async fn run_canonical_mode(
                         } else {
                             Vec::new()
                         };
+                        let shadow_started = std::time::Instant::now();
                         let shadow_result = opportunity_source
                             .run_evidence_round(anchor, evidence_for_shadow, &cfg, number, true)
                             .await;
+                        let shadow_ms = shadow_started.elapsed().as_millis() as u64;
                         info!(
                             round = rounds_completed,
                             anchor = number,
@@ -995,6 +1003,9 @@ async fn run_canonical_mode(
                             risk_approved = shadow_result.risk_approvals.iter().filter(|(_, r)| r.is_ok()).count(),
                             strategies_selected = shadow_result.strategy_decisions.len(),
                             dry_run_results = shadow_result.execution_results.len(),
+                            discovery_ms,
+                            shadow_ms,
+                            duration_ms = round_started.elapsed().as_millis(),
                             "CANONICAL_ROUND_COMPLETE"
                         );
                         persist_round(
@@ -1002,6 +1013,8 @@ async fn run_canonical_mode(
                             rounds_completed,
                             number,
                             round_started,
+                            discovery_ms,
+                            shadow_ms,
                             &top_spreads_for_history,
                             quotes_count,
                             u64::from(negative_cycles),

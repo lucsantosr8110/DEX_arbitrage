@@ -81,11 +81,11 @@ pub async fn serve(
 }
 
 async fn health(State(state): State<ApiState>) -> Json<Health> {
-    let snapshot = build_snapshot(&state.tui);
+    let snapshot = build_snapshot(&state.tui, &state.history);
     Json(Health { status: "ok", api: "ready", worker: if snapshot.sequence > 0 { "running" } else { "starting" }, sequence: snapshot.sequence, data_age_ms: state.tui.read().ok().and_then(|s| s.last_update.map(|i| i.elapsed().as_millis())) })
 }
 
-async fn snapshot(State(state): State<ApiState>) -> Json<Snapshot> { Json(build_snapshot(&state.tui)) }
+async fn snapshot(State(state): State<ApiState>) -> Json<Snapshot> { Json(build_snapshot(&state.tui, &state.history)) }
 
 async fn rounds(State(state): State<ApiState>, Query(query): Query<RoundsQuery>) -> Json<RoundsResponse> {
     let limit = query.limit.unwrap_or(24).clamp(1, 500);
@@ -110,15 +110,20 @@ async fn operator_events(State(state): State<ApiState>) -> Sse<impl tokio_stream
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("keep-alive"))
 }
 
-fn build_snapshot(tui: &Arc<RwLock<TuiState>>) -> Snapshot {
+fn build_snapshot(tui: &Arc<RwLock<TuiState>>, history: &Option<Arc<RoundHistory>>) -> Snapshot {
     let state = tui.read().expect("TUI state poisoned");
     let age = state.last_update.map(|instant| instant.elapsed().as_millis());
+    // Latência p50/p95 da duração do round, calculada do histórico SQLite.
+    let latency = history
+        .as_ref()
+        .and_then(|db| db.overall_stats().ok())
+        .map(|stats| stats.latency);
     Snapshot {
         schema_version: "operator.v1", sequence: state.cycle_count, generated_at: chrono::Utc::now().to_rfc3339(), data_source: "tui_state",
         runtime: Runtime { mode: "PAPER", dry_run: std::env::var("CONFIG_FILE").map(|v| v.contains("dryrun")).unwrap_or(true), phase: state.startup_phase.clone(), uptime_secs: state.start.elapsed().as_secs(), shutdown_state: "armed" },
         safety: Safety { signer_present: false, broadcaster_present: false, wrapper_enabled: false, simulate_before_execute: true, economics_consistent: None, mainnet_blocked: true },
         chain: Chain { network: "Polygon", chain_id: 137, head_block: None, anchor_block: None, anchor_hash: None, confirmations: None, data_age_ms: age },
-        round: Round { duration_ms: None, quotes: state.pairs_count as u64, edges: None, cycles_detected: state.negative_cycles as u64, routes_ranked: state.top_spreads.len() as u64, routes_evaluated: None, gross_positive: state.gross_positive as u64, economically_positive: state.net_positive as u64, stable: None, risk_approved: None, selected: None, timeouts: None, latency_p50_ms: None, latency_p95_ms: None },
+        round: Round { duration_ms: None, quotes: state.pairs_count as u64, edges: None, cycles_detected: state.negative_cycles as u64, routes_ranked: state.top_spreads.len() as u64, routes_evaluated: None, gross_positive: state.gross_positive as u64, economically_positive: state.net_positive as u64, stable: None, risk_approved: None, selected: None, timeouts: None, latency_p50_ms: latency.as_ref().and_then(|l| l.duration_p50_ms), latency_p95_ms: latency.as_ref().and_then(|l| l.duration_p95_ms) },
         prices: state.last_prices.iter().map(|price| Price { pair: price.pair.clone(), quickswap: price.quickswap, sushiswap: price.sushiswap, curve: price.curve, uniswap_v3: price.uniswap_v3, net_usd: price.net_usd }).collect(),
         routes: state.top_spreads.iter().enumerate().map(|(index, route)| Route { id: format!("{}-{:02}", state.cycle_count, index + 1), route_kind: if route.hop_count >= 3 { "triangular" } else { "two_leg" }, path: route.legs_label.clone().unwrap_or_else(|| route.pair.clone()), venues: format!("{} / {}", route.buy_dex, route.sell_dex), gross: route.tui_spread_pct, net: route.net_usd, distance: route.distance_to_profit, status: "observed", authoritative: false, executable: false, reason: route.outlier.clone().or_else(|| Some("observação read-only; sem autorização de execução".into())) }).collect(),
         rpc: Vec::new(), alerts: Vec::new(),
