@@ -30,7 +30,7 @@ use flashloan_bot::{
     core::{
         bot::{execute_opportunity_standalone, should_try_next_opp, Bot},
         c2b_round::RoundEvidence,
-        c2b_shadow_service::{should_schedule_anchor, CanonicalC2BOpportunitySource},
+        c2b_shadow_service::{should_schedule_anchor, C2BShadowResult, CanonicalC2BOpportunitySource},
         canonical_adapters::PinnedQuoteRecord,
         canonical_discovery::{
             CanonicalDiscoveryConfig, CanonicalDiscoveryProfile, CanonicalDiscoveryService,
@@ -54,6 +54,7 @@ use flashloan_bot::{
     emergency_shutdown::{self},
     // execution:: imports removidos: ExecutionEngine/MevConfig/gwei eram codigo morto
     infra::{
+        history::{RoundHistory, RoundRecord},
         metrics,
         rpc_provider::{is_usable_endpoint, RpcProvider},
         try_serve_metrics_with_fallback,
@@ -201,6 +202,65 @@ fn update_tui_state(
         state.top_spreads = top_spreads;
         state.last_prices = last_prices;
         state.last_update = Some(std::time::Instant::now());
+    }
+}
+
+/// Persiste o resumo de uma rodada canônica no histórico SQLite.
+/// Best-effort: falha de escrita apenas loga warning — o bot segue rodando.
+#[allow(clippy::too_many_arguments)]
+fn persist_round(
+    history: &Option<Arc<RoundHistory>>,
+    sequence: u64,
+    anchor_block: u64,
+    round_started: std::time::Instant,
+    top_spreads: &[tui::TopSpreadRow],
+    quotes: usize,
+    cycles_detected: u64,
+    gross_positive: usize,
+    economically_positive: u64,
+    net_usd_total: f64,
+    shadow: &C2BShadowResult,
+) {
+    let Some(db) = history else { return };
+    let best = top_spreads.first();
+    let record = RoundRecord {
+        sequence,
+        completed_at: chrono::Utc::now().to_rfc3339(),
+        duration_ms: Some(round_started.elapsed().as_millis() as u64),
+        quotes: quotes as u64,
+        edges: None,
+        cycles_detected,
+        routes_ranked: top_spreads.len() as u64,
+        routes_evaluated: None,
+        gross_positive: gross_positive as u64,
+        economically_positive,
+        stable: Some(shadow.stable_opportunities.len() as u64),
+        risk_approved: Some(
+            shadow
+                .risk_approvals
+                .iter()
+                .filter(|(_, result)| result.is_ok())
+                .count() as u64,
+        ),
+        selected: Some(shadow.strategy_decisions.len() as u64),
+        net_usd_total,
+        anchor_block: Some(anchor_block),
+        best_route_kind: best.map(|route| {
+            if route.hop_count >= 3 {
+                "triangular".to_string()
+            } else {
+                "two_leg".to_string()
+            }
+        }),
+        best_route_path: best
+            .and_then(|route| route.legs_label.clone())
+            .or_else(|| best.map(|route| route.pair.clone())),
+        best_route_venues: best.map(|route| format!("{} / {}", route.buy_dex, route.sell_dex)),
+        best_route_gross: best.map(|route| route.tui_spread_pct),
+        best_route_net: best.and_then(|route| route.net_usd),
+    };
+    if let Err(error) = db.insert_round(&record) {
+        warn!(%error, round = sequence, "falha ao persistir round no histórico");
     }
 }
 
@@ -694,6 +754,7 @@ fn graceful_startup_cleanup(
 /// ever reached, so there is no route back into legacy from here — a
 /// rejected or failed canonical round is logged and dropped, never
 /// retried against the legacy engine.
+#[allow(clippy::too_many_arguments)]
 async fn run_canonical_mode(
     provider: Arc<Provider<Http>>,
     cfg: Arc<Config>,
@@ -701,6 +762,7 @@ async fn run_canonical_mode(
     every_n_blocks: u64,
     round_timeout: Duration,
     tui_state: Arc<std::sync::RwLock<tui::TuiState>>,
+    history: Option<Arc<RoundHistory>>,
     mut shutdown_rx: broadcast::Receiver<()>,
     tui_guard: &mut TuiGuard,
 ) -> Result<()> {
@@ -812,6 +874,7 @@ async fn run_canonical_mode(
                     continue;
                 }
                 last_scheduled = Some((number, hash));
+                let round_started = std::time::Instant::now();
 
                 // Once a `select!` branch is chosen, its handler runs to
                 // completion; the outer shutdown branch cannot interrupt an
@@ -867,6 +930,16 @@ async fn run_canonical_mode(
                             two_leg_net_positive.saturating_add(canonical_net_positive);
                         let negative_cycles =
                             two_leg_negative_cycles.saturating_add(canonical_negative_cycles);
+                        // Capturas p/ persistência ANTES do move p/ TUI state.
+                        let quotes_count = last_prices.len();
+                        let gross_positive_count = result
+                            .round_evidence
+                            .iter()
+                            .filter(|evidence| {
+                                evidence.gross_pnl_atomic.is_some_and(|gross| gross > 0)
+                            })
+                            .count();
+                        let top_spreads_for_history = top_spreads.clone();
                         let economics_consistent =
                             economically_positive == canonical_net_positive as usize;
                         if !economics_consistent {
@@ -884,6 +957,9 @@ async fn run_canonical_mode(
                         );
                         if let Ok(mut state) = tui_state.write() {
                             state.running = true;
+                            state.set_startup_phase(&format!(
+                                "em execução — round {rounds_completed} (anchor {number})"
+                            ));
                             state.cycle_count = rounds_completed;
                             state.dex_count = venue_count;
                             state.pairs_count = last_prices.len();
@@ -920,6 +996,19 @@ async fn run_canonical_mode(
                             strategies_selected = shadow_result.strategy_decisions.len(),
                             dry_run_results = shadow_result.execution_results.len(),
                             "CANONICAL_ROUND_COMPLETE"
+                        );
+                        persist_round(
+                            &history,
+                            rounds_completed,
+                            number,
+                            round_started,
+                            &top_spreads_for_history,
+                            quotes_count,
+                            u64::from(negative_cycles),
+                            gross_positive_count,
+                            u64::from(net_positive),
+                            net_usd_total,
+                            &shadow_result,
                         );
                     }
                     Ok(Err(error)) => warn!(error = %error, "canonical round rejected; no legacy fallback"),
@@ -1103,10 +1192,31 @@ async fn main() -> Result<()> {
     // operador via uma tela preta por segundos (ou indefinidamente se RPC
     // travasse). Agora mostramos splash screen com a fase de inicialização.
     let tui_state = Arc::new(std::sync::RwLock::new(tui::TuiState::default()));
+    let history = match std::env::var("OPERATOR_DB_PATH") {
+        Ok(path) if !path.trim().is_empty() => {
+            match RoundHistory::open(PathBuf::from(path)) {
+                Ok(db) => Some(db),
+                Err(error) => {
+                    warn!(%error, "histórico SQLite indisponível — rodadas NÃO persistidas");
+                    None
+                }
+            }
+        }
+        _ => match RoundHistory::open(PathBuf::from("data/operator.db")) {
+            Ok(db) => Some(db),
+            Err(error) => {
+                warn!(%error, "histórico SQLite indisponível — rodadas NÃO persistidas");
+                None
+            }
+        },
+    };
     {
         let api_state = tui_state.clone();
+        let api_history = history.clone();
         let api_shutdown = shutdown_tx.clone();
-        tokio::spawn(async move { flashloan_bot::operator_api::serve(api_state, api_shutdown).await; });
+        tokio::spawn(async move {
+            flashloan_bot::operator_api::serve(api_state, api_history, api_shutdown).await;
+        });
     }
     let tui_enabled = !headless;
     let mut tui_handle = TuiGuard {
@@ -1231,6 +1341,7 @@ async fn main() -> Result<()> {
             cfg_unlocked.c2b_shadow.shadow_every_n_blocks,
             Duration::from_secs(cfg_unlocked.c2b_shadow.round_timeout_secs.max(1)),
             tui_state.clone(),
+            history,
             shutdown_tx.subscribe(),
             &mut tui_handle,
         )

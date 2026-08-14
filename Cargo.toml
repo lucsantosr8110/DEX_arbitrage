@@ -50,6 +50,8 @@ shellexpand = "2.1"
 once_cell = "1.19"
 lazy_static = "1.4"
 moka = { version = "0.12", features = ["sync"] }
+# Persistência de histórico de rodadas (SQLite embutido)
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 # =========================
 # Blockchain / Ethers

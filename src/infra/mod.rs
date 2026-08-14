@@ -9,6 +9,7 @@
 // TokenCache Global e Telegram integrados
 // ============================================================
 
+pub mod history;
 pub mod metrics;
 pub mod network;
 pub mod price_feed;

@@ -1,14 +1,31 @@
-use axum::{extract::State, response::sse::{Event, KeepAlive, Sse}, routing::get, Json, Router};
-use serde::Serialize;
-use std::{convert::Infallible, net::SocketAddr, sync::{Arc, RwLock}, time::Duration};
+use axum::{
+    extract::{Query, State},
+    response::sse::{Event, KeepAlive, Sse},
+    routing::get,
+    Json, Router,
+};
+use serde::{Deserialize, Serialize};
+use std::{
+    convert::Infallible,
+    net::SocketAddr,
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 use tokio::sync::broadcast;
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use tracing::{info, warn};
 
-use crate::tui::TuiState;
+use crate::{
+    infra::history::{OverallStats, RoundHistory, RoundRow},
+    tui::TuiState,
+};
 
 #[derive(Clone)]
-struct ApiState { tui: Arc<RwLock<TuiState>>, events: broadcast::Sender<String> }
+struct ApiState {
+    tui: Arc<RwLock<TuiState>>,
+    history: Option<Arc<RoundHistory>>,
+    events: broadcast::Sender<String>,
+}
 
 #[derive(Serialize)]
 struct Health { status: &'static str, api: &'static str, worker: &'static str, sequence: u64, data_age_ms: Option<u128> }
@@ -29,10 +46,29 @@ struct Snapshot {
 #[derive(Serialize)] struct Rpc { alias: &'static str, status: &'static str, latency_ms: Option<u64> }
 #[derive(Serialize)] struct Alert { severity: &'static str, title: String, detail: String }
 
-pub async fn serve(tui: Arc<RwLock<TuiState>>, shutdown_tx: broadcast::Sender<()>) {
+#[derive(Serialize)]
+struct RoundsResponse { rounds: Vec<RoundRow> }
+
+#[derive(Serialize)]
+struct StatsResponse { history_enabled: bool, stats: OverallStats }
+
+#[derive(Deserialize)]
+struct RoundsQuery { limit: Option<u64> }
+
+pub async fn serve(
+    tui: Arc<RwLock<TuiState>>,
+    history: Option<Arc<RoundHistory>>,
+    shutdown_tx: broadcast::Sender<()>,
+) {
     let (events, _) = broadcast::channel(32);
-    let state = ApiState { tui, events };
-    let app = Router::new().route("/api/v1/health", get(health)).route("/api/v1/snapshot", get(snapshot)).route("/api/v1/events", get(operator_events)).with_state(state);
+    let state = ApiState { tui, history, events };
+    let app = Router::new()
+        .route("/api/v1/health", get(health))
+        .route("/api/v1/snapshot", get(snapshot))
+        .route("/api/v1/rounds", get(rounds))
+        .route("/api/v1/stats", get(stats))
+        .route("/api/v1/events", get(operator_events))
+        .with_state(state);
     let port = std::env::var("OPERATOR_API_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(8080);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = match tokio::net::TcpListener::bind(addr).await { Ok(listener) => listener, Err(error) => { warn!(%error, "operator API não iniciou"); return; } };
@@ -50,6 +86,24 @@ async fn health(State(state): State<ApiState>) -> Json<Health> {
 }
 
 async fn snapshot(State(state): State<ApiState>) -> Json<Snapshot> { Json(build_snapshot(&state.tui)) }
+
+async fn rounds(State(state): State<ApiState>, Query(query): Query<RoundsQuery>) -> Json<RoundsResponse> {
+    let limit = query.limit.unwrap_or(24).clamp(1, 500);
+    let rounds = match &state.history {
+        Some(db) => db.recent_rounds(limit).unwrap_or_default(),
+        None => Vec::new(),
+    };
+    Json(RoundsResponse { rounds })
+}
+
+async fn stats(State(state): State<ApiState>) -> Json<StatsResponse> {
+    let history_enabled = state.history.is_some();
+    let stats = match &state.history {
+        Some(db) => db.overall_stats().unwrap_or_default(),
+        None => OverallStats::default(),
+    };
+    Json(StatsResponse { history_enabled, stats })
+}
 
 async fn operator_events(State(state): State<ApiState>) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
     let stream = BroadcastStream::new(state.events.subscribe()).filter_map(|item| item.ok()).map(|payload| Ok(Event::default().event("snapshot").data(payload)));

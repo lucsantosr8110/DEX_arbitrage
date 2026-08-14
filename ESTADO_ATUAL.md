@@ -19,6 +19,15 @@ Esta seção substitui o retrato de 2026-07-24 para o estado atual do código.
 | Fork Polygon | ⏳ ainda não validado nesta sessão | depende de RPC/fork disponível |
 | Mainnet | 🚫 bloqueada | simulação on-chain, saldo e fork ainda não certificados |
 
+### Persistência de histórico de rodadas — 2026-08-14
+
+- Novo módulo `src/infra/history.rs`: SQLite embutido (`rusqlite` bundled) persiste um resumo por rodada canônica — funnel (quotes/cycles/top ranked/econ/risk), `net_usd_total`, melhor rota (path/venues/gross/net), duração, anchor.
+- Escrita 1x por rodada no loop canônico (`persist_round` em `main.rs`); best-effort — falha só loga warning, bot segue.
+- DB em `data/operator.db` (default) ou env `OPERATOR_DB_PATH`. WAL + `synchronous=NORMAL`.
+- Endpoints novos: `GET /api/v1/rounds?limit=N` (histórico recente) e `GET /api/v1/stats` (total, melhor net ever, melhor rota ever).
+- Frontend: painel "Atividade de 1 hora" agora é bar-chart de net por rodada; "Melhor net" e waterfall vêm do histórico, não só do snapshot atual.
+- Loop legado do radar NÃO persiste (não é rodada — é scan de preço). Só o funil canônico gera rounds.
+
 ### Segurança operacional atual
 
 - `config/config.dryrun.toml`: `execution.dry_run = true`; usar este arquivo para testes locais.

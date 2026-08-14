@@ -53,12 +53,51 @@ function useOperatorData() {
   return { snapshot, connection };
 }
 
+// Histórico persistido em SQLite (rodadas passadas sobrevivem a restarts).
+// Rounds são lentos (~5-15min), então poll de 30s é suficiente.
+function useHistory() {
+  const [rounds, setRounds] = useState([]);
+  const [stats, setStats] = useState(null);
+  const [historyEnabled, setHistoryEnabled] = useState(false);
+
+  useEffect(() => {
+    const refresh = () => {
+      fetch("/api/v1/rounds?limit=24")
+        .then((response) => { if (!response.ok) throw new Error("rounds unavailable"); return response.json(); })
+        .then((data) => setRounds(data.rounds || []))
+        .catch(() => {});
+      fetch("/api/v1/stats")
+        .then((response) => { if (!response.ok) throw new Error("stats unavailable"); return response.json(); })
+        .then((data) => { setStats(data.stats || null); setHistoryEnabled(!!data.history_enabled); })
+        .catch(() => {});
+    };
+    refresh();
+    const poll = window.setInterval(refresh, 30000);
+    return () => window.clearInterval(poll);
+  }, []);
+  return { rounds, stats, historyEnabled };
+}
+
+// Bar-chart CSS do net USD por rodada (sem lib — espelha estilo do console).
+function RoundChart({ rounds }) {
+  if (!rounds.length) return <EmptyState message="Sem histórico persistido de rodadas." />;
+  const ordered = rounds.slice().reverse().slice(-24); // mais antigo → mais recente
+  const maxAbs = Math.max(0.01, ...ordered.map((round) => Math.abs(round.net_usd_total || 0)));
+  return <div className="chart"><div className="bars">{ordered.map((round) => {
+    const net = round.net_usd_total || 0;
+    const tone = net > 0 ? "green" : net < 0 ? "red" : "neutral";
+    const height = Math.max(2, (Math.abs(net) / maxAbs) * 100);
+    return <div className="bar-group" key={round.sequence} title={`#${round.sequence} ${money(net)} (${round.completed_at})`}><i style={{ height: `${height}%`, background: tone === "green" ? "var(--green)" : tone === "red" ? "var(--red)" : "#377582" }} /></div>;
+  })}</div><div className="chart-labels"><span>últimas {ordered.length} rodadas · net USD por round</span><span>máx {money(Math.max(0, ...ordered.map((round) => round.net_usd_total || 0)))}</span></div><div className="break-even"><span /><span>Break-even</span></div></div>;
+}
+
 function Badge({ children, tone = "neutral" }) { return <span className={`badge badge-${tone}`}>{children}</span>; }
 function Section({ title, eyebrow, action, children, className = "" }) { return <section className={`panel ${className}`}><div className="panel-heading"><div><span className="eyebrow">{eyebrow}</span><h2>{title}</h2></div>{action}</div>{children}</section>; }
 function Gate({ label, value, good = false }) { return <div className="gate"><span className={`gate-dot ${good ? "good" : "blocked"}`} /><div><strong>{label}</strong><small>{value}</small></div></div>; }
 
 function App() {
   const { snapshot, connection } = useOperatorData();
+  const { rounds, stats } = useHistory();
   const [section, setSection] = useState("overview");
   const [onlyAuthoritative, setOnlyAuthoritative] = useState(false);
   const age = snapshot.chain?.data_age_ms;
@@ -71,7 +110,7 @@ function App() {
     <main className="main"><header className="topbar"><div className="mobile-brand">ARGUS <span>operator console</span></div><div className="topbar-status"><Badge tone="cyan">POLYGON</Badge><Badge tone="amber">DRY RUN</Badge><span className="status-item"><i className={`status-dot ${connection === "live" ? "live" : "warn"}`} />{connection === "live" ? "SSE connected" : connection === "reconnecting" ? "reconnecting" : connection === "offline" ? "API offline" : "aguardando API"}</span><span className="status-item">anchor <b>{snapshot.chain?.anchor_block ?? "—"}</b></span><span className="status-item">data age <b className={age > 10000 ? "text-amber" : ""}>{ageLabel(age)}</b></span></div></header>
       <div className="content"><div className="page-intro"><div><span className="eyebrow">OPERATOR / {section.toUpperCase()}</span><h1>{nav.find((item) => item.id === section)?.label}</h1><p>Snapshot autoritativo · sequência <span className="mono">#{snapshot.sequence}</span> · {snapshot.generated_at ? new Date(snapshot.generated_at).toLocaleTimeString("pt-BR") : "sem evidência"}</p></div><div className="intro-actions"><Badge tone="outline">READ ONLY</Badge><button className="icon-button" aria-label="Atualizar snapshot" onClick={() => window.location.reload()}>↻</button></div></div>
       {age > 10000 && <div className="stale-banner"><span>!</span><div><strong>Dados potencialmente stale</strong><small>O console preserva o último snapshot conhecido. Nenhuma decisão de execução é habilitada.</small></div></div>}
-      {section === "overview" && <Overview snapshot={snapshot} bestRoute={bestRoute} />}
+      {section === "overview" && <Overview snapshot={snapshot} bestRoute={bestRoute} rounds={rounds} stats={stats} />}
       {section === "market" && <Market prices={snapshot.prices || []} />}
       {section === "routes" && <Routes routes={routes} onlyAuthoritative={onlyAuthoritative} setOnlyAuthoritative={setOnlyAuthoritative} />}
       {section === "pipeline" && <Pipeline snapshot={snapshot} />}
@@ -94,7 +133,16 @@ class ConsoleErrorBoundary extends React.Component {
   }
 }
 
-function Overview({ snapshot, bestRoute }) { const r = snapshot.round; return <><div className="kpi-grid"><Kpi label="Rodadas" value={formatNumber(snapshot.sequence)} note="última sequência" /><Kpi label="Melhor net" value={bestRoute ? money(bestRoute.net) : "—"} note="sem rota observada" tone={bestRoute?.net > 0 ? "green" : "amber"} /><Kpi label="Gross positivas" value={formatNumber(r.gross_positive)} note={`${formatNumber(r.economically_positive)} economicamente positivas`} /><Kpi label="Latência p95" value={r.latency_p95_ms == null ? "—" : `${r.latency_p95_ms}ms`} note={r.latency_p50_ms == null ? "sem medição" : `p50 ${r.latency_p50_ms}ms`} tone="cyan" /></div><div className="overview-grid"><Section title="Economia da melhor rota" eyebrow="WATERFALL" action={bestRoute && <Badge tone={bestRoute.authoritative ? "green" : "amber"}>{bestRoute.authoritative ? "EXECUTABLE" : "OBSERVED"}</Badge>}>{bestRoute ? <><div className="route-title"><strong>{bestRoute.path}</strong><span>{bestRoute.venues}</span></div><div className="waterfall"><div className="water-row cyan"><span>Gross spread</span><div className="water-track"><i style={{ width: `${Math.min(100, Math.max(8, Math.abs(bestRoute.gross) * 90))}%` }} /></div><b>{pct(bestRoute.gross)}</b></div><div className="water-row"><span>Net projetado</span><div className="water-track"><i style={{ width: `${Math.min(100, Math.max(8, Math.abs(bestRoute.net || 0) * 90))}%` }} /></div><b>{money(bestRoute.net)}</b></div></div></> : <EmptyState message="Nenhuma rota real observada ainda." />}</Section><Section title="Estado dos gates" eyebrow="SAFETY GATES"><div className="gates"><Gate label="Economics consistent" value={snapshot.safety.economics_consistent == null ? "sem evidência" : snapshot.safety.economics_consistent ? "confirmado" : "inconsistente"} good={snapshot.safety.economics_consistent === true} /><Gate label="Simulate before execute" value="obrigatório" good /><Gate label="Signer" value="ausente · bloqueado" /><Gate label="Broadcaster" value="ausente · bloqueado" /><Gate label="Mainnet execution" value="bloqueado por política" /></div></Section></div><div className="bottom-grid"><Section title="Atividade de 1 hora" eyebrow="ROUND PERFORMANCE"><div className="chart"><EmptyState message="Sem histórico persistido de rodadas." /></div></Section><Section title="Alertas recentes" eyebrow="ACTIONABLE"><div className="alerts">{snapshot.alerts.length ? snapshot.alerts.map((alert) => <div className="alert" key={alert.title}><span className={`alert-icon ${alert.severity}`}>{alert.severity === "warning" ? "!" : "i"}</span><div><strong>{alert.title}</strong><small>{alert.detail}</small></div></div>) : <EmptyState message="Nenhum alerta emitido pela API." />}</div></Section></div></>; }
+function Overview({ snapshot, bestRoute, rounds, stats }) {
+  const r = snapshot.round;
+  const bestNet = stats?.best_net_usd ?? bestRoute?.net ?? null;
+  const histRoute = stats?.best_net_route_path ? {
+    path: stats.best_net_route_path, venues: stats.best_net_route_venues || "—",
+    gross: stats.best_net_route_gross, net: stats.best_net_route_net, authoritative: false,
+  } : null;
+  const waterfall = histRoute ?? bestRoute ?? null;
+  const totalRounds = stats?.total_rounds ?? snapshot.sequence;
+  return <><div className="kpi-grid"><Kpi label="Rodadas" value={formatNumber(totalRounds)} note={stats ? "persistidas em SQLite" : "última sequência"} /><Kpi label="Melhor net" value={bestNet == null ? "—" : money(bestNet)} note={histRoute ? `melhor histórico · #${stats.best_net_sequence}` : "sem rota observada"} tone={bestNet > 0 ? "green" : "amber"} /><Kpi label="Gross positivas" value={formatNumber(r.gross_positive)} note={`${formatNumber(r.economically_positive)} economicamente positivas`} /><Kpi label="Latência p95" value={r.latency_p95_ms == null ? "—" : `${r.latency_p95_ms}ms`} note={r.latency_p50_ms == null ? "sem medição" : `p50 ${r.latency_p50_ms}ms`} tone="cyan" /></div><div className="overview-grid"><Section title="Economia da melhor rota" eyebrow="WATERFALL" action={histRoute ? <Badge tone="green">BEST EVER</Badge> : bestRoute ? <Badge tone="amber">OBSERVED</Badge> : null}>{waterfall ? <><div className="route-title"><strong>{waterfall.path}</strong><span>{waterfall.venues}</span></div><div className="waterfall"><div className="water-row cyan"><span>Gross spread</span><div className="water-track"><i style={{ width: `${Math.min(100, Math.max(8, Math.abs(waterfall.gross || 0) * 90))}%` }} /></div><b>{pct(waterfall.gross || 0)}</b></div><div className="water-row green"><span>Net projetado</span><div className="water-track"><i style={{ width: `${Math.min(100, Math.max(8, Math.abs(waterfall.net || 0) * 90))}%` }} /></div><b>{money(waterfall.net)}</b></div></div></> : <EmptyState message="Nenhuma rota real observada ainda." />}</Section><Section title="Estado dos gates" eyebrow="SAFETY GATES"><div className="gates"><Gate label="Economics consistent" value={snapshot.safety.economics_consistent == null ? "sem evidência" : snapshot.safety.economics_consistent ? "confirmado" : "inconsistente"} good={snapshot.safety.economics_consistent === true} /><Gate label="Simulate before execute" value="obrigatório" good /><Gate label="Signer" value="ausente · bloqueado" /><Gate label="Broadcaster" value="ausente · bloqueado" /><Gate label="Mainnet execution" value="bloqueado por política" /></div></Section></div><div className="bottom-grid"><Section title="Atividade de 1 hora" eyebrow="ROUND PERFORMANCE"><RoundChart rounds={rounds} /></Section><Section title="Alertas recentes" eyebrow="ACTIONABLE"><div className="alerts">{snapshot.alerts.length ? snapshot.alerts.map((alert) => <div className="alert" key={alert.title}><span className={`alert-icon ${alert.severity}`}>{alert.severity === "warning" ? "!" : "i"}</span><div><strong>{alert.title}</strong><small>{alert.detail}</small></div></div>) : <EmptyState message="Nenhum alerta emitido pela API." />}</div></Section></div></>; }
 function EmptyState({ message }) { return <div className="empty-state">{message}</div>; }
 function Kpi({ label, value, note, tone = "" }) { return <div className="kpi"><span>{label}</span><strong className={tone ? `text-${tone}` : ""}>{value}</strong><small>{note}</small></div>; }
 function Market({ prices }) { return <Section title="Matriz de preços" eyebrow="MARKET / FRESHNESS">{prices.length ? <div className="table-wrap"><table><thead><tr><th>Token / par</th><th>QuickSwap</th><th>SushiSwap</th><th>Curve</th><th>Uniswap V3</th><th>Net projetado</th></tr></thead><tbody>{prices.map((price) => <tr key={price.pair}><td><strong>{price.pair}</strong></td>{["quickswap", "sushiswap", "curve", "uniswap_v3"].map((dex) => <td className={price[dex] != null ? "mono" : "muted"} key={dex}>{formatPrice(price[dex])}</td>)}<td className="mono">{money(price.net_usd)}</td></tr>)}</tbody></table></div> : <EmptyState message="Nenhum preço real recebido do radar ainda." />}</Section>; }
