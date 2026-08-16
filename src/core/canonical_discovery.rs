@@ -988,87 +988,127 @@ where
             "canonical structural ranking stage complete"
         );
 
-        // ---- Phase B: sequential re-quote per structural route so
+        // ---- Phase B: parallel re-quote per structural route so
         // leg[n].amount_in == leg[n-1].amount_out with real adapter output.
-        // Caching by (pool, amount_in) keeps real RPC volume bounded when
-        // several structural routes share the same first leg. ----
+        // Routes are independent (legs within a route stay sequential), so
+        // they run concurrently via buffer_unordered. Caching by
+        // (pool, amount_in) keeps real RPC volume bounded when several
+        // structural routes share the same first leg. ----
+        let requote_concurrency = std::env::var("CANONICAL_REQUOTE_CONCURRENCY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(4);
         let mut route_leg_quotes: HashMap<String, Vec<PinnedQuoteRecord>> = HashMap::new();
-        let mut requote_cache: HashMap<(Address, U256), PinnedQuoteRecord> = HashMap::new();
+        let requote_cache: Arc<tokio::sync::Mutex<HashMap<(Address, U256), PinnedQuoteRecord>>> =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let pools = Arc::new(pools);
+        let provider = self.provider.clone();
+        let anchor_for_requote = anchor.clone();
+        let token_meta_for_requote = token_meta_by_addr.clone();
 
-        for (key, route) in &route_map {
-            let executable_legs = route.executable_legs.clone().unwrap_or_default();
-            if executable_legs.is_empty() {
-                rejections.push(CanonicalRejection {
-                    stage: "leg_quote_chain",
-                    reason: "ADAPTER_MISSING_TYPED_LEGS".to_string(),
-                    anchor: anchor.clone(),
-                    structural_cycle_key: Some(key.clone()),
-                });
-                continue;
-            }
+        let requote_results = stream::iter(route_map.iter().map(|(key, route)| {
+            let key = key.clone();
+            let route = route.clone();
+            let requote_cache = requote_cache.clone();
+            let pools = pools.clone();
+            let provider = provider.clone();
+            let anchor = anchor_for_requote.clone();
+            let token_meta_by_addr = token_meta_for_requote.clone();
+            async move {
+                let executable_legs = route.executable_legs.clone().unwrap_or_default();
+                if executable_legs.is_empty() {
+                    let rejection = CanonicalRejection {
+                        stage: "leg_quote_chain",
+                        reason: "ADAPTER_MISSING_TYPED_LEGS".to_string(),
+                        anchor: anchor.clone(),
+                        structural_cycle_key: Some(key.clone()),
+                    };
+                    return (key, Err(rejection));
+                }
 
-            let mut leg_quotes: Vec<PinnedQuoteRecord> = Vec::new();
-            let mut current_amount = route.route_input;
-            let mut chain_ok = true;
-            for leg in &executable_legs {
-                let cache_key = (leg.pool, current_amount);
-                let quote = if let Some(cached) = requote_cache.get(&cache_key) {
-                    Some(cached.clone())
-                } else {
-                    let fresh = requote_leg(
-                        &self.provider,
-                        leg,
-                        current_amount,
-                        &anchor,
-                        &token_meta_by_addr,
-                        &pools,
-                    )
-                    .await;
-                    if let Some(q) = &fresh {
-                        requote_cache.insert(cache_key, q.clone());
+                let mut leg_quotes: Vec<PinnedQuoteRecord> = Vec::new();
+                let mut current_amount = route.route_input;
+                let mut chain_ok = true;
+                for leg in &executable_legs {
+                    let cache_key = (leg.pool, current_amount);
+                    let quote = {
+                        let cache = requote_cache.lock().await;
+                        cache.get(&cache_key).cloned()
+                    };
+                    let quote = match quote {
+                        Some(quote) => Some(quote),
+                        None => {
+                            let fresh = requote_leg(
+                                &provider,
+                                leg,
+                                current_amount,
+                                &anchor,
+                                &token_meta_by_addr,
+                                pools.as_ref(),
+                            )
+                            .await;
+                            if let Some(quote) = &fresh {
+                                requote_cache.lock().await.insert(cache_key, quote.clone());
+                            }
+                            fresh
+                        }
+                    };
+                    match quote {
+                        Some(quote) => {
+                            current_amount = quote.amount_out;
+                            leg_quotes.push(quote);
+                        }
+                        None => {
+                            chain_ok = false;
+                            break;
+                        }
                     }
-                    fresh
-                };
-                match quote {
-                    Some(quote) => {
-                        current_amount = quote.amount_out;
-                        leg_quotes.push(quote);
+                }
+
+                let assembled = chain_ok.then(|| {
+                    assemble_route_leg_quotes(
+                        route.route_input,
+                        route.anchor_block,
+                        route.anchor_block_hash,
+                        leg_quotes.clone(),
+                        executable_legs.len(),
+                    )
+                });
+                match assembled {
+                    Some(Ok(_)) => (key, Ok(leg_quotes)),
+                    Some(Err(err)) => {
+                        let rejection = CanonicalRejection {
+                            stage: "leg_quote_chain",
+                            reason: err.to_string(),
+                            anchor: anchor.clone(),
+                            structural_cycle_key: Some(key.clone()),
+                        };
+                        (key, Err(rejection))
                     }
                     None => {
-                        chain_ok = false;
-                        break;
+                        let rejection = CanonicalRejection {
+                            stage: "leg_quote_chain",
+                            reason: "LEG_QUOTE_CHAIN_INCOMPLETE".to_string(),
+                            anchor: anchor.clone(),
+                            structural_cycle_key: Some(key.clone()),
+                        };
+                        (key, Err(rejection))
                     }
                 }
             }
+        }))
+        .buffer_unordered(requote_concurrency)
+        .collect::<Vec<_>>()
+        .await;
 
-            let assembled = chain_ok.then(|| {
-                assemble_route_leg_quotes(
-                    route.route_input,
-                    route.anchor_block,
-                    route.anchor_block_hash,
-                    leg_quotes.clone(),
-                    executable_legs.len(),
-                )
-            });
-            match assembled {
-                Some(Ok(_)) => {
-                    route_leg_quotes.insert(key.clone(), leg_quotes);
+        for (key, outcome) in requote_results {
+            match outcome {
+                Ok(leg_quotes) => {
+                    route_leg_quotes.insert(key, leg_quotes);
                 }
-                Some(Err(err)) => {
-                    rejections.push(CanonicalRejection {
-                        stage: "leg_quote_chain",
-                        reason: err.to_string(),
-                        anchor: anchor.clone(),
-                        structural_cycle_key: Some(key.clone()),
-                    });
-                }
-                None => {
-                    rejections.push(CanonicalRejection {
-                        stage: "leg_quote_chain",
-                        reason: "LEG_QUOTE_CHAIN_INCOMPLETE".to_string(),
-                        anchor: anchor.clone(),
-                        structural_cycle_key: Some(key.clone()),
-                    });
+                Err(rejection) => {
+                    rejections.push(rejection);
                 }
             }
         }
