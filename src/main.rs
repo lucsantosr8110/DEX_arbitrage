@@ -262,6 +262,11 @@ fn persist_round(
         best_route_venues: best.map(|route| format!("{} / {}", route.buy_dex, route.sell_dex)),
         best_route_gross: best.map(|route| route.tui_spread_pct),
         best_route_net: best.and_then(|route| route.net_usd),
+        // v1.1: cycle rate real (não tui_spread). Permite distinguir
+        // "spread forward-only" de "cycle fecha" no histórico.
+        tui_spread_pct: best.map(|route| route.tui_spread_pct),
+        cycle_rate_pct: best.and_then(|route| route.cycle_rate).map(|r| (r - 1.0) * 100.0),
+        cycle_net_usd: best.and_then(|route| route.net_usd),
     };
     if let Err(error) = db.insert_round(&record) {
         warn!(%error, round = sequence, "falha ao persistir round no histórico");
@@ -1223,13 +1228,20 @@ async fn main() -> Result<()> {
             }
         },
     };
+    // API server: spawn ANTES do `return run_canonical_mode` (linha 1349)
+    // para o caminho canonical (dry-run, default) também ter API. Cria
+    // circuit_breaker local só para satisfazer assinatura 4-arg de serve();
+    // a instância "real" usada pelo pipeline está em seção 7.
+    let circuit_breaker = Arc::new(DexCircuitBreaker::new(5, 30));
     {
         let api_state = tui_state.clone();
         let api_history = history.clone();
         let api_shutdown = shutdown_tx.clone();
+        let api_cb = circuit_breaker.clone();
         tokio::spawn(async move {
-            flashloan_bot::operator_api::serve(api_state, api_history, api_shutdown).await;
+            flashloan_bot::operator_api::serve(api_state, api_history, api_shutdown, Some(api_cb)).await;
         });
+        info!("🔌 Circuit breaker inicializado (5 falhas → cooldown 30s); exposto via /api/v1/snapshot.rpc");
     }
     let tui_enabled = !headless;
     let mut tui_handle = TuiGuard {

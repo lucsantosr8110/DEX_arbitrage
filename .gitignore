@@ -24,6 +24,9 @@ ignition/deployments/chain-31337
 /logs/
 *.log
 
+# Runtime db (sqlite round history)
+/data/
+
 # Audits and logs
 /audits/
 *.csv

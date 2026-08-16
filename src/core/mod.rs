@@ -34,6 +34,7 @@ pub mod fork_preflight;
 pub mod fork_route_executor;
 pub mod fork_trace_validation;
 pub mod fresh_discovery_gate;
+pub mod last_route_cache;
 pub mod fresh_economics;
 pub mod gas;
 pub mod gas_oracle;

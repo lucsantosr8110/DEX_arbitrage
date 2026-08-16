@@ -16,6 +16,7 @@ use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use tracing::{info, warn};
 
 use crate::{
+    dex::circuit_breaker::DexCircuitBreaker,
     infra::history::{OverallStats, RoundHistory, RoundRow},
     tui::TuiState,
 };
@@ -25,6 +26,7 @@ struct ApiState {
     tui: Arc<RwLock<TuiState>>,
     history: Option<Arc<RoundHistory>>,
     events: broadcast::Sender<String>,
+    circuit_breaker: Option<Arc<DexCircuitBreaker>>,
 }
 
 #[derive(Serialize)]
@@ -43,7 +45,7 @@ struct Snapshot {
 #[derive(Serialize)] struct Round { duration_ms: Option<u64>, quotes: u64, edges: Option<u64>, cycles_detected: u64, routes_ranked: u64, routes_evaluated: Option<u64>, gross_positive: u64, economically_positive: u64, stable: Option<u64>, risk_approved: Option<u64>, selected: Option<u64>, timeouts: Option<u64>, latency_p50_ms: Option<u64>, latency_p95_ms: Option<u64> }
 #[derive(Serialize)] struct Price { pair: String, quickswap: Option<f64>, sushiswap: Option<f64>, curve: Option<f64>, uniswap_v3: Option<f64>, net_usd: Option<f64> }
 #[derive(Serialize)] struct Route { id: String, route_kind: &'static str, path: String, venues: String, gross: f64, net: Option<f64>, distance: f64, status: &'static str, authoritative: bool, executable: bool, reason: Option<String> }
-#[derive(Serialize)] struct Rpc { alias: &'static str, status: &'static str, latency_ms: Option<u64> }
+#[derive(Serialize)] struct Rpc { alias: String, status: &'static str, latency_ms: Option<u64>, failures: u32, cooldown_active: bool }
 #[derive(Serialize)] struct Alert { severity: &'static str, title: String, detail: String }
 
 #[derive(Serialize)]
@@ -59,9 +61,10 @@ pub async fn serve(
     tui: Arc<RwLock<TuiState>>,
     history: Option<Arc<RoundHistory>>,
     shutdown_tx: broadcast::Sender<()>,
+    circuit_breaker: Option<Arc<DexCircuitBreaker>>,
 ) {
     let (events, _) = broadcast::channel(32);
-    let state = ApiState { tui, history, events };
+    let state = ApiState { tui, history, events, circuit_breaker };
     let app = Router::new()
         .route("/api/v1/health", get(health))
         .route("/api/v1/snapshot", get(snapshot))
@@ -81,11 +84,11 @@ pub async fn serve(
 }
 
 async fn health(State(state): State<ApiState>) -> Json<Health> {
-    let snapshot = build_snapshot(&state.tui, &state.history);
+    let snapshot = build_snapshot(&state.tui, &state.history, &state.circuit_breaker);
     Json(Health { status: "ok", api: "ready", worker: if snapshot.sequence > 0 { "running" } else { "starting" }, sequence: snapshot.sequence, data_age_ms: state.tui.read().ok().and_then(|s| s.last_update.map(|i| i.elapsed().as_millis())) })
 }
 
-async fn snapshot(State(state): State<ApiState>) -> Json<Snapshot> { Json(build_snapshot(&state.tui, &state.history)) }
+async fn snapshot(State(state): State<ApiState>) -> Json<Snapshot> { Json(build_snapshot(&state.tui, &state.history, &state.circuit_breaker)) }
 
 async fn rounds(State(state): State<ApiState>, Query(query): Query<RoundsQuery>) -> Json<RoundsResponse> {
     let limit = query.limit.unwrap_or(24).clamp(1, 500);
@@ -110,7 +113,11 @@ async fn operator_events(State(state): State<ApiState>) -> Sse<impl tokio_stream
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("keep-alive"))
 }
 
-fn build_snapshot(tui: &Arc<RwLock<TuiState>>, history: &Option<Arc<RoundHistory>>) -> Snapshot {
+fn build_snapshot(
+    tui: &Arc<RwLock<TuiState>>,
+    history: &Option<Arc<RoundHistory>>,
+    circuit_breaker: &Option<Arc<DexCircuitBreaker>>,
+) -> Snapshot {
     let state = tui.read().expect("TUI state poisoned");
     let age = state.last_update.map(|instant| instant.elapsed().as_millis());
     // Latência p50/p95 da duração do round, calculada do histórico SQLite.
@@ -118,6 +125,13 @@ fn build_snapshot(tui: &Arc<RwLock<TuiState>>, history: &Option<Arc<RoundHistory
         .as_ref()
         .and_then(|db| db.overall_stats().ok())
         .map(|stats| stats.latency);
+    // Circuit breaker state por adapter. Snapshot via `list_states()` é async —
+    // coletamos de forma bloqueante via `futures::executor::block_on` (mesmo
+    // padrão já usado em `should_skip` em circuit_breaker.rs).
+    let cb_states: Vec<(String, u32, bool)> = match circuit_breaker {
+        Some(cb) => futures::executor::block_on(cb.list_states()),
+        None => Vec::new(),
+    };
     Snapshot {
         schema_version: "operator.v1", sequence: state.cycle_count, generated_at: chrono::Utc::now().to_rfc3339(), data_source: "tui_state",
         runtime: Runtime { mode: "PAPER", dry_run: std::env::var("CONFIG_FILE").map(|v| v.contains("dryrun")).unwrap_or(true), phase: state.startup_phase.clone(), uptime_secs: state.start.elapsed().as_secs(), shutdown_state: "armed" },
@@ -126,6 +140,13 @@ fn build_snapshot(tui: &Arc<RwLock<TuiState>>, history: &Option<Arc<RoundHistory
         round: Round { duration_ms: None, quotes: state.pairs_count as u64, edges: None, cycles_detected: state.negative_cycles as u64, routes_ranked: state.top_spreads.len() as u64, routes_evaluated: None, gross_positive: state.gross_positive as u64, economically_positive: state.net_positive as u64, stable: None, risk_approved: None, selected: None, timeouts: None, latency_p50_ms: latency.as_ref().and_then(|l| l.duration_p50_ms), latency_p95_ms: latency.as_ref().and_then(|l| l.duration_p95_ms) },
         prices: state.last_prices.iter().map(|price| Price { pair: price.pair.clone(), quickswap: price.quickswap, sushiswap: price.sushiswap, curve: price.curve, uniswap_v3: price.uniswap_v3, net_usd: price.net_usd }).collect(),
         routes: state.top_spreads.iter().enumerate().map(|(index, route)| Route { id: format!("{}-{:02}", state.cycle_count, index + 1), route_kind: if route.hop_count >= 3 { "triangular" } else { "two_leg" }, path: route.legs_label.clone().unwrap_or_else(|| route.pair.clone()), venues: format!("{} / {}", route.buy_dex, route.sell_dex), gross: route.tui_spread_pct, net: route.net_usd, distance: route.distance_to_profit, status: "observed", authoritative: false, executable: false, reason: route.outlier.clone().or_else(|| Some("observação read-only; sem autorização de execução".into())) }).collect(),
-        rpc: Vec::new(), alerts: Vec::new(),
+        rpc: cb_states.iter().map(|(name, failures, cooldown_active)| Rpc {
+            alias: name.clone(),
+            status: if *cooldown_active { "cooldown" } else if *failures > 0 { "degraded" } else { "healthy" },
+            latency_ms: None,
+            failures: *failures,
+            cooldown_active: *cooldown_active,
+        }).collect(),
+        alerts: Vec::new(),
     }
 }

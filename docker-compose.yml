@@ -16,6 +16,7 @@ services:
       - "8081:8080"
     volumes:
       - ./logs:/app/logs
+      - ./data:/app/data
     networks: [monitoring]
 
   operator-console:

@@ -51,6 +51,15 @@ pub struct RoundRecord {
     pub best_route_venues: Option<String>,
     pub best_route_gross: Option<f64>,
     pub best_route_net: Option<f64>,
+    /// TUI spread (forward dispersion) — mesma métrica que `best_route_gross`
+    /// legado; mantido separado para não quebrar consumidores que já importam
+    /// o nome antigo.
+    pub tui_spread_pct: Option<f64>,
+    /// Cycle rate real (economics) em %. Diferente de `tui_spread_pct` quando
+    /// route é multi-leg e reverse leg piora o rate composto.
+    pub cycle_rate_pct: Option<f64>,
+    /// Net projetado em USD da rota com cycle rate real.
+    pub cycle_net_usd: Option<f64>,
 }
 
 /// Linha lida do DB para o console (serializável p/ /api/v1/rounds).
@@ -78,6 +87,15 @@ pub struct RoundRow {
     pub best_route_venues: Option<String>,
     pub best_route_gross: Option<f64>,
     pub best_route_net: Option<f64>,
+    /// TUI spread (forward dispersion) — mesma métrica que `best_route_gross`
+    /// legado; mantido separado para não quebrar consumidores que já importam
+    /// o nome antigo.
+    pub tui_spread_pct: Option<f64>,
+    /// Cycle rate real (economics) em %. Diferente de `tui_spread_pct` quando
+    /// route é multi-leg e reverse leg piora o rate composto.
+    pub cycle_rate_pct: Option<f64>,
+    /// Net projetado em USD da rota com cycle rate real.
+    pub cycle_net_usd: Option<f64>,
 }
 
 impl RoundRow {
@@ -105,6 +123,9 @@ impl RoundRow {
             best_route_venues: row.get("best_route_venues")?,
             best_route_gross: row.get("best_route_gross")?,
             best_route_net: row.get("best_route_net")?,
+            tui_spread_pct: row.get("tui_spread_pct")?,
+            cycle_rate_pct: row.get("cycle_rate_pct")?,
+            cycle_net_usd: row.get("cycle_net_usd")?,
         })
     }
 }
@@ -169,7 +190,14 @@ CREATE TABLE IF NOT EXISTS rounds (
     best_route_path       TEXT,
     best_route_venues     TEXT,
     best_route_gross      REAL,
-    best_route_net        REAL
+    best_route_net        REAL,
+    -- v1.1: distinguir spread forward (TUI) de cycle rate real (economics).
+    -- `tui_spread_pct` = (max-min)/min*100 entre venues; `cycle_rate_pct`
+    -- = (cycle_rate-1)*100 = gross cycle real; `cycle_net_usd` = net já com
+    -- custos deduzidos em USD. Migração idempotente via ALTER TABLE.
+    tui_spread_pct        REAL,
+    cycle_rate_pct        REAL,
+    cycle_net_usd         REAL
 );
 CREATE INDEX IF NOT EXISTS idx_rounds_sequence ON rounds(sequence);
 "#;
@@ -203,7 +231,7 @@ impl RoundHistory {
                 .context("listar colunas do histórico")?;
             mapped.filter_map(Result::ok).collect()
         };
-        for column in ["discovery_ms", "shadow_ms"] {
+        for column in ["discovery_ms", "shadow_ms", "tui_spread_pct", "cycle_rate_pct", "cycle_net_usd"] {
             if !existing.iter().any(|name| name == column) {
                 conn.execute_batch(&format!("ALTER TABLE rounds ADD COLUMN {column} INTEGER"))
                     .with_context(|| format!("migrar coluna {column} no histórico"))?;
@@ -228,14 +256,16 @@ impl RoundHistory {
                 gross_positive, economically_positive, stable,
                 risk_approved, selected, net_usd_total, anchor_block,
                 best_route_kind, best_route_path, best_route_venues,
-                best_route_gross, best_route_net
+                best_route_gross, best_route_net,
+                tui_spread_pct, cycle_rate_pct, cycle_net_usd
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7,
                 ?8, ?9, ?10,
                 ?11, ?12, ?13,
                 ?14, ?15, ?16, ?17,
                 ?18, ?19, ?20,
-                ?21, ?22
+                ?21, ?22,
+                ?23, ?24, ?25
             )",
             params![
                 record.sequence as i64,
@@ -260,6 +290,9 @@ impl RoundHistory {
                 record.best_route_venues,
                 record.best_route_gross,
                 record.best_route_net,
+                record.tui_spread_pct,
+                record.cycle_rate_pct,
+                record.cycle_net_usd,
             ],
         )
         .context("insert round no histórico")?;
@@ -418,6 +451,9 @@ mod tests {
             best_route_venues: Some("QuickSwap / UniswapV3".into()),
             best_route_gross: Some(1.5),
             best_route_net: Some(net),
+            tui_spread_pct: Some(1.5),
+            cycle_rate_pct: Some(0.5),
+            cycle_net_usd: Some(net),
         }
     }
 
