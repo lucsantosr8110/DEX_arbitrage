@@ -159,7 +159,11 @@ fn default_shadow_every_n_blocks() -> u64 {
     32
 }
 fn default_round_timeout_secs() -> u64 {
-    60
+    // 60s era curto demais: round real médio observado em produção é ~38s,
+    // com picos >100s sob RPC lento. config.dryrun.toml já sobrescrevia para
+    // 900s; alinhando o default para não deixar config.toml/midtier expostos
+    // ao mesmo timeout que já causou failover/reconexão espúrios.
+    900
 }
 fn default_canonical_discovery_profile() -> String {
     "base".to_string()
@@ -3185,7 +3189,7 @@ mod config_parser_tests {
         assert!(!cfg.primary_enabled);
         assert!(!cfg.broadcast_enabled);
         assert_eq!(cfg.shadow_every_n_blocks, 32);
-        assert_eq!(cfg.round_timeout_secs, 60);
+        assert_eq!(cfg.round_timeout_secs, 900);
     }
 
     #[test]

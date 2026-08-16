@@ -7,7 +7,7 @@
 
 use flashloan_bot::core::fork_execution_domain::{validate_loopback_endpoint, EndpointRejection};
 
-const BINARY_SOURCE: &str = include_str!("../src/bin/phase2d_d_fork_bytecode.rs");
+const BINARY_SOURCE: &str = include_str!("../tools/legacy_diagnostics/phase2d_d_fork_bytecode.rs");
 const EXECUTOR_SOURCE: &str = include_str!("../src/core/fork_route_executor.rs");
 const DEDUP_SOURCE: &str = include_str!("../src/core/fork_candidate_dedup.rs");
 const DOMAIN_SOURCE: &str = include_str!("../src/core/fork_execution_domain.rs");

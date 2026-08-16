@@ -11,12 +11,8 @@
 
 use crate::{
     config::{token_cache::TokenCache, Config},
-    // ✅ CORREÇÃO (E0308): `ArbitrageOpportunity` deve vir de `core::types` para
-    //    ser compatível com o campo `base_opportunity` de `FlashloanOpportunity`.
-    core::types::{ArbitrageOpportunity, FlashloanOpportunity},
     dex::{
         adapters::{curve::CurveDex, uniswap_v2::V2Dex, uniswap_v3::UniswapV3Dex},
-        // ❌ `ArbitrageOpportunity` de `dex` (mod.rs) não é o usado para Flashloans.
         DexContract,
         TokenPairPrice,
     },
@@ -26,11 +22,10 @@ use crate::{
 use anyhow::{anyhow, Context, Result};
 use ethers::{
     providers::Middleware,
-    types::{Address, U256, U64},
+    types::{Address, U64},
 };
 use std::{
     collections::HashMap,
-    str::FromStr,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -172,114 +167,14 @@ impl DexManager {
         }
     }
 
-    // ============================================================
-    // ⚡ Suporte a Flashloan Opportunities
-    // ============================================================
-    pub async fn find_flashloan_opportunities(
-        &self,
-        base_token: &str,
-        amount: U256,
-    ) -> Result<Vec<FlashloanOpportunity>> {
-        let mut opportunities = Vec::new();
-        // ✅ CORREÇÃO (E0308): `find_circular_arbitrage` agora retorna o tipo
-        //    correto `core::types::ArbitrageOpportunity` (devido à mudança no `use`)
-        let circular_opps = self.find_circular_arbitrage(base_token).await?;
-
-        for opp in circular_opps {
-            if let Some(flash_opp) = self
-                .convert_to_flashloan_opportunity(opp, base_token, amount)
-                .await?
-            {
-                opportunities.push(flash_opp);
-            }
-        }
-
-        Ok(opportunities)
-    }
-
-    async fn find_circular_arbitrage(&self, base_token: &str) -> Result<Vec<ArbitrageOpportunity>> {
-        debug!("🔍 Buscando rotas circulares para {}", base_token);
-        Ok(Vec::new()) // placeholder
-    }
-
-    async fn convert_to_flashloan_opportunity(
-        &self,
-        opp: ArbitrageOpportunity, // ✅ CORREÇÃO (E0308): Este tipo agora é `core::types::ArbitrageOpportunity`
-        base_token: &str,
-        amount: U256,
-    ) -> Result<Option<FlashloanOpportunity>> {
-        // 🚀 CORREÇÃO SOLICITADA: VALIDAR SE A ROTA COMEÇA E TERMINA COM O TOKEN BASE
-        let base_token_upper = base_token.to_uppercase();
-        let first_token = opp.path.first().map(|s| s.to_uppercase());
-        let last_token = opp.path.last().map(|s| s.to_uppercase());
-
-        // Garante que é circular E que o token de empréstimo é o start/end
-        if first_token != Some(base_token_upper.clone())
-            || last_token != Some(base_token_upper.clone())
-        {
-            warn!(
-                "⚠️ Oportunidade ignorada: O token base do flashloan ({}) não é o ponto de partida/chegada da rota: {:?}",
-                base_token, opp.path
-            );
-            return Ok(None);
-        }
-        // FIM DA CORREÇÃO SOLICITADA
-
-        let premium_cost = self.calculate_flashloan_premium(amount);
-        let gas_overhead = self.estimate_flashloan_gas(&opp).await?;
-
-        let flash_opp = FlashloanOpportunity {
-            // ✅ CORREÇÃO (E0308): `opp` (core::types::ArbitrageOpportunity) agora
-            //    bate com o tipo esperado pelo campo `base_opportunity`.
-            base_opportunity: opp,
-            asset: Self::resolve_token(base_token)?,
-            amount,
-            steps: vec![], // TODO: Converter `opp.steps` para `FlashloanStep`
-            expected_profit: 0.0,
-            premium_cost,
-            gas_overhead,
-        };
-
-        Ok(Some(flash_opp))
-    }
-
-    #[allow(dead_code)]
-    fn is_valid_flashloan_route(&self, opp: &ArbitrageOpportunity) -> bool {
-        // A função foi mantida por compatibilidade.
-        if let (Some(first), Some(last)) = (opp.path.first(), opp.path.last()) {
-            // Ex: path [USDC, WETH, USDC] -> first=USDC, last=USDC
-            first == last
-        } else {
-            false
-        }
-    }
-
-    fn calculate_flashloan_premium(&self, amount: U256) -> f64 {
-        // Display/estimate only — execution gates use fixed_usd + on-chain premium.
-        let premium_bps = 9u64; // 0.09% Aave-ish placeholder + buffer handled below
-        let price = crate::core::fixed_usd::UsdE8(crate::core::fixed_usd::USD_E8_SCALE);
-        let principal = crate::core::fixed_usd::token_raw_to_usd_e8(amount, price, 6)
-            .unwrap_or(crate::core::fixed_usd::UsdE8::zero());
-        let fee = crate::core::fixed_usd::flashloan_fee_usd_e8(principal, premium_bps)
-            .unwrap_or(crate::core::fixed_usd::UsdE8::zero());
-        // +10% buffer (legacy behaviour)
-        fee.display_f64() * 1.1
-    }
-
-    async fn estimate_flashloan_gas(&self, _opp: &ArbitrageOpportunity) -> Result<u64> {
-        Ok(350_000) // Placeholder
-    }
-
-    fn resolve_token(symbol: &str) -> Result<Address> {
-        Address::from_str(match symbol.to_uppercase().as_str() {
-            "USDC" => "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
-            "USDT" => "0xc2132D05D31c914a87C6611C10748AEb04B58e8F",
-            "DAI" => "0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063",
-            "WMATIC" => "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270",
-            _ => return Err(anyhow!("Token base não reconhecido: {}", symbol)),
-        })
-        .context("Erro ao converter símbolo para endereço")
-    }
+    // NOTA: havia aqui um cluster `find_flashloan_opportunities` /
+    // `find_circular_arbitrage` / `convert_to_flashloan_opportunity` +
+    // helpers (calculate_flashloan_premium/estimate_flashloan_gas/
+    // resolve_token/is_valid_flashloan_route). `find_circular_arbitrage`
+    // era um placeholder que sempre retornava `Vec::new()` — o cluster
+    // inteiro nunca teve caller real (opportunity discovery de verdade é
+    // `core::canonical_discovery`). Removido para não parecer um segundo
+    // caminho de descoberta que na verdade nunca roda.
 
     // NOTA: havia aqui um `multicall()` que disparava N `eth_call` paralelos via
     // `join_all`. Nunca foi chamado por ninguém — a agregação real acontece nos

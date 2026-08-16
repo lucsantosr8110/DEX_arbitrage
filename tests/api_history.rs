@@ -34,6 +34,9 @@ fn record(sequence: u64) -> RoundRecord {
         best_route_venues: Some("QuickSwap / UniswapV3".into()),
         best_route_gross: Some(1.5),
         best_route_net: Some(0.42),
+        tui_spread_pct: Some(1.5),
+        cycle_rate_pct: Some(0.42),
+        cycle_net_usd: Some(0.42),
     }
 }
 
@@ -63,7 +66,7 @@ async fn rounds_and_stats_endpoints_serve_persisted_history() {
     let (shutdown_tx, _rx) = tokio::sync::broadcast::channel::<()>(1);
     let tui2 = tui.clone();
     let db2 = db.clone();
-    tokio::spawn(async move { operator_api::serve(tui2, Some(db2), shutdown_tx).await; });
+    tokio::spawn(async move { operator_api::serve(tui2, Some(db2), shutdown_tx, None).await; });
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
     db.insert_round(&record(1)).expect("insert round 1");

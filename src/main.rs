@@ -534,14 +534,35 @@ fn canonical_route_economics(
                 .unwrap_or(f64::INFINITY);
         let net_usd = net_fraction * cost.notional_usd;
         if !net_usd.is_finite() || !sane_route_economics(cycle_rate, gross_pct, net_usd, cost.notional_usd) {
-            warn!(
-                target: "canonical_discovery",
-                structural_cycle_key = %evidence.structural_cycle_key,
-                cycle_rate,
-                gross_pct,
-                net_usd,
-                "canonical route rejected from operator metrics: economics outside sanity bounds"
-            );
+            // >80% de desvio é quase certamente glitch de cotação (leg com
+            // preço 10x+ fora do normal), não uma decisão econômica de borda.
+            // Achado 2026-08-16: pool WETH>USDT UniswapV3 fee=500
+            // (0xbb98b3d2b18aef63a3178023a920971cf5f29be4) respondeu por 93%
+            // (12841/13838) destas rejeições no histórico — mas o MESMO pool
+            // também aparece em CANONICAL_TOP_COMBO aceito com preço são
+            // (~1885 WETH/USDT), então não é pool morta para excluir; parece
+            // cotação intermitente (stale block / race). Rebaixado para
+            // DEBUG no caso extremo para não afogar o WARN de casos
+            // realmente de borda (50-80%) que merecem atenção do operador.
+            if gross_pct.abs() > 80.0 {
+                debug!(
+                    target: "canonical_discovery",
+                    structural_cycle_key = %evidence.structural_cycle_key,
+                    cycle_rate,
+                    gross_pct,
+                    net_usd,
+                    "canonical route rejected from operator metrics: economics outside sanity bounds (extreme, provável glitch de cotação)"
+                );
+            } else {
+                warn!(
+                    target: "canonical_discovery",
+                    structural_cycle_key = %evidence.structural_cycle_key,
+                    cycle_rate,
+                    gross_pct,
+                    net_usd,
+                    "canonical route rejected from operator metrics: economics outside sanity bounds"
+                );
+            }
             continue;
         }
 

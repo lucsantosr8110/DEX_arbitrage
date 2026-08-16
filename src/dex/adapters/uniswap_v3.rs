@@ -84,6 +84,9 @@ pub struct UniswapV3Dex {
     client: Arc<AppMiddleware>,
     quoter_v1: Address,
     quoter_v2: Address,
+    // Só usado pelo swap() desativado (ver DexContract::swap acima); mantido
+    // para quando a execução real ganhar um path por aqui.
+    #[allow(dead_code)]
     router: Address,
     factory: Address, // Endereço da Factory V3 adicionado
     config: Arc<Config>,
@@ -226,6 +229,8 @@ impl UniswapV3Dex {
         serde_json::from_value(array).map_err(|e| anyhow!("Erro parse array ABI: {e}"))
     }
 
+    // Só usado pelo swap() desativado (ver DexContract::swap acima).
+    #[allow(dead_code)]
     fn deadline(&self) -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -814,70 +819,18 @@ impl DexContract for UniswapV3Dex {
             return Ok(amount_in);
         }
 
-        // 1. CRÍTICO: Checar se o par existe antes de tentar o swap (evitar revert)
-        if self
-            .get_pair_or_pool_address(token_in, token_out)
-            .await?
-            .is_none()
-        {
-            return Err(anyhow!(
-                "[{}] Swap: Nenhum Pool V3 encontrado para o par.",
-                DEX_NAME
-            ));
-        }
-
-        let router_abi =
-            Self::load_abi_from_wrapper(include_str!("../../../abi/UniswapV3Router.json"))?;
-        let router = Contract::new(self.router, router_abi, self.client.clone());
-
-        // A2: fee tier hardcoded 3000 revertia em pools fee=500/10000. Resolver
-        // via cache (preenchido pelo get_price/multicall) — fallback 3000 só se
-        // sem cache (e loga, pois é arriscado).
-        let (sym_in, sym_out) = (
-            self.token_cache
-                .get_by_address(&token_in)
-                .await
-                .map(|i| i.symbol),
-            self.token_cache
-                .get_by_address(&token_out)
-                .await
-                .map(|i| i.symbol),
-        );
-        let fee_tier = match (sym_in.as_deref(), sym_out.as_deref()) {
-            (Some(a), Some(b)) => crate::dex::cached_fee_tier(DEX_NAME, a, b),
-            _ => None,
-        };
-        let fee = fee_tier.unwrap_or_else(|| {
-            warn!(
-                "[{}] swap: fee_tier não cacheado p/ {:?}/{:?} — fallback 3000 (arriscado p/ pool 500/10000)",
-                DEX_NAME, token_in, token_out
-            );
-            3000
-        });
-
-        let params = (
-            token_in,
-            token_out,
-            fee,
-            self.client.address(),
-            self.deadline(),
-            amount_in,
-            U256::zero(),
-            U256::zero(),
-        );
-
-        // The canonical ISwapRouter.exactInputSingle takes a single
-        // ExactInputSingleParams TUPLE, not 8 flat arguments.  The outer
-        // 1-tuple here makes ethers-rs encode a single `tuple` input,
-        // matching the real on-chain selector.
-        let method = router.method::<_, U256>("exactInputSingle", (params,))?;
-        ALCHEMY_RATE_LIMITER.acquire().await?;
-        let pending = method.send().await?;
-        if let Some(r) = pending.await? {
-            info!("✅ [{}] Swap executado: {:?}", DEX_NAME, r.transaction_hash);
-        }
-
-        Ok(amount_in)
+        // Path morto e perigoso: mandava amountOutMinimum=0 e sqrtPriceLimitX96=0
+        // (zero proteção de slippage/sandwich). Nenhum caller real usa
+        // DexContract::swap() — execução de verdade sai por core::flashloan
+        // (execute_direct/execute_flashloan/execute_wrapper), que calcula
+        // amount_out_min via apply_slippage_safe e rejeita zero. Fail-closed
+        // aqui em vez de consertar minOut sem contexto de quote/slippage
+        // disponível nesta assinatura.
+        let _ = (token_in, token_out, amount_in);
+        Err(anyhow!(
+            "[{}] DexContract::swap() desativado — usa core::flashloan para execução real",
+            DEX_NAME
+        ))
     }
 
     // ========================================================

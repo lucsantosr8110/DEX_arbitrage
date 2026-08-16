@@ -366,35 +366,21 @@ impl DexContract for V2Dex {
     }
 
     async fn swap(&self, token_in: Address, token_out: Address, amount_in: U256) -> Result<U256> {
-        // Mantém contrato histórico: UniswapV2 é quote-only; Quick/Sushi podem
-        // enviar quando dry-run está desligado.
         if self.config.execution.dry_run || self.dex_name == "UniswapV2" {
             warn!("💱 [{}] Swap simulado (modo leitura)", self.name());
             return Ok(amount_in);
         }
-        let abi: Abi = serde_json::from_str(include_str!("../../../abi/uniswap_v2_router.json"))?;
-        let router = Contract::new(self.router, abi, self.client.clone());
-        let deadline = U256::from(chrono::Utc::now().timestamp().saturating_add(600) as u64);
-        let call = router.method::<_, Vec<U256>>(
-            "swapExactTokensForTokens",
-            (
-                amount_in,
-                U256::zero(),
-                vec![token_in, token_out],
-                self.client.address(),
-                deadline,
-            ),
-        )?;
-        ALCHEMY_RATE_LIMITER.acquire().await?;
-        let pending = call.send().await?;
-        if let Some(receipt) = pending.await? {
-            info!(
-                "✅ [{}] Swap confirmado: {:?}",
-                self.name(),
-                receipt.transaction_hash
-            );
-        }
-        Ok(amount_in)
+        // Path morto e perigoso: mandava amountOutMin=0 (zero proteção de
+        // slippage/sandwich). Nenhum caller real usa DexContract::swap() —
+        // execução de verdade sai por core::flashloan (execute_direct/
+        // execute_flashloan/execute_wrapper), que calcula amount_out_min via
+        // apply_slippage_safe e rejeita zero. Fail-closed aqui em vez de
+        // consertar minOut sem contexto de quote/slippage disponível.
+        let _ = (token_in, token_out, amount_in);
+        Err(anyhow!(
+            "[{}] DexContract::swap() desativado — usa core::flashloan para execução real",
+            self.name()
+        ))
     }
     fn client(&self) -> &Arc<AppMiddleware> {
         &self.client

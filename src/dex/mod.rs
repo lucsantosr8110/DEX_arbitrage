@@ -509,7 +509,6 @@ pub mod metadata_warm;
 pub mod pool_state_cache;
 pub mod radar;
 pub mod rate_limiter;
-pub mod resilient_dex_system;
 
 // ================================================================
 // REEXPORTS
