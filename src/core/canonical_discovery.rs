@@ -1118,7 +1118,8 @@ where
             routes_discovered = route_map.len(),
             routes_requoted = route_leg_quotes.len(),
             rejections = rejections.len(),
-            "canonical sequential requote stage complete"
+            requote_concurrency,
+            "canonical parallel requote stage complete"
         );
 
         let pool_states: HashMap<Address, SimulatedPoolState> = pools
