@@ -24,6 +24,17 @@ O projeto adota uma arquitetura híbrida de alto nível:
   * Exposição nativa de métricas no padrão do Prometheus.
   * Integração com Grafana (dashboard incluso).
   * Alertas instantâneos no Telegram para lucros, erros e atualizações críticas.
+* **🖥️ Operator Console & API:** Console web (React + nginx) e API HTTP
+  read-only (`/api/v1/snapshot`, `/api/v1/rounds`, `/api/v1/stats`,
+  `/api/v1/events` SSE) com persistência de histórico de rodadas em SQLite
+  (`data/operator.db`). Veja
+  [`docs/DOCKER_OPERATOR_CONSOLE.md`](docs/DOCKER_OPERATOR_CONSOLE.md).
+* **⚙️ Pipeline Canonical de Descoberta:** Descoberta de rotas pinned a um
+  bloco-âncora canônico (mesmo estado on-chain para todas as leituras de um
+  round), com cache de metadados imutáveis (token0/token1, code hashes) e
+  batching de leituras de estado de pool via Multicall3 `aggregate3`
+  (fase A) — reduz RTTs RPC preservando equivalência exata vs leituras
+  individuais.
 
 ---
 
@@ -52,8 +63,8 @@ O projeto adota uma arquitetura híbrida de alto nível:
 ## 🛠️ Pré-requisitos
 
 Antes de iniciar, certifique-se de ter instalado:
-* **Rust** (versão estável mais recente, 1.75 ou superior)
-* **Node.js** (v18.x ou superior) & **NPM**
+* **Rust** (1.88 ou superior — mesma versão da imagem Docker)
+* **Node.js** (v22.x ou superior) & **NPM**
 
 ---
 
@@ -98,7 +109,7 @@ POLYGONSCAN_API_KEY=sua_api_key_do_scan
 > errado no FlashloanCaller). O bot usa flashloan direto. Ver `ESTADO_ATUAL.md` §4.2.
 >
 > **Dry run:** copie `.env.dryrun.example` para `.env` e use
-> `CONFIG_PATH=config/config.dryrun.toml` para rodar sem enviar transações.
+> `CONFIG_FILE=config/config.dryrun.toml` para rodar sem enviar transações.
 
 ### 3. Compilar Contratos Solidity
 
