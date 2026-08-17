@@ -30,7 +30,9 @@ use flashloan_bot::{
     core::{
         bot::{execute_opportunity_standalone, should_try_next_opp, Bot},
         c2b_round::RoundEvidence,
-        c2b_shadow_service::{should_schedule_anchor, C2BShadowResult, CanonicalC2BOpportunitySource},
+        c2b_shadow_service::{
+            should_schedule_anchor, C2BShadowResult, CanonicalC2BOpportunitySource,
+        },
         canonical_adapters::PinnedQuoteRecord,
         canonical_discovery::{
             CanonicalDiscoveryConfig, CanonicalDiscoveryProfile, CanonicalDiscoveryService,
@@ -274,7 +276,9 @@ fn persist_round(
         // v1.1: cycle rate real (não tui_spread). Permite distinguir
         // "spread forward-only" de "cycle fecha" no histórico.
         tui_spread_pct: best.map(|route| route.tui_spread_pct),
-        cycle_rate_pct: best.and_then(|route| route.cycle_rate).map(|r| (r - 1.0) * 100.0),
+        cycle_rate_pct: best
+            .and_then(|route| route.cycle_rate)
+            .map(|r| (r - 1.0) * 100.0),
         cycle_net_usd: best.and_then(|route| route.net_usd),
         anchor_resolution_ms: Some(timing.anchor_resolution_ms),
         metadata_ms: Some(timing.metadata_ms),
@@ -574,7 +578,9 @@ fn canonical_route_economics(
         let gross_pnl_usd = economics.gross_pnl_atomic as f64 * atomic_to_usd;
         let gas_cost_usd = economics.gas_cost_atomic.as_u128() as f64 * atomic_to_usd;
         let flashloan_cost_usd = economics.flashloan_cost_atomic.as_u128() as f64 * atomic_to_usd;
-        if !net_usd.is_finite() || !sane_route_economics(cycle_rate, gross_pct, net_usd, cost.notional_usd) {
+        if !net_usd.is_finite()
+            || !sane_route_economics(cycle_rate, gross_pct, net_usd, cost.notional_usd)
+        {
             // >80% de desvio é quase certamente glitch de cotação (leg com
             // preço 10x+ fora do normal), não uma decisão econômica de borda.
             // Achado 2026-08-16: pool WETH>USDT UniswapV3 fee=500
@@ -1289,15 +1295,13 @@ async fn main() -> Result<()> {
     // travasse). Agora mostramos splash screen com a fase de inicialização.
     let tui_state = Arc::new(std::sync::RwLock::new(tui::TuiState::default()));
     let history = match std::env::var("OPERATOR_DB_PATH") {
-        Ok(path) if !path.trim().is_empty() => {
-            match RoundHistory::open(PathBuf::from(path)) {
-                Ok(db) => Some(db),
-                Err(error) => {
-                    warn!(%error, "histórico SQLite indisponível — rodadas NÃO persistidas");
-                    None
-                }
+        Ok(path) if !path.trim().is_empty() => match RoundHistory::open(PathBuf::from(path)) {
+            Ok(db) => Some(db),
+            Err(error) => {
+                warn!(%error, "histórico SQLite indisponível — rodadas NÃO persistidas");
+                None
             }
-        }
+        },
         _ => match RoundHistory::open(PathBuf::from("data/operator.db")) {
             Ok(db) => Some(db),
             Err(error) => {
@@ -1317,7 +1321,8 @@ async fn main() -> Result<()> {
         let api_shutdown = shutdown_tx.clone();
         let api_cb = circuit_breaker.clone();
         tokio::spawn(async move {
-            flashloan_bot::operator_api::serve(api_state, api_history, api_shutdown, Some(api_cb)).await;
+            flashloan_bot::operator_api::serve(api_state, api_history, api_shutdown, Some(api_cb))
+                .await;
         });
         info!("🔌 Circuit breaker inicializado (5 falhas → cooldown 30s); exposto via /api/v1/snapshot.rpc");
     }

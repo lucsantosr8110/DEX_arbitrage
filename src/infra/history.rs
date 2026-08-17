@@ -361,7 +361,9 @@ impl RoundHistory {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.conn.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Persiste um resumo de rodada. Chamada uma vez por round completado.
@@ -736,7 +738,8 @@ mod tests {
     fn recent_rounds_respect_limit() {
         let db = RoundHistory::open(temp_db("limit")).unwrap();
         for seq in 1..=5 {
-            db.insert_round(&record(seq, seq as f64 * 0.1, "X")).unwrap();
+            db.insert_round(&record(seq, seq as f64 * 0.1, "X"))
+                .unwrap();
         }
         let rows = db.recent_rounds(2).unwrap();
         assert_eq!(rows.len(), 2);
@@ -748,7 +751,8 @@ mod tests {
     fn overall_stats_picks_best_net_round() {
         let db = RoundHistory::open(temp_db("stats")).unwrap();
         db.insert_round(&record(1, 0.05, "WMATIC→USDC")).unwrap();
-        db.insert_round(&record(2, 1.20, "WMATIC→WETH→USDC")).unwrap();
+        db.insert_round(&record(2, 1.20, "WMATIC→WETH→USDC"))
+            .unwrap();
         db.insert_round(&record(3, 0.70, "USDC→USDT")).unwrap();
 
         let stats = db.overall_stats().unwrap();
@@ -779,7 +783,8 @@ mod tests {
         let path = temp_db("reopen");
         {
             let db = RoundHistory::open(&path).unwrap();
-            db.insert_round(&record(7, 2.5, "WMATIC→WETH→USDC")).unwrap();
+            db.insert_round(&record(7, 2.5, "WMATIC→WETH→USDC"))
+                .unwrap();
         }
         let db = RoundHistory::open(&path).unwrap();
         let rows = db.recent_rounds(10).unwrap();

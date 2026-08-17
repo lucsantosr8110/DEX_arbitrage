@@ -13,8 +13,7 @@ use crate::{
     config::{token_cache::TokenCache, Config},
     dex::{
         adapters::{curve::CurveDex, uniswap_v2::V2Dex, uniswap_v3::UniswapV3Dex},
-        DexContract,
-        TokenPairPrice,
+        DexContract, TokenPairPrice,
     },
     infra::metrics,
     AppMiddleware,

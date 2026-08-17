@@ -12,7 +12,8 @@
 //! `SignerMiddleware`/`LocalWallet`/`AppMiddleware`, so there is no code path
 //! through which a transaction could be signed even if a bug tried.
 
-const CAMPAIGN_SOURCE: &str = include_str!("../tools/legacy_diagnostics/phase2d_c_sequential_sim.rs");
+const CAMPAIGN_SOURCE: &str =
+    include_str!("../tools/legacy_diagnostics/phase2d_c_sequential_sim.rs");
 const ROUTE_ARTIFACT_SOURCE: &str = include_str!("../src/core/route_artifact.rs");
 const POOL_STATE_SIM_SOURCE: &str = include_str!("../src/core/pool_state_sim.rs");
 const QUANTIZATION_SOURCE: &str = include_str!("../src/core/quantization.rs");

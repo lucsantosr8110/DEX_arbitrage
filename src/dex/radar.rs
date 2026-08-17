@@ -1087,14 +1087,12 @@ pub fn analyze_pair_spread(
                 false,
             ),
         };
-    let sane_economics = gross_pct
-        .zip(net_usd)
-        .is_some_and(|(gross, net)| {
-            gross.is_finite()
-                && net.is_finite()
-                && gross.abs() <= 50.0
-                && net.abs() <= cost.notional_usd.abs().max(1.0) * 0.5
-        });
+    let sane_economics = gross_pct.zip(net_usd).is_some_and(|(gross, net)| {
+        gross.is_finite()
+            && net.is_finite()
+            && gross.abs() <= 50.0
+            && net.abs() <= cost.notional_usd.abs().max(1.0) * 0.5
+    });
     let (gross_pct, net_usd, executable) = if sane_economics {
         (gross_pct, net_usd, executable)
     } else {

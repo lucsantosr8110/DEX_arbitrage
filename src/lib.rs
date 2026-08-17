@@ -1,7 +1,6 @@
 // src/lib.rs
 
 pub mod api;
-pub mod operator_api;
 pub mod config;
 pub mod contracts;
 pub mod core;
@@ -9,6 +8,7 @@ pub mod dex;
 pub mod emergency_shutdown;
 pub mod execution; // ✅ Este deve existir
 pub mod infra; // ✅ Este deve existir
+pub mod operator_api;
 pub mod tui;
 pub mod utils;
 pub use dex::DexContract;

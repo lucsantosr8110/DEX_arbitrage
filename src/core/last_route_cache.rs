@@ -79,7 +79,10 @@ pub async fn invalidate() {
 /// Telemetria: (hits, misses, last_age_secs).
 pub async fn stats() -> (u64, u64, Option<f64>) {
     let cache = CACHE.read().await;
-    let age = cache.last.as_ref().map(|r| r.computed_at.elapsed().as_secs_f64());
+    let age = cache
+        .last
+        .as_ref()
+        .map(|r| r.computed_at.elapsed().as_secs_f64());
     (cache.hits, cache.misses, age)
 }
 
@@ -105,7 +108,8 @@ mod tests {
             venues: "A/B".into(),
             path: "X-Y-X".into(),
             trade_size_usd: 100.0,
-        }).await;
+        })
+        .await;
         let got = try_get(103).await.unwrap();
         assert!((got.cycle_rate - 1.01).abs() < 1e-9);
     }
@@ -122,7 +126,8 @@ mod tests {
             venues: String::new(),
             path: String::new(),
             trade_size_usd: 0.0,
-        }).await;
+        })
+        .await;
         // anchor 6 blocks ahead (acima da tolerância de 5)
         assert!(try_get(106).await.is_none());
     }

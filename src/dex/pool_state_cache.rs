@@ -115,12 +115,17 @@ mod tests {
     #[tokio::test]
     async fn v3_round_trip() {
         let pool = Address::from_low_u64_be(0x5678);
-        put_v3(pool, 3000, V3PoolState {
-            sqrt_price_x96: U256::from(42u64),
-            liquidity: 100,
-            tick: -100,
-            fetched_at: Instant::now(),
-        }).await;
+        put_v3(
+            pool,
+            3000,
+            V3PoolState {
+                sqrt_price_x96: U256::from(42u64),
+                liquidity: 100,
+                tick: -100,
+                fetched_at: Instant::now(),
+            },
+        )
+        .await;
         let got = get_v3(pool, 3000).await.unwrap();
         assert_eq!(got.tick, -100);
         assert!(get_v3(pool, 500).await.is_none()); // tier diferente = miss
@@ -129,11 +134,15 @@ mod tests {
     #[tokio::test]
     async fn v2_invalidate() {
         let pool = Address::from_low_u64_be(0x9abc);
-        put_v2(pool, V2PoolState {
-            reserve_a: U256::zero(),
-            reserve_b: U256::zero(),
-            fetched_at: Instant::now(),
-        }).await;
+        put_v2(
+            pool,
+            V2PoolState {
+                reserve_a: U256::zero(),
+                reserve_b: U256::zero(),
+                fetched_at: Instant::now(),
+            },
+        )
+        .await;
         assert!(get_v2(pool).await.is_some());
         invalidate_v2(pool).await;
         assert!(get_v2(pool).await.is_none());

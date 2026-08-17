@@ -78,7 +78,9 @@ async fn rounds_and_stats_endpoints_serve_persisted_history() {
     let (shutdown_tx, _rx) = tokio::sync::broadcast::channel::<()>(1);
     let tui2 = tui.clone();
     let db2 = db.clone();
-    tokio::spawn(async move { operator_api::serve(tui2, Some(db2), shutdown_tx, None).await; });
+    tokio::spawn(async move {
+        operator_api::serve(tui2, Some(db2), shutdown_tx, None).await;
+    });
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
     db.insert_round(&record(1)).expect("insert round 1");
