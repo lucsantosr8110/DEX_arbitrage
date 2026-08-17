@@ -191,6 +191,14 @@ pub struct OverallStats {
     pub best_net_route_venues: Option<String>,
     pub best_net_route_gross: Option<f64>,
     pub best_net_route_net: Option<f64>,
+    /// `cycle_rate_pct` da rota (economics real; para rotas triangulares
+    /// canônicas coincide com `best_net_route_gross` — mesma fonte, mesmo
+    /// `cycle_rate` — mas para o path de 2-leg diagnóstico pode divergir).
+    /// Faltava no struct: o frontend já pedia esse campo por nome
+    /// (`best_net_route_cycle_rate_pct`) mas ele nunca existiu aqui, então
+    /// sempre chegava `undefined` e a UI mostrava "0.00%" mesmo com edge
+    /// real (achado 2026-08-17, spec ARGUS economic-proof).
+    pub best_net_route_cycle_rate_pct: Option<f64>,
     /// Economic waterfall (ver `tui::TopSpreadRow`/`tui::NegativeCause`).
     pub best_net_route_gross_pnl_usd: Option<f64>,
     pub best_net_route_gas_cost_usd: Option<f64>,
@@ -487,6 +495,7 @@ impl RoundHistory {
             best_net_route_venues: best.as_ref().and_then(|row| row.best_route_venues.clone()),
             best_net_route_gross: best.as_ref().and_then(|row| row.best_route_gross),
             best_net_route_net: best.as_ref().and_then(|row| row.best_route_net),
+            best_net_route_cycle_rate_pct: best.as_ref().and_then(|row| row.cycle_rate_pct),
             best_net_route_gross_pnl_usd: best
                 .as_ref()
                 .and_then(|row| row.best_route_gross_pnl_usd),

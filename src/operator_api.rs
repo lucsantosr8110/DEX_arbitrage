@@ -135,7 +135,7 @@ fn build_snapshot(
     Snapshot {
         schema_version: "operator.v1", sequence: state.cycle_count, generated_at: chrono::Utc::now().to_rfc3339(), data_source: "tui_state",
         runtime: Runtime { mode: "PAPER", dry_run: std::env::var("CONFIG_FILE").map(|v| v.contains("dryrun")).unwrap_or(true), phase: state.startup_phase.clone(), uptime_secs: state.start.elapsed().as_secs(), shutdown_state: "armed" },
-        safety: Safety { signer_present: false, broadcaster_present: false, wrapper_enabled: false, simulate_before_execute: true, economics_consistent: None, mainnet_blocked: true },
+        safety: Safety { signer_present: false, broadcaster_present: false, wrapper_enabled: false, simulate_before_execute: true, economics_consistent: state.economics_consistent, mainnet_blocked: true },
         chain: Chain { network: "Polygon", chain_id: 137, head_block: None, anchor_block: None, anchor_hash: None, confirmations: None, data_age_ms: age },
         round: Round { duration_ms: None, quotes: state.pairs_count as u64, edges: None, cycles_detected: state.negative_cycles as u64, routes_ranked: state.top_spreads.len() as u64, routes_evaluated: None, gross_positive: state.gross_positive as u64, economically_positive: state.net_positive as u64, stable: None, risk_approved: None, selected: None, timeouts: None, latency_p50_ms: latency.as_ref().and_then(|l| l.duration_p50_ms), latency_p95_ms: latency.as_ref().and_then(|l| l.duration_p95_ms) },
         prices: state.last_prices.iter().map(|price| Price { pair: price.pair.clone(), quickswap: price.quickswap, sushiswap: price.sushiswap, curve: price.curve, uniswap_v3: price.uniswap_v3, net_usd: price.net_usd }).collect(),

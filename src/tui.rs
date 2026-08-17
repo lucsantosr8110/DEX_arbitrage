@@ -67,6 +67,12 @@ pub struct TuiState {
     pub startup_done: bool,
     /// Erro fatal durante startup (ex.: RPC indisponível).
     pub startup_error: Option<String>,
+    /// `economically_positive == canonical_net_positive` do último round —
+    /// já era calculado em `main.rs` (decide se a evidência vai pro shadow
+    /// round) mas nunca chegava ao snapshot/API; o gate "Economics
+    /// consistent" no console ficava sempre "sem evidência" mesmo com o
+    /// dado real disponível. `None` só antes do primeiro round completar.
+    pub economics_consistent: Option<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -197,6 +203,7 @@ impl Default for TuiState {
             startup_phase: "Inicializando...".into(),
             startup_done: false,
             startup_error: None,
+            economics_consistent: None,
         }
     }
 }

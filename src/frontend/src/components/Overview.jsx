@@ -109,7 +109,13 @@ export function Overview({ snapshot, bestRoute, rounds, stats }) {
   const histRoute = stats?.best_net_route_path ? {
     path: stats.best_net_route_path,
     venues: stats.best_net_route_venues || "—",
-    tui_spread_pct: stats.best_net_route_tui_spread_pct,
+    // `best_net_route_gross` é o mesmo valor que `tui_spread_pct` (ver
+    // persist_round: best_route_gross = route.tui_spread_pct); o campo
+    // `best_net_route_tui_spread_pct` nunca existiu na API — pedir por
+    // esse nome sempre voltava `undefined`, caindo no fallback `value || 0`
+    // do WaterfallRow e mostrando "0.00%" mesmo com edge real (achado
+    // 2026-08-17).
+    tui_spread_pct: stats.best_net_route_gross,
     cycle_rate_pct: stats.best_net_route_cycle_rate_pct,
     cycle_net_usd: stats.best_net_route_net,
     gas_estimate_usd: stats.best_net_route_gas_estimate_usd,
@@ -192,7 +198,15 @@ export function Overview({ snapshot, bestRoute, rounds, stats }) {
 
         <Section title="Estado dos gates" eyebrow="SAFETY GATES">
           <div className="gates">
-            <Gate label="Economics consistent" value={snapshot.safety.economics_consistent == null ? "sem evidência" : snapshot.safety.economics_consistent ? "confirmado" : "inconsistente"} good={snapshot.safety.economics_consistent === true} />
+            <Gate
+              label="Economics consistent"
+              value={snapshot.safety.economics_consistent == null
+                ? "INCOMPLETE — sem round processado ainda"
+                : snapshot.safety.economics_consistent
+                  ? "PASS — discovery e projeção canônica batem"
+                  : "FAIL — discovery_net_positive ≠ canonical_projection_net_positive"}
+              good={snapshot.safety.economics_consistent === true}
+            />
             <Gate label="Simulate before execute" value="obrigatório" good />
             <Gate label="Signer" value="ausente · bloqueado" />
             <Gate label="Broadcaster" value="ausente · bloqueado" />

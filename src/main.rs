@@ -258,9 +258,16 @@ fn persist_round(
                 "two_leg".to_string()
             }
         }),
+        // Achado 2026-08-17: `legs_label` (abreviação de venue, ex. "U→U→U")
+        // tinha prioridade sobre `pair` (path real de tokens, ex.
+        // "USDT>USDC>WMATIC>USDT") — como legs_label é quase sempre Some
+        // para rotas canônicas, o console nunca mostrava os tokens de
+        // fato, só a letra do venue repetida. `pair` sempre carrega o
+        // token path real; venue já aparece separado em
+        // `best_route_venues`.
         best_route_path: best
-            .and_then(|route| route.legs_label.clone())
-            .or_else(|| best.map(|route| route.pair.clone())),
+            .map(|route| route.pair.clone())
+            .or_else(|| best.and_then(|route| route.legs_label.clone())),
         best_route_venues: best.map(|route| format!("{} / {}", route.buy_dex, route.sell_dex)),
         best_route_gross: best.map(|route| route.tui_spread_pct),
         best_route_net: best.and_then(|route| route.net_usd),
@@ -1053,6 +1060,7 @@ where
                             state.net_positive = net_positive;
                             state.negative_cycles = negative_cycles;
                             state.net_usd_total = net_usd_total;
+                            state.economics_consistent = Some(economics_consistent);
                             state.last_prices = last_prices;
                             state.top_spreads = top_spreads;
                             state.last_update = Some(std::time::Instant::now());
