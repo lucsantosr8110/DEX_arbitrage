@@ -92,8 +92,9 @@ export function Overview({ snapshot, bestRoute, rounds, stats }) {
 
       <div className="kpi-row">
         <div className="kpi-label">PERFORMANCE</div>
-        <div className="kpi-grid">
+        <div className="kpi-grid kpi-grid-5">
           <Kpi label="Rodadas totais" value={formatNumber(totalRounds)} note={stats ? "persistidas em SQLite" : "última sequência"} />
+          <Kpi label="Net acumulado" value={money(stats?.sum_net_usd)} note={stats ? `soma de ${formatNumber(totalRounds)} rounds` : "sem histórico"} tone={stats?.sum_net_usd > 0 ? "green" : stats?.sum_net_usd < 0 ? "red" : "amber"} />
           <Kpi label="Melhor net" value={money(bestNet)} note={histRoute ? `melhor histórico · #${stats.best_net_sequence}` : "sem rota observada"} tone={bestNet > 0 ? "green" : "amber"} />
           <Kpi label="Latência p95" value={r.latency_p95_ms == null ? "—" : `${r.latency_p95_ms}ms`} note={r.latency_p50_ms == null ? "sem medição" : `p50 ${r.latency_p50_ms}ms · duração do round`} tone="cyan" />
           <Kpi label="Uptime" value={`${formatNumber(Math.floor((snapshot.runtime.uptime_secs || 0) / 60))}min`} note="desde startup" />
