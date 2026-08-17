@@ -17,7 +17,7 @@ use crate::core::{
     canonical_adapters::{
         assemble_route_leg_quotes, code_hash, normalized_v2_state, normalized_v3_state,
         quote_v2_leg, quote_v3_leg, read_v2_pool, read_v3_pool, resolve_v2_pool_address,
-        resolve_v3_pool_address, PinnedQuoteRecord,
+        resolve_v3_pool_address, MetadataCache, PinnedQuoteRecord, QuoteMetrics, RpcCallRecord,
     },
     canonical_execution_context::{
         CanonicalExecutionContext, ForkSetupRecord, PinnedPoolState, PoolExecutionMetadata,
@@ -40,7 +40,7 @@ use ethers::{
 };
 use futures::{stream, StreamExt};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -440,6 +440,9 @@ async fn quote_v2_edge<M: Middleware>(
     amount_in: U256,
     anchor: &AnchorBlock,
     pools: &mut PoolContext,
+    chain_id: u64,
+    cache: &MetadataCache,
+    metrics: &QuoteMetrics,
 ) -> Option<ExecutablePriceEdge> {
     let pool = tokio::time::timeout(
         QUOTE_TIMEOUT,
@@ -449,6 +452,9 @@ async fn quote_v2_edge<M: Middleware>(
             token_in.address,
             token_out.address,
             anchor.number,
+            chain_id,
+            cache,
+            metrics,
         ),
     )
     .await
@@ -456,7 +462,15 @@ async fn quote_v2_edge<M: Middleware>(
     .ok()??;
     let read = tokio::time::timeout(
         QUOTE_TIMEOUT,
-        read_v2_pool(provider.clone(), pool, router, anchor.number),
+        read_v2_pool(
+            provider.clone(),
+            pool,
+            router,
+            anchor.number,
+            chain_id,
+            cache,
+            metrics,
+        ),
     )
     .await
     .ok()?
@@ -496,6 +510,7 @@ async fn quote_v2_edge<M: Middleware>(
             token_out.clone(),
             pool_meta.clone(),
             pool_state.clone(),
+            metrics,
         ),
     )
     .await
@@ -525,6 +540,9 @@ async fn quote_v3_edge<M: Middleware>(
     amount_in: U256,
     anchor: &AnchorBlock,
     pools: &mut PoolContext,
+    chain_id: u64,
+    cache: &MetadataCache,
+    metrics: &QuoteMetrics,
 ) -> Option<ExecutablePriceEdge> {
     let pool = tokio::time::timeout(
         QUOTE_TIMEOUT,
@@ -535,6 +553,9 @@ async fn quote_v3_edge<M: Middleware>(
             token_out.address,
             fee,
             anchor.number,
+            chain_id,
+            cache,
+            metrics,
         ),
     )
     .await
@@ -542,7 +563,15 @@ async fn quote_v3_edge<M: Middleware>(
     .ok()??;
     let read = tokio::time::timeout(
         QUOTE_TIMEOUT,
-        read_v3_pool(provider.clone(), pool, router, anchor.number),
+        read_v3_pool(
+            provider.clone(),
+            pool,
+            router,
+            anchor.number,
+            chain_id,
+            cache,
+            metrics,
+        ),
     )
     .await
     .ok()?
@@ -580,6 +609,7 @@ async fn quote_v3_edge<M: Middleware>(
             token_out.clone(),
             pool_meta.clone(),
             pool_state.clone(),
+            metrics,
         ),
     )
     .await
@@ -615,6 +645,10 @@ async fn requote_leg<M: Middleware>(
     let pool_meta = pools.meta.get(&leg.pool)?.clone();
     let pool_state = pools.state.get(&leg.pool)?.clone();
     let target = *pools.quote_target.get(&leg.pool)?;
+    // Phase-B re-quotes have their own `(pool, amount_in)` cache upstream and
+    // sit outside the `quote_ms` decomposition, so no RPC calls are recorded
+    // here.
+    let metrics = QuoteMetrics::disabled();
     if let Some(fee) = leg.fee {
         let (_, quote) = tokio::time::timeout(
             QUOTE_TIMEOUT,
@@ -632,6 +666,7 @@ async fn requote_leg<M: Middleware>(
                 meta_out,
                 pool_meta,
                 pool_state,
+                &metrics,
             ),
         )
         .await
@@ -655,6 +690,7 @@ async fn requote_leg<M: Middleware>(
                 meta_out,
                 pool_meta,
                 pool_state,
+                &metrics,
             ),
         )
         .await
@@ -671,6 +707,11 @@ pub struct CanonicalDiscoveryService<M> {
     provider: Arc<M>,
     expected_chain_id: u64,
     config: CanonicalDiscoveryConfig,
+    /// Phase-A immutable-metadata cache (pool/pair address resolution,
+    /// token0/token1, contract code hash). Lives for the service's whole
+    /// lifetime, so it stays warm across rounds -- never state, never a
+    /// quote amount; see `canonical_metadata_cache` module docs.
+    metadata_cache: MetadataCache,
 }
 
 impl<M> CanonicalDiscoveryService<M>
@@ -683,11 +724,20 @@ where
             provider,
             expected_chain_id,
             config,
+            metadata_cache: MetadataCache::new(),
         }
     }
 
     pub fn config(&self) -> &CanonicalDiscoveryConfig {
         &self.config
+    }
+
+    /// Exposes cache hit/miss counters for diagnostics/logging. Never
+    /// exposes cached values themselves -- only aggregate counts.
+    pub fn metadata_cache_metrics(
+        &self,
+    ) -> crate::core::canonical_metadata_cache::CanonicalMetadataCacheMetrics {
+        self.metadata_cache.metrics()
     }
 
     pub async fn discover_at(&self, anchor: PinnedAnchor) -> Result<CanonicalDiscoveryResult> {
@@ -734,6 +784,24 @@ where
         }
         timing.anchor_resolution_ms = stage_start.elapsed().as_millis() as u64;
         stage_start = Instant::now();
+
+        // Freshness baseline: the anchor block's own on-chain timestamp.
+        // Every later `anchor_age_ms` reading is wall-clock-now minus this,
+        // i.e. how old the opportunity already is by the time each stage
+        // finishes -- the number that answers "did we get there before it
+        // vanished," not just "how long did the stage take."
+        let anchor_timestamp_ms = observed.timestamp.as_u64().saturating_mul(1000);
+        let anchor_age_ms = || {
+            chrono::Utc::now()
+                .timestamp_millis()
+                .saturating_sub(anchor_timestamp_ms as i64)
+        };
+        tracing::info!(
+            target: "canonical_discovery",
+            anchor = anchor.number,
+            anchor_age_ms = anchor_age_ms(),
+            "canonical anchor resolution stage complete"
+        );
 
         let profile = self.config.profile.label();
 
@@ -785,6 +853,7 @@ where
             anchor = anchor.number,
             tokens_configured = self.config.tokens.len(),
             tokens_with_code = token_meta.len(),
+            anchor_age_ms = anchor_age_ms(),
             "canonical metadata stage complete"
         );
         let symbols: Vec<String> = self
@@ -839,6 +908,15 @@ where
 
         let provider = self.provider.clone();
         let anchor_for_quotes = anchor.clone();
+        let chain_id = self.expected_chain_id;
+        let cache = &self.metadata_cache;
+        // Diagnostic-only: collects every real eth_call made while quoting
+        // (Phase A), plus each edge-attempt's own wall-clock elapsed time
+        // (quickswap/sushiswap/v3-per-fee-tier), so `quote_ms` can be
+        // decomposed into RPC-call count, RPC wait, duplicate reads, and
+        // per-pair serial critical path after the round finishes.
+        let quote_metrics = QuoteMetrics::new();
+        let metadata_cache_before = self.metadata_cache.metrics();
         let quote_results = stream::iter(pair_inputs.into_iter().map(
             |(pair_index, (symbol_in, symbol_out, meta_in, meta_out))| {
                 let provider = provider.clone();
@@ -846,6 +924,7 @@ where
                 let quickswap = quickswap.cloned();
                 let sushiswap = sushiswap.cloned();
                 let v3 = v3.cloned();
+                let metrics = quote_metrics.clone();
                 async move {
                     tracing::info!(
                         target: "canonical_discovery",
@@ -856,9 +935,11 @@ where
                     );
                     let mut local_pools = PoolContext::default();
                     let mut edges = Vec::new();
+                    let mut edge_attempts_ms: Vec<u64> = Vec::new();
                     let amount_in = human_to_atomic(NOTIONAL_USD, meta_in.decimals);
                     if let Some(cfg) = quickswap {
-                        if let Some(edge) = quote_v2_edge(
+                        let t0 = Instant::now();
+                        let outcome = quote_v2_edge(
                             &provider,
                             Venue::QuickSwap,
                             cfg.router,
@@ -868,14 +949,19 @@ where
                             amount_in,
                             &anchor,
                             &mut local_pools,
+                            chain_id,
+                            cache,
+                            &metrics,
                         )
-                        .await
-                        {
+                        .await;
+                        edge_attempts_ms.push(t0.elapsed().as_millis() as u64);
+                        if let Some(edge) = outcome {
                             edges.push(edge);
                         }
                     }
                     if let Some(cfg) = sushiswap {
-                        if let Some(edge) = quote_v2_edge(
+                        let t0 = Instant::now();
+                        let outcome = quote_v2_edge(
                             &provider,
                             Venue::SushiSwap,
                             cfg.router,
@@ -885,16 +971,21 @@ where
                             amount_in,
                             &anchor,
                             &mut local_pools,
+                            chain_id,
+                            cache,
+                            &metrics,
                         )
-                        .await
-                        {
+                        .await;
+                        edge_attempts_ms.push(t0.elapsed().as_millis() as u64);
+                        if let Some(edge) = outcome {
                             edges.push(edge);
                         }
                     }
                     if let Some(cfg) = v3.filter(|cfg| cfg.quoter.is_some()) {
                         let quoter = cfg.quoter.expect("filtered on Some");
                         for fee in V3_FEE_TIERS {
-                            if let Some(edge) = quote_v3_edge(
+                            let t0 = Instant::now();
+                            let outcome = quote_v3_edge(
                                 &provider,
                                 cfg.router,
                                 cfg.factory,
@@ -905,9 +996,13 @@ where
                                 amount_in,
                                 &anchor,
                                 &mut local_pools,
+                                chain_id,
+                                cache,
+                                &metrics,
                             )
-                            .await
-                            {
+                            .await;
+                            edge_attempts_ms.push(t0.elapsed().as_millis() as u64);
+                            if let Some(edge) = outcome {
                                 edges.push(edge);
                             }
                         }
@@ -920,7 +1015,8 @@ where
                         quotes_succeeded = edges.len(),
                         "canonical quote pair complete"
                     );
-                    (pair_index, edges, local_pools)
+                    let pair_serial_ms: u64 = edge_attempts_ms.iter().sum();
+                    (pair_index, edges, local_pools, pair_serial_ms)
                 }
             },
         ))
@@ -929,8 +1025,13 @@ where
         .await;
 
         let mut quote_results = quote_results;
-        quote_results.sort_by_key(|(pair_index, _, _)| *pair_index);
-        for (_, edges, local_pools) in quote_results {
+        quote_results.sort_by_key(|(pair_index, ..)| *pair_index);
+        let critical_path_floor_ms = quote_results
+            .iter()
+            .map(|(_, _, _, pair_serial_ms)| *pair_serial_ms)
+            .max()
+            .unwrap_or(0);
+        for (_, edges, local_pools, _) in quote_results {
             stats.quotes_succeeded += edges.len() as u64;
             for edge in edges {
                 initial_quotes.push(PinnedQuoteRecord {
@@ -964,7 +1065,129 @@ where
             quotes_succeeded = stats.quotes_succeeded,
             edges_created = stats.edges_created,
             pools_observed = pools.meta.len(),
+            anchor_age_ms = anchor_age_ms(),
             "canonical quote stage complete"
+        );
+
+        // ---- quote_ms decomposition: real eth_call count/wait, duplicate
+        // reads, and the per-pair serial critical path -- gathered once so
+        // any concurrency-tuning decision (raising `quote_concurrency`,
+        // adding an address/metadata cache) rests on measured evidence
+        // instead of a guess. `computation_ms` is deliberately not reported
+        // separately: every adapter fn here does only ABI encode/decode and
+        // a keccak256 hash between calls, which is negligible next to RPC
+        // wait -- `quote_ms` is, for practical purposes, all RPC. ----
+        let rpc_calls: Vec<RpcCallRecord> = quote_metrics.drain();
+        let rpc_calls_total = rpc_calls.len();
+        let rpc_wait_ms_sum: u64 = rpc_calls.iter().map(|c| c.wait_ms).sum();
+        let mut seen_calls: HashSet<(Address, &'static str)> = HashSet::new();
+        let mut duplicate_calls: u64 = 0;
+        let mut by_kind: BTreeMap<&'static str, (u64, u64)> = BTreeMap::new();
+        for rec in &rpc_calls {
+            let entry = by_kind.entry(rec.call_kind).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += rec.wait_ms;
+            if !seen_calls.insert((rec.pool, rec.call_kind)) {
+                duplicate_calls += 1;
+            }
+        }
+        let pools_touched = rpc_calls
+            .iter()
+            .map(|c| c.pool)
+            .collect::<HashSet<_>>()
+            .len();
+        let parallel_efficiency = if timing.quote_ms > 0 {
+            rpc_wait_ms_sum as f64 / timing.quote_ms as f64
+        } else {
+            0.0
+        };
+        tracing::info!(
+            target: "canonical_discovery",
+            anchor = anchor.number,
+            quote_ms = timing.quote_ms,
+            rpc_calls_total,
+            rpc_wait_ms_sum,
+            rpc_duplicate_calls = duplicate_calls,
+            pools_touched,
+            quote_concurrency,
+            critical_path_floor_ms,
+            parallel_efficiency = format!("{parallel_efficiency:.2}"),
+            "canonical quote stage rpc breakdown"
+        );
+        for (call_kind, (count, wait_ms)) in &by_kind {
+            tracing::info!(
+                target: "canonical_discovery",
+                anchor = anchor.number,
+                call_kind = %call_kind,
+                count,
+                wait_ms_sum = wait_ms,
+                wait_ms_avg = *wait_ms / (*count).max(1),
+                "canonical quote rpc call kind breakdown"
+            );
+        }
+
+        // ---- Phase-A immutable-metadata cache: exact hit/miss delta for
+        // this round only (before/after snapshot, not cumulative since
+        // process start). `metadata_calls_avoided` is exact -- every
+        // lookup this round that did not trigger `fetch()` inside the
+        // cache, whether a genuine hit or a single-flighted duplicate.
+        // `metadata_wait_ms_avoided_estimate` is NOT exact: avoided calls
+        // have no measured wait_ms of their own (no RPC ran), so it is the
+        // average wait_ms of this round's real metadata RPC calls times
+        // the avoided count -- clearly marked as an estimate below. ----
+        let metadata_cache_after = self.metadata_cache.metrics();
+        let metadata_delta = metadata_cache_after.saturating_sub(&metadata_cache_before);
+        let metadata_calls_avoided = metadata_delta.calls_avoided_total();
+        const METADATA_CALL_KINDS: [&str; 6] = [
+            "get_code(pool)",
+            "get_code(router)",
+            "token0",
+            "token1",
+            "getPair",
+            "getPool",
+        ];
+        let (metadata_wait_ms_sum, metadata_wait_calls) = by_kind
+            .iter()
+            .filter(|(k, _)| METADATA_CALL_KINDS.contains(k))
+            .fold((0u64, 0u64), |(acc_ms, acc_n), (_, (n, ms))| {
+                (acc_ms + ms, acc_n + n)
+            });
+        let metadata_wait_ms_avoided_estimate = if metadata_wait_calls > 0 {
+            ((metadata_wait_ms_sum as f64 / metadata_wait_calls as f64)
+                * metadata_calls_avoided as f64) as u64
+        } else {
+            0
+        };
+        tracing::info!(
+            target: "canonical_discovery",
+            anchor = anchor.number,
+            metadata_calls_avoided,
+            metadata_wait_ms_avoided_estimate,
+            metadata_wait_ms_avoided_is_estimate = true,
+            metadata_lookups_total = metadata_delta.lookups_total(),
+            metadata_rpc_calls_total = metadata_delta.rpc_calls_total(),
+            v2_pair_hits = metadata_delta.v2_pair.hits,
+            v2_pair_misses = metadata_delta.v2_pair.misses,
+            v2_pair_negative_hits = metadata_delta.v2_pair.negative_hits,
+            v2_pair_negative_expired = metadata_delta.v2_pair.negative_expired,
+            v2_pair_rpc_calls = metadata_delta.v2_pair.rpc_calls,
+            v3_pool_hits = metadata_delta.v3_pool.hits,
+            v3_pool_misses = metadata_delta.v3_pool.misses,
+            v3_pool_negative_hits = metadata_delta.v3_pool.negative_hits,
+            v3_pool_negative_expired = metadata_delta.v3_pool.negative_expired,
+            v3_pool_rpc_calls = metadata_delta.v3_pool.rpc_calls,
+            token0_hits = metadata_delta.token0.hits,
+            token0_misses = metadata_delta.token0.misses,
+            token0_rpc_calls = metadata_delta.token0.rpc_calls,
+            token1_hits = metadata_delta.token1.hits,
+            token1_misses = metadata_delta.token1.misses,
+            token1_rpc_calls = metadata_delta.token1.rpc_calls,
+            code_hash_hits = metadata_delta.code_hash.hits,
+            code_hash_misses = metadata_delta.code_hash.misses,
+            code_hash_negative_hits = metadata_delta.code_hash.negative_hits,
+            code_hash_negative_expired = metadata_delta.code_hash.negative_expired,
+            code_hash_rpc_calls = metadata_delta.code_hash.rpc_calls,
+            "canonical quote stage metadata cache breakdown"
         );
 
         // ---- Structural cycle discovery: one DFS pass per start token,
@@ -1057,6 +1280,7 @@ where
             rank_min_multiplier,
             rank_max_multiplier,
             max_routes,
+            anchor_age_ms = anchor_age_ms(),
             "canonical structural ranking stage complete"
         );
 
@@ -1193,6 +1417,7 @@ where
             routes_requoted = route_leg_quotes.len(),
             rejections = rejections.len(),
             requote_concurrency,
+            anchor_age_ms = anchor_age_ms(),
             "canonical parallel requote stage complete"
         );
 
@@ -1304,6 +1529,7 @@ where
             context_pools,
             context_states,
             context_routes,
+            anchor_age_ms = anchor_age_ms(),
             "canonical execution context stage complete"
         );
 
@@ -1459,6 +1685,7 @@ where
             rejections = rejections.len(),
             total_round_ms = timing.total_ms,
             unattributed_ms = timing.unattributed_ms,
+            anchor_age_ms = anchor_age_ms(),
             "canonical discovery complete"
         );
 

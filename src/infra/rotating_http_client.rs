@@ -79,6 +79,35 @@ struct JsonRpcResponse<R> {
     error: Option<JsonRpcError>,
 }
 
+/// Contadores observáveis, só-leitura-via-snapshot, de eventos de
+/// rate-limit/retry/failover. Puramente aditivo -- não influencia a retry
+/// policy (backoff/timeout) em nada; existe só para medir o efeito real de
+/// mudanças em outra camada (ex.: cache de metadata reduzindo volume de
+/// chamadas) sem reabrir esta política nesta fase.
+#[derive(Debug, Default)]
+pub struct RotatingClientCounters {
+    /// Toda rotação de endpoint por status/erro classificado como
+    /// rate-limit puro (429, "rate limit", "too many requests", etc. --
+    /// ver `is_rate_limit`/`HTTP 429` em `is_recoverable_status`).
+    pub rate_limit_events: AtomicU64,
+    /// Toda tentativa além da primeira (`offset > 0`) -- uma "retry" contra
+    /// o próximo endpoint da lista, por qualquer motivo recuperável.
+    pub retry_count: AtomicU64,
+    /// Toda troca efetiva de endpoint corrente (`current.store`), contando
+    /// motivo de transporte, HTTP recuperável, ou erro de provedor.
+    pub failover_count: AtomicU64,
+}
+
+impl RotatingClientCounters {
+    pub fn snapshot(&self) -> (u64, u64, u64) {
+        (
+            self.rate_limit_events.load(Ordering::Relaxed),
+            self.retry_count.load(Ordering::Relaxed),
+            self.failover_count.load(Ordering::Relaxed),
+        )
+    }
+}
+
 /// Cliente HTTP que rotaciona endpoints a cada falha de transporte/rate-limit.
 #[derive(Debug)]
 pub struct RotatingHttpClient {
@@ -89,6 +118,7 @@ pub struct RotatingHttpClient {
     current: AtomicUsize,
     request_timeout: Duration,
     id: AtomicU64,
+    pub counters: RotatingClientCounters,
 }
 
 impl RotatingHttpClient {
@@ -101,6 +131,7 @@ impl RotatingHttpClient {
                 current: AtomicUsize::new(0),
                 request_timeout,
                 id: AtomicU64::new(1),
+                counters: RotatingClientCounters::default(),
             });
         }
 
@@ -111,6 +142,7 @@ impl RotatingHttpClient {
             current: AtomicUsize::new(0),
             request_timeout,
             id: AtomicU64::new(1),
+            counters: RotatingClientCounters::default(),
         })
     }
 
@@ -243,6 +275,7 @@ impl JsonRpcClient for RotatingHttpClient {
             // retentativa (não na primeira tentativa) dá chance de a rede
             // se recuperar em vez de esgotar o pool instantaneamente.
             if offset > 0 {
+                self.counters.retry_count.fetch_add(1, Ordering::Relaxed);
                 tokio::time::sleep(Duration::from_millis(150)).await;
             }
             let idx = (start_idx + offset) % n;
@@ -259,6 +292,7 @@ impl JsonRpcClient for RotatingHttpClient {
                             "RPC[{}] falha de transporte ({}) — rotacionando...",
                             idx, msg
                         );
+                        self.counters.failover_count.fetch_add(1, Ordering::Relaxed);
                         self.current.store((idx + 1) % n, Ordering::Relaxed);
                         last_err = Some(msg);
                         continue;
@@ -271,6 +305,7 @@ impl JsonRpcClient for RotatingHttpClient {
                         idx,
                         self.request_timeout.as_millis()
                     );
+                    self.counters.failover_count.fetch_add(1, Ordering::Relaxed);
                     self.current.store((idx + 1) % n, Ordering::Relaxed);
                     last_err = Some(format!("timeout externo em {}", url));
                     continue;
@@ -286,6 +321,7 @@ impl JsonRpcClient for RotatingHttpClient {
                             "RPC[{}] erro ao ler resposta ({}) — rotacionando...",
                             idx, e
                         );
+                        self.counters.failover_count.fetch_add(1, Ordering::Relaxed);
                         self.current.store((idx + 1) % n, Ordering::Relaxed);
                         last_err = Some(e.to_string());
                         continue;
@@ -302,6 +338,12 @@ impl JsonRpcClient for RotatingHttpClient {
                     idx,
                     status.as_u16()
                 );
+                if status == StatusCode::TOO_MANY_REQUESTS {
+                    self.counters
+                        .rate_limit_events
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                self.counters.failover_count.fetch_add(1, Ordering::Relaxed);
                 self.current.store((idx + 1) % n, Ordering::Relaxed);
                 last_err = Some(format!("HTTP {}", status.as_u16()));
                 continue;
@@ -322,6 +364,7 @@ impl JsonRpcClient for RotatingHttpClient {
                             idx,
                             body.len()
                         );
+                        self.counters.failover_count.fetch_add(1, Ordering::Relaxed);
                         self.current.store((idx + 1) % n, Ordering::Relaxed);
                         last_err = Some(text.chars().take(200).collect());
                         continue;
@@ -343,6 +386,12 @@ impl JsonRpcClient for RotatingHttpClient {
                         "RPC[{}] erro JSON-RPC de provedor ({}) — rotacionando...",
                         idx, msg
                     );
+                    if Self::is_rate_limit(&msg) {
+                        self.counters
+                            .rate_limit_events
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    self.counters.failover_count.fetch_add(1, Ordering::Relaxed);
                     self.current.store((idx + 1) % n, Ordering::Relaxed);
                     last_err = Some(msg);
                     continue;
