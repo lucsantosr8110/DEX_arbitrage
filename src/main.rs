@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result};
 use ethers::{
-    providers::{Http, Middleware, Provider, Ws},
+    providers::{Middleware, Provider, Ws},
     types::{Address, H256, U256},
 };
 use futures::future;
@@ -56,6 +56,7 @@ use flashloan_bot::{
     infra::{
         history::{RoundHistory, RoundRecord},
         metrics,
+        rotating_http_client::RotatingHttpClient,
         rpc_provider::{is_usable_endpoint, RpcProvider},
         try_serve_metrics_with_fallback,
     },
@@ -785,8 +786,8 @@ fn graceful_startup_cleanup(
 /// rejected or failed canonical round is logged and dropped, never
 /// retried against the legacy engine.
 #[allow(clippy::too_many_arguments)]
-async fn run_canonical_mode(
-    provider: Arc<Provider<Http>>,
+async fn run_canonical_mode<M>(
+    provider: Arc<M>,
     cfg: Arc<Config>,
     adj_cost: Arc<AdjCostParams>,
     every_n_blocks: u64,
@@ -795,7 +796,11 @@ async fn run_canonical_mode(
     history: Option<Arc<RoundHistory>>,
     mut shutdown_rx: broadcast::Receiver<()>,
     tui_guard: &mut TuiGuard,
-) -> Result<()> {
+) -> Result<()>
+where
+    M: Middleware,
+    M::Error: 'static,
+{
     let profile = match cfg.c2b_shadow.canonical_discovery_profile.as_str() {
         "liquid" => CanonicalDiscoveryProfile::Liquid,
         _ => CanonicalDiscoveryProfile::Base,
@@ -1371,11 +1376,26 @@ async fn main() -> Result<()> {
     if DiscoveryEngine::resolve(&cfg_unlocked.c2b_shadow.discovery_engine)
         == DiscoveryEngine::Canonical
     {
-        let endpoint = rpc_endpoints
+        let usable_endpoints: Vec<String> = rpc_endpoints
             .iter()
-            .find(|endpoint| is_usable_endpoint(endpoint))
-            .ok_or_else(|| anyhow::anyhow!("canonical mode has no usable read-only RPC"))?;
-        let provider = Arc::new(Provider::<Http>::try_from(endpoint.as_str())?);
+            .filter(|endpoint| is_usable_endpoint(endpoint))
+            .cloned()
+            .collect();
+        if usable_endpoints.is_empty() {
+            anyhow::bail!("canonical mode has no usable read-only RPC");
+        }
+        // Antes: pegava só o primeiro endpoint usável e criava um
+        // Provider::<Http> fixo pra vida toda do processo — sem failover.
+        // Descoberto 2026-08-16: QuickNode como primário bateu "-32003 daily
+        // request limit reached" após ~4h de uso solo e travou o canonical
+        // block-poll indefinidamente (nenhum outro endpoint da lista era
+        // tentado). RotatingHttpClient já existia (usado só pelo path legado
+        // signer-based) e é read-only-friendly — reaproveitado aqui.
+        let rpc_timeout =
+            Duration::from_millis(cfg_unlocked.network.timeout_ms.max(1000));
+        let rotating = RotatingHttpClient::from_strings(&usable_endpoints, rpc_timeout)
+            .context("❌ falha ao construir RotatingHttpClient para o modo canonical")?;
+        let provider = Arc::new(Provider::new(rotating));
         if let Ok(mut state) = tui_state.write() {
             state.set_startup_phase("descoberta canônica em execução...");
             state.mark_startup_done();
