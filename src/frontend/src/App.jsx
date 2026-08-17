@@ -172,7 +172,7 @@ function App() {
           {section === "overview" && <Overview snapshot={snapshot} bestRoute={bestRoute} rounds={rounds} stats={stats} />}
           {section === "market" && <Market prices={snapshot.prices || []} />}
           {section === "routes" && <Routes routes={routes} />}
-          {section === "pipeline" && <Pipeline snapshot={snapshot} stats={stats} />}
+          {section === "pipeline" && <Pipeline snapshot={snapshot} stats={stats} rounds={rounds} />}
           {section === "infra" && <Infrastructure snapshot={snapshot} />}
           {section === "safety" && <Safety snapshot={snapshot} />}
         </div>

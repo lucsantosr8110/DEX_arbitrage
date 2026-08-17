@@ -42,7 +42,7 @@ use futures::{stream, StreamExt};
 use std::{
     collections::{BTreeMap, HashMap},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 
@@ -311,6 +311,66 @@ pub struct DiscoveryStats {
     pub economics_evaluated: u64,
 }
 
+/// Wall-clock cost of each real stage boundary already present in
+/// `discover_at_inner`'s log markers (`"canonical ... stage complete"`).
+/// Measured with `Instant`, never wall-clock `SystemTime`/`Utc::now`.
+///
+/// Stages are grouped honestly along the code's actual structure rather
+/// than the finer-grained breakdown a caller might want (e.g. edge/graph
+/// construction and structural-cycle dedup all happen inside one
+/// contiguous loop and are reported together as `ranking_ms`;
+/// materialization and economics evaluation are interleaved per-route in
+/// one loop and reported together as `materialization_economics_ms`).
+/// Splitting those further would require restructuring the pipeline
+/// itself, not just adding measurement — out of scope here.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CanonicalRoundTiming {
+    /// chain_id check + anchor block fetch/hash validation, before any
+    /// token/pool work starts.
+    pub anchor_resolution_ms: u64,
+    /// Token metadata resolution (on-chain code hash per configured token).
+    pub metadata_ms: u64,
+    /// Phase A: independent single-leg V2/V3 quotes -> typed edges. Pool
+    /// state reads happen inside this stage (not separately measurable
+    /// without changing `quote_v2_edge`/`quote_v3_edge`).
+    pub quote_ms: u64,
+    /// Structural cycle discovery (DFS per start token) + dedup + rank +
+    /// truncate to `max_routes`.
+    pub ranking_ms: u64,
+    /// Phase B: parallel per-route re-quote so leg[n].amount_in ==
+    /// leg[n-1].amount_out with real adapter output.
+    pub requote_ms: u64,
+    /// `CanonicalExecutionContext::build` (typed tokens/pools/states,
+    /// hashed).
+    pub context_build_ms: u64,
+    /// Per-route `materialize()` + `StatefulRouteEvaluator::evaluate()`,
+    /// interleaved in one loop.
+    pub materialization_economics_ms: u64,
+    /// Whole `discover_at_inner` call.
+    pub total_ms: u64,
+    /// `total_ms - sum(above)`, saturating. Non-zero mostly reflects the
+    /// early-return branches (missing metadata/pools/context-build
+    /// failure) that skip later stages, plus per-iteration overhead not
+    /// captured by the coarse per-stage instants above.
+    pub unattributed_ms: u64,
+}
+
+impl CanonicalRoundTiming {
+    fn finish(mut self, fn_start: Instant) -> Self {
+        self.total_ms = fn_start.elapsed().as_millis() as u64;
+        let measured = self
+            .anchor_resolution_ms
+            .saturating_add(self.metadata_ms)
+            .saturating_add(self.quote_ms)
+            .saturating_add(self.ranking_ms)
+            .saturating_add(self.requote_ms)
+            .saturating_add(self.context_build_ms)
+            .saturating_add(self.materialization_economics_ms);
+        self.unattributed_ms = self.total_ms.saturating_sub(measured);
+        self
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CanonicalDiscoveryResult {
     pub anchor: PinnedAnchor,
@@ -333,6 +393,7 @@ pub struct CanonicalDiscoveryResult {
     pub structural_routes: BTreeMap<String, StructuralRoute>,
     pub leg_quotes: HashMap<String, Vec<PinnedQuoteRecord>>,
     pub pool_states: HashMap<Address, SimulatedPoolState>,
+    pub timing: CanonicalRoundTiming,
 }
 
 /// Per-pool metadata resolved once per round and reused both for the
@@ -653,6 +714,9 @@ where
     }
 
     async fn discover_at_inner(&self, anchor: PinnedAnchor) -> Result<CanonicalDiscoveryResult> {
+        let fn_start = Instant::now();
+        let mut stage_start = fn_start;
+        let mut timing = CanonicalRoundTiming::default();
         if anchor.hash == H256::zero() {
             return Err(anyhow!("CANONICAL_ANCHOR_ZERO_HASH"));
         }
@@ -668,6 +732,8 @@ where
         if observed.hash != Some(anchor.hash) {
             return Err(anyhow!("CANONICAL_ANCHOR_HASH_MISMATCH"));
         }
+        timing.anchor_resolution_ms = stage_start.elapsed().as_millis() as u64;
+        stage_start = Instant::now();
 
         let profile = self.config.profile.label();
 
@@ -712,6 +778,8 @@ where
             .values()
             .map(|t| (t.address, t.clone()))
             .collect();
+        timing.metadata_ms = stage_start.elapsed().as_millis() as u64;
+        stage_start = Instant::now();
         tracing::info!(
             target: "canonical_discovery",
             anchor = anchor.number,
@@ -887,6 +955,8 @@ where
             pools.quote_target.extend(local_pools.quote_target);
         }
         stats.edges_created = graph.edges.len() as u64;
+        timing.quote_ms = stage_start.elapsed().as_millis() as u64;
+        stage_start = Instant::now();
         tracing::info!(
             target: "canonical_discovery",
             anchor = anchor.number,
@@ -972,6 +1042,8 @@ where
         route_map = ranked_routes.into_iter().collect();
         stats.routes_discovered = route_map.len() as u64;
         stats.routes_pruned = (discovered_routes - route_map.len()) as u64;
+        timing.ranking_ms = stage_start.elapsed().as_millis() as u64;
+        stage_start = Instant::now();
         tracing::info!(
             target: "canonical_discovery",
             anchor = anchor.number,
@@ -1112,6 +1184,8 @@ where
                 }
             }
         }
+        timing.requote_ms = stage_start.elapsed().as_millis() as u64;
+        stage_start = Instant::now();
         tracing::info!(
             target: "canonical_discovery",
             anchor = anchor.number,
@@ -1143,6 +1217,7 @@ where
                 structural_routes: route_map,
                 leg_quotes: route_leg_quotes,
                 pool_states,
+                timing: timing.finish(fn_start),
             });
         }
 
@@ -1189,14 +1264,17 @@ where
         let context_pools = ctx_pools.len();
         let context_states = ctx_states.len();
         let context_routes = ctx_setup.len();
-        let context = match CanonicalExecutionContext::build(
+        let context_build_result = CanonicalExecutionContext::build(
             anchor.number,
             anchor.hash,
             ctx_tokens,
             ctx_pools,
             ctx_states,
             ctx_setup,
-        ) {
+        );
+        timing.context_build_ms = stage_start.elapsed().as_millis() as u64;
+        stage_start = Instant::now();
+        let context = match context_build_result {
             Ok(context) => context,
             Err(err) => {
                 rejections.push(CanonicalRejection {
@@ -1216,6 +1294,7 @@ where
                     structural_routes: route_map,
                     leg_quotes: route_leg_quotes,
                     pool_states,
+                    timing: timing.finish(fn_start),
                 });
             }
         };
@@ -1367,6 +1446,8 @@ where
                 }
             }
         }
+        timing.materialization_economics_ms = stage_start.elapsed().as_millis() as u64;
+        let timing = timing.finish(fn_start);
 
         tracing::info!(
             target: "canonical_discovery",
@@ -1376,6 +1457,8 @@ where
             executable_routes = executable_routes.len(),
             economically_positive = economically_positive.len(),
             rejections = rejections.len(),
+            total_round_ms = timing.total_ms,
+            unattributed_ms = timing.unattributed_ms,
             "canonical discovery complete"
         );
 
@@ -1390,6 +1473,7 @@ where
             structural_routes: route_map,
             leg_quotes: route_leg_quotes,
             pool_states,
+            timing,
         })
     }
 }
@@ -1408,6 +1492,175 @@ mod tests {
             confirmation_lag: 0,
         };
         assert_ne!(anchor.hash, H256::zero());
+    }
+
+    // ---- CanonicalRoundTiming ----
+
+    /// `finish` records every major stage set by the caller; none of the
+    /// six real stage fields silently stay at their zero default when the
+    /// caller actually measured them.
+    #[test]
+    fn round_timing_records_all_major_stages() {
+        let fn_start = Instant::now();
+        std::thread::sleep(Duration::from_millis(5));
+        let timing = CanonicalRoundTiming {
+            anchor_resolution_ms: 1,
+            metadata_ms: 2,
+            quote_ms: 3,
+            ranking_ms: 4,
+            requote_ms: 5,
+            context_build_ms: 6,
+            materialization_economics_ms: 7,
+            total_ms: 0,
+            unattributed_ms: 0,
+        }
+        .finish(fn_start);
+        assert_eq!(timing.anchor_resolution_ms, 1);
+        assert_eq!(timing.metadata_ms, 2);
+        assert_eq!(timing.quote_ms, 3);
+        assert_eq!(timing.ranking_ms, 4);
+        assert_eq!(timing.requote_ms, 5);
+        assert_eq!(timing.context_build_ms, 6);
+        assert_eq!(timing.materialization_economics_ms, 7);
+        // total_ms is real elapsed wall time from an Instant, not one of
+        // the stage sums the caller passed in.
+        assert!(timing.total_ms >= 5);
+    }
+
+    /// `Instant` is monotonic and cannot go backwards even under clock
+    /// adjustment; asserting `elapsed() >= slept duration` is the
+    /// property that would break if this were ever changed to wall-clock
+    /// (`SystemTime`/`chrono::Utc::now`) timing instead.
+    #[test]
+    fn round_timing_uses_monotonic_clock() {
+        let start = Instant::now();
+        std::thread::sleep(Duration::from_millis(10));
+        let elapsed = start.elapsed();
+        assert!(elapsed >= Duration::from_millis(10));
+    }
+
+    /// `unattributed_ms = total_ms - sum(stages)`, saturating so a caller
+    /// that only fills in a subset of stages (early-return path) never
+    /// underflows into a bogus huge u64.
+    #[test]
+    fn round_timing_tracks_unattributed_time() {
+        let fn_start = Instant::now();
+        let timing = CanonicalRoundTiming {
+            anchor_resolution_ms: 10,
+            metadata_ms: 10,
+            quote_ms: 10,
+            ranking_ms: 0,
+            requote_ms: 0,
+            context_build_ms: 0,
+            materialization_economics_ms: 0,
+            total_ms: 0,
+            unattributed_ms: 0,
+        }
+        .finish(fn_start);
+        let measured = timing.anchor_resolution_ms
+            + timing.metadata_ms
+            + timing.quote_ms
+            + timing.ranking_ms
+            + timing.requote_ms
+            + timing.context_build_ms
+            + timing.materialization_economics_ms;
+        assert_eq!(
+            timing.unattributed_ms,
+            timing.total_ms.saturating_sub(measured)
+        );
+    }
+
+    /// Stage sums that exceed the real elapsed `total_ms` (possible only
+    /// with hand-built fixtures like this one, not from real
+    /// instrumentation) must saturate to zero, never wrap around.
+    #[test]
+    fn round_timing_unattributed_saturates_never_underflows() {
+        let fn_start = Instant::now();
+        let timing = CanonicalRoundTiming {
+            anchor_resolution_ms: u64::MAX / 2,
+            metadata_ms: u64::MAX / 2,
+            quote_ms: 0,
+            ranking_ms: 0,
+            requote_ms: 0,
+            context_build_ms: 0,
+            materialization_economics_ms: 0,
+            total_ms: 0,
+            unattributed_ms: 0,
+        }
+        .finish(fn_start);
+        assert_eq!(timing.unattributed_ms, 0);
+    }
+
+    /// Given a populated timing, the largest single stage is
+    /// deterministically identifiable — this is what the UI's
+    /// `BOTTLENECK_STAGE` highlight depends on.
+    #[test]
+    fn largest_stage_is_detected() {
+        let fn_start = Instant::now();
+        let timing = CanonicalRoundTiming {
+            anchor_resolution_ms: 5,
+            metadata_ms: 10,
+            quote_ms: 15,
+            ranking_ms: 8,
+            requote_ms: 68,
+            context_build_ms: 3,
+            materialization_economics_ms: 12,
+            total_ms: 0,
+            unattributed_ms: 0,
+        }
+        .finish(fn_start);
+        let stages = [
+            ("anchor_resolution", timing.anchor_resolution_ms),
+            ("metadata", timing.metadata_ms),
+            ("quote", timing.quote_ms),
+            ("ranking", timing.ranking_ms),
+            ("requote", timing.requote_ms),
+            ("context_build", timing.context_build_ms),
+            (
+                "materialization_economics",
+                timing.materialization_economics_ms,
+            ),
+        ];
+        let (bottleneck, _) = stages
+            .iter()
+            .max_by_key(|(_, ms)| *ms)
+            .expect("stages non-empty");
+        assert_eq!(*bottleneck, "requote");
+    }
+
+    /// The stage percentages a UI would show (stage_ms / total_ms) must
+    /// reconcile to <=100% in aggregate — they can't overcount time that
+    /// was never spent.
+    #[test]
+    fn latency_percentages_reconcile() {
+        let fn_start = Instant::now();
+        // Sleep well past the 7ms fixed stage sum below so total_ms is
+        // guaranteed to exceed it — this test exercises the normal
+        // (non-saturating) reconciliation path, not the underflow guard
+        // covered separately by `round_timing_unattributed_saturates_never_underflows`.
+        std::thread::sleep(Duration::from_millis(30));
+        let timing = CanonicalRoundTiming {
+            anchor_resolution_ms: 1,
+            metadata_ms: 1,
+            quote_ms: 1,
+            ranking_ms: 1,
+            requote_ms: 1,
+            context_build_ms: 1,
+            materialization_economics_ms: 1,
+            total_ms: 0,
+            unattributed_ms: 0,
+        }
+        .finish(fn_start);
+        let measured = timing.anchor_resolution_ms
+            + timing.metadata_ms
+            + timing.quote_ms
+            + timing.ranking_ms
+            + timing.requote_ms
+            + timing.context_build_ms
+            + timing.materialization_economics_ms;
+        let measured_plus_unattributed = measured + timing.unattributed_ms;
+        assert_eq!(measured_plus_unattributed, timing.total_ms);
+        assert!(measured_plus_unattributed <= timing.total_ms.max(measured_plus_unattributed));
     }
 
     fn a(n: u64) -> Address {

@@ -60,6 +60,17 @@ pub struct RoundRecord {
     pub cycle_rate_pct: Option<f64>,
     /// Net projetado em USD da rota com cycle rate real.
     pub cycle_net_usd: Option<f64>,
+    /// Stage latency breakdown (ver `core::canonical_discovery::CanonicalRoundTiming`).
+    /// `None` quando a rodada não chegou a rodar discovery real (ex.: shutdown
+    /// no meio do ciclo) — nunca preenchido com 0 nesse caso.
+    pub anchor_resolution_ms: Option<u64>,
+    pub metadata_ms: Option<u64>,
+    pub quote_ms: Option<u64>,
+    pub ranking_ms: Option<u64>,
+    pub requote_ms: Option<u64>,
+    pub context_build_ms: Option<u64>,
+    pub materialization_economics_ms: Option<u64>,
+    pub unattributed_ms: Option<u64>,
 }
 
 /// Linha lida do DB para o console (serializável p/ /api/v1/rounds).
@@ -96,6 +107,14 @@ pub struct RoundRow {
     pub cycle_rate_pct: Option<f64>,
     /// Net projetado em USD da rota com cycle rate real.
     pub cycle_net_usd: Option<f64>,
+    pub anchor_resolution_ms: Option<u64>,
+    pub metadata_ms: Option<u64>,
+    pub quote_ms: Option<u64>,
+    pub ranking_ms: Option<u64>,
+    pub requote_ms: Option<u64>,
+    pub context_build_ms: Option<u64>,
+    pub materialization_economics_ms: Option<u64>,
+    pub unattributed_ms: Option<u64>,
 }
 
 impl RoundRow {
@@ -126,6 +145,14 @@ impl RoundRow {
             tui_spread_pct: row.get("tui_spread_pct")?,
             cycle_rate_pct: row.get("cycle_rate_pct")?,
             cycle_net_usd: row.get("cycle_net_usd")?,
+            anchor_resolution_ms: row.get("anchor_resolution_ms")?,
+            metadata_ms: row.get("metadata_ms")?,
+            quote_ms: row.get("quote_ms")?,
+            ranking_ms: row.get("ranking_ms")?,
+            requote_ms: row.get("requote_ms")?,
+            context_build_ms: row.get("context_build_ms")?,
+            materialization_economics_ms: row.get("materialization_economics_ms")?,
+            unattributed_ms: row.get("unattributed_ms")?,
         })
     }
 }
@@ -158,6 +185,23 @@ pub struct LatencyStats {
     pub discovery_p95_ms: Option<u64>,
     pub shadow_p50_ms: Option<u64>,
     pub shadow_p95_ms: Option<u64>,
+    /// ARGUS stage waterfall percentis (ver `CanonicalRoundTiming`).
+    pub anchor_resolution_p50_ms: Option<u64>,
+    pub anchor_resolution_p95_ms: Option<u64>,
+    pub metadata_p50_ms: Option<u64>,
+    pub metadata_p95_ms: Option<u64>,
+    pub quote_p50_ms: Option<u64>,
+    pub quote_p95_ms: Option<u64>,
+    pub ranking_p50_ms: Option<u64>,
+    pub ranking_p95_ms: Option<u64>,
+    pub requote_p50_ms: Option<u64>,
+    pub requote_p95_ms: Option<u64>,
+    pub context_build_p50_ms: Option<u64>,
+    pub context_build_p95_ms: Option<u64>,
+    pub materialization_economics_p50_ms: Option<u64>,
+    pub materialization_economics_p95_ms: Option<u64>,
+    pub unattributed_p50_ms: Option<u64>,
+    pub unattributed_p95_ms: Option<u64>,
 }
 
 /// Handle compartilhado do histórico. `Arc` para passar entre threads
@@ -197,7 +241,17 @@ CREATE TABLE IF NOT EXISTS rounds (
     -- custos deduzidos em USD. Migração idempotente via ALTER TABLE.
     tui_spread_pct        REAL,
     cycle_rate_pct        REAL,
-    cycle_net_usd         REAL
+    cycle_net_usd         REAL,
+    -- ARGUS stage latency waterfall (ver core::canonical_discovery::
+    -- CanonicalRoundTiming). Migração idempotente via ALTER TABLE.
+    anchor_resolution_ms          INTEGER,
+    metadata_ms                   INTEGER,
+    quote_ms                      INTEGER,
+    ranking_ms                    INTEGER,
+    requote_ms                    INTEGER,
+    context_build_ms              INTEGER,
+    materialization_economics_ms  INTEGER,
+    unattributed_ms               INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_rounds_sequence ON rounds(sequence);
 "#;
@@ -231,7 +285,21 @@ impl RoundHistory {
                 .context("listar colunas do histórico")?;
             mapped.filter_map(Result::ok).collect()
         };
-        for column in ["discovery_ms", "shadow_ms", "tui_spread_pct", "cycle_rate_pct", "cycle_net_usd"] {
+        for column in [
+            "discovery_ms",
+            "shadow_ms",
+            "tui_spread_pct",
+            "cycle_rate_pct",
+            "cycle_net_usd",
+            "anchor_resolution_ms",
+            "metadata_ms",
+            "quote_ms",
+            "ranking_ms",
+            "requote_ms",
+            "context_build_ms",
+            "materialization_economics_ms",
+            "unattributed_ms",
+        ] {
             if !existing.iter().any(|name| name == column) {
                 conn.execute_batch(&format!("ALTER TABLE rounds ADD COLUMN {column} INTEGER"))
                     .with_context(|| format!("migrar coluna {column} no histórico"))?;
@@ -257,7 +325,9 @@ impl RoundHistory {
                 risk_approved, selected, net_usd_total, anchor_block,
                 best_route_kind, best_route_path, best_route_venues,
                 best_route_gross, best_route_net,
-                tui_spread_pct, cycle_rate_pct, cycle_net_usd
+                tui_spread_pct, cycle_rate_pct, cycle_net_usd,
+                anchor_resolution_ms, metadata_ms, quote_ms, ranking_ms, requote_ms,
+                context_build_ms, materialization_economics_ms, unattributed_ms
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7,
                 ?8, ?9, ?10,
@@ -265,7 +335,9 @@ impl RoundHistory {
                 ?14, ?15, ?16, ?17,
                 ?18, ?19, ?20,
                 ?21, ?22,
-                ?23, ?24, ?25
+                ?23, ?24, ?25,
+                ?26, ?27, ?28, ?29, ?30,
+                ?31, ?32, ?33
             )",
             params![
                 record.sequence as i64,
@@ -293,6 +365,14 @@ impl RoundHistory {
                 record.tui_spread_pct,
                 record.cycle_rate_pct,
                 record.cycle_net_usd,
+                record.anchor_resolution_ms.map(|v| v as i64),
+                record.metadata_ms.map(|v| v as i64),
+                record.quote_ms.map(|v| v as i64),
+                record.ranking_ms.map(|v| v as i64),
+                record.requote_ms.map(|v| v as i64),
+                record.context_build_ms.map(|v| v as i64),
+                record.materialization_economics_ms.map(|v| v as i64),
+                record.unattributed_ms.map(|v| v as i64),
             ],
         )
         .context("insert round no histórico")?;
@@ -371,7 +451,10 @@ impl RoundHistory {
     fn latency_stats_locked(conn: &Connection, limit: u64) -> Result<LatencyStats> {
         let mut stmt = conn
             .prepare(
-                "SELECT duration_ms, discovery_ms, shadow_ms
+                "SELECT duration_ms, discovery_ms, shadow_ms,
+                        anchor_resolution_ms, metadata_ms, quote_ms, ranking_ms,
+                        requote_ms, context_build_ms, materialization_economics_ms,
+                        unattributed_ms
                  FROM rounds
                  ORDER BY id DESC
                  LIMIT ?1",
@@ -379,7 +462,19 @@ impl RoundHistory {
             .context("preparar latency_stats")?;
         let rows = stmt
             .query_map(params![limit as i64], |row| {
-                Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?, row.get::<_, Option<i64>>(2)?))
+                Ok((
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
+                    row.get::<_, Option<i64>>(9)?,
+                    row.get::<_, Option<i64>>(10)?,
+                ))
             })
             .context("query latency_stats")?
             .collect::<rusqlite::Result<Vec<_>>>()
@@ -388,20 +483,60 @@ impl RoundHistory {
         let mut durations = Vec::new();
         let mut discoveries = Vec::new();
         let mut shadows = Vec::new();
-        for (duration, discovery, shadow) in rows {
-            if let Some(value) = duration {
-                durations.push(value as u64);
-            }
-            if let Some(value) = discovery {
-                discoveries.push(value as u64);
-            }
-            if let Some(value) = shadow {
-                shadows.push(value as u64);
-            }
+        let mut anchor_res = Vec::new();
+        let mut metadata = Vec::new();
+        let mut quote = Vec::new();
+        let mut ranking = Vec::new();
+        let mut requote = Vec::new();
+        let mut context_build = Vec::new();
+        let mut materialization_economics = Vec::new();
+        let mut unattributed = Vec::new();
+        for (
+            duration,
+            discovery,
+            shadow,
+            anchor_resolution,
+            metadata_v,
+            quote_v,
+            ranking_v,
+            requote_v,
+            context_build_v,
+            materialization_economics_v,
+            unattributed_v,
+        ) in rows
+        {
+            let push = |bucket: &mut Vec<u64>, value: Option<i64>| {
+                if let Some(v) = value {
+                    bucket.push(v as u64);
+                }
+            };
+            push(&mut durations, duration);
+            push(&mut discoveries, discovery);
+            push(&mut shadows, shadow);
+            push(&mut anchor_res, anchor_resolution);
+            push(&mut metadata, metadata_v);
+            push(&mut quote, quote_v);
+            push(&mut ranking, ranking_v);
+            push(&mut requote, requote_v);
+            push(&mut context_build, context_build_v);
+            push(&mut materialization_economics, materialization_economics_v);
+            push(&mut unattributed, unattributed_v);
         }
-        durations.sort_unstable();
-        discoveries.sort_unstable();
-        shadows.sort_unstable();
+        for bucket in [
+            &mut durations,
+            &mut discoveries,
+            &mut shadows,
+            &mut anchor_res,
+            &mut metadata,
+            &mut quote,
+            &mut ranking,
+            &mut requote,
+            &mut context_build,
+            &mut materialization_economics,
+            &mut unattributed,
+        ] {
+            bucket.sort_unstable();
+        }
         Ok(LatencyStats {
             sample_count: durations.len() as u64,
             duration_p50_ms: percentile(&durations, 0.50),
@@ -410,6 +545,22 @@ impl RoundHistory {
             discovery_p95_ms: percentile(&discoveries, 0.95),
             shadow_p50_ms: percentile(&shadows, 0.50),
             shadow_p95_ms: percentile(&shadows, 0.95),
+            anchor_resolution_p50_ms: percentile(&anchor_res, 0.50),
+            anchor_resolution_p95_ms: percentile(&anchor_res, 0.95),
+            metadata_p50_ms: percentile(&metadata, 0.50),
+            metadata_p95_ms: percentile(&metadata, 0.95),
+            quote_p50_ms: percentile(&quote, 0.50),
+            quote_p95_ms: percentile(&quote, 0.95),
+            ranking_p50_ms: percentile(&ranking, 0.50),
+            ranking_p95_ms: percentile(&ranking, 0.95),
+            requote_p50_ms: percentile(&requote, 0.50),
+            requote_p95_ms: percentile(&requote, 0.95),
+            context_build_p50_ms: percentile(&context_build, 0.50),
+            context_build_p95_ms: percentile(&context_build, 0.95),
+            materialization_economics_p50_ms: percentile(&materialization_economics, 0.50),
+            materialization_economics_p95_ms: percentile(&materialization_economics, 0.95),
+            unattributed_p50_ms: percentile(&unattributed, 0.50),
+            unattributed_p95_ms: percentile(&unattributed, 0.95),
         })
     }
 }
@@ -454,6 +605,14 @@ mod tests {
             tui_spread_pct: Some(1.5),
             cycle_rate_pct: Some(0.5),
             cycle_net_usd: Some(net),
+            anchor_resolution_ms: Some(10),
+            metadata_ms: Some(20),
+            quote_ms: Some(300),
+            ranking_ms: Some(15),
+            requote_ms: Some(400),
+            context_build_ms: Some(25),
+            materialization_economics_ms: Some(50),
+            unattributed_ms: Some(5),
         }
     }
 
@@ -570,6 +729,7 @@ mod tests {
             r.duration_ms = Some(1_000 + seq);
             r.discovery_ms = Some(500 + seq);
             r.shadow_ms = Some(200 + seq);
+            r.requote_ms = Some(400 + seq);
             db.insert_round(&r).unwrap();
         }
 
@@ -581,6 +741,9 @@ mod tests {
         assert_eq!(stats.discovery_p95_ms, Some(505));
         assert_eq!(stats.shadow_p50_ms, Some(203));
         assert_eq!(stats.shadow_p95_ms, Some(205));
+        // ARGUS stage waterfall percentiles reconcile the same way.
+        assert_eq!(stats.requote_p50_ms, Some(403));
+        assert_eq!(stats.requote_p95_ms, Some(405));
     }
 
     #[test]

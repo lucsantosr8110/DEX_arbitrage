@@ -6,6 +6,16 @@
 .waterfall-legend{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;padding:14px 0;border-bottom:1px solid var(--border);margin-bottom:8px;font-size:10px;color:var(--muted)}.waterfall-legend span{display:flex;align-items:center;gap:5px}.water-row.amber .water-track i{background:var(--amber)}
 /* Anomaly highlighting: edge real mas gas domina, ou spread forward-only */
 .anomaly-note{border:1px solid #30424a;border-radius:6px;padding:10px 13px;margin-top:14px;display:grid;gap:3px}.anomaly-note strong{font-size:11px}.anomaly-note small{font-size:10px;color:var(--muted)}.anomaly-note.amber{background:#1a1610;border-color:#6c4e25;color:var(--amber)}.anomaly-note.cyan{background:#102430;border-color:#1c6069;color:var(--cyan)}.water-row.anomaly-gas-dominates .water-track i{background:var(--red)!important;box-shadow:0 0 8px rgba(240,120,120,.35)}.water-row.anomaly-forward-only .water-track i{background:var(--cyan);opacity:.6}.row-anomaly-gas-dominates{background:rgba(240,120,120,.04)}.row-anomaly-forward-only{background:rgba(84,216,232,.04)}
+/* ARGUS round latency waterfall: por estágio real (CanonicalRoundTiming) */
+.latency-bottleneck{display:flex;justify-content:space-between;align-items:center;background:#1a1610;border:1px solid #6c4e25;border-radius:6px;padding:10px 13px;margin-bottom:14px;font-size:11px;color:var(--amber)}.latency-bottleneck strong{font-family:'IBM Plex Mono';font-weight:600}
+.latency-waterfall{display:grid;gap:2px}
+.latency-waterfall-head{display:grid;grid-template-columns:1.6fr 75px 60px 60px 1fr;gap:10px;font-size:9px;letter-spacing:.06em;text-transform:uppercase;color:#5e6c7b;padding:0 0 8px}
+.latency-waterfall-row{display:grid;grid-template-columns:1.6fr 75px 60px 60px 1fr;align-items:center;gap:10px;padding:11px 0;border-bottom:1px solid #202a34;font-size:11px}
+.latency-waterfall-row span:nth-child(n+2){font-family:'IBM Plex Mono';color:#c3ccd6;text-align:right}
+.latency-waterfall-row.bottleneck{background:rgba(239,184,102,.06)}.latency-waterfall-row.bottleneck span:first-child{color:var(--amber);font-weight:600}
+.latency-waterfall-bar{height:5px;background:#202b35;border-radius:4px;overflow:hidden}
+.latency-waterfall-bar i{display:block;height:100%;background:#668ba0;border-radius:4px}
+.latency-waterfall-row.bottleneck .latency-waterfall-bar i{background:var(--amber)}
 /* Footer operacional */
 .footer{display:flex;justify-content:center;align-items:center;gap:10px;padding:18px 36px;border-top:1px solid #1c252f;color:#566373;font-size:10px;font-family:'IBM Plex Mono',monospace}.footer span:last-child{color:#8190a1}
 /* Filter select precisa de estilo coerente com filter buttons */

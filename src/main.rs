@@ -34,7 +34,7 @@ use flashloan_bot::{
         canonical_adapters::PinnedQuoteRecord,
         canonical_discovery::{
             CanonicalDiscoveryConfig, CanonicalDiscoveryProfile, CanonicalDiscoveryService,
-            CanonicalToken,
+            CanonicalRoundTiming, CanonicalToken,
         },
         canonical_simulation::CanonicalSimulationClient,
         executable_call::Venue,
@@ -223,6 +223,7 @@ fn persist_round(
     economically_positive: u64,
     net_usd_total: f64,
     shadow: &C2BShadowResult,
+    timing: CanonicalRoundTiming,
 ) {
     let Some(db) = history else { return };
     let best = top_spreads.first();
@@ -268,6 +269,14 @@ fn persist_round(
         tui_spread_pct: best.map(|route| route.tui_spread_pct),
         cycle_rate_pct: best.and_then(|route| route.cycle_rate).map(|r| (r - 1.0) * 100.0),
         cycle_net_usd: best.and_then(|route| route.net_usd),
+        anchor_resolution_ms: Some(timing.anchor_resolution_ms),
+        metadata_ms: Some(timing.metadata_ms),
+        quote_ms: Some(timing.quote_ms),
+        ranking_ms: Some(timing.ranking_ms),
+        requote_ms: Some(timing.requote_ms),
+        context_build_ms: Some(timing.context_build_ms),
+        materialization_economics_ms: Some(timing.materialization_economics_ms),
+        unattributed_ms: Some(timing.unattributed_ms),
     };
     if let Err(error) = db.insert_round(&record) {
         warn!(%error, round = sequence, "falha ao persistir round no histórico");
@@ -932,6 +941,7 @@ where
                 match discovery_result {
                     Ok(Ok(result)) => {
                         rounds_completed += 1;
+                        let round_timing = result.timing;
                         let round_evidence_count = result.round_evidence.len();
                         let economically_positive = result.economically_positive.len();
                         let mut last_prices = canonical_price_rows(&result.initial_quotes, &canonical_tokens);
@@ -1053,6 +1063,7 @@ where
                             u64::from(net_positive),
                             net_usd_total,
                             &shadow_result,
+                            round_timing,
                         );
                     }
                     Ok(Err(error)) => warn!(error = %error, "canonical round rejected; no legacy fallback"),
@@ -1391,8 +1402,7 @@ async fn main() -> Result<()> {
         // block-poll indefinidamente (nenhum outro endpoint da lista era
         // tentado). RotatingHttpClient já existia (usado só pelo path legado
         // signer-based) e é read-only-friendly — reaproveitado aqui.
-        let rpc_timeout =
-            Duration::from_millis(cfg_unlocked.network.timeout_ms.max(1000));
+        let rpc_timeout = Duration::from_millis(cfg_unlocked.network.timeout_ms.max(1000));
         let rotating = RotatingHttpClient::from_strings(&usable_endpoints, rpc_timeout)
             .context("❌ falha ao construir RotatingHttpClient para o modo canonical")?;
         let provider = Arc::new(Provider::new(rotating));

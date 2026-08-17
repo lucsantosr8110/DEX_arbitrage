@@ -37,6 +37,14 @@ fn record(sequence: u64) -> RoundRecord {
         tui_spread_pct: Some(1.5),
         cycle_rate_pct: Some(0.42),
         cycle_net_usd: Some(0.42),
+        anchor_resolution_ms: Some(10),
+        metadata_ms: Some(20),
+        quote_ms: Some(300),
+        ranking_ms: Some(15),
+        requote_ms: Some(400),
+        context_build_ms: Some(25),
+        materialization_economics_ms: Some(50),
+        unattributed_ms: Some(5),
     }
 }
 
