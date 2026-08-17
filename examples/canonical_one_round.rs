@@ -124,6 +124,26 @@ async fn main() -> anyhow::Result<()> {
             println!("ROUTES_DISCOVERED={}", res.stats.routes_discovered);
             println!("EXECUTABLE_ROUTES={}", res.executable_routes.len());
             println!("REJECTIONS={}", res.rejections.len());
+            // Phase-A state-read batching (Multicall3 aggregate3).
+            let mc = &res.multicall;
+            let batch_size_avg = if mc.batch_sizes.is_empty() {
+                0
+            } else {
+                mc.batch_sizes.iter().sum::<usize>() / mc.batch_sizes.len()
+            };
+            let batch_size_max = mc.batch_sizes.iter().copied().max().unwrap_or(0);
+            println!("CRITICAL_PATH_FLOOR_MS={}", res.critical_path_floor_ms);
+            println!("STATE_BATCH_MS={}", res.state_batch_ms);
+            println!("MULTICALL_RPC_CALLS={}", mc.rpc_calls);
+            println!("MULTICALL_SUBCALLS={}", mc.subcalls);
+            println!("MULTICALL_BATCH_COUNT={}", mc.batch_count);
+            println!("MULTICALL_SUBCALL_FAILURES={}", mc.subcall_failures);
+            println!("INDIVIDUAL_STATE_RPC_CALLS={}", mc.individual_state_calls);
+            println!("MULTICALL_WAIT_MS={}", mc.wait_ms);
+            println!("MULTICALL_BATCH_SIZE_AVG={}", batch_size_avg);
+            println!("MULTICALL_BATCH_SIZE_MAX={}", batch_size_max);
+            println!("STATE_CACHE_USED=false");
+            println!("PAIR_CONCURRENCY=4");
             Ok(())
         }
         Err(err) => {

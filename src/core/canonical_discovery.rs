@@ -15,9 +15,11 @@ use crate::config::Config;
 use crate::core::{
     c2b_round::RoundEvidence,
     canonical_adapters::{
-        assemble_route_leg_quotes, code_hash, normalized_v2_state, normalized_v3_state,
-        quote_v2_leg, quote_v3_leg, read_v2_pool, read_v3_pool, resolve_v2_pool_address,
-        resolve_v3_pool_address, MetadataCache, PinnedQuoteRecord, QuoteMetrics, RpcCallRecord,
+        assemble_route_leg_quotes, batch_read_pool_state, build_v2_pool_read_from_state,
+        build_v3_pool_read_from_state, code_hash, normalized_v2_state, normalized_v3_state,
+        quote_v2_leg, quote_v3_leg, resolve_v2_pool_address, resolve_v3_pool_address,
+        MetadataCache, MulticallStats, PinnedQuoteRecord, QuoteMetrics, RpcCallRecord,
+        StateSubcall,
     },
     canonical_execution_context::{
         CanonicalExecutionContext, ForkSetupRecord, PinnedPoolState, PoolExecutionMetadata,
@@ -394,6 +396,17 @@ pub struct CanonicalDiscoveryResult {
     pub leg_quotes: HashMap<String, Vec<PinnedQuoteRecord>>,
     pub pool_states: HashMap<Address, SimulatedPoolState>,
     pub timing: CanonicalRoundTiming,
+    /// Phase-A state-read batching diagnostics (Multicall3 `aggregate3`):
+    /// physical RPC count, subcall count, batch sizes, failures. See
+    /// `MulticallStats` fields. `individual_state_calls` is 0 in the hot
+    /// path (non-batched fallback only).
+    pub multicall: MulticallStats,
+    /// Phase-A critical-path floor: `state_batch_ms` + max over pairs of
+    /// (resolve_ms + quote_ms). The minimum Phase A latency given the
+    /// 3-pass batching structure.
+    pub critical_path_floor_ms: u64,
+    /// Multicall3 batch eth_call wall time for the state-read pass.
+    pub state_batch_ms: u64,
 }
 
 /// Per-pool metadata resolved once per round and reused both for the
@@ -429,8 +442,56 @@ fn venue_str(venue: Venue) -> &'static str {
     }
 }
 
+/// One resolved pool awaiting state + quote in Phase A. Produced by the
+/// resolve pass (warm metadata cache -> 0 RPC), consumed by the state
+/// batch pass and the quote pass. Carries everything the quote pass
+/// needs to call `quote_v2_leg` / `quote_v3_leg` without resolving again.
+#[derive(Clone, Debug)]
+enum PoolRequest {
+    V2 {
+        venue: Venue,
+        router: Address,
+        pool: Address,
+        token_in: TokenMetadata,
+        token_out: TokenMetadata,
+        amount_in: U256,
+    },
+    V3 {
+        router: Address,
+        quoter: Address,
+        fee: u32,
+        pool: Address,
+        token_in: TokenMetadata,
+        token_out: TokenMetadata,
+        amount_in: U256,
+    },
+}
+
+impl PoolRequest {
+    fn pool(&self) -> Address {
+        match self {
+            Self::V2 { pool, .. } | Self::V3 { pool, .. } => *pool,
+        }
+    }
+}
+
+/// Fully assembled per-pool state for the quote pass: the
+/// Multicall3-decoded + cached-metadata `OnlinePoolRead`, the
+/// `PinnedPoolState`, and the `PoolExecutionMetadata` -- everything
+/// `quote_v2_edge` / `quote_v3_edge` used to build inline before quoting.
+/// State is never cached across anchors (kept only for this round).
+struct PoolState {
+    pinned_state: PinnedPoolState,
+    meta: PoolExecutionMetadata,
+}
+
+/// Resolve pass half of the old `quote_v2_edge`: resolves the V2 pair
+/// address via the cached factory lookup (warm = 0 RPC) and returns a
+/// `PoolRequest::V2` for the state batch + quote passes. No state read,
+/// no quote -- those now happen in their own passes so the 220 state
+/// reads can be batched into Multicall3.
 #[allow(clippy::too_many_arguments)]
-async fn quote_v2_edge<M: Middleware>(
+async fn resolve_v2_edge<M: Middleware>(
     provider: &Arc<M>,
     venue: Venue,
     router: Address,
@@ -439,11 +500,10 @@ async fn quote_v2_edge<M: Middleware>(
     token_out: &TokenMetadata,
     amount_in: U256,
     anchor: &AnchorBlock,
-    pools: &mut PoolContext,
     chain_id: u64,
     cache: &MetadataCache,
     metrics: &QuoteMetrics,
-) -> Option<ExecutablePriceEdge> {
+) -> Option<PoolRequest> {
     let pool = tokio::time::timeout(
         QUOTE_TIMEOUT,
         resolve_v2_pool_address(
@@ -460,76 +520,20 @@ async fn quote_v2_edge<M: Middleware>(
     .await
     .ok()?
     .ok()??;
-    let read = tokio::time::timeout(
-        QUOTE_TIMEOUT,
-        read_v2_pool(
-            provider.clone(),
-            pool,
-            router,
-            anchor.number,
-            chain_id,
-            cache,
-            metrics,
-        ),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    if read.token0 != token_in.address && read.token1 != token_in.address {
-        return None;
-    }
-    let (r0, r1) = (read.reserve0?, read.reserve1?);
-    let pool_id = format!("{pool:?}");
-    let pool_state =
-        normalized_v2_state(r0, r1, 30, read.pool_code_hash, anchor.number, &pool_id).ok()?;
-    let pool_meta = PoolExecutionMetadata {
-        venue: venue_str(venue).to_string(),
-        pool,
+    Some(PoolRequest::V2 {
+        venue,
         router,
-        spender: router,
-        token_order: (read.token0, read.token1),
-        fee: None,
-        curve_method: None,
-        curve_indices: None,
-        implementation_code_hash: read.pool_code_hash,
-        anchor_block: anchor.number,
-    };
-    let (_, quote) = tokio::time::timeout(
-        QUOTE_TIMEOUT,
-        quote_v2_leg(
-            provider.clone(),
-            venue,
-            router,
-            pool,
-            token_in.address,
-            token_out.address,
-            amount_in,
-            anchor.number,
-            anchor.hash,
-            token_in.clone(),
-            token_out.clone(),
-            pool_meta.clone(),
-            pool_state.clone(),
-            metrics,
-        ),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    pools.meta.insert(pool, pool_meta.clone());
-    pools.state.insert(pool, pool_state);
-    pools.quote_target.insert(pool, router);
-    ExecutablePriceEdge::from_quote(
-        &quote,
-        &pool_meta,
-        Some(token_in.symbol.clone()),
-        Some(token_out.symbol.clone()),
-    )
-    .ok()
+        pool,
+        token_in: token_in.clone(),
+        token_out: token_out.clone(),
+        amount_in,
+    })
 }
 
+/// Resolve pass half of the old `quote_v3_edge`: resolves a V3 pool
+/// address for one fee tier and returns a `PoolRequest::V3`.
 #[allow(clippy::too_many_arguments)]
-async fn quote_v3_edge<M: Middleware>(
+async fn resolve_v3_edge<M: Middleware>(
     provider: &Arc<M>,
     router: Address,
     factory: Address,
@@ -539,11 +543,10 @@ async fn quote_v3_edge<M: Middleware>(
     token_out: &TokenMetadata,
     amount_in: U256,
     anchor: &AnchorBlock,
-    pools: &mut PoolContext,
     chain_id: u64,
     cache: &MetadataCache,
     metrics: &QuoteMetrics,
-) -> Option<ExecutablePriceEdge> {
+) -> Option<PoolRequest> {
     let pool = tokio::time::timeout(
         QUOTE_TIMEOUT,
         resolve_v3_pool_address(
@@ -561,37 +564,113 @@ async fn quote_v3_edge<M: Middleware>(
     .await
     .ok()?
     .ok()??;
-    let read = tokio::time::timeout(
-        QUOTE_TIMEOUT,
-        read_v3_pool(
-            provider.clone(),
-            pool,
+    Some(PoolRequest::V3 {
+        router,
+        quoter,
+        fee,
+        pool,
+        token_in: token_in.clone(),
+        token_out: token_out.clone(),
+        amount_in,
+    })
+}
+
+/// Quote pass half of the old `quote_v2_edge`: takes an assembled
+/// `PoolState` and calls `quote_v2_leg` (getAmountsOut, individual
+/// eth_call pinned to anchor -- intentionally NOT batched). On success
+/// registers the pool in `PoolContext` exactly as before.
+#[allow(clippy::too_many_arguments)]
+async fn quote_v2_edge_from_state<M: Middleware>(
+    provider: &Arc<M>,
+    req: &PoolRequest,
+    ps: &PoolState,
+    anchor: &AnchorBlock,
+    pools: &mut PoolContext,
+    metrics: &QuoteMetrics,
+) -> Option<ExecutablePriceEdge> {
+    let (venue, router, pool, token_in, token_out, amount_in) = match req {
+        PoolRequest::V2 {
+            venue,
             router,
+            pool,
+            token_in,
+            token_out,
+            amount_in,
+        } => (
+            *venue,
+            *router,
+            *pool,
+            token_in.clone(),
+            token_out.clone(),
+            *amount_in,
+        ),
+        _ => return None,
+    };
+    let (_, quote) = tokio::time::timeout(
+        QUOTE_TIMEOUT,
+        quote_v2_leg(
+            provider.clone(),
+            venue,
+            router,
+            pool,
+            token_in.address,
+            token_out.address,
+            amount_in,
             anchor.number,
-            chain_id,
-            cache,
+            anchor.hash,
+            token_in.clone(),
+            token_out.clone(),
+            ps.meta.clone(),
+            ps.pinned_state.clone(),
             metrics,
         ),
     )
     .await
     .ok()?
     .ok()?;
-    if read.token0 != token_in.address && read.token1 != token_in.address {
-        return None;
-    }
-    let pool_id = format!("{pool:?}");
-    let pool_state = normalized_v3_state(read.pool_code_hash, anchor.number, &pool_id).ok()?;
-    let pool_meta = PoolExecutionMetadata {
-        venue: venue_str(Venue::UniswapV3).to_string(),
-        pool,
-        router,
-        spender: router,
-        token_order: (read.token0, read.token1),
-        fee: Some(fee),
-        curve_method: None,
-        curve_indices: None,
-        implementation_code_hash: read.pool_code_hash,
-        anchor_block: anchor.number,
+    pools.meta.insert(pool, ps.meta.clone());
+    pools.state.insert(pool, ps.pinned_state.clone());
+    pools.quote_target.insert(pool, router);
+    ExecutablePriceEdge::from_quote(
+        &quote,
+        &ps.meta,
+        Some(token_in.symbol.clone()),
+        Some(token_out.symbol.clone()),
+    )
+    .ok()
+}
+
+/// Quote pass half of the old `quote_v3_edge`: takes an assembled
+/// `PoolState` and calls `quote_v3_leg` (quoteExactInputSingle,
+/// individual eth_call pinned to anchor -- NOT batched).
+#[allow(clippy::too_many_arguments)]
+async fn quote_v3_edge_from_state<M: Middleware>(
+    provider: &Arc<M>,
+    req: &PoolRequest,
+    ps: &PoolState,
+    anchor: &AnchorBlock,
+    pools: &mut PoolContext,
+    metrics: &QuoteMetrics,
+) -> Option<ExecutablePriceEdge> {
+    let (_router, quoter, fee, pool, token_in, token_out, amount_in) = match req {
+        PoolRequest::V3 {
+            router,
+            quoter,
+            fee,
+            pool,
+            token_in,
+            token_out,
+            amount_in,
+        } => (
+            *router,
+            *quoter,
+            *fee,
+            *pool,
+            token_in.clone(),
+            token_out.clone(),
+            *amount_in,
+        ),
+        _ => return None,
     };
     let (_, quote) = tokio::time::timeout(
         QUOTE_TIMEOUT,
@@ -607,24 +686,142 @@ async fn quote_v3_edge<M: Middleware>(
             anchor.hash,
             token_in.clone(),
             token_out.clone(),
-            pool_meta.clone(),
-            pool_state.clone(),
+            ps.meta.clone(),
+            ps.pinned_state.clone(),
             metrics,
         ),
     )
     .await
     .ok()?
     .ok()?;
-    pools.meta.insert(pool, pool_meta.clone());
-    pools.state.insert(pool, pool_state);
+    pools.meta.insert(pool, ps.meta.clone());
+    pools.state.insert(pool, ps.pinned_state.clone());
     pools.quote_target.insert(pool, quoter);
     ExecutablePriceEdge::from_quote(
         &quote,
-        &pool_meta,
+        &ps.meta,
         Some(token_in.symbol.clone()),
         Some(token_out.symbol.clone()),
     )
     .ok()
+}
+
+/// Assembles a `PoolState` for a V2 pool from a Multicall3-decoded
+/// `StateRead::Reserves` plus cached metadata, then builds the
+/// `PinnedPoolState` and `PoolExecutionMetadata` exactly as the old
+/// inline `quote_v2_edge` did. Returns `None` when the pool does not
+/// contain `token_in` (token-order check) or the state is unusable --
+/// the quote pass then skips this pool, identical to the old behavior.
+async fn assemble_v2_pool_state<M: Middleware>(
+    provider: &Arc<M>,
+    req: &PoolRequest,
+    state: &crate::core::canonical_adapters::StateRead,
+    anchor: &AnchorBlock,
+    chain_id: u64,
+    cache: &MetadataCache,
+    metrics: &QuoteMetrics,
+) -> Option<PoolState> {
+    let (venue, router, pool, token_in, _token_out) = match req {
+        PoolRequest::V2 {
+            venue,
+            router,
+            pool,
+            token_in,
+            token_out,
+            ..
+        } => (*venue, *router, *pool, token_in.clone(), token_out.clone()),
+        _ => return None,
+    };
+    let read = build_v2_pool_read_from_state(
+        provider,
+        pool,
+        router,
+        state,
+        anchor.number,
+        chain_id,
+        cache,
+        metrics,
+    )
+    .await
+    .ok()?;
+    if read.token0 != token_in.address && read.token1 != token_in.address {
+        return None;
+    }
+    let (r0, r1) = (read.reserve0?, read.reserve1?);
+    let pool_id = format!("{pool:?}");
+    let pinned_state =
+        normalized_v2_state(r0, r1, 30, read.pool_code_hash, anchor.number, &pool_id).ok()?;
+    let meta = PoolExecutionMetadata {
+        venue: venue_str(venue).to_string(),
+        pool,
+        router,
+        spender: router,
+        token_order: (read.token0, read.token1),
+        fee: None,
+        curve_method: None,
+        curve_indices: None,
+        implementation_code_hash: read.pool_code_hash,
+        anchor_block: anchor.number,
+    };
+    Some(PoolState { pinned_state, meta })
+}
+
+/// Assembles a `PoolState` for a V3 pool from the Multicall3-decoded
+/// slot0 / liquidity / fee trio plus cached metadata.
+#[allow(clippy::too_many_arguments)]
+async fn assemble_v3_pool_state<M: Middleware>(
+    provider: &Arc<M>,
+    req: &PoolRequest,
+    slot0: &crate::core::canonical_adapters::StateRead,
+    liquidity: &crate::core::canonical_adapters::StateRead,
+    fee: &crate::core::canonical_adapters::StateRead,
+    anchor: &AnchorBlock,
+    chain_id: u64,
+    cache: &MetadataCache,
+    metrics: &QuoteMetrics,
+) -> Option<PoolState> {
+    let (router, fee_tier, pool, token_in) = match req {
+        PoolRequest::V3 {
+            router,
+            fee,
+            pool,
+            token_in,
+            ..
+        } => (*router, *fee, *pool, token_in.clone()),
+        _ => return None,
+    };
+    let read = build_v3_pool_read_from_state(
+        provider,
+        pool,
+        router,
+        slot0,
+        liquidity,
+        fee,
+        anchor.number,
+        chain_id,
+        cache,
+        metrics,
+    )
+    .await
+    .ok()?;
+    if read.token0 != token_in.address && read.token1 != token_in.address {
+        return None;
+    }
+    let pool_id = format!("{pool:?}");
+    let pinned_state = normalized_v3_state(read.pool_code_hash, anchor.number, &pool_id).ok()?;
+    let meta = PoolExecutionMetadata {
+        venue: venue_str(Venue::UniswapV3).to_string(),
+        pool,
+        router,
+        spender: router,
+        token_order: (read.token0, read.token1),
+        fee: Some(fee_tier),
+        curve_method: None,
+        curve_indices: None,
+        implementation_code_hash: read.pool_code_hash,
+        anchor_block: anchor.number,
+    };
+    Some(PoolState { pinned_state, meta })
 }
 
 /// Re-quotes a single already-discovered structural leg at a caller-supplied
@@ -868,7 +1065,23 @@ where
         let v3 = self.config.venue_config(Venue::UniswapV3);
 
         // ---- Phase A: independent single-leg quotes -> typed edges.
-        // Curve is intentionally never quoted here. ----
+        // Curve is intentionally never quoted here.
+        //
+        // Per-pair state-read batching inside the existing
+        // `buffer_unordered(quote_concurrency)` stream: each pair resolves
+        // its venues/fee-tiers (cached -> 0 RPC warm), packs ALL of that
+        // pair's pool state reads (V2 getReserves; V3 slot0+liquidity+fee
+        // per fee tier) into ONE Multicall3 `aggregate3` eth_call pinned to
+        // the anchor, assembles `PoolState`s, then quotes each leg
+        // (`getAmountsOut` / `quoteExactInputSingle`, unchanged individual
+        // eth_call, NOT batched). There is NO global barrier between
+        // resolve and quote -- pairs stay pipelined at `PAIR_CONCURRENCY=4`,
+        // so a slow pair's resolve cannot block another pair's quotes
+        // (the tail-latency coupling a global batch would introduce on
+        // high-variance RPCs). `STATE_CACHE_USED=false` (pool state is
+        // never cached across anchors; only immutable metadata is,
+        // unchanged).
+        // ----
         let mut graph = ExecutableEdgeGraph::new();
         let mut pools = PoolContext::default();
 
@@ -911,14 +1124,25 @@ where
         let chain_id = self.expected_chain_id;
         let cache = &self.metadata_cache;
         // Diagnostic-only: collects every real eth_call made while quoting
-        // (Phase A), plus each edge-attempt's own wall-clock elapsed time
-        // (quickswap/sushiswap/v3-per-fee-tier), so `quote_ms` can be
-        // decomposed into RPC-call count, RPC wait, duplicate reads, and
-        // per-pair serial critical path after the round finishes.
+        // (Phase A), plus the Multicall3 batching accumulator, so `quote_ms`
+        // can be decomposed into RPC-call count, RPC wait, duplicate reads,
+        // per-pair serial critical path, and multicall batch consolidation
+        // after the round finishes.
         let quote_metrics = QuoteMetrics::new();
         let metadata_cache_before = self.metadata_cache.metrics();
-        let quote_results = stream::iter(pair_inputs.into_iter().map(
-            |(pair_index, (symbol_in, symbol_out, meta_in, meta_out))| {
+
+        // ---- Per-pair state-read batching. Each pair, inside the existing
+        // `buffer_unordered(quote_concurrency)` stream, resolves its
+        // venues/fee-tiers (cached factory lookup -> 0 RPC warm), packs ALL
+        // of that pair's pool state reads (V2 getReserves; V3
+        // slot0+liquidity+fee per fee tier) into ONE Multicall3 `aggregate3`
+        // eth_call pinned to the anchor, assembles `PoolState`s from the
+        // decoded results, then quotes each leg (`getAmountsOut` /
+        // `quoteExactInputSingle`, unchanged individual eth_call, NOT
+        // batched). No global barrier -- pairs stay pipelined at
+        // `PAIR_CONCURRENCY=4`. ----
+        let quote_results = stream::iter(pair_inputs.iter().map(
+            |(pair_index, (_symbol_in, _symbol_out, meta_in, meta_out))| {
                 let provider = provider.clone();
                 let anchor = anchor_for_quotes.clone();
                 let quickswap = quickswap.cloned();
@@ -926,97 +1150,206 @@ where
                 let v3 = v3.cloned();
                 let metrics = quote_metrics.clone();
                 async move {
-                    tracing::info!(
-                        target: "canonical_discovery",
-                        anchor = anchor.number,
-                        token_in = %symbol_in,
-                        token_out = %symbol_out,
-                        "canonical quote pair started"
-                    );
                     let mut local_pools = PoolContext::default();
                     let mut edges = Vec::new();
-                    let mut edge_attempts_ms: Vec<u64> = Vec::new();
+                    let pair_start = Instant::now();
+
+                    // 1) Resolve all venues / fee tiers for this pair
+                    //    (cached factory lookup -> 0 RPC warm).
                     let amount_in = human_to_atomic(NOTIONAL_USD, meta_in.decimals);
+                    let mut reqs: Vec<PoolRequest> = Vec::new();
                     if let Some(cfg) = quickswap {
-                        let t0 = Instant::now();
-                        let outcome = quote_v2_edge(
+                        if let Some(req) = resolve_v2_edge(
                             &provider,
                             Venue::QuickSwap,
                             cfg.router,
                             cfg.factory,
-                            &meta_in,
-                            &meta_out,
+                            meta_in,
+                            meta_out,
                             amount_in,
                             &anchor,
-                            &mut local_pools,
                             chain_id,
                             cache,
                             &metrics,
                         )
-                        .await;
-                        edge_attempts_ms.push(t0.elapsed().as_millis() as u64);
-                        if let Some(edge) = outcome {
-                            edges.push(edge);
+                        .await
+                        {
+                            reqs.push(req);
                         }
                     }
                     if let Some(cfg) = sushiswap {
-                        let t0 = Instant::now();
-                        let outcome = quote_v2_edge(
+                        if let Some(req) = resolve_v2_edge(
                             &provider,
                             Venue::SushiSwap,
                             cfg.router,
                             cfg.factory,
-                            &meta_in,
-                            &meta_out,
+                            meta_in,
+                            meta_out,
                             amount_in,
                             &anchor,
-                            &mut local_pools,
                             chain_id,
                             cache,
                             &metrics,
                         )
-                        .await;
-                        edge_attempts_ms.push(t0.elapsed().as_millis() as u64);
-                        if let Some(edge) = outcome {
-                            edges.push(edge);
+                        .await
+                        {
+                            reqs.push(req);
                         }
                     }
                     if let Some(cfg) = v3.filter(|cfg| cfg.quoter.is_some()) {
                         let quoter = cfg.quoter.expect("filtered on Some");
                         for fee in V3_FEE_TIERS {
-                            let t0 = Instant::now();
-                            let outcome = quote_v3_edge(
+                            if let Some(req) = resolve_v3_edge(
                                 &provider,
                                 cfg.router,
                                 cfg.factory,
                                 quoter,
                                 fee,
-                                &meta_in,
-                                &meta_out,
+                                meta_in,
+                                meta_out,
                                 amount_in,
                                 &anchor,
-                                &mut local_pools,
                                 chain_id,
                                 cache,
                                 &metrics,
                             )
-                            .await;
-                            edge_attempts_ms.push(t0.elapsed().as_millis() as u64);
-                            if let Some(edge) = outcome {
-                                edges.push(edge);
+                            .await
+                            {
+                                reqs.push(req);
                             }
                         }
                     }
-                    tracing::info!(
-                        target: "canonical_discovery",
-                        anchor = anchor.number,
-                        token_in = %symbol_in,
-                        token_out = %symbol_out,
-                        quotes_succeeded = edges.len(),
-                        "canonical quote pair complete"
-                    );
-                    let pair_serial_ms: u64 = edge_attempts_ms.iter().sum();
-                    (pair_index, edges, local_pools, pair_serial_ms)
+                    if reqs.is_empty() {
+                        return (
+                            *pair_index,
+                            edges,
+                            local_pools,
+                            pair_start.elapsed().as_millis() as u64,
+                            0u64,
+                        );
+                    }
+
+                    // 2) Build this pair's subcall list (V2 -> 1 getReserves;
+                    //    V3 -> slot0+liquidity+fee = 3 per pool), pack into
+                    //    ONE Multicall3 batch pinned to the anchor, decode.
+                    //    One eth_call for the whole pair.
+                    let mut subcalls: Vec<StateSubcall> = Vec::new();
+                    for req in &reqs {
+                        match req {
+                            PoolRequest::V2 { .. } => {
+                                subcalls.push(StateSubcall::V2Reserves(req.pool()));
+                            }
+                            PoolRequest::V3 { .. } => {
+                                subcalls.push(StateSubcall::V3Slot0(req.pool()));
+                                subcalls.push(StateSubcall::V3Liquidity(req.pool()));
+                                subcalls.push(StateSubcall::V3Fee(req.pool()));
+                            }
+                        }
+                    }
+                    let state_batch_start = Instant::now();
+                    let batch_results = batch_read_pool_state(
+                        &provider,
+                        &subcalls,
+                        anchor.number,
+                        chain_id,
+                        subcalls.len(),
+                        &metrics,
+                    )
+                    .await;
+                    let pair_state_batch_ms = state_batch_start.elapsed().as_millis() as u64;
+
+                    // 3) Walk `reqs` in lockstep with the subcall layout to
+                    //    assemble each pool's `PoolState` from the decoded
+                    //    state plus cached metadata (token0/token1, code
+                    //    hashes -- 0 RPC warm).
+                    let mut pool_states: HashMap<Address, PoolState> = HashMap::new();
+                    let mut subcall_idx = 0usize;
+                    for req in &reqs {
+                        let pool = req.pool();
+                        let assembled = match req {
+                            PoolRequest::V2 { .. } => {
+                                let state = batch_results.get(subcall_idx).and_then(Option::as_ref);
+                                subcall_idx += 1;
+                                match state {
+                                    Some(s) => {
+                                        assemble_v2_pool_state(
+                                            &provider, req, s, &anchor, chain_id, cache, &metrics,
+                                        )
+                                        .await
+                                    }
+                                    None => None,
+                                }
+                            }
+                            PoolRequest::V3 { .. } => {
+                                let slot0 = batch_results.get(subcall_idx).and_then(Option::as_ref);
+                                let liquidity =
+                                    batch_results.get(subcall_idx + 1).and_then(Option::as_ref);
+                                let fee =
+                                    batch_results.get(subcall_idx + 2).and_then(Option::as_ref);
+                                subcall_idx += 3;
+                                match (slot0, liquidity, fee) {
+                                    (Some(s0), Some(l), Some(f)) => {
+                                        assemble_v3_pool_state(
+                                            &provider, req, s0, l, f, &anchor, chain_id, cache,
+                                            &metrics,
+                                        )
+                                        .await
+                                    }
+                                    _ => None,
+                                }
+                            }
+                        };
+                        if let Some(ps) = assembled {
+                            pool_states.insert(pool, ps);
+                        }
+                    }
+
+                    // 4) Quote each leg with the unchanged `getAmountsOut` /
+                    //    `quoteExactInputSingle` (individual eth_call at
+                    //    anchor, NOT batched).
+                    for req in &reqs {
+                        let Some(ps) = pool_states.get(&req.pool()) else {
+                            // State did not assemble (failed subcall or
+                            // token-order mismatch) -- fail-closed, no edge.
+                            continue;
+                        };
+                        let outcome = match req {
+                            PoolRequest::V2 { .. } => {
+                                quote_v2_edge_from_state(
+                                    &provider,
+                                    req,
+                                    ps,
+                                    &anchor,
+                                    &mut local_pools,
+                                    &metrics,
+                                )
+                                .await
+                            }
+                            PoolRequest::V3 { .. } => {
+                                quote_v3_edge_from_state(
+                                    &provider,
+                                    req,
+                                    ps,
+                                    &anchor,
+                                    &mut local_pools,
+                                    &metrics,
+                                )
+                                .await
+                            }
+                        };
+                        if let Some(edge) = outcome {
+                            edges.push(edge);
+                        }
+                    }
+
+                    let pair_serial_ms = pair_start.elapsed().as_millis() as u64;
+                    (
+                        *pair_index,
+                        edges,
+                        local_pools,
+                        pair_serial_ms,
+                        pair_state_batch_ms,
+                    )
                 }
             },
         ))
@@ -1026,12 +1359,22 @@ where
 
         let mut quote_results = quote_results;
         quote_results.sort_by_key(|(pair_index, ..)| *pair_index);
+        // Per-pair batching has no global state-read barrier; the
+        // critical-path floor is the slowest pair's full serial
+        // resolve+state-batch+quote. `state_batch_ms` is reported as the
+        // max per-pair batch wait (the worst pair's single multicall
+        // eth_call) -- the largest single state-read RTT in the round.
         let critical_path_floor_ms = quote_results
             .iter()
-            .map(|(_, _, _, pair_serial_ms)| *pair_serial_ms)
+            .map(|(_, _, _, pair_serial_ms, _)| *pair_serial_ms)
             .max()
             .unwrap_or(0);
-        for (_, edges, local_pools, _) in quote_results {
+        let state_batch_ms = quote_results
+            .iter()
+            .map(|(_, _, _, _, pair_state_batch_ms)| *pair_state_batch_ms)
+            .max()
+            .unwrap_or(0);
+        for (_, edges, local_pools, _, _) in quote_results {
             stats.quotes_succeeded += edges.len() as u64;
             for edge in edges {
                 initial_quotes.push(PinnedQuoteRecord {
@@ -1125,6 +1468,44 @@ where
                 "canonical quote rpc call kind breakdown"
             );
         }
+
+        // ---- Phase-A state-read batching breakdown. `rpc_calls_total`
+        // above now counts only the quote eth_calls (getAmountsOut /
+        // quoteExactInputSingle) plus one physical RPC per Multicall3
+        // `aggregate3` batch -- the 220 individual getReserves/slot0/
+        // liquidity/fee eth_calls are gone, replaced by `multicall_rpc_calls`
+        // batches. `1 batch eth_call = 1 physical RPC; N subcalls = N
+        // subcalls` -- subcalls are never counted as physical RPCs.
+        // `individual_state_calls` is 0 in the hot path (it only moves when
+        // the non-batched fallback / reference path ran). ----
+        let multicall_stats = quote_metrics.multicall_snapshot();
+        let multicall_batch_size_avg = if multicall_stats.batch_sizes.is_empty() {
+            0
+        } else {
+            multicall_stats.batch_sizes.iter().sum::<usize>() / multicall_stats.batch_sizes.len()
+        };
+        let multicall_batch_size_max = multicall_stats
+            .batch_sizes
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0);
+        tracing::info!(
+            target: "canonical_discovery",
+            anchor = anchor.number,
+            state_batch_ms,
+            multicall_rpc_calls = multicall_stats.rpc_calls,
+            multicall_subcalls = multicall_stats.subcalls,
+            multicall_batch_count = multicall_stats.batch_count,
+            multicall_subcall_failures = multicall_stats.subcall_failures,
+            individual_state_rpc_calls = multicall_stats.individual_state_calls,
+            multicall_wait_ms = multicall_stats.wait_ms,
+            multicall_batch_size_avg,
+            multicall_batch_size_max,
+            state_cache_used = false,
+            pair_concurrency = quote_concurrency,
+            "canonical quote stage multicall breakdown"
+        );
 
         // ---- Phase-A immutable-metadata cache: exact hit/miss delta for
         // this round only (before/after snapshot, not cumulative since
@@ -1443,6 +1824,9 @@ where
                 leg_quotes: route_leg_quotes,
                 pool_states,
                 timing: timing.finish(fn_start),
+                multicall: MulticallStats::default(),
+                critical_path_floor_ms: 0,
+                state_batch_ms: 0,
             });
         }
 
@@ -1520,6 +1904,9 @@ where
                     leg_quotes: route_leg_quotes,
                     pool_states,
                     timing: timing.finish(fn_start),
+                    multicall: MulticallStats::default(),
+                    critical_path_floor_ms: 0,
+                    state_batch_ms: 0,
                 });
             }
         };
@@ -1701,6 +2088,9 @@ where
             leg_quotes: route_leg_quotes,
             pool_states,
             timing,
+            multicall: multicall_stats,
+            critical_path_floor_ms,
+            state_batch_ms,
         })
     }
 }
