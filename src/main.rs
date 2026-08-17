@@ -277,6 +277,19 @@ fn persist_round(
         context_build_ms: Some(timing.context_build_ms),
         materialization_economics_ms: Some(timing.materialization_economics_ms),
         unattributed_ms: Some(timing.unattributed_ms),
+        best_route_gross_pnl_usd: best.and_then(|route| route.gross_pnl_usd),
+        best_route_gas_cost_usd: best.and_then(|route| route.gas_cost_usd),
+        best_route_flashloan_cost_usd: best.and_then(|route| route.flashloan_cost_usd),
+        best_route_negative_cause: best.map(|route| {
+            tui::classify_negative_cause(
+                route.gross_pnl_usd,
+                route.gas_cost_usd,
+                route.flashloan_cost_usd,
+                route.net_usd,
+            )
+            .as_str()
+            .to_string()
+        }),
     };
     if let Err(error) = db.insert_round(&record) {
         warn!(%error, round = sequence, "falha ao persistir round no histórico");
@@ -536,13 +549,24 @@ fn canonical_route_economics(
             continue;
         };
         let gross_pct = (cycle_rate - 1.0) * 100.0;
-        let net_fraction = economics.net_pnl_atomic as f64
-            / evidence
-                .amount_in
-                .to_string()
-                .parse::<f64>()
-                .unwrap_or(f64::INFINITY);
+        let amount_in_f64 = evidence
+            .amount_in
+            .to_string()
+            .parse::<f64>()
+            .unwrap_or(f64::INFINITY);
+        // Mesma conversão atomic->USD do net_usd abaixo, aplicada aos
+        // componentes individuais de RouteSimulationResult. gross_pnl_atomic
+        // já é pós-fee do AMM (a cotação real/reuse local já embute o fee
+        // do pool — nunca subtraído de novo aqui). gas/flashloan_cost_atomic
+        // são as MESMAS quantias já subtraídas uma única vez dentro de
+        // net_pnl_atomic (StatefulRouteEvaluator::evaluate) — expor os
+        // componentes aqui não os deduz de novo, só os torna visíveis.
+        let atomic_to_usd = cost.notional_usd / amount_in_f64;
+        let net_fraction = economics.net_pnl_atomic as f64 / amount_in_f64;
         let net_usd = net_fraction * cost.notional_usd;
+        let gross_pnl_usd = economics.gross_pnl_atomic as f64 * atomic_to_usd;
+        let gas_cost_usd = economics.gas_cost_atomic.as_u128() as f64 * atomic_to_usd;
+        let flashloan_cost_usd = economics.flashloan_cost_atomic.as_u128() as f64 * atomic_to_usd;
         if !net_usd.is_finite() || !sane_route_economics(cycle_rate, gross_pct, net_usd, cost.notional_usd) {
             // >80% de desvio é quase certamente glitch de cotação (leg com
             // preço 10x+ fora do normal), não uma decisão econômica de borda.
@@ -622,6 +646,9 @@ fn canonical_route_economics(
                 executable: true,
                 has_curve_leg: venues.iter().any(|venue| venue == "Curve"),
                 outlier: None,
+                gross_pnl_usd: Some(gross_pnl_usd),
+                gas_cost_usd: Some(gas_cost_usd),
+                flashloan_cost_usd: Some(flashloan_cost_usd),
             },
             evidence.structural_cycle_key.clone(),
             exact_legs,
@@ -729,6 +756,12 @@ fn top_spread_row_from_info(i: TopSpreadInfo) -> tui::TopSpreadRow {
         executable: i.executable,
         has_curve_leg: i.has_curve_leg,
         outlier: i.outlier,
+        // Direct-pair diagnostic path: no gas/flashloan cost breakdown
+        // available here (see canonical_route_economics for the path that
+        // does have it).
+        gross_pnl_usd: None,
+        gas_cost_usd: None,
+        flashloan_cost_usd: None,
     }
 }
 
@@ -1979,6 +2012,9 @@ mod canonical_tui_tests {
             executable: true,
             has_curve_leg: false,
             outlier: None,
+            gross_pnl_usd: None,
+            gas_cost_usd: None,
+            flashloan_cost_usd: None,
         };
         let mut triangular = base.clone();
         triangular.hop_count = 3;

@@ -45,6 +45,10 @@ fn record(sequence: u64) -> RoundRecord {
         context_build_ms: Some(25),
         materialization_economics_ms: Some(50),
         unattributed_ms: Some(5),
+        best_route_gross_pnl_usd: Some(0.5),
+        best_route_gas_cost_usd: Some(0.3),
+        best_route_flashloan_cost_usd: Some(0.1),
+        best_route_negative_cause: Some("GAS_DOMINATES".into()),
     }
 }
 

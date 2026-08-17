@@ -1,7 +1,7 @@
 // Overview — KPIs hierárquicos + waterfall honesto + chart + alertas.
-// Waterfall tem 3 colunas: tui_spread (forward dispersion), cycle_rate
-// (cycle fecha), cycle_net (projetado em $). Anomaly highlighting marca
-// edge real onde cycle_rate > 0 mas cycle_net < 0.
+// Waterfall tem 3 linhas de % (tui_spread, cycle_rate, cycle_net) + o
+// economic waterfall em USD (gross/gas/flashloan/net) quando disponível.
+// Anomaly highlighting marca edge real onde cycle_rate > 0 mas cycle_net < 0.
 
 import { Badge, EmptyState, Gate, Kpi, Section } from "./primitives.jsx";
 import { formatDualTime, formatNumber, money, pct, timeAgo } from "../lib/format.js";
@@ -57,6 +57,52 @@ function WaterfallRow({ label, value, kind, anomaly }) {
   );
 }
 
+const NEGATIVE_CAUSE_LABEL = {
+  NO_GROSS_SPREAD: "sem spread bruto",
+  GAS_DOMINATES: "gas domina",
+  FLASHLOAN_FEE_DOMINATES: "fee do flashloan domina",
+  NET_NON_POSITIVE_OTHER: "net negativo, causa não isolada",
+};
+
+// Economic waterfall em USD: gross (já pós-fee do AMM, não deduz fee de
+// novo) → gas → flashloan → net. Componente ausente = "—", nunca $0.00
+// fabricado (COMPONENT_UNAVAILABLE).
+function EconomicWaterfallUsd({ route }) {
+  const hasAny = route.gross_pnl_usd != null || route.gas_cost_usd != null || route.flashloan_cost_usd != null;
+  if (!hasAny) return null;
+  const rows = [
+    ["Gross (pós-fee AMM)", route.gross_pnl_usd],
+    ["Gas", route.gas_cost_usd != null ? -route.gas_cost_usd : null],
+    ["Flashloan", route.flashloan_cost_usd != null ? -route.flashloan_cost_usd : null],
+  ];
+  const maxAbs = Math.max(0.01, ...rows.map(([, v]) => Math.abs(v ?? 0)), Math.abs(route.cycle_net_usd ?? 0));
+  return (
+    <div className="econ-waterfall">
+      <div className="econ-waterfall-head">Economic waterfall (USD)</div>
+      {rows.map(([label, value]) => {
+        const widthPct = value == null ? 0 : Math.min(100, Math.max(4, (Math.abs(value) / maxAbs) * 100));
+        return (
+          <div className="econ-waterfall-row" key={label}>
+            <span>{label}</span>
+            <div className="econ-waterfall-track"><i className={value != null && value < 0 ? "neg" : ""} style={{ width: `${widthPct}%` }} /></div>
+            <b title={value == null ? "Component unavailable" : undefined}>{value == null ? "—" : money(value)}</b>
+          </div>
+        );
+      })}
+      <div className="econ-waterfall-row net">
+        <span>Net</span>
+        <div className="econ-waterfall-track"><i style={{ width: `${Math.min(100, Math.max(4, Math.abs(route.cycle_net_usd ?? 0) / maxAbs * 100))}%` }} /></div>
+        <b>{money(route.cycle_net_usd)}</b>
+      </div>
+      {route.negative_cause && route.negative_cause !== "POSITIVE" && (
+        <div className="econ-waterfall-cause">
+          PRIMARY_NEGATIVE_CAUSE: <b>{NEGATIVE_CAUSE_LABEL[route.negative_cause] || route.negative_cause}</b>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function Overview({ snapshot, bestRoute, rounds, stats }) {
   const r = snapshot.round;
   const bestNet = stats?.best_net_usd ?? bestRoute?.net ?? null;
@@ -67,6 +113,10 @@ export function Overview({ snapshot, bestRoute, rounds, stats }) {
     cycle_rate_pct: stats.best_net_route_cycle_rate_pct,
     cycle_net_usd: stats.best_net_route_net,
     gas_estimate_usd: stats.best_net_route_gas_estimate_usd,
+    gross_pnl_usd: stats.best_net_route_gross_pnl_usd,
+    gas_cost_usd: stats.best_net_route_gas_cost_usd,
+    flashloan_cost_usd: stats.best_net_route_flashloan_cost_usd,
+    negative_cause: stats.best_net_route_negative_cause,
   } : null;
   const waterfall = histRoute ?? bestRoute ?? null;
   const anomaly = waterfall ? routeAnomaly(waterfall) : null;
@@ -123,6 +173,7 @@ export function Overview({ snapshot, bestRoute, rounds, stats }) {
                 <WaterfallRow label="Cycle rate" value={waterfall.cycle_rate_pct} kind="amber" anomaly={null} />
                 <WaterfallRow label="Cycle net" value={waterfall.cycle_net_usd} kind="green" anomaly={anomaly === "gas-dominates" ? anomaly : null} />
               </div>
+              <EconomicWaterfallUsd route={waterfall} />
               {anomaly === "gas-dominates" && (
                 <div className="anomaly-note amber">
                   <strong>edge real, gas domina</strong>

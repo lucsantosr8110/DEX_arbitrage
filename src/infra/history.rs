@@ -71,6 +71,18 @@ pub struct RoundRecord {
     pub context_build_ms: Option<u64>,
     pub materialization_economics_ms: Option<u64>,
     pub unattributed_ms: Option<u64>,
+    /// Economic waterfall (USD) da melhor rota (ver `tui::TopSpreadRow`).
+    /// `gross_pnl_usd` já é pós-fee do AMM; `gas_cost_usd`/`flashloan_cost_usd`
+    /// são os MESMOS componentes já deduzidos uma única vez dentro de
+    /// `best_route_net`/`cycle_net_usd` — expostos aqui só para visibilidade,
+    /// não para dedução adicional. `None` = não computado nesta rodada
+    /// (nunca um 0 fabricado).
+    pub best_route_gross_pnl_usd: Option<f64>,
+    pub best_route_gas_cost_usd: Option<f64>,
+    pub best_route_flashloan_cost_usd: Option<f64>,
+    /// Ver `tui::NegativeCause` — "POSITIVE" | "NO_GROSS_SPREAD" |
+    /// "GAS_DOMINATES" | "FLASHLOAN_FEE_DOMINATES" | "NET_NON_POSITIVE_OTHER".
+    pub best_route_negative_cause: Option<String>,
 }
 
 /// Linha lida do DB para o console (serializável p/ /api/v1/rounds).
@@ -115,6 +127,10 @@ pub struct RoundRow {
     pub context_build_ms: Option<u64>,
     pub materialization_economics_ms: Option<u64>,
     pub unattributed_ms: Option<u64>,
+    pub best_route_gross_pnl_usd: Option<f64>,
+    pub best_route_gas_cost_usd: Option<f64>,
+    pub best_route_flashloan_cost_usd: Option<f64>,
+    pub best_route_negative_cause: Option<String>,
 }
 
 impl RoundRow {
@@ -153,6 +169,10 @@ impl RoundRow {
             context_build_ms: row.get("context_build_ms")?,
             materialization_economics_ms: row.get("materialization_economics_ms")?,
             unattributed_ms: row.get("unattributed_ms")?,
+            best_route_gross_pnl_usd: row.get("best_route_gross_pnl_usd")?,
+            best_route_gas_cost_usd: row.get("best_route_gas_cost_usd")?,
+            best_route_flashloan_cost_usd: row.get("best_route_flashloan_cost_usd")?,
+            best_route_negative_cause: row.get("best_route_negative_cause")?,
         })
     }
 }
@@ -171,6 +191,11 @@ pub struct OverallStats {
     pub best_net_route_venues: Option<String>,
     pub best_net_route_gross: Option<f64>,
     pub best_net_route_net: Option<f64>,
+    /// Economic waterfall (ver `tui::TopSpreadRow`/`tui::NegativeCause`).
+    pub best_net_route_gross_pnl_usd: Option<f64>,
+    pub best_net_route_gas_cost_usd: Option<f64>,
+    pub best_net_route_flashloan_cost_usd: Option<f64>,
+    pub best_net_route_negative_cause: Option<String>,
     /// Percentis de latência (duração do round + estágios) nas últimas rodadas.
     pub latency: LatencyStats,
 }
@@ -251,7 +276,13 @@ CREATE TABLE IF NOT EXISTS rounds (
     requote_ms                    INTEGER,
     context_build_ms              INTEGER,
     materialization_economics_ms  INTEGER,
-    unattributed_ms               INTEGER
+    unattributed_ms               INTEGER,
+    -- ARGUS economic waterfall (ver tui::TopSpreadRow /
+    -- tui::classify_negative_cause). Migração idempotente via ALTER TABLE.
+    best_route_gross_pnl_usd      REAL,
+    best_route_gas_cost_usd       REAL,
+    best_route_flashloan_cost_usd REAL,
+    best_route_negative_cause     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_rounds_sequence ON rounds(sequence);
 "#;
@@ -299,11 +330,22 @@ impl RoundHistory {
             "context_build_ms",
             "materialization_economics_ms",
             "unattributed_ms",
+            "best_route_gross_pnl_usd",
+            "best_route_gas_cost_usd",
+            "best_route_flashloan_cost_usd",
         ] {
             if !existing.iter().any(|name| name == column) {
                 conn.execute_batch(&format!("ALTER TABLE rounds ADD COLUMN {column} INTEGER"))
                     .with_context(|| format!("migrar coluna {column} no histórico"))?;
             }
+        }
+        // TEXT separado: coluna nova de causa negativa (string, não número).
+        if !existing
+            .iter()
+            .any(|name| name == "best_route_negative_cause")
+        {
+            conn.execute_batch("ALTER TABLE rounds ADD COLUMN best_route_negative_cause TEXT")
+                .context("migrar coluna best_route_negative_cause no histórico")?;
         }
         Ok(Arc::new(RoundHistory {
             conn: Mutex::new(conn),
@@ -327,7 +369,9 @@ impl RoundHistory {
                 best_route_gross, best_route_net,
                 tui_spread_pct, cycle_rate_pct, cycle_net_usd,
                 anchor_resolution_ms, metadata_ms, quote_ms, ranking_ms, requote_ms,
-                context_build_ms, materialization_economics_ms, unattributed_ms
+                context_build_ms, materialization_economics_ms, unattributed_ms,
+                best_route_gross_pnl_usd, best_route_gas_cost_usd,
+                best_route_flashloan_cost_usd, best_route_negative_cause
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7,
                 ?8, ?9, ?10,
@@ -337,7 +381,8 @@ impl RoundHistory {
                 ?21, ?22,
                 ?23, ?24, ?25,
                 ?26, ?27, ?28, ?29, ?30,
-                ?31, ?32, ?33
+                ?31, ?32, ?33,
+                ?34, ?35, ?36, ?37
             )",
             params![
                 record.sequence as i64,
@@ -373,6 +418,10 @@ impl RoundHistory {
                 record.context_build_ms.map(|v| v as i64),
                 record.materialization_economics_ms.map(|v| v as i64),
                 record.unattributed_ms.map(|v| v as i64),
+                record.best_route_gross_pnl_usd,
+                record.best_route_gas_cost_usd,
+                record.best_route_flashloan_cost_usd,
+                record.best_route_negative_cause,
             ],
         )
         .context("insert round no histórico")?;
@@ -438,6 +487,16 @@ impl RoundHistory {
             best_net_route_venues: best.as_ref().and_then(|row| row.best_route_venues.clone()),
             best_net_route_gross: best.as_ref().and_then(|row| row.best_route_gross),
             best_net_route_net: best.as_ref().and_then(|row| row.best_route_net),
+            best_net_route_gross_pnl_usd: best
+                .as_ref()
+                .and_then(|row| row.best_route_gross_pnl_usd),
+            best_net_route_gas_cost_usd: best.as_ref().and_then(|row| row.best_route_gas_cost_usd),
+            best_net_route_flashloan_cost_usd: best
+                .as_ref()
+                .and_then(|row| row.best_route_flashloan_cost_usd),
+            best_net_route_negative_cause: best
+                .as_ref()
+                .and_then(|row| row.best_route_negative_cause.clone()),
             latency,
         })
     }
@@ -613,6 +672,10 @@ mod tests {
             context_build_ms: Some(25),
             materialization_economics_ms: Some(50),
             unattributed_ms: Some(5),
+            best_route_gross_pnl_usd: Some(0.5),
+            best_route_gas_cost_usd: Some(0.3),
+            best_route_flashloan_cost_usd: Some(0.1),
+            best_route_negative_cause: Some("GAS_DOMINATES".into()),
         }
     }
 
@@ -639,6 +702,13 @@ mod tests {
         assert_eq!(row.best_route_gross, Some(1.5));
         assert_eq!(row.risk_approved, Some(0));
         assert_eq!(row.anchor_block, Some(101));
+        assert_eq!(row.best_route_gross_pnl_usd, Some(0.5));
+        assert_eq!(row.best_route_gas_cost_usd, Some(0.3));
+        assert_eq!(row.best_route_flashloan_cost_usd, Some(0.1));
+        assert_eq!(
+            row.best_route_negative_cause.as_deref(),
+            Some("GAS_DOMINATES")
+        );
     }
 
     #[test]

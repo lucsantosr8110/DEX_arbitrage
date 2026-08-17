@@ -100,6 +100,81 @@ pub struct TopSpreadRow {
     pub executable: bool,
     pub has_curve_leg: bool,
     pub outlier: Option<String>,
+    /// Economic waterfall (USD, mesma conversão de `net_usd`):
+    /// `gross_pnl_usd` já vem pós-fee do AMM (a cotação real de
+    /// `first_touch_quotes`/reuse local já embute o fee do pool — nunca
+    /// subtraído de novo aqui). `gas_cost_usd`/`flashloan_cost_usd` são
+    /// estimativas proporcionais (`config.gas_cost_ppb`/`flashloan_cost_ppb`),
+    /// não gas real nem premium Aave on-chain. `net_usd` acima já é
+    /// `gross - gas - flashloan` (única dedução, sem double-count).
+    /// `wrapper_cost_usd`/direct-vs-flashloan-vs-wrapper split não são
+    /// computados por `StatefulRouteEvaluator` — permanecem `None`
+    /// (COMPONENT_UNAVAILABLE), nunca fabricados como 0.
+    pub gross_pnl_usd: Option<f64>,
+    pub gas_cost_usd: Option<f64>,
+    pub flashloan_cost_usd: Option<f64>,
+}
+
+/// Causa dominante de uma rota não-positiva. Determinística: dado o mesmo
+/// `(gross_pnl_usd, gas_cost_usd, flashloan_cost_usd, net_usd)`, sempre
+/// devolve a mesma classe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NegativeCause {
+    /// net_usd > 0 — não há causa negativa a classificar.
+    Positive,
+    /// gross_pnl_usd <= 0: nem antes de custos a rota fecha.
+    NoGrossSpread,
+    /// gross > 0 mas net <= 0, e gas_cost_usd é o maior componente de custo.
+    GasDominates,
+    /// gross > 0 mas net <= 0, e flashloan_cost_usd é o maior componente.
+    FlashloanFeeDominates,
+    /// gross > 0, net <= 0, mas gas/flashloan indisponíveis ou não
+    /// suficientes para explicar sozinhos — não inventa uma causa.
+    Other,
+}
+
+impl NegativeCause {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NegativeCause::Positive => "POSITIVE",
+            NegativeCause::NoGrossSpread => "NO_GROSS_SPREAD",
+            NegativeCause::GasDominates => "GAS_DOMINATES",
+            NegativeCause::FlashloanFeeDominates => "FLASHLOAN_FEE_DOMINATES",
+            NegativeCause::Other => "NET_NON_POSITIVE_OTHER",
+        }
+    }
+}
+
+/// Classifica a causa dominante de uma rota não-positiva. Pura, sem RPC,
+/// sem estado — mesma entrada sempre produz a mesma saída.
+pub fn classify_negative_cause(
+    gross_pnl_usd: Option<f64>,
+    gas_cost_usd: Option<f64>,
+    flashloan_cost_usd: Option<f64>,
+    net_usd: Option<f64>,
+) -> NegativeCause {
+    let Some(net) = net_usd else {
+        return NegativeCause::Other;
+    };
+    if net > 0.0 {
+        return NegativeCause::Positive;
+    }
+    let Some(gross) = gross_pnl_usd else {
+        return NegativeCause::Other;
+    };
+    if gross <= 0.0 {
+        return NegativeCause::NoGrossSpread;
+    }
+    match (gas_cost_usd, flashloan_cost_usd) {
+        (Some(gas), Some(flashloan)) if gas > 0.0 || flashloan > 0.0 => {
+            if gas >= flashloan {
+                NegativeCause::GasDominates
+            } else {
+                NegativeCause::FlashloanFeeDominates
+            }
+        }
+        _ => NegativeCause::Other,
+    }
 }
 
 impl Default for TuiState {
@@ -877,6 +952,59 @@ mod tests {
         assert_eq!(norm_pair("USDC-USDT"), "USDC-USDT");
         // par sem '-' → retorna como está (não panic).
         assert_eq!(norm_pair("USDC"), "USDC");
+    }
+
+    // ---- classify_negative_cause ----
+
+    #[test]
+    fn negative_cause_classification_is_deterministic() {
+        // Same inputs called twice must produce identical output — no
+        // hidden state, no ordering dependency.
+        let inputs = (Some(0.5), Some(0.6), Some(0.1), Some(-0.2));
+        let a = classify_negative_cause(inputs.0, inputs.1, inputs.2, inputs.3);
+        let b = classify_negative_cause(inputs.0, inputs.1, inputs.2, inputs.3);
+        assert_eq!(a, b);
+        assert_eq!(a, NegativeCause::GasDominates);
+    }
+
+    #[test]
+    fn negative_cause_positive_when_net_positive() {
+        let cause = classify_negative_cause(Some(1.0), Some(0.3), Some(0.1), Some(0.6));
+        assert_eq!(cause, NegativeCause::Positive);
+        assert_eq!(cause.as_str(), "POSITIVE");
+    }
+
+    #[test]
+    fn negative_cause_no_gross_spread_when_gross_non_positive() {
+        let cause = classify_negative_cause(Some(-0.1), Some(0.0), Some(0.0), Some(-0.1));
+        assert_eq!(cause, NegativeCause::NoGrossSpread);
+    }
+
+    #[test]
+    fn negative_cause_gas_dominates_when_gas_exceeds_flashloan() {
+        let cause = classify_negative_cause(Some(1.0), Some(0.8), Some(0.3), Some(-0.1));
+        assert_eq!(cause, NegativeCause::GasDominates);
+    }
+
+    #[test]
+    fn negative_cause_flashloan_dominates_when_flashloan_exceeds_gas() {
+        let cause = classify_negative_cause(Some(1.0), Some(0.2), Some(0.9), Some(-0.1));
+        assert_eq!(cause, NegativeCause::FlashloanFeeDominates);
+    }
+
+    #[test]
+    fn negative_cause_other_when_components_unavailable() {
+        // gross positive, net negative, but no gas/flashloan breakdown to
+        // point at — must not fabricate a specific cause.
+        let cause = classify_negative_cause(Some(1.0), None, None, Some(-0.1));
+        assert_eq!(cause, NegativeCause::Other);
+        assert_eq!(cause.as_str(), "NET_NON_POSITIVE_OTHER");
+    }
+
+    #[test]
+    fn negative_cause_other_when_net_unavailable() {
+        let cause = classify_negative_cause(Some(1.0), Some(0.5), Some(0.5), None);
+        assert_eq!(cause, NegativeCause::Other);
     }
 
     #[test]
