@@ -1,4 +1,4 @@
-﻿// src/utils/mod.rs
+// src/utils/mod.rs
 
 pub mod abi_loader;
 pub mod check_executor_permissions;
@@ -11,4 +11,3 @@ pub use abi_loader::load_abi; // Exporta a funÃ§Ã£o corrigida
 pub use reporting::report_error;
 pub use telegram::TelegramNotifier; // Assumido necessÃ¡rio do contexto
 pub use utils::*; // reexporta tudo dentro dele
-

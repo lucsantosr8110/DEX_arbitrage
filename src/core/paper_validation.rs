@@ -13,10 +13,7 @@
 //! CSV append ocorre em task async (channel) — **fora** do hot path do radar.
 
 use crate::{
-    config::Config,
-    contracts::ERC20,
-    core::economics,
-    core::types::ArbitrageOpportunity,
+    config::Config, contracts::ERC20, core::economics, core::types::ArbitrageOpportunity,
     AppMiddleware,
 };
 
@@ -87,11 +84,7 @@ fn extract_plain_revert_reason(err: &str) -> Option<String> {
                 .unwrap_or("")
                 .trim()
                 .trim_matches('"');
-            if !t.is_empty()
-                && !t.starts_with("data")
-                && !t.starts_with("0x")
-                && t.len() < 120
-            {
+            if !t.is_empty() && !t.starts_with("data") && !t.starts_with("0x") && t.len() < 120 {
                 return Some(t.to_string());
             }
         }
@@ -116,10 +109,7 @@ pub fn extract_revert_hex(err: &str) -> Option<String> {
             let start = idx + marker.len();
             // marker may already consume "0x"
             let rest = &err[start..];
-            let hex: String = rest
-                .chars()
-                .take_while(|c| c.is_ascii_hexdigit())
-                .collect();
+            let hex: String = rest.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
             if hex.len() >= 8 {
                 return Some(hex);
             }
@@ -130,7 +120,10 @@ pub fn extract_revert_hex(err: &str) -> Option<String> {
 
 /// Decodifica payload de revert ABI (sem prefixo 0x).
 pub fn decode_revert_data_hex(hex_data: &str) -> String {
-    let hex_data = hex_data.trim().trim_start_matches("0x").trim_start_matches("0X");
+    let hex_data = hex_data
+        .trim()
+        .trim_start_matches("0x")
+        .trim_start_matches("0X");
     if hex_data.len() < 8 {
         return format!("RevertData(short): 0x{hex_data}");
     }
@@ -271,8 +264,7 @@ pub async fn probe_aave_flashloan_revert(
     // from = executor (endereço do contrato — eth_call não assina).
     match eth_call_raw(client, executor, aave, data, block, state_override).await {
         Ok(_) => {
-            "Aave.flashLoanSimple succeeded on probe (unexpected vs executeFlashloan=false)"
-                .into()
+            "Aave.flashLoanSimple succeeded on probe (unexpected vs executeFlashloan=false)".into()
         }
         Err(reason) => format!("Aave.flashLoanSimple revert: {reason}"),
     }
@@ -361,7 +353,10 @@ pub fn would_execute(spread_pct: f64, cfg: &Config) -> bool {
 /// para priorizar amostras úteis. Fee V3=100 ainda é observado (grava CSV com
 /// abort A4) para medir quão frequente o bloqueio é no mid-band.
 pub fn route_executor_supported(opp: &ArbitrageOpportunity) -> bool {
-    opp.steps.0.iter().all(|s| executor_dex_supported(&s.dex_name))
+    opp.steps
+        .0
+        .iter()
+        .all(|s| executor_dex_supported(&s.dex_name))
 }
 
 fn executor_dex_supported(dex: &str) -> bool {
@@ -417,11 +412,8 @@ pub fn parse_balance_pair_abi(
     decimals: u32,
     token_price_usd: f64,
 ) -> Result<(U256, U256, f64)> {
-    let tokens = decode(
-        &[ParamType::Uint(256), ParamType::Uint(256)],
-        data,
-    )
-    .context("decode balance pair ABI")?;
+    let tokens = decode(&[ParamType::Uint(256), ParamType::Uint(256)], data)
+        .context("decode balance pair ABI")?;
     let before = match &tokens[0] {
         Token::Uint(v) => *v,
         _ => return Err(anyhow!("expected uint before")),
@@ -655,10 +647,7 @@ impl PaperAggregate {
                 .map(|s| {
                     format!(
                         "net={:.4} real={:?} abs={:?} rel={:?}",
-                        s.net_previsto_usd,
-                        s.profit_realizado_usd,
-                        s.erro_abs_usd,
-                        s.erro_rel_pct
+                        s.net_previsto_usd, s.profit_realizado_usd, s.erro_abs_usd, s.erro_rel_pct
                     )
                 })
                 .take(5)
@@ -1002,9 +991,7 @@ pub async fn try_alchemy_asset_delta(
         data: format!("{}", data),
     };
     let provider = client.provider();
-    let raw: Result<Value, _> = provider
-        .request("alchemy_simulateAssetChanges", [tx])
-        .await;
+    let raw: Result<Value, _> = provider.request("alchemy_simulateAssetChanges", [tx]).await;
     match raw {
         Ok(v) => parse_alchemy_asset_changes_delta(&v, asset, holder),
         Err(e) => {
@@ -1099,10 +1086,7 @@ mod tests {
         // Formato que o provider devolveu no paper run
         let err = r#"(code: 3, message: execution reverted: Invalid initiator, data: Some(String("0x08c379a000000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000011496e76616c696420696e69746961746f72000000000000000000000000000000")))"#;
         let msg = decode_revert_message(err);
-        assert!(
-            msg.contains("Invalid initiator"),
-            "msg={msg}"
-        );
+        assert!(msg.contains("Invalid initiator"), "msg={msg}");
     }
 
     #[test]
@@ -1119,7 +1103,10 @@ mod tests {
         let body = encode(&[Token::Uint(U256::from(0x11u64))]);
         let hex = format!("4e487b71{}", hex::encode(&body));
         let msg = decode_revert_data_hex(&hex);
-        assert!(msg.contains("overflow") || msg.contains("0x11"), "msg={msg}");
+        assert!(
+            msg.contains("overflow") || msg.contains("0x11"),
+            "msg={msg}"
+        );
     }
 
     #[test]
@@ -1156,7 +1143,14 @@ mod tests {
             .unwrap();
         let ovr = erc20_balance_state_override(token, holder, U256::from(1_000_000u64));
         let key = format!("{:?}", token);
-        assert!(ovr.get(&key).is_some() || ovr.as_object().unwrap().keys().any(|k| k.eq_ignore_ascii_case(&key)));
+        assert!(
+            ovr.get(&key).is_some()
+                || ovr
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .any(|k| k.eq_ignore_ascii_case(&key))
+        );
     }
 
     #[test]

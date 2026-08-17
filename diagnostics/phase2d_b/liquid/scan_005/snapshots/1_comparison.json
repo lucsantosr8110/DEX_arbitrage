@@ -1,0 +1,20 @@
+{
+  "anchor_block_hash": "0x4302e0ef44c03411b8fc9bd6cc3e03855249911d9f09e315c825976909d43a5a",
+  "anchor_block_number": 91141099,
+  "block_number_per_quote_unavailable": false,
+  "head_advance_during_scan": 47,
+  "head_at_scan_end": 91141148,
+  "head_at_scan_start": 91141101,
+  "negative_cycles_created_by_filter": 7,
+  "negative_cycles_removed_by_reciprocity": 7,
+  "post_graph_edges": 112,
+  "post_negative_cycles": 7,
+  "pre_graph_edges": 274,
+  "pre_negative_cycles": 7,
+  "quote_state_block_span": 0,
+  "quotes_pinned_to_anchor_block": true,
+  "reciprocity_removed_edges": 162,
+  "reorg_detected": false,
+  "scan_duration_ms": 71243,
+  "scan_id": 1
+}

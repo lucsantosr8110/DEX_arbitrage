@@ -1,0 +1,16 @@
+diagnostics/phase2d_b/base/scan_001/snapshots/1_post_reciprocity.json
+diagnostics/phase2d_b/base/scan_001/snapshots/1_pre_reciprocity.json
+diagnostics/phase2d_b/base/scan_002/snapshots/1_post_reciprocity.json
+diagnostics/phase2d_b/base/scan_002/snapshots/1_pre_reciprocity.json
+diagnostics/phase2d_b/base/scan_003/snapshots/1_post_reciprocity.json
+diagnostics/phase2d_b/base/scan_003/snapshots/1_pre_reciprocity.json
+diagnostics/phase2d_b/liquid/scan_001/snapshots/1_post_reciprocity.json
+diagnostics/phase2d_b/liquid/scan_001/snapshots/1_pre_reciprocity.json
+diagnostics/phase2d_b/liquid/scan_002/snapshots/1_post_reciprocity.json
+diagnostics/phase2d_b/liquid/scan_002/snapshots/1_pre_reciprocity.json
+diagnostics/phase2d_b/liquid/scan_003/snapshots/1_post_reciprocity.json
+diagnostics/phase2d_b/liquid/scan_003/snapshots/1_pre_reciprocity.json
+diagnostics/phase2d_b/liquid/scan_004/snapshots/1_post_reciprocity.json
+diagnostics/phase2d_b/liquid/scan_004/snapshots/1_pre_reciprocity.json
+diagnostics/phase2d_b/liquid/scan_005/snapshots/1_post_reciprocity.json
+diagnostics/phase2d_b/liquid/scan_005/snapshots/1_pre_reciprocity.json

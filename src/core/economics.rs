@@ -1,5 +1,12 @@
 //! Fonte única do modelo de custo de uma rota de arbitragem.
 //!
+//! B9 (money/profit): aritmética inteira `deny(arithmetic_side_effects)` —
+//! overflow wrap em money = bug silencioso. Casts f64↔int em math de bps são
+//! `warn` (valores < 2^52, perda de precisão negligenciável); locais sensíveis
+//! usam `checked_*` e abortam a opp em falha (never silent saturate in profit).
+#![deny(clippy::arithmetic_side_effects)]
+#![warn(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+//!
 //! # O que já está no `total_rate` (e portanto NÃO é custo separado)
 //!
 //! Os rates de cada perna vêm de `getAmountsOut` (V2), `quoteExactInputSingle`
@@ -26,6 +33,7 @@
 //! GROSS usando este módulo — convenção A5, uma única dedução por custo.
 
 use serde::Serialize;
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// `FLASHLOAN_PREMIUM_TOTAL` da Aave V3 (5 bps). Verificado on-chain 2026-07-24.
@@ -33,11 +41,18 @@ pub const AAVE_V3_PREMIUM_PCT: f64 = 0.0005;
 
 /// Última estimativa VIVA de gás (micro-dólares; 0 = nunca publicada).
 ///
-/// Escrita por [`crate::core::gas::GasEstimator::estimate_arbitrage_gas_usd`],
+/// Escrita por [`crate::core::gas::GasEstimator::estimate_gas_usd_for_route`],
 /// lida pelo finder e pelo risk manager. Existe para que os três gates de lucro
 /// usem **o mesmo** número de gás em vez de três modelos divergentes (o finder
 /// usava um estático de config, o risk manager saturava num teto fixo de $0.10).
 static LAST_LIVE_GAS_USD_MICROS: AtomicU64 = AtomicU64::new(0);
+
+/// A6: estimativa viva POR número de hops (micro-dólares). Antes só se
+/// publicava em rotas de 3 hops — rotas de 2/4 hops caiam no fallback estático
+/// no finder, drift de ~33%. Agora cada contagem de hops tem seu próprio live.
+static LAST_LIVE_GAS_BY_HOPS: once_cell::sync::Lazy<
+    std::sync::RwLock<std::collections::HashMap<u32, u64>>,
+> = once_cell::sync::Lazy::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
 
 /// Publica a estimativa viva de gás. Valores não-finitos/negativos são ignorados.
 pub fn publish_live_gas_usd(usd: f64) {
@@ -51,6 +66,21 @@ pub fn publish_live_gas_usd(usd: f64) {
     LAST_LIVE_GAS_USD_MICROS.store(micros as u64, Ordering::Relaxed);
 }
 
+/// Publica a estimativa viva de gás para uma contagem de hops específica
+/// (A6). Rotas de 2/4 hops agora alimentam seu próprio slot em vez de cair no
+/// fallback estático no finder.
+pub fn publish_live_gas_usd_for_hops(usd: f64, n_hops: usize) {
+    if !usd.is_finite() || usd < 0.0 {
+        return;
+    }
+    let micros = (usd * 1e6).round();
+    if micros < 1.0 || micros >= u64::MAX as f64 || n_hops == 0 {
+        return;
+    }
+    let mut map = LAST_LIVE_GAS_BY_HOPS.write().unwrap();
+    map.insert(n_hops as u32, micros as u64);
+}
+
 /// Estimativa viva de gás, se já houve alguma.
 pub fn live_gas_usd() -> Option<f64> {
     match LAST_LIVE_GAS_USD_MICROS.load(Ordering::Relaxed) {
@@ -59,9 +89,22 @@ pub fn live_gas_usd() -> Option<f64> {
     }
 }
 
+/// Estimativa viva de gás para `n_hops`, se publicada (A6).
+pub fn live_gas_usd_for_hops(n_hops: usize) -> Option<f64> {
+    let map = LAST_LIVE_GAS_BY_HOPS.read().unwrap();
+    map.get(&(n_hops as u32)).map(|&m| m as f64 / 1e6)
+}
+
 /// Gás a usar num gate de lucro: preferir a medição viva, cair no estático.
 pub fn gas_usd_or_fallback(fallback_usd: f64) -> f64 {
     live_gas_usd().unwrap_or_else(|| sane(fallback_usd))
+}
+
+/// Gás a usar num gate de lucro para `n_hops`: prefere a medição viva DAQUELA
+/// contagem de hops (A6); se não houver, cai no `fallback_usd` (estático, já
+/// referência 3 hops — caller escala via `gas_cost_for_hops` se precisar).
+pub fn gas_usd_or_fallback_for_hops(fallback_usd: f64, n_hops: usize) -> f64 {
+    live_gas_usd_for_hops(n_hops).unwrap_or_else(|| sane(fallback_usd))
 }
 
 /// Custos de uma rota, em USD. Cada campo aparece **uma** vez no net.
@@ -110,9 +153,42 @@ pub fn flashloan_fee_usd_from_amount(
     flashloan_fee_usd(amount_usd, fee_pct)
 }
 
+/// B6 — fator de crescimento EIP-1559 do base_fee projetado `n` blocos à frente.
+/// `pow_bps(11_250, n)` = `1.125^n` (max 12.5%/bloco). Usado para precificar o
+/// custo de gas no EV (não o max_fee enviado). `pow_bps(10_000, n)` = 1.0.
+/// Razão `pow_bps(11_250, n) / pow_bps(10_000, n)` = `1.125^n`.
+pub fn pow_bps(numerator_bps: u32, exp: u32) -> f64 {
+    (numerator_bps as f64 / 10_000.0).powi(exp as i32)
+}
+
 /// Buffer opcional de drift quote→execução. **Não** é price impact.
+/// Single-hop (legado); prefira `compounded_adverse_move_usd` (B5).
 pub fn adverse_move_usd(trade_amount_usd: f64, adverse_move_bps: u32) -> f64 {
     sane(trade_amount_usd) * (adverse_move_bps as f64 / 10_000.0)
+}
+
+/// B5 — haircut de adverse_move_bps por hop, **composto** sobre o expected_out.
+/// Reduz o output acumulado da rota por um fator `(1 − b/10_000)^n_hops`. O
+/// custo equivalente em USD = `trade_amount * (1 − (1 − b/10_000)^n_hops)`.
+///
+/// Para 1 hop ≡ `adverse_move_usd` (b bps do notional). Para n hops é
+/// levemente menor que `n * b` bps (juros compostos), sempre conservador.
+/// `adverse_move_bps = 0` ⇒ 0 (opt-out explícito via config).
+// SAFETY-EV: ~2s entre simulação e inclusão na Polygon; drift médio observado.
+pub fn compounded_adverse_move_usd(
+    trade_amount_usd: f64,
+    adverse_move_bps: u32,
+    n_hops: usize,
+) -> f64 {
+    let amt = sane(trade_amount_usd);
+    if adverse_move_bps == 0 || n_hops == 0 {
+        return 0.0;
+    }
+    let per_hop = 1.0 - (adverse_move_bps as f64 / 10_000.0);
+    let compounded = per_hop.powi(n_hops as i32);
+    // haircut fraction = 1 - compounded; jamais negativo (per_hop ≤ 1).
+    let haircut_frac = (1.0 - compounded).max(0.0);
+    amt * haircut_frac
 }
 
 /// Net = gross − custos. Única fórmula de net do projeto.
@@ -156,8 +232,7 @@ pub fn max_slippage_bps_for_edge(
     if !per_hop.is_finite() || per_hop <= 0.0 {
         return MIN_SLIPPAGE_BPS.min(ceiling_bps.max(MIN_SLIPPAGE_BPS));
     }
-    (per_hop as u32)
-        .clamp(MIN_SLIPPAGE_BPS, ceiling_bps.max(MIN_SLIPPAGE_BPS))
+    (per_hop as u32).clamp(MIN_SLIPPAGE_BPS, ceiling_bps.max(MIN_SLIPPAGE_BPS))
 }
 
 /// Delta esperado de um `eth_call` de simulação.
@@ -171,6 +246,128 @@ pub fn expected_sim_delta_usd(gross_profit_usd: f64, flashloan_fee_usd: f64) -> 
         return 0.0;
     }
     gross_profit_usd - sane(flashloan_fee_usd)
+}
+
+/// Orçamento de edge em BPS do notional (gate inteiro, sem f64 na decisão).
+///
+/// `budget_bps = floor(net_profit_usd / trade_amount_usd * 10_000)`.
+pub fn edge_budget_bps(net_profit_usd: f64, trade_amount_usd: f64) -> i64 {
+    if !net_profit_usd.is_finite()
+        || net_profit_usd <= 0.0
+        || !trade_amount_usd.is_finite()
+        || trade_amount_usd <= 0.0
+    {
+        return 0;
+    }
+    ((net_profit_usd / trade_amount_usd) * 10_000.0).floor() as i64
+}
+
+/// Snapshot econômico de uma rota — **fonte única de verdade** compartilhada
+/// entre finder (`arbitrage.rs`) e executor (`flashloan.rs`).
+///
+/// Ambos derivam `net_profit_usd` da mesma fórmula [`net_profit_usd`]
+/// (finder em f64, executor em `UsdE8` — versão inteira mais estrita, que é o
+/// gate final pré-broadcast). Decimals desconhecidos ou preço de native token
+/// zero/stale devem ser rejeitados **antes** de preencher este snapshot
+/// (fail-closed nos respectivos módulos: `get_token_decimals_smart`,
+/// `GasEstimator::estimate_gas_usd_for_hops`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct TradeEconomics {
+    pub trade_size_usd: f64,
+    pub gross_profit_usd: f64,
+    pub gas_cost_usd: f64,
+    pub flashloan_fee_usd: f64,
+    pub adverse_move_usd: f64,
+    pub net_profit_usd: f64,
+    pub edge_bps: i64,
+}
+
+impl TradeEconomics {
+    /// Constrói a partir dos custos já calculados pela fonte única.
+    pub fn from_costs(trade_size_usd: f64, gross_profit_usd: f64, costs: &TradeCosts) -> Self {
+        let net = net_profit_usd(gross_profit_usd, costs);
+        Self {
+            trade_size_usd,
+            gross_profit_usd,
+            gas_cost_usd: costs.gas_usd,
+            flashloan_fee_usd: costs.flashloan_fee_usd,
+            adverse_move_usd: costs.adverse_move_usd,
+            net_profit_usd: net,
+            edge_bps: edge_budget_bps(net, trade_size_usd),
+        }
+    }
+
+    /// Gate de aprovação compartilhado. Rejeita fail-closed se:
+    ///   - net_profit_usd não é finito (custo NaN/inf virou −∞ em net_profit_usd);
+    ///   - net_profit_usd <= min_profit_usd (sem edge positivo acima do piso).
+    ///
+    /// Retorna o net validado em caso de aprovação.
+    pub fn validate_gate(&self, min_profit_usd: f64) -> Result<f64, EconomicsRejection> {
+        if !self.net_profit_usd.is_finite() {
+            return Err(EconomicsRejection::NonFiniteNet);
+        }
+        if self.net_profit_usd <= min_profit_usd {
+            return Err(EconomicsRejection::BelowMinProfit {
+                net: self.net_profit_usd,
+                min: min_profit_usd,
+            });
+        }
+        Ok(self.net_profit_usd)
+    }
+}
+
+/// Motivo de rejeição econômica — explícito, não "skipped".
+#[derive(Debug, Clone, PartialEq)]
+pub enum EconomicsRejection {
+    NonFiniteNet,
+    BelowMinProfit { net: f64, min: f64 },
+}
+
+impl fmt::Display for EconomicsRejection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EconomicsRejection::NonFiniteNet => write!(f, "net profit não-finito (custo NaN/inf)"),
+            EconomicsRejection::BelowMinProfit { net, min } => {
+                write!(f, "net profit ${:.6} <= min ${:.6}", net, min)
+            }
+        }
+    }
+}
+
+/// Teto cumulativo de slippage autorizado pelo edge líquido.
+///
+/// Regra:
+///   budget_bps    = floor(net/trade * 10_000)
+///   se budget_bps ≤ edge_safety_margin_bps → `None` (rejeita rota, fail-closed)
+///   allowed_total = min(configured_slippage_bps,
+///                       budget_bps − edge_safety_margin_bps,
+///                       route_limit_bps)
+///
+/// O `route_limit_bps` estático NUNCA autoriza mais que o edge: entra só como
+/// um teto adicional dentro do `min`. Gate de rejeição compara inteiros — f64
+/// só aparece na entrada `budget_bps`, nunca na decisão final.
+pub fn slippage_allowed_total_bps(
+    net_profit_usd: f64,
+    trade_amount_usd: f64,
+    edge_safety_margin_bps: u32,
+    configured_slippage_bps: u32,
+    route_limit_bps: u32,
+) -> Option<u32> {
+    let budget_bps = edge_budget_bps(net_profit_usd, trade_amount_usd);
+    let margin = edge_safety_margin_bps as i64;
+    if budget_bps <= margin {
+        return None;
+    }
+    // SAFETY-EV: budget_bps > margin garantido acima; checked_sub nunca falha
+    // aqui. checked_int_to u32: edge_total cabe em u32 (bps ≤ ~10000); se não
+    // couber, fail-closed None (abort opp) — nunca saturate silencioso.
+    let edge_total = budget_bps
+        .checked_sub(margin)
+        .expect("budget_bps > margin guardado acima")
+        .try_into()
+        .ok()
+        .filter(|v: &u32| *v <= 100_000)?;
+    Some(configured_slippage_bps.min(edge_total).min(route_limit_bps))
 }
 
 #[cfg(test)]
@@ -213,6 +410,70 @@ mod tests {
         assert!((adverse_move_usd(100.0, 25) - 0.25).abs() < 1e-12);
     }
 
+    /// B6: pow_bps(11250,n)/pow_bps(10000,n) = 1.125^n (EIP-1559 12.5%/bloco).
+    /// n=0 → 1.0; n=1 → 1.125; n=2 → 1.265625.
+    #[test]
+    fn b6_pow_bps_eip1559_projection() {
+        assert!((pow_bps(11_250, 0) - 1.0).abs() < 1e-12);
+        assert!((pow_bps(11_250, 1) - 1.125).abs() < 1e-12);
+        let n2 = pow_bps(11_250, 2) / pow_bps(10_000, 2);
+        assert!((n2 - 1.265625).abs() < 1e-9, "1.125^2 = {}", n2);
+        // base_fee 100 gwei projetado 2 blocos → 126.5625 gwei (antes *1.05 = 105)
+        let projected = 100.0 * pow_bps(11_250, 2) / pow_bps(10_000, 2);
+        assert!(projected > 105.0, "projeção B6 > buffer 5%: {}", projected);
+        assert!((projected - 126.5625).abs() < 1e-9);
+    }
+
+    /// B5: haircut composto por hop. 1 hop ≡ legado; n hops > n*b (juros
+    /// compostos, levemente menor); 0 bps ⇒ 0 (opt-out).
+    #[test]
+    fn b5_compounded_adverse_move_usd() {
+        // 0 bps → 0 mesmo com hops
+        assert_eq!(compounded_adverse_move_usd(100.0, 0, 3), 0.0);
+        // 1 hop, 5 bps → 5 bps do notional = 0.05 (≡ adverse_move_usd)
+        let one = compounded_adverse_move_usd(100.0, 5, 1);
+        assert!((one - 0.05).abs() < 1e-12, "1 hop: {}", one);
+        // 2 hops, 5 bps → (1 - 0.9995^2)*100 = 0.099975... > 0.05, < 0.10
+        let two = compounded_adverse_move_usd(100.0, 5, 2);
+        assert!(two > 0.05 && two < 0.10, "2 hops composto: {}", two);
+        assert!((two - (1.0 - (0.9995f64).powi(2)) * 100.0).abs() < 1e-12);
+        // 0 hops → 0
+        assert_eq!(compounded_adverse_move_usd(100.0, 5, 0), 0.0);
+    }
+
+    /// B5 spec: edge 6 bps rejeitado com default 5 bps, aceito com 0.
+    /// Cenário: gross edge 6 bps = $0.06 em $100, gas/flashloan = 0.
+    /// adverse 5 (1 hop) = $0.05 → net $0.01 = 1 bps ≤ margin 1 → None (rejeita).
+    /// adverse 0 → net $0.06 = 6 bps → Some (aceita).
+    #[test]
+    fn b5_edge_6bps_rejected_with_default_adverse_accepted_with_zero() {
+        let trade = 100.0;
+        let gross_edge_bps = 6u32;
+        let gross_usd = trade * (gross_edge_bps as f64 / 10_000.0); // 0.06
+
+        // default 5 bps, 1 hop
+        let adverse5 = compounded_adverse_move_usd(trade, 5, 1); // 0.05
+        let net5 = gross_usd - adverse5; // 0.01 = 1 bps
+        let gate5 = slippage_allowed_total_bps(net5, trade, 1, 50, 200);
+        assert!(
+            gate5.is_none(),
+            "edge 6 bps c/ adverse 5 deve rejeitar: net={} gate={:?}",
+            net5,
+            gate5
+        );
+
+        // opt-out 0
+        let adverse0 = compounded_adverse_move_usd(trade, 0, 1); // 0
+        let net0 = gross_usd - adverse0; // 0.06 = 6 bps
+        let gate0 = slippage_allowed_total_bps(net0, trade, 1, 50, 200);
+        assert!(
+            gate0.is_some(),
+            "edge 6 bps c/ adverse 0 deve aceitar: net={} gate={:?}",
+            net0,
+            gate0
+        );
+    }
+
     #[test]
     fn sim_delta_excludes_gas_includes_premium() {
         let gross = 0.30;
@@ -242,7 +503,7 @@ mod tests {
         publish_live_gas_usd(f64::NAN);
         publish_live_gas_usd(-1.0);
         publish_live_gas_usd(0.0); // < 1 micro-dólar => ignorado
-        // (outros testes podem já ter publicado; só exigimos o contrato do fallback)
+                                   // (outros testes podem já ter publicado; só exigimos o contrato do fallback)
         assert!((gas_usd_or_fallback(0.0092) - live_gas_usd().unwrap_or(0.0092)).abs() < 1e-9);
 
         publish_live_gas_usd(0.0051);
@@ -272,8 +533,14 @@ mod tests {
     #[test]
     fn slippage_budget_floors_on_zero_or_negative_edge() {
         // Sem lucro, aperta no piso — não abre folga para sandwich.
-        assert_eq!(max_slippage_bps_for_edge(0.0, 100.0, 3, 50), MIN_SLIPPAGE_BPS);
-        assert_eq!(max_slippage_bps_for_edge(-1.0, 100.0, 3, 50), MIN_SLIPPAGE_BPS);
+        assert_eq!(
+            max_slippage_bps_for_edge(0.0, 100.0, 3, 50),
+            MIN_SLIPPAGE_BPS
+        );
+        assert_eq!(
+            max_slippage_bps_for_edge(-1.0, 100.0, 3, 50),
+            MIN_SLIPPAGE_BPS
+        );
         assert_eq!(
             max_slippage_bps_for_edge(f64::NAN, 100.0, 3, 50),
             MIN_SLIPPAGE_BPS
@@ -308,5 +575,113 @@ mod tests {
         };
         // inf - inf seria NaN; somar inf no total e subtrair gross finito dá -inf.
         assert!(net_profit_usd(1.0, &inf_costs) < 0.0);
+    }
+
+    // ===== FASE 4: slippage cap por edge líquido =====
+
+    #[test]
+    fn edge_budget_bps_floors_and_safe_on_zero() {
+        // 20 bps de edge em $100 → budget 20.
+        assert_eq!(edge_budget_bps(0.20, 100.0), 20);
+        // 0.5 bps em $100 → floor 0 (não arredonda p/ cima).
+        assert_eq!(edge_budget_bps(0.005, 100.0), 0);
+        // negativo/NaN/zero → 0.
+        assert_eq!(edge_budget_bps(-1.0, 100.0), 0);
+        assert_eq!(edge_budget_bps(0.20, 0.0), 0);
+        assert_eq!(edge_budget_bps(f64::NAN, 100.0), 0);
+    }
+
+    #[test]
+    fn slippage_total_caps_below_edge_when_hop_increase_would_exceed() {
+        // Edge 20 bps (net $0.20 em $100). hop_increase 5 bps × 3 hops daria 33 bps
+        // cumulativos sem o cap. allowed_total deve capar ABAIXO de 20 bps.
+        let allowed = slippage_allowed_total_bps(0.20, 100.0, 1, 50, 200);
+        assert_eq!(allowed, Some(19), "esperava 19 bps (20 - margin 1)");
+        // Cumulativo nunca pode passar o próprio edge.
+        assert!(allowed.unwrap() < 20);
+        // E jamais acima do teto configurado nem do route_limit.
+        assert!(allowed.unwrap() <= 50);
+        assert!(allowed.unwrap() <= 200);
+    }
+
+    #[test]
+    fn slippage_total_rejects_when_edge_le_safety_margin() {
+        // budget 1 bps, margin 1 bps → 1 ≤ 1 → rejeita (None).
+        assert_eq!(slippage_allowed_total_bps(0.01, 100.0, 1, 50, 200), None);
+        // budget 0 → rejeita.
+        assert_eq!(slippage_allowed_total_bps(0.0, 100.0, 1, 50, 200), None);
+        // budget 2 bps, margin 1 → edge_total 1 → Some(1) (não rejeita, aperta).
+        assert_eq!(slippage_allowed_total_bps(0.02, 100.0, 1, 50, 200), Some(1));
+    }
+
+    #[test]
+    fn slippage_total_accepts_with_limit_when_edge_is_fat() {
+        // Edge gordo (5% = 500 bps): configured 50 vence (route_limit 200 > 50).
+        assert_eq!(slippage_allowed_total_bps(5.0, 100.0, 1, 50, 200), Some(50));
+        // configured alto (250) mas route_limit 200 manda → 200.
+        assert_eq!(
+            slippage_allowed_total_bps(5.0, 100.0, 1, 250, 200),
+            Some(200)
+        );
+    }
+
+    #[test]
+    fn slippage_total_route_limit_never_authorizes_above_edge() {
+        // route_limit 200 mas edge só 10 bps → allowed ≤ 9 (10 − margin 1).
+        let allowed = slippage_allowed_total_bps(0.10, 100.0, 1, 50, 200);
+        assert_eq!(allowed, Some(9));
+        // route_limit estático não autoriza slippage > edge líquido.
+        assert!(allowed.unwrap() < 10);
+    }
+
+    // ===== FASE 5: TradeEconomics gate compartilhado finder/executor =====
+
+    #[test]
+    fn trade_economics_gate_approves_above_min() {
+        let costs = TradeCosts {
+            gas_usd: 0.005,
+            flashloan_fee_usd: 0.05,
+            adverse_move_usd: 0.0,
+        };
+        let econ = TradeEconomics::from_costs(100.0, 0.30, &costs);
+        // net = 0.30 − 0.055 = 0.245; edge_bps = floor(0.245/100*10000) = 24
+        assert!((econ.net_profit_usd - 0.245).abs() < 1e-9);
+        assert_eq!(econ.edge_bps, 24);
+        assert!(econ.validate_gate(0.0015).is_ok());
+    }
+
+    #[test]
+    fn trade_economics_gate_rejects_below_min() {
+        let costs = TradeCosts {
+            gas_usd: 0.005,
+            flashloan_fee_usd: 0.05,
+            adverse_move_usd: 0.0,
+        };
+        let econ = TradeEconomics::from_costs(100.0, 0.05, &costs);
+        // net = 0.05 − 0.055 = -0.005
+        let err = econ.validate_gate(0.0015).unwrap_err();
+        assert_eq!(
+            err,
+            EconomicsRejection::BelowMinProfit {
+                net: econ.net_profit_usd,
+                min: 0.0015
+            }
+        );
+    }
+
+    #[test]
+    fn trade_economics_gate_rejects_nonfinite_net() {
+        // custo NaN → net = −∞ (net_profit_usd trata).
+        let costs = TradeCosts {
+            gas_usd: f64::NAN,
+            flashloan_fee_usd: 0.0,
+            adverse_move_usd: 0.0,
+        };
+        let econ = TradeEconomics::from_costs(100.0, 1.0, &costs);
+        assert_eq!(econ.net_profit_usd, f64::NEG_INFINITY);
+        assert_eq!(
+            econ.validate_gate(0.0015).unwrap_err(),
+            EconomicsRejection::NonFiniteNet
+        );
     }
 }

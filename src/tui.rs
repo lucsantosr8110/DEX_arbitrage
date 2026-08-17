@@ -61,6 +61,18 @@ pub struct TuiState {
     /// thread do bot_task — se ela bloqueava em process_prices().await,
     /// o uptime congelava junto.
     pub start: Instant,
+    /// Fase atual de inicialização exibida no splash screen.
+    pub startup_phase: String,
+    /// Startup finalizado — a partir daqui mostra dashboard completo.
+    pub startup_done: bool,
+    /// Erro fatal durante startup (ex.: RPC indisponível).
+    pub startup_error: Option<String>,
+    /// `economically_positive == canonical_net_positive` do último round —
+    /// já era calculado em `main.rs` (decide se a evidência vai pro shadow
+    /// round) mas nunca chegava ao snapshot/API; o gate "Economics
+    /// consistent" no console ficava sempre "sem evidência" mesmo com o
+    /// dado real disponível. `None` só antes do primeiro round completar.
+    pub economics_consistent: Option<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -77,15 +89,98 @@ pub struct PriceRow {
 /// Linha do painel Top Spreads (sem TVL — TVL só no log `[TOPSPREAD]`).
 #[derive(Clone, Debug)]
 pub struct TopSpreadRow {
+    /// Number of executable legs represented by this row (2L or 3L).
+    pub hop_count: usize,
     pub pair: String,
     pub tui_spread_pct: f64,
+    pub buy_dex: String,
+    pub sell_dex: String,
+    /// Optional complete venue chain for canonical routes (for example U→Q→S).
+    pub legs_label: Option<String>,
     /// None = sem reverse cotado (cycle_rate indisponível).
     pub cycle_rate: Option<f64>,
-    /// None = sem 2-hop.
+    /// None = route economics unavailable.
     pub net_usd: Option<f64>,
+    /// Quanto falta para o net projetado virar positivo (0 se já lucrativo).
+    pub distance_to_profit: f64,
     pub executable: bool,
     pub has_curve_leg: bool,
     pub outlier: Option<String>,
+    /// Economic waterfall (USD, mesma conversão de `net_usd`):
+    /// `gross_pnl_usd` já vem pós-fee do AMM (a cotação real de
+    /// `first_touch_quotes`/reuse local já embute o fee do pool — nunca
+    /// subtraído de novo aqui). `gas_cost_usd`/`flashloan_cost_usd` são
+    /// estimativas proporcionais (`config.gas_cost_ppb`/`flashloan_cost_ppb`),
+    /// não gas real nem premium Aave on-chain. `net_usd` acima já é
+    /// `gross - gas - flashloan` (única dedução, sem double-count).
+    /// `wrapper_cost_usd`/direct-vs-flashloan-vs-wrapper split não são
+    /// computados por `StatefulRouteEvaluator` — permanecem `None`
+    /// (COMPONENT_UNAVAILABLE), nunca fabricados como 0.
+    pub gross_pnl_usd: Option<f64>,
+    pub gas_cost_usd: Option<f64>,
+    pub flashloan_cost_usd: Option<f64>,
+}
+
+/// Causa dominante de uma rota não-positiva. Determinística: dado o mesmo
+/// `(gross_pnl_usd, gas_cost_usd, flashloan_cost_usd, net_usd)`, sempre
+/// devolve a mesma classe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NegativeCause {
+    /// net_usd > 0 — não há causa negativa a classificar.
+    Positive,
+    /// gross_pnl_usd <= 0: nem antes de custos a rota fecha.
+    NoGrossSpread,
+    /// gross > 0 mas net <= 0, e gas_cost_usd é o maior componente de custo.
+    GasDominates,
+    /// gross > 0 mas net <= 0, e flashloan_cost_usd é o maior componente.
+    FlashloanFeeDominates,
+    /// gross > 0, net <= 0, mas gas/flashloan indisponíveis ou não
+    /// suficientes para explicar sozinhos — não inventa uma causa.
+    Other,
+}
+
+impl NegativeCause {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NegativeCause::Positive => "POSITIVE",
+            NegativeCause::NoGrossSpread => "NO_GROSS_SPREAD",
+            NegativeCause::GasDominates => "GAS_DOMINATES",
+            NegativeCause::FlashloanFeeDominates => "FLASHLOAN_FEE_DOMINATES",
+            NegativeCause::Other => "NET_NON_POSITIVE_OTHER",
+        }
+    }
+}
+
+/// Classifica a causa dominante de uma rota não-positiva. Pura, sem RPC,
+/// sem estado — mesma entrada sempre produz a mesma saída.
+pub fn classify_negative_cause(
+    gross_pnl_usd: Option<f64>,
+    gas_cost_usd: Option<f64>,
+    flashloan_cost_usd: Option<f64>,
+    net_usd: Option<f64>,
+) -> NegativeCause {
+    let Some(net) = net_usd else {
+        return NegativeCause::Other;
+    };
+    if net > 0.0 {
+        return NegativeCause::Positive;
+    }
+    let Some(gross) = gross_pnl_usd else {
+        return NegativeCause::Other;
+    };
+    if gross <= 0.0 {
+        return NegativeCause::NoGrossSpread;
+    }
+    match (gas_cost_usd, flashloan_cost_usd) {
+        (Some(gas), Some(flashloan)) if gas > 0.0 || flashloan > 0.0 => {
+            if gas >= flashloan {
+                NegativeCause::GasDominates
+            } else {
+                NegativeCause::FlashloanFeeDominates
+            }
+        }
+        _ => NegativeCause::Other,
+    }
 }
 
 impl Default for TuiState {
@@ -105,7 +200,25 @@ impl Default for TuiState {
             last_update: None,
             render_tick: 0,
             start: Instant::now(),
+            startup_phase: "Inicializando...".into(),
+            startup_done: false,
+            startup_error: None,
+            economics_consistent: None,
         }
+    }
+}
+
+impl TuiState {
+    pub fn set_startup_phase(&mut self, phase: &str) {
+        self.startup_phase = phase.into();
+    }
+
+    pub fn mark_startup_done(&mut self) {
+        self.startup_done = true;
+    }
+
+    pub fn mark_startup_error(&mut self, err: String) {
+        self.startup_error = Some(err);
     }
 }
 
@@ -136,25 +249,21 @@ impl TuiApp {
         let reader_shutdown = Arc::new(AtomicBool::new(false));
         let sd = reader_shutdown.clone();
 
-        let handle = thread::spawn(move || {
-            loop {
-                if sd.load(Ordering::Relaxed) {
-                    break;
-                }
-                match crossterm::event::poll(Duration::from_millis(100)) {
-                    Ok(true) => {
-                        match crossterm::event::read() {
-                            Ok(ev) => {
-                                if event_tx.send(ev).is_err() {
-                                    break;
-                                }
-                            }
-                            Err(_) => break,
+        let handle = thread::spawn(move || loop {
+            if sd.load(Ordering::Relaxed) {
+                break;
+            }
+            match crossterm::event::poll(Duration::from_millis(100)) {
+                Ok(true) => match crossterm::event::read() {
+                    Ok(ev) => {
+                        if event_tx.send(ev).is_err() {
+                            break;
                         }
                     }
-                    Ok(false) => {}
                     Err(_) => break,
-                }
+                },
+                Ok(false) => {}
+                Err(_) => break,
             }
         });
 
@@ -212,7 +321,8 @@ impl TuiApp {
             // Shutdown check via broadcast (sinal do Ctrl+C no main).
             match shutdown_rx.try_recv() {
                 Ok(_) | Err(broadcast::error::TryRecvError::Closed) => return Ok(()),
-                Err(broadcast::error::TryRecvError::Lagged(_)) | Err(broadcast::error::TryRecvError::Empty) => {}
+                Err(broadcast::error::TryRecvError::Lagged(_))
+                | Err(broadcast::error::TryRecvError::Empty) => {}
             }
 
             // Heartbeat + uptime: computado na thread da TUI, independente
@@ -224,8 +334,15 @@ impl TuiApp {
                 s.uptime = s.start.elapsed();
             }
 
-            // Draw: ignoramos erro de resize (terminal muito pequeno).
-            let _ = terminal.draw(|f| self.draw(f));
+            // Draw: splash durante startup, dashboard depois.
+            let startup_done = self.state.read().map(|s| s.startup_done).unwrap_or(false);
+            let _ = terminal.draw(|f| {
+                if startup_done {
+                    self.draw(f);
+                } else {
+                    self.draw_splash(f);
+                }
+            });
 
             // Leitura NÃO-BLOQUEANTE de eventos via canal mpsc.
             // A thread dedicada (spawnada em TuiApp::new) lê do crossterm
@@ -240,7 +357,9 @@ impl TuiApp {
                                 let _ = self.shutdown_tx.send(());
                                 return Ok(());
                             }
-                            KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                            KeyCode::Char('c')
+                                if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
+                            {
                                 crate::emergency_shutdown::request_emergency_shutdown();
                                 let _ = self.shutdown_tx.send(());
                                 return Ok(());
@@ -276,10 +395,10 @@ impl TuiApp {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(5),   // Header (border + 3 lines de conteúdo)
-                Constraint::Length(6),   // Status (border + 4 lines de conteúdo)
-                Constraint::Min(10),     // Center: Prices | TopSpreads (split horizontal)
-                Constraint::Length(4),   // Footer (border + 2 lines de conteúdo)
+                Constraint::Length(5), // Header (border + 3 lines de conteúdo)
+                Constraint::Length(6), // Status (border + 4 lines de conteúdo)
+                Constraint::Min(10),   // Center: Prices | TopSpreads (split horizontal)
+                Constraint::Length(4), // Footer (border + 2 lines de conteúdo)
             ])
             .split(f.area());
 
@@ -299,9 +418,12 @@ impl TuiApp {
 
     fn draw_header(&self, f: &mut Frame, area: Rect) {
         let header = Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled("  DEX ARBITRAGE BOT v1.0", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            ]),
+            Line::from(vec![Span::styled(
+                "  DEX ARBITRAGE BOT v1.0",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )]),
             Line::from(vec![
                 Span::styled("  Polygon", Style::default().fg(Color::Yellow)),
                 Span::raw(" | "),
@@ -309,26 +431,42 @@ impl TuiApp {
             ]),
             Line::from(vec![
                 Span::raw("  Press "),
-                Span::styled("q", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "q",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
                 Span::raw(" to quit"),
             ]),
         ])
-        .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan)));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        );
         f.render_widget(header, area);
     }
 
     fn draw_status(&self, f: &mut Frame, area: Rect) {
         let state = self.blocking_read();
 
-        let uptime_str = format!("{:02}:{:02}:{:02}",
+        let uptime_str = format!(
+            "{:02}:{:02}:{:02}",
             state.uptime.as_secs() / 3600,
             (state.uptime.as_secs() % 3600) / 60,
             state.uptime.as_secs() % 60
         );
 
         // Heartbeat: pisca a cada render tick (4 ticks/s). Parado = TUI travou.
-        let beat = if state.render_tick % 2 == 0 { "●" } else { "○" };
-        let beat_color = if state.render_tick % 2 == 0 { Color::Green } else { Color::DarkGray };
+        let beat = if state.render_tick % 2 == 0 {
+            "●"
+        } else {
+            "○"
+        };
+        let beat_color = if state.render_tick % 2 == 0 {
+            Color::Green
+        } else {
+            Color::DarkGray
+        };
 
         // Idade do último scan: quanto faz que o radar entregou preços. Se crescer
         // além de ~normal (segundos), radar stallou (WS morto / RPC rate-limit).
@@ -353,9 +491,17 @@ impl TuiApp {
         let status_items = vec![
             ListItem::new(Line::from(vec![
                 Span::styled("  ", Style::default()),
-                Span::styled(beat, Style::default().fg(beat_color).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    beat,
+                    Style::default().fg(beat_color).add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(" Status: ", Style::default().fg(Color::Gray)),
-                Span::styled("RUNNING", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "RUNNING",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw(" | "),
                 Span::raw(format!("Uptime: {}", uptime_str)),
                 Span::raw(" | "),
@@ -364,7 +510,10 @@ impl TuiApp {
             ])),
             ListItem::new(Line::from(vec![
                 Span::styled("  DEXes: ", Style::default().fg(Color::Gray)),
-                Span::styled(format!("{}", state.dex_count), Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    format!("{}", state.dex_count),
+                    Style::default().fg(Color::Cyan),
+                ),
                 Span::raw(" | "),
                 Span::raw(format!("Pares: {}", state.pairs_count)),
                 Span::raw(" | "),
@@ -372,18 +521,48 @@ impl TuiApp {
             ])),
             ListItem::new(Line::from(vec![
                 Span::styled("  Econ: ", Style::default().fg(Color::Gray)),
-                Span::styled(format!("gross={}", state.gross_positive), Style::default().fg(if state.gross_positive > 0 { Color::Green } else { Color::Red })),
+                Span::styled(
+                    format!("gross={}", state.gross_positive),
+                    Style::default().fg(if state.gross_positive > 0 {
+                        Color::Green
+                    } else {
+                        Color::Red
+                    }),
+                ),
                 Span::raw(" | "),
-                Span::styled(format!("net+={}", state.net_positive), Style::default().fg(if state.net_positive > 0 { Color::Green } else { Color::Yellow })),
+                Span::styled(
+                    format!("net+={}", state.net_positive),
+                    Style::default().fg(if state.net_positive > 0 {
+                        Color::Green
+                    } else {
+                        Color::Yellow
+                    }),
+                ),
                 Span::raw(" | "),
-                Span::styled(format!("net=${:.2}", state.net_usd_total), Style::default().fg(if state.net_usd_total > 0.0 { Color::Green } else if state.net_usd_total < 0.0 { Color::Red } else { Color::Gray })),
+                Span::styled(
+                    format!("net=${:.2}", state.net_usd_total),
+                    Style::default().fg(if state.net_usd_total > 0.0 {
+                        Color::Green
+                    } else if state.net_usd_total < 0.0 {
+                        Color::Red
+                    } else {
+                        Color::Gray
+                    }),
+                ),
                 Span::raw(" | "),
-                Span::styled(format!("neg={}", state.negative_cycles), Style::default().fg(Color::Gray)),
+                Span::styled(
+                    format!("neg={}", state.negative_cycles),
+                    Style::default().fg(Color::Gray),
+                ),
             ])),
         ];
 
-        let status_list = List::new(status_items)
-            .block(Block::default().borders(Borders::ALL).title(" Status ").border_style(Style::default().fg(Color::Yellow)));
+        let status_list = List::new(status_items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Status ")
+                .border_style(Style::default().fg(Color::Yellow)),
+        );
         f.render_widget(status_list, area);
     }
 
@@ -391,7 +570,11 @@ impl TuiApp {
         let state = self.blocking_read();
 
         let header = Row::new(vec![
-            Cell::from("Pair").style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Cell::from("Pair").style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Cell::from("QuickSwap").style(Style::default().fg(Color::Green)),
             Cell::from("SushiSwap").style(Style::default().fg(Color::Magenta)),
             Cell::from("Curve").style(Style::default().fg(Color::Yellow)),
@@ -410,7 +593,10 @@ impl TuiApp {
 
             let spread = if venue_prices.len() >= 2 {
                 let min = venue_prices.iter().cloned().fold(f64::INFINITY, f64::min);
-                let max = venue_prices.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let max = venue_prices
+                    .iter()
+                    .cloned()
+                    .fold(f64::NEG_INFINITY, f64::max);
                 (max - min) / min * 100.0
             } else {
                 0.0
@@ -429,32 +615,44 @@ impl TuiApp {
                 Cell::from(format_opt(p.sushiswap)),
                 Cell::from(format_opt(p.curve)),
                 Cell::from(format_opt(p.uniswap_v3)),
-                Cell::from(format!("{:.2}%", spread)).style(  // Reduzir para 2 casas decimais
-                    if spread > 0.5 { Style::default().fg(Color::Red) }
-                    else if spread > 0.1 { Style::default().fg(Color::Yellow) }
-                    else { Style::default().fg(Color::Gray) }
+                Cell::from(format!("{:.2}%", spread)).style(
+                    // Reduzir para 2 casas decimais
+                    if spread > 0.5 {
+                        Style::default().fg(Color::Red)
+                    } else if spread > 0.1 {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default().fg(Color::Gray)
+                    },
                 ),
                 Cell::from(fmt_opt_net(p.net_usd)).style(
-                    if matches!(p.net_usd, Some(n) if n > 0.0) { Style::default().fg(Color::Green) }
-                    else if matches!(p.net_usd, Some(n) if n < 0.0) { Style::default().fg(Color::Red) }
-                    else { Style::default().fg(Color::Gray) }
+                    if matches!(p.net_usd, Some(n) if n > 0.0) {
+                        Style::default().fg(Color::Green)
+                    } else if matches!(p.net_usd, Some(n) if n < 0.0) {
+                        Style::default().fg(Color::Red)
+                    } else {
+                        Style::default().fg(Color::Gray)
+                    },
                 ),
             ]));
         }
 
         let widths = [
-            Constraint::Length(14),     // Pair
-            Constraint::Length(13),     // QuickSwap
-            Constraint::Length(13),     // SushiSwap
-            Constraint::Length(13),     // Curve
-            Constraint::Length(13),     // UniV3
-            Constraint::Length(10),     // Spread%
-            Constraint::Length(9),      // Net$
+            Constraint::Length(14), // Pair
+            Constraint::Length(13), // QuickSwap
+            Constraint::Length(13), // SushiSwap
+            Constraint::Length(13), // Curve
+            Constraint::Length(13), // UniV3
+            Constraint::Length(10), // Spread%
+            Constraint::Length(9),  // Net$
         ];
 
-        let table = Table::new(rows, widths)
-            .header(header)
-            .block(Block::default().borders(Borders::ALL).title(" Preços Cross-DEX ").border_style(Style::default().fg(Color::Green)));
+        let table = Table::new(rows, widths).header(header).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Preços Cross-DEX ")
+                .border_style(Style::default().fg(Color::Green)),
+        );
 
         f.render_widget(table, area);
     }
@@ -463,23 +661,42 @@ impl TuiApp {
         let state = self.blocking_read();
 
         let header = Row::new(vec![
-            Cell::from("Pair").style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Cell::from("Spread%").style(Style::default().fg(Color::Red)),
-            Cell::from("cyc").style(Style::default().fg(Color::Yellow)),
+            Cell::from("Tipo").style(Style::default().fg(Color::Magenta)),
+            Cell::from("Pair").style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Cell::from("Legs").style(Style::default().fg(Color::Yellow)),
+            Cell::from("Gross%").style(Style::default().fg(Color::Red)),
             Cell::from("Net$").style(Style::default().fg(Color::Green)),
-            Cell::from("exec").style(Style::default().fg(Color::Gray)),
+            Cell::from("Dist$").style(Style::default().fg(Color::Gray)),
+            Cell::from("E").style(Style::default().fg(Color::Gray)),
         ]);
 
+        // Ordena por proximidade do lucro: positivos no topo, depois menor distância.
+        let mut sorted: Vec<&TopSpreadRow> = state.top_spreads.iter().collect();
+        sorted.sort_by(|a, b| {
+            a.distance_to_profit
+                .partial_cmp(&b.distance_to_profit)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    let na = a.net_usd.unwrap_or(f64::NEG_INFINITY);
+                    let nb = b.net_usd.unwrap_or(f64::NEG_INFINITY);
+                    nb.partial_cmp(&na).unwrap_or(std::cmp::Ordering::Equal)
+                })
+        });
+
         let mut rows: Vec<Row> = Vec::new();
-        for t in &state.top_spreads {
+        for t in sorted {
             let pair_display = if t.pair.chars().count() > 10 {
                 format!("{}..", t.pair.chars().take(10).collect::<String>())
             } else {
                 t.pair.clone()
             };
-            let cyc = match t.cycle_rate {
-                Some(c) if c.is_finite() => format!("{:.4}", c),
-                _ => "N/A".to_string(),
+            let gross = match t.cycle_rate {
+                Some(c) if c.is_finite() => (c - 1.0) * 100.0,
+                _ => 0.0,
             };
             let exec = if t.has_curve_leg {
                 "C".to_string() // perna Curve (vitrine)
@@ -488,26 +705,50 @@ impl TuiApp {
             } else {
                 "n".to_string()
             };
+            let net_color = if t.net_usd.map(|n| n > 0.0).unwrap_or(false) {
+                Color::Green
+            } else if t.net_usd.map(|n| n < 0.0).unwrap_or(false) {
+                Color::Red
+            } else {
+                Color::Gray
+            };
+            let dist_color = if t.distance_to_profit <= 0.0 {
+                Color::Green
+            } else if t.distance_to_profit < 0.5 {
+                Color::Yellow
+            } else {
+                Color::Red
+            };
             rows.push(Row::new(vec![
+                Cell::from(format!("{}L", t.hop_count)),
                 Cell::from(pair_display),
-                Cell::from(format!("{:.2}%", t.tui_spread_pct)),
-                Cell::from(cyc),
-                Cell::from(fmt_opt_net(t.net_usd)),
+                Cell::from(t.legs_label.clone().unwrap_or_else(|| {
+                    format!("{}→{}", abbrev_venue(&t.buy_dex), abbrev_venue(&t.sell_dex))
+                })),
+                Cell::from(format!("{:.2}%", gross)),
+                Cell::from(fmt_opt_net(t.net_usd)).style(Style::default().fg(net_color)),
+                Cell::from(format!("{:.3}", t.distance_to_profit))
+                    .style(Style::default().fg(dist_color)),
                 Cell::from(exec),
             ]));
         }
 
         let widths = [
-            Constraint::Length(13), // Pair
-            Constraint::Length(9),  // Spread%
-            Constraint::Length(9),  // cyc
-            Constraint::Length(9),  // Net$
-            Constraint::Length(6),  // exec
+            Constraint::Length(5),  // Tipo
+            Constraint::Length(12), // Pair
+            Constraint::Length(9),  // Legs
+            Constraint::Length(7),  // Gross%
+            Constraint::Length(7),  // Net$
+            Constraint::Length(7),  // Dist$
+            Constraint::Length(3),  // E
         ];
 
-        let table = Table::new(rows, widths)
-            .header(header)
-            .block(Block::default().borders(Borders::ALL).title(" Top Spreads ").border_style(Style::default().fg(Color::Magenta)));
+        let table = Table::new(rows, widths).header(header).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Top Combos (dist p/ lucro) ")
+                .border_style(Style::default().fg(Color::Magenta)),
+        );
 
         f.render_widget(table, area);
     }
@@ -525,16 +766,103 @@ impl TuiApp {
                 Span::styled("UniV3 0.01-1%", Style::default().fg(Color::Blue)),
             ]),
         ])
-        .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Gray)));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Gray)),
+        );
         f.render_widget(footer, area);
+    }
+
+    /// Splash screen exibida durante a inicialização, antes do dashboard.
+    /// Mostra a fase atual, uptime e instruções — dá feedback imediato ao
+    /// operador quando RPC/DexManager/Bot ainda estão subindo.
+    fn draw_splash(&self, f: &mut Frame) {
+        let state = self.blocking_read();
+
+        let area = f.area();
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(20),
+                Constraint::Percentage(60),
+                Constraint::Percentage(20),
+            ])
+            .split(area);
+
+        let uptime_str = format!(
+            "{:02}:{:02}:{:02}",
+            state.uptime.as_secs() / 3600,
+            (state.uptime.as_secs() % 3600) / 60,
+            state.uptime.as_secs() % 60
+        );
+
+        let phase_color = if state.startup_error.is_some() {
+            Color::Red
+        } else {
+            Color::Yellow
+        };
+
+        let status_text = match &state.startup_error {
+            Some(err) => format!("Erro: {}", err),
+            None => state.startup_phase.clone(),
+        };
+
+        let body = Paragraph::new(vec![
+            Line::from(vec![Span::styled(
+                "  ⚡ DEX Arbitrage Bot",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  Status: ", Style::default().fg(Color::Gray)),
+                Span::styled(
+                    "INICIALIZANDO",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("  Fase:   ", Style::default().fg(Color::Gray)),
+                Span::styled(status_text, Style::default().fg(phase_color)),
+            ]),
+            Line::from(vec![
+                Span::styled("  Uptime: ", Style::default().fg(Color::Gray)),
+                Span::raw(uptime_str),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::raw("  Pressione "),
+                Span::styled(
+                    "q",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" ou "),
+                Span::styled(
+                    "Esc",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" para sair"),
+            ]),
+        ])
+        .alignment(ratatui::layout::Alignment::Center)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Inicializando ")
+                .border_style(Style::default().fg(Color::Cyan)),
+        );
+
+        f.render_widget(body, chunks[1]);
     }
 
     fn blocking_read(&self) -> TuiState {
         match self.state.read() {
             Ok(guard) => guard.clone(),
-            Err(poisoned) => {
-                poisoned.into_inner().clone()
-            }
+            Err(poisoned) => poisoned.into_inner().clone(),
         }
     }
 }
@@ -552,6 +880,22 @@ fn fmt_opt_net(v: Option<f64>) -> String {
     match v {
         Some(n) if n.is_finite() => format!("${:.2}", n),
         _ => "-".to_string(),
+    }
+}
+
+/// Abrevia nome de DEX para caber na coluna Legs.
+fn abbrev_venue(v: &str) -> String {
+    let s = v.to_ascii_lowercase();
+    if s.contains("quickswap") {
+        "Q".to_string()
+    } else if s.contains("sushiswap") {
+        "S".to_string()
+    } else if s.contains("uniswap_v3") || s.contains("uniswap") {
+        "U".to_string()
+    } else if s.contains("curve") {
+        "C".to_string()
+    } else {
+        v.chars().take(3).collect::<String>()
     }
 }
 
@@ -588,7 +932,10 @@ pub fn norm_pair(pair: &str) -> String {
 /// nenhum comando respondia, precisava `reset`. O join espera a TUI sair do
 /// run_inner (que ela faz ao receber o broadcast de shutdown), momento em
 /// que o cleanup já rodou.
-pub fn spawn_tui(state: Arc<RwLock<TuiState>>, shutdown_tx: broadcast::Sender<()>) -> std::thread::JoinHandle<()> {
+pub fn spawn_tui(
+    state: Arc<RwLock<TuiState>>,
+    shutdown_tx: broadcast::Sender<()>,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut sd_rx = shutdown_tx.subscribe();
         let app = TuiApp::new(state, shutdown_tx);
@@ -612,6 +959,59 @@ mod tests {
         assert_eq!(norm_pair("USDC-USDT"), "USDC-USDT");
         // par sem '-' → retorna como está (não panic).
         assert_eq!(norm_pair("USDC"), "USDC");
+    }
+
+    // ---- classify_negative_cause ----
+
+    #[test]
+    fn negative_cause_classification_is_deterministic() {
+        // Same inputs called twice must produce identical output — no
+        // hidden state, no ordering dependency.
+        let inputs = (Some(0.5), Some(0.6), Some(0.1), Some(-0.2));
+        let a = classify_negative_cause(inputs.0, inputs.1, inputs.2, inputs.3);
+        let b = classify_negative_cause(inputs.0, inputs.1, inputs.2, inputs.3);
+        assert_eq!(a, b);
+        assert_eq!(a, NegativeCause::GasDominates);
+    }
+
+    #[test]
+    fn negative_cause_positive_when_net_positive() {
+        let cause = classify_negative_cause(Some(1.0), Some(0.3), Some(0.1), Some(0.6));
+        assert_eq!(cause, NegativeCause::Positive);
+        assert_eq!(cause.as_str(), "POSITIVE");
+    }
+
+    #[test]
+    fn negative_cause_no_gross_spread_when_gross_non_positive() {
+        let cause = classify_negative_cause(Some(-0.1), Some(0.0), Some(0.0), Some(-0.1));
+        assert_eq!(cause, NegativeCause::NoGrossSpread);
+    }
+
+    #[test]
+    fn negative_cause_gas_dominates_when_gas_exceeds_flashloan() {
+        let cause = classify_negative_cause(Some(1.0), Some(0.8), Some(0.3), Some(-0.1));
+        assert_eq!(cause, NegativeCause::GasDominates);
+    }
+
+    #[test]
+    fn negative_cause_flashloan_dominates_when_flashloan_exceeds_gas() {
+        let cause = classify_negative_cause(Some(1.0), Some(0.2), Some(0.9), Some(-0.1));
+        assert_eq!(cause, NegativeCause::FlashloanFeeDominates);
+    }
+
+    #[test]
+    fn negative_cause_other_when_components_unavailable() {
+        // gross positive, net negative, but no gas/flashloan breakdown to
+        // point at — must not fabricate a specific cause.
+        let cause = classify_negative_cause(Some(1.0), None, None, Some(-0.1));
+        assert_eq!(cause, NegativeCause::Other);
+        assert_eq!(cause.as_str(), "NET_NON_POSITIVE_OTHER");
+    }
+
+    #[test]
+    fn negative_cause_other_when_net_unavailable() {
+        let cause = classify_negative_cause(Some(1.0), Some(0.5), Some(0.5), None);
+        assert_eq!(cause, NegativeCause::Other);
     }
 
     #[test]

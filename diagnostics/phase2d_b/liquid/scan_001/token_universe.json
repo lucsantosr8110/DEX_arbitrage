@@ -1,0 +1,102 @@
+[
+  {
+    "address": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359",
+    "category": "STABLE",
+    "decimals": 6,
+    "enabled": true,
+    "profile": "liquid",
+    "symbol": "USDC",
+    "validation_reason": "configured Polygon address and decimals",
+    "validation_status": "VALID"
+  },
+  {
+    "address": "0xc2132d05d31c914a87c6611c10748aeb04b58e8f",
+    "category": "STABLE",
+    "decimals": 6,
+    "enabled": true,
+    "profile": "liquid",
+    "symbol": "USDT",
+    "validation_reason": "configured Polygon address and decimals",
+    "validation_status": "VALID"
+  },
+  {
+    "address": "0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270",
+    "category": "WRAPPED_NATIVE",
+    "decimals": 18,
+    "enabled": true,
+    "profile": "liquid",
+    "symbol": "WMATIC",
+    "validation_reason": "configured Polygon address and decimals",
+    "validation_status": "VALID"
+  },
+  {
+    "address": "0x7ceb23fd6bc0add59e62ac25578270cff1b9f619",
+    "category": "WRAPPED_NATIVE",
+    "decimals": 18,
+    "enabled": true,
+    "profile": "liquid",
+    "symbol": "WETH",
+    "validation_reason": "configured Polygon address and decimals",
+    "validation_status": "VALID"
+  },
+  {
+    "address": "0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6",
+    "category": "MAJOR",
+    "decimals": 8,
+    "enabled": true,
+    "profile": "liquid",
+    "symbol": "WBTC",
+    "validation_reason": "configured Polygon address and decimals",
+    "validation_status": "VALID"
+  },
+  {
+    "address": "0x8f3cf7ad23cd3cadbd9735aff958023239c6a063",
+    "category": "STABLE",
+    "decimals": 18,
+    "enabled": true,
+    "profile": "liquid",
+    "symbol": "DAI",
+    "validation_reason": "configured Polygon address and decimals",
+    "validation_status": "VALID"
+  },
+  {
+    "address": "0x53e0bca35ec356bd5dddfebbd1fc0fd03fabad39",
+    "category": "MAJOR",
+    "decimals": 18,
+    "enabled": true,
+    "profile": "liquid",
+    "symbol": "LINK",
+    "validation_reason": "configured Polygon address and decimals",
+    "validation_status": "VALID"
+  },
+  {
+    "address": "0xb33eaad8d922b1083446dc23f610c2567fb5180f",
+    "category": "MAJOR",
+    "decimals": 18,
+    "enabled": true,
+    "profile": "liquid",
+    "symbol": "UNI",
+    "validation_reason": "configured Polygon address and decimals",
+    "validation_status": "VALID"
+  },
+  {
+    "address": "0xc3c7d422809852031b44ab29eec9f1eff2a58756",
+    "category": "LST_OR_WRAPPED",
+    "decimals": 18,
+    "enabled": true,
+    "profile": "liquid",
+    "symbol": "LDO",
+    "validation_reason": "configured Polygon address and decimals",
+    "validation_status": "VALID"
+  },
+  {
+    "address": "0xd6df932a45c0f2553776ed742056204d536d3d8e",
+    "category": "MAJOR",
+    "decimals": 18,
+    "enabled": true,
+    "profile": "liquid",
+    "symbol": "AAVE",
+    "validation_reason": "configured Polygon address and decimals",
+    "validation_status": "VALID"
+  }
+]

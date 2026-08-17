@@ -12,14 +12,15 @@
 use anyhow::{anyhow, Result};
 use once_cell::sync::Lazy;
 use reqwest::Client;
-// ❌ REMOVIDO: Deserialize (não usado)
 use std::{
     collections::HashMap,
     sync::RwLock,
     time::{Duration, Instant},
 };
 use tokio::sync::Mutex;
-use tracing::debug;
+use tracing::{debug, warn};
+
+use crate::core::pipeline_obs::{pipeline_counters, QuoteRejectReason};
 
 // ============================================================
 // 📊 Estrutura principal
@@ -34,6 +35,12 @@ struct CachedEntry {
     is_fallback: bool,
     /// TTL individual evita que todos os símbolos/instâncias expirem juntos.
     ttl: Duration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PriceFeedSource {
+    Primary,
+    Fallback,
 }
 
 #[derive(Clone)]
@@ -88,6 +95,10 @@ impl CachedPriceFeed {
 
         // 1️⃣ Verifica cache (TTL depende se é fallback — A14)
         if let Some(price) = self.read_fresh_cache(&key) {
+            pipeline_counters().inc(&pipeline_counters().price_feed_attempted);
+            pipeline_counters().inc(&pipeline_counters().price_feed_succeeded);
+            pipeline_counters().inc(&pipeline_counters().price_feed_cache_hit);
+            debug!(target: "price_feed", symbol, price_usd = price, "💾 Cache HIT");
             return Ok(price);
         }
 
@@ -98,12 +109,47 @@ impl CachedPriceFeed {
         // Double-checked: outro waiter pode ter preenchido o cache enquanto
         // esperávamos o lock.
         if let Some(price) = self.read_fresh_cache(&key) {
+            pipeline_counters().inc(&pipeline_counters().price_feed_attempted);
+            pipeline_counters().inc(&pipeline_counters().price_feed_succeeded);
+            pipeline_counters().inc(&pipeline_counters().price_feed_cache_hit);
+            debug!(target: "price_feed", symbol, price_usd = price, "💾 Cache HIT (double-checked)");
             return Ok(price);
         }
 
         // 3️⃣ Atualiza via Coingecko
+        pipeline_counters().inc(&pipeline_counters().price_feed_attempted);
+        pipeline_counters().inc(&pipeline_counters().price_feed_cache_miss);
+
         match self.fetch_from_coingecko(symbol).await {
             Ok(price) => {
+                // Validate price before caching
+                if !price.is_finite() || price <= 0.0 {
+                    pipeline_counters().inc(&pipeline_counters().price_feed_zero_or_invalid);
+                    warn!(
+                        target: "price_feed",
+                        symbol,
+                        price,
+                        "Price feed returned invalid price (NaN/Inf/<=0), using fallback"
+                    );
+                    // Fall through to fallback
+                    let fallback_price = Self::fallback_price(symbol);
+                    {
+                        let mut cache = CACHE.write().unwrap();
+                        cache.insert(
+                            key.clone(),
+                            CachedEntry {
+                                price_usd: fallback_price,
+                                timestamp: Instant::now(),
+                                is_fallback: true,
+                                ttl: Self::ttl_with_jitter(self.fallback_ttl, &key),
+                            },
+                        );
+                    }
+                    pipeline_counters().inc(&pipeline_counters().price_feed_fallback_used);
+                    debug!(target: "price_feed", symbol, fallback = fallback_price, "preço via fallback heurístico (cacheado TTL curto) — invalid coingecko price");
+                    return Ok(fallback_price);
+                }
+
                 {
                     let mut cache = CACHE.write().unwrap();
                     cache.insert(
@@ -116,6 +162,7 @@ impl CachedPriceFeed {
                         },
                     );
                 }
+                pipeline_counters().inc(&pipeline_counters().price_feed_succeeded);
                 debug!(target: "price_feed", symbol, price_usd = price, "🌐 Cache MISS — atualizando");
                 Ok(price)
             }
@@ -126,23 +173,80 @@ impl CachedPriceFeed {
                 // (o preço que vale para lucro é sempre o que o DEX devolve), então
                 // cacheamos o fallback — mas com TTL curto (A14), p/ recuperação
                 // rápida do Coingecko não prender o bot em preço stale por 2min.
-                let price = Self::fallback_price(symbol);
+
+                // Classify the error
+                let error_str = e.to_string();
+                let (_reject_reason, fallback_price) =
+                    if error_str.contains("429") || error_str.contains("rate limit") {
+                        pipeline_counters().inc(&pipeline_counters().price_feed_failed);
+                        (
+                            QuoteRejectReason::PriceFeedRateLimited,
+                            Self::fallback_price(symbol),
+                        )
+                    } else if error_str.contains("timeout") || error_str.contains("timed out") {
+                        pipeline_counters().inc(&pipeline_counters().price_feed_failed);
+                        (
+                            QuoteRejectReason::PriceFeedTimeout,
+                            Self::fallback_price(symbol),
+                        )
+                    } else if error_str.contains("not found") || error_str.contains("404") {
+                        pipeline_counters().inc(&pipeline_counters().price_feed_failed);
+                        (
+                            QuoteRejectReason::PriceFeedUnknownSymbol,
+                            Self::fallback_price(symbol),
+                        )
+                    } else if error_str.contains("json") || error_str.contains("parse") {
+                        pipeline_counters().inc(&pipeline_counters().price_feed_failed);
+                        (
+                            QuoteRejectReason::PriceFeedParseError,
+                            Self::fallback_price(symbol),
+                        )
+                    } else {
+                        pipeline_counters().inc(&pipeline_counters().price_feed_failed);
+                        (
+                            QuoteRejectReason::PriceFeedUnavailable,
+                            Self::fallback_price(symbol),
+                        )
+                    };
+
                 {
                     let mut cache = CACHE.write().unwrap();
                     cache.insert(
                         key.clone(),
                         CachedEntry {
-                            price_usd: price,
+                            price_usd: fallback_price,
                             timestamp: Instant::now(),
                             is_fallback: true,
                             ttl: Self::ttl_with_jitter(self.fallback_ttl, &key),
                         },
                     );
                 }
-                debug!(target: "price_feed", symbol, error = %e, fallback = price, "preço via fallback heurístico (cacheado TTL curto)");
-                Ok(price)
+                pipeline_counters().inc(&pipeline_counters().price_feed_fallback_used);
+                debug!(target: "price_feed", symbol, error = %e, fallback = fallback_price, "preço via fallback heurístico (cacheado TTL curto)");
+                Ok(fallback_price)
             }
         }
+    }
+
+    /// Returns the cached source after a normal lookup. The lookup semantics are
+    /// unchanged; this only exposes whether the result came from Coingecko or
+    /// the existing fallback path for read-only diagnostics.
+    pub async fn get_price_with_source(&self, symbol: &str) -> Result<(f64, PriceFeedSource)> {
+        let price = self.get_price(symbol).await?;
+        let key = symbol.to_lowercase();
+        let source = CACHE
+            .read()
+            .ok()
+            .and_then(|cache| cache.get(&key).map(|entry| entry.is_fallback))
+            .map(|fallback| {
+                if fallback {
+                    PriceFeedSource::Fallback
+                } else {
+                    PriceFeedSource::Primary
+                }
+            })
+            .ok_or_else(|| anyhow!("price source missing from cache for {}", symbol))?;
+        Ok((price, source))
     }
 
     /// Lê cache se a entrada ainda está fresca (TTL real vs fallback, A14).
@@ -157,6 +261,46 @@ impl CachedPriceFeed {
         }
     }
 
+    /// Preço **estrito**: só retorna `Ok` se houver entrada de cache NÃO-fallback
+    /// (Coingecko real) com idade ≤ `max_stale`. Caso contrário `Err` — fail-closed.
+    ///
+    /// Usado para precificar gás quando o operador opta por rejeitar opps com
+    /// preço de native token ausente/stale/fallback. `max_stale = Duration::ZERO`
+    /// exige apenas que exista entrada não-fallback (qualquer idade dentro do
+    /// TTL do cache, já garantido por `read_fresh_cache`).
+    pub async fn get_price_strict(&self, symbol: &str, max_stale: Duration) -> Result<f64> {
+        let key = symbol.to_lowercase();
+        let cache = CACHE.read().unwrap();
+        let entry = cache
+            .get(&key)
+            .ok_or_else(|| anyhow!("preço de {} ausente do cache (fail-closed)", symbol))?;
+        if entry.is_fallback {
+            return Err(anyhow!(
+                "preço de {} é fallback heurístico, não Coingecko real (fail-closed)",
+                symbol
+            ));
+        }
+        let age = entry.timestamp.elapsed();
+        if max_stale > Duration::ZERO && age > max_stale {
+            return Err(anyhow!(
+                "preço de {} stale: {:?} > max {:?} (fail-closed)",
+                symbol,
+                age,
+                max_stale
+            ));
+        }
+        // Validade numérica final (gate inteiro/literal, sem f64 na decisão de
+        // rejeição: NaN/<=0 são rejeitados por comparação direta).
+        if !entry.price_usd.is_finite() || entry.price_usd <= 0.0 {
+            return Err(anyhow!(
+                "preço de {} inválido ({} <= 0 ou NaN) — fail-closed",
+                symbol,
+                entry.price_usd
+            ));
+        }
+        Ok(entry.price_usd)
+    }
+
     /// Jitter de ±12.5%, derivado de chave + relógio de inserção. Evita burst
     /// de refresh quando muitos caches expiram na mesma janela (I5).
     fn ttl_with_jitter(base: Duration, key: &str) -> Duration {
@@ -166,7 +310,9 @@ impl CachedPriceFeed {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos() as u64)
             .unwrap_or(0);
-        let hash = key.bytes().fold(clock, |acc, byte| acc.wrapping_mul(31).wrapping_add(byte as u64));
+        let hash = key.bytes().fold(clock, |acc, byte| {
+            acc.wrapping_mul(31).wrapping_add(byte as u64)
+        });
         let offset = hash % (spread * 2 + 1);
         Duration::from_secs(base_secs + offset - spread)
     }

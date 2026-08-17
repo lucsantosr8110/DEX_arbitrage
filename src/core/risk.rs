@@ -6,17 +6,52 @@
 // ============================================================
 
 use crate::core::economics;
+use crate::core::executable_opportunity::ExecutableOpportunity;
 use crate::core::types::{
     ArbitrageOpportunity, FlashloanOpportunity, RiskAssessment, RiskConfig, RiskFactor,
 };
 use crate::infra::metrics;
 use crate::utils::validate_price;
+use ethers::types::U256;
 use once_cell::sync::OnceCell;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, info};
+
+/// Integer-only controls for the canonical shadow decision path.
+#[derive(Debug, Clone)]
+pub struct CanonicalRiskConfig {
+    pub absolute_min_profit_floor_raw: U256,
+    pub retention_bps: u32,
+    pub max_gas_raw: U256,
+    pub max_slippage_bps: u32,
+    pub max_anchor_age_blocks: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RiskApproval {
+    pub min_profit_raw: U256,
+    pub max_gas_raw: U256,
+    pub max_slippage_bps: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CanonicalRiskRejection {
+    StaleAnchor,
+    InvalidContextHash,
+    UnstableRoute,
+    NonPositiveNetPnl,
+    GasExceedsLimit,
+    SlippageExceedsLimit,
+    EthCallFailed,
+    PreflightFailed,
+    TraceFailed,
+    IncompleteQuotes,
+    RouteDiscontinuity,
+    RejectedRegistryHit,
+}
 
 // ============================================================
 // 🔒 RISK_MANAGER Global
@@ -25,7 +60,9 @@ use tracing::{debug, info};
 pub static RISK_MANAGER: OnceCell<Arc<Mutex<RiskManager>>> = OnceCell::new();
 
 pub fn init_global_risk_manager(cfg: RiskConfig) -> bool {
-    RISK_MANAGER.set(Arc::new(Mutex::new(RiskManager::new(cfg)))).is_ok()
+    RISK_MANAGER
+        .set(Arc::new(Mutex::new(RiskManager::new(cfg))))
+        .is_ok()
 }
 
 pub fn get_global_risk_manager() -> Option<&'static Arc<Mutex<RiskManager>>> {
@@ -237,7 +274,8 @@ impl RiskManager {
             risk_score += self.config.weight_high_execution_risk;
         }
 
-        let approved = adjusted_net_profit >= min_profit_usd && risk_score <= self.config.max_risk_score;
+        let approved =
+            adjusted_net_profit >= min_profit_usd && risk_score <= self.config.max_risk_score;
 
         if approved {
             info!(
@@ -252,7 +290,12 @@ impl RiskManager {
         }
 
         self.update_metrics(risk_score, approved, false);
-        RiskAssessment { approved, risk_factors, risk_score, adaptive_mode: false }
+        RiskAssessment {
+            approved,
+            risk_factors,
+            risk_score,
+            adaptive_mode: false,
+        }
     }
 
     // ============================================================
@@ -280,33 +323,37 @@ impl RiskManager {
             risk_factors.push(RiskFactor::NegativeProfit);
             risk_score += self.config.weight_negative_profit_adaptive * 0.5;
         }
-        
+
         if opportunity.profit_percent < (self.config.adaptive_min_profit_percent * 0.5) {
             risk_factors.push(RiskFactor::ProfitTooLow);
             risk_score += self.config.weight_profit_too_low_adaptive * 0.5;
         }
-        
-        let gas_ratio = if adjusted_net_profit > 0.0 { 
-            gas_real / adjusted_net_profit 
-        } else { 
-            f64::INFINITY 
+
+        let gas_ratio = if adjusted_net_profit > 0.0 {
+            gas_real / adjusted_net_profit
+        } else {
+            f64::INFINITY
         };
-        
+
         if gas_ratio > (self.config.adaptive_gas_ratio * 1.5) {
             risk_factors.push(RiskFactor::GasCostTooHigh);
             risk_score += self.config.weight_gas_too_high_adaptive * 0.5;
         }
-        
-        if opportunity.confidence < (self.config.min_confidence * self.config.adaptive_confidence_factor) {
+
+        if opportunity.confidence
+            < (self.config.min_confidence * self.config.adaptive_confidence_factor)
+        {
             risk_factors.push(RiskFactor::LowConfidence);
             risk_score += self.config.weight_low_confidence_adaptive * 0.5;
         }
-        
-        if opportunity.estimated_volume_usd < (self.config.min_volume_usd * self.config.adaptive_volume_factor) {
+
+        if opportunity.estimated_volume_usd
+            < (self.config.min_volume_usd * self.config.adaptive_volume_factor)
+        {
             risk_factors.push(RiskFactor::LowVolume);
             risk_score += self.config.weight_low_volume_adaptive * 0.5;
         }
-        
+
         if opportunity.execution_risk > self.config.max_execution_risk {
             risk_factors.push(RiskFactor::HighExecutionRisk);
             risk_score += self.config.weight_high_execution_risk_adaptive;
@@ -323,7 +370,12 @@ impl RiskManager {
         }
 
         self.update_metrics(risk_score, approved, true);
-        RiskAssessment { approved, risk_factors, risk_score, adaptive_mode: true }
+        RiskAssessment {
+            approved,
+            risk_factors,
+            risk_score,
+            adaptive_mode: true,
+        }
     }
 
     // ============================================================
@@ -334,22 +386,25 @@ impl RiskManager {
         opportunity: &FlashloanOpportunity,
     ) -> RiskAssessment {
         let mut assessment = self.assess_opportunity(&opportunity.base_opportunity);
-        
+
         // ✅ PENALIDADE POR STEPS ADICIONAIS - COMPATÍVEL
         let extra_steps = opportunity.steps.len().saturating_sub(3) as f64;
         let penalty = (extra_steps * self.config.weight_step_penalty).max(0.0);
         assessment.risk_score = (assessment.risk_score + penalty).min(100.0);
-        
+
         assessment.adaptive_mode = self.adaptive_mode.load(Ordering::Relaxed);
-        
+
         let max_risk = if self.adaptive_mode.load(Ordering::Relaxed) {
             self.config.max_risk_score * 1.1
         } else {
             self.config.max_risk_score
         };
-        
+
         let approved = assessment.risk_score <= max_risk;
-        RiskAssessment { approved, ..assessment }
+        RiskAssessment {
+            approved,
+            ..assessment
+        }
     }
 
     // ============================================================
@@ -370,7 +425,8 @@ impl RiskManager {
     fn update_adaptive_mode(&mut self) {
         let now = Instant::now();
         if self.opportunities_analyzed % self.config.adaptive_check_every_ops as u64 == 0
-            || now.duration_since(self.last_adjustment) > Duration::from_secs(self.config.adaptive_check_secs as u64)
+            || now.duration_since(self.last_adjustment)
+                > Duration::from_secs(self.config.adaptive_check_secs as u64)
         {
             let hit_rate = self.calculate_hit_rate();
             let should_activate = hit_rate < self.config.adaptive_activate_below_hitrate;
@@ -410,6 +466,65 @@ impl RiskManager {
             adaptive_mode: self.adaptive_mode.load(Ordering::Relaxed),
             config: self.config.clone(),
         }
+    }
+
+    /// Fail-closed canonical approval. This path is purely an assessment: it
+    /// cannot sign or broadcast a transaction.
+    pub fn assess_executable_opportunity(
+        &self,
+        opportunity: &ExecutableOpportunity,
+        cfg: &CanonicalRiskConfig,
+        current_head_block: u64,
+    ) -> Result<RiskApproval, Vec<CanonicalRiskRejection>> {
+        let mut rejections = Vec::new();
+        if current_head_block.saturating_sub(opportunity.anchor_block) > cfg.max_anchor_age_blocks {
+            rejections.push(CanonicalRiskRejection::StaleAnchor);
+        }
+        if opportunity.context_hash.is_zero() || opportunity.evidence_hash.is_zero() {
+            rejections.push(CanonicalRiskRejection::InvalidContextHash);
+        }
+        let [first, second, third] = opportunity.stability.anchor_blocks;
+        if !(first < second && second < third) {
+            rejections.push(CanonicalRiskRejection::UnstableRoute);
+        }
+        if opportunity.net_pnl <= 0 {
+            rejections.push(CanonicalRiskRejection::NonPositiveNetPnl);
+        }
+        if opportunity.gas_estimate > cfg.max_gas_raw {
+            rejections.push(CanonicalRiskRejection::GasExceedsLimit);
+        }
+        // Pending dry-run obtains its eth_call evidence only after risk and
+        // strategy select a bounded route. Fork-only receipt/trace gates do
+        // not apply to this operational profile and must never be fabricated.
+        if opportunity.execution_profile.requires_fork_evidence() {
+            if !opportunity.evidence.eth_call_pass {
+                rejections.push(CanonicalRiskRejection::EthCallFailed);
+            }
+            if !opportunity.evidence.preflight_pass {
+                rejections.push(CanonicalRiskRejection::PreflightFailed);
+            }
+            if !opportunity.evidence.trace_validated {
+                rejections.push(CanonicalRiskRejection::TraceFailed);
+            }
+        }
+        if opportunity.route_plan.legs.is_empty() {
+            rejections.push(CanonicalRiskRejection::RouteDiscontinuity);
+        }
+        if opportunity.rejected_registry_hit {
+            rejections.push(CanonicalRiskRejection::RejectedRegistryHit);
+        }
+        if !rejections.is_empty() {
+            return Err(rejections);
+        }
+
+        let retention_floor = U256::from(opportunity.net_pnl as u128)
+            .saturating_mul(U256::from(cfg.retention_bps))
+            / U256::from(10_000u64);
+        Ok(RiskApproval {
+            min_profit_raw: cfg.absolute_min_profit_floor_raw.max(retention_floor),
+            max_gas_raw: cfg.max_gas_raw,
+            max_slippage_bps: cfg.max_slippage_bps,
+        })
     }
 }
 
@@ -456,7 +571,7 @@ mod tests {
             buy_price: 0.999,
             sell_price: 1.001,
             spread_percent: 0.2,
-            amount_in: U256::from(100_000_000u64), // 100 USDT
+            amount_in: U256::from(100_000_000u64),  // 100 USDT
             amount_out: U256::from(100_200_000u64), // 100.2 USDC
             estimated_profit_usd: 0.15,
             gas_cost_usd: 0.05,
@@ -540,13 +655,13 @@ mod tests {
     #[test]
     fn test_adaptive_mode_switch() {
         let mut manager = RiskManager::with_defaults();
-        
+
         // Forçar modo adaptativo
         manager.adaptive_mode.store(true, Ordering::Relaxed);
-        
+
         let op = create_test_opportunity();
         let assessment = manager.assess_opportunity(&op);
-        
+
         assert!(assessment.adaptive_mode);
     }
 }

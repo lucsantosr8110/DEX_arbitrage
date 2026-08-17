@@ -70,15 +70,10 @@ impl TokenCache {
         for (symbol, addr_str) in tokens_map {
             match Address::from_str(addr_str) {
                 Ok(address) => {
-                    let decimals = match metadata_map
-                        .get(symbol)
-                        .and_then(|meta| meta.decimals)
-                    {
+                    let decimals = match metadata_map.get(symbol).and_then(|meta| meta.decimals) {
                         Some(d) => d,
                         None => {
-                            if let Some(d) =
-                                crate::dex::metadata_warm::expected_decimals(symbol)
-                            {
+                            if let Some(d) = crate::dex::metadata_warm::expected_decimals(symbol) {
                                 warn!(
                                     "⚠️ TokenCache: decimals ausente no metadata para {} — usando expected {}",
                                     symbol, d
@@ -115,7 +110,10 @@ impl TokenCache {
         }
 
         metrics.size.set(map.len() as i64);
-        info!("✅ TokenCache inicializado com {} tokens (via config.toml)", map.len());
+        info!(
+            "✅ TokenCache inicializado com {} tokens (via config.toml)",
+            map.len()
+        );
 
         Self {
             inner: Arc::new(RwLock::new(map)),
@@ -263,7 +261,10 @@ mod tests {
         use crate::config::{PairsConfig, TokenMetadata};
 
         let mut tokens = HashMap::new();
-        tokens.insert("TEST".to_string(), "0x000000000000000000000000000000000000abcd".to_string());
+        tokens.insert(
+            "TEST".to_string(),
+            "0x000000000000000000000000000000000000abcd".to_string(),
+        );
 
         let mut metadata = HashMap::new();
         metadata.insert(
@@ -312,12 +313,13 @@ mod tests {
         let cache = TokenCache::new_from_config(Arc::new(dummy_cfg)).await;
 
         // Teste de inserção dinâmica
-        cache.insert(
-            "NEWTOKEN",
-            Address::from_str("0x0000000000000000000000000000000000001234").unwrap(),
-            6,
-        )
-        .await;
+        cache
+            .insert(
+                "NEWTOKEN",
+                Address::from_str("0x0000000000000000000000000000000000001234").unwrap(),
+                6,
+            )
+            .await;
 
         // Teste de resolução
         let addr = cache.resolve("NEWTOKEN").await.unwrap();
@@ -345,17 +347,18 @@ mod tests {
         let dummy_cfg = create_test_config(); // 🔧 Use a função de criação
 
         let cache = TokenCache::new_from_config(Arc::new(dummy_cfg)).await;
-        
+
         let initial_size = cache.size().await;
         assert!(initial_size >= 1); // Pelo menos o token TEST
 
         // Adiciona um token e verifica o tamanho
-        cache.insert(
-            "SIZE_TEST",
-            Address::from_str("0x0000000000000000000000000000000000009999").unwrap(),
-            18,
-        )
-        .await;
+        cache
+            .insert(
+                "SIZE_TEST",
+                Address::from_str("0x0000000000000000000000000000000000009999").unwrap(),
+                18,
+            )
+            .await;
 
         let new_size = cache.size().await;
         assert_eq!(new_size, initial_size + 1);

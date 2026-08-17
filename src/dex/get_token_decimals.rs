@@ -8,7 +8,9 @@
 // ================================================================
 
 // ⬇️ CORREÇÃO: Importar o rate limiter ⬇️
-use crate::{config::token_cache::TokenCache, dex::rate_limiter::ALCHEMY_RATE_LIMITER, AppMiddleware};
+use crate::{
+    config::token_cache::TokenCache, dex::rate_limiter::ALCHEMY_RATE_LIMITER, AppMiddleware,
+};
 use anyhow::Result;
 use ethers::prelude::*;
 use once_cell::sync::Lazy;

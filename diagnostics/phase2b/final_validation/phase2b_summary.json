@@ -1,0 +1,14 @@
+{
+  "avg_scan_block_span": 8.0,
+  "block_number_per_quote_unavailable": true,
+  "max_scan_block_span": 8,
+  "post_graph_edges_total": 60,
+  "pre_graph_edges_total": 80,
+  "quotes_pinned_to_anchor_block": false,
+  "raw_quotes_total": 80,
+  "reciprocity_block_classification": "UNAVAILABLE",
+  "reciprocity_rejected_total": 20,
+  "reciprocity_rejection_rate": 25.0,
+  "scans_completed": 2,
+  "scans_started": 2
+}

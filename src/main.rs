@@ -5,17 +5,18 @@
 use anyhow::{Context, Result};
 use ethers::{
     providers::{Middleware, Provider, Ws},
+    types::{Address, H256, U256},
 };
 use futures::future;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::PathBuf,
     sync::Arc,
     time::Duration,
 };
-use tokio::sync::{broadcast, mpsc, Mutex};
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::{broadcast, mpsc, Mutex};
 use tracing::{debug, error, info, warn, Level};
 use tracing_subscriber::{
     filter::LevelFilter,
@@ -24,22 +25,75 @@ use tracing_subscriber::{
 };
 
 use flashloan_bot::{
-    config::Config,
-    core::bot::Bot,
-    dex::{
-        circuit_breaker::DexCircuitBreaker, manager::DexManager,
-        radar::{compute_top_spreads, extract_edges, start_high_hit_rate_radar, AdjCostParams, TopSpreadInfo},
+    config::{Config, DiscoveryEngine},
+    core::flashloan::ArbitrageClient,
+    core::{
+        bot::{execute_opportunity_standalone, should_try_next_opp, Bot},
+        c2b_round::RoundEvidence,
+        c2b_shadow_service::{
+            should_schedule_anchor, C2BShadowResult, CanonicalC2BOpportunitySource,
+        },
+        canonical_adapters::PinnedQuoteRecord,
+        canonical_discovery::{
+            CanonicalDiscoveryConfig, CanonicalDiscoveryProfile, CanonicalDiscoveryService,
+            CanonicalRoundTiming, CanonicalToken,
+        },
+        canonical_simulation::CanonicalSimulationClient,
+        executable_call::Venue,
+        execution_profile::{ExecutionProfile, MAIN_PENDING_DRY_RUN_PROFILE},
+        phase2d_anchor::AnchorBlock,
+        risk::{CanonicalRiskConfig, RiskManager},
+        route_artifact::StructuralRoute,
     },
-    emergency_shutdown::{self, EMERGENCY_SHUTDOWN},
+    dex::{
+        circuit_breaker::DexCircuitBreaker,
+        manager::DexManager,
+        radar::{
+            compute_top_spreads, extract_edges, start_high_hit_rate_radar, AdjCostParams,
+            TopSpreadInfo,
+        },
+    },
+    emergency_shutdown::{self},
     // execution:: imports removidos: ExecutionEngine/MevConfig/gwei eram codigo morto
     infra::{
+        history::{RoundHistory, RoundRecord},
         metrics,
+        rotating_http_client::RotatingHttpClient,
         rpc_provider::{is_usable_endpoint, RpcProvider},
         try_serve_metrics_with_fallback,
     },
     tui,
     utils::telegram::TelegramNotifier,
 };
+
+/// Detecta modo headless (sem TUI): PAPER_VALIDATION, BOT_NO_TUI=1 ou
+/// BOT_TUI=0 desligam a interface. Usado tanto no setup de logs quanto no
+/// spawn da TUI para manter comportamento único.
+fn headless_mode() -> bool {
+    fn env_true(name: &str) -> bool {
+        std::env::var(name)
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    }
+    fn env_false(name: &str) -> bool {
+        std::env::var(name)
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "no" | "off"
+                )
+            })
+            .unwrap_or(false)
+    }
+    env_true("BOT_NO_TUI")
+        || env_false("BOT_TUI")
+        || flashloan_bot::core::paper_validation::env_paper_flag()
+}
 
 // ============================================================
 // 0️⃣.5 FUNÇÃO AUXILIAR PARA LOG DE CONFIGURAÇÃO
@@ -52,8 +106,19 @@ fn log_config_snapshot(config: &Config) {
         "  Versão: {}",
         config.general.version.as_deref().unwrap_or("unknown")
     );
-    info!("  Modo: {} | Dry Run: {}", if config.flashloan.enabled { "FLASHLOAN" } else { "DIRECT" }, config.execution.dry_run);
-    info!("  Gas: priority={:.1} gwei, max={} gwei", config.gas.priority_gwei, config.gas.max_gwei);
+    info!(
+        "  Modo: {} | Dry Run: {}",
+        if config.flashloan.enabled {
+            "FLASHLOAN"
+        } else {
+            "DIRECT"
+        },
+        config.execution.dry_run
+    );
+    info!(
+        "  Gas: priority={:.1} gwei, max={} gwei",
+        config.gas.priority_gwei, config.gas.max_gwei
+    );
     info!(
         "  Min Profit: ${:.4} | Min Spread: {}%",
         config
@@ -143,17 +208,922 @@ fn update_tui_state(
     }
 }
 
+/// Persiste o resumo de uma rodada canônica no histórico SQLite.
+/// Best-effort: falha de escrita apenas loga warning — o bot segue rodando.
+#[allow(clippy::too_many_arguments)]
+fn persist_round(
+    history: &Option<Arc<RoundHistory>>,
+    sequence: u64,
+    anchor_block: u64,
+    round_started: std::time::Instant,
+    discovery_ms: u64,
+    shadow_ms: u64,
+    top_spreads: &[tui::TopSpreadRow],
+    quotes: usize,
+    cycles_detected: u64,
+    gross_positive: usize,
+    economically_positive: u64,
+    net_usd_total: f64,
+    shadow: &C2BShadowResult,
+    timing: CanonicalRoundTiming,
+) {
+    let Some(db) = history else { return };
+    let best = top_spreads.first();
+    let record = RoundRecord {
+        sequence,
+        completed_at: chrono::Utc::now().to_rfc3339(),
+        duration_ms: Some(round_started.elapsed().as_millis() as u64),
+        discovery_ms: Some(discovery_ms),
+        shadow_ms: Some(shadow_ms),
+        quotes: quotes as u64,
+        edges: None,
+        cycles_detected,
+        routes_ranked: top_spreads.len() as u64,
+        routes_evaluated: None,
+        gross_positive: gross_positive as u64,
+        economically_positive,
+        stable: Some(shadow.stable_opportunities.len() as u64),
+        risk_approved: Some(
+            shadow
+                .risk_approvals
+                .iter()
+                .filter(|(_, result)| result.is_ok())
+                .count() as u64,
+        ),
+        selected: Some(shadow.strategy_decisions.len() as u64),
+        net_usd_total,
+        anchor_block: Some(anchor_block),
+        best_route_kind: best.map(|route| {
+            if route.hop_count >= 3 {
+                "triangular".to_string()
+            } else {
+                "two_leg".to_string()
+            }
+        }),
+        // Achado 2026-08-17: `legs_label` (abreviação de venue, ex. "U→U→U")
+        // tinha prioridade sobre `pair` (path real de tokens, ex.
+        // "USDT>USDC>WMATIC>USDT") — como legs_label é quase sempre Some
+        // para rotas canônicas, o console nunca mostrava os tokens de
+        // fato, só a letra do venue repetida. `pair` sempre carrega o
+        // token path real; venue já aparece separado em
+        // `best_route_venues`.
+        best_route_path: best
+            .map(|route| route.pair.clone())
+            .or_else(|| best.and_then(|route| route.legs_label.clone())),
+        best_route_venues: best.map(|route| format!("{} / {}", route.buy_dex, route.sell_dex)),
+        best_route_gross: best.map(|route| route.tui_spread_pct),
+        best_route_net: best.and_then(|route| route.net_usd),
+        // v1.1: cycle rate real (não tui_spread). Permite distinguir
+        // "spread forward-only" de "cycle fecha" no histórico.
+        tui_spread_pct: best.map(|route| route.tui_spread_pct),
+        cycle_rate_pct: best
+            .and_then(|route| route.cycle_rate)
+            .map(|r| (r - 1.0) * 100.0),
+        cycle_net_usd: best.and_then(|route| route.net_usd),
+        anchor_resolution_ms: Some(timing.anchor_resolution_ms),
+        metadata_ms: Some(timing.metadata_ms),
+        quote_ms: Some(timing.quote_ms),
+        ranking_ms: Some(timing.ranking_ms),
+        requote_ms: Some(timing.requote_ms),
+        context_build_ms: Some(timing.context_build_ms),
+        materialization_economics_ms: Some(timing.materialization_economics_ms),
+        unattributed_ms: Some(timing.unattributed_ms),
+        best_route_gross_pnl_usd: best.and_then(|route| route.gross_pnl_usd),
+        best_route_gas_cost_usd: best.and_then(|route| route.gas_cost_usd),
+        best_route_flashloan_cost_usd: best.and_then(|route| route.flashloan_cost_usd),
+        best_route_negative_cause: best.map(|route| {
+            tui::classify_negative_cause(
+                route.gross_pnl_usd,
+                route.gas_cost_usd,
+                route.flashloan_cost_usd,
+                route.net_usd,
+            )
+            .as_str()
+            .to_string()
+        }),
+    };
+    if let Err(error) = db.insert_round(&record) {
+        warn!(%error, round = sequence, "falha ao persistir round no histórico");
+    }
+}
+
+/// Converte quotes canônicos reais em linhas de preço para a TUI.
+/// A TUI é apresentação בלבד: nenhuma decisão de execução é tomada aqui.
+fn canonical_price_rows(
+    quotes: &[PinnedQuoteRecord],
+    tokens: &[CanonicalToken],
+) -> Vec<tui::PriceRow> {
+    let min_roundtrip = std::env::var("CANONICAL_TUI_MIN_ROUNDTRIP_BPS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value <= 10_000)
+        .unwrap_or(9_000) as f64
+        / 10_000.0;
+    let max_roundtrip = std::env::var("CANONICAL_TUI_MAX_ROUNDTRIP_BPS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value >= 10_000)
+        .unwrap_or(10_500) as f64
+        / 10_000.0;
+    canonical_price_rows_with_bounds(quotes, tokens, min_roundtrip, max_roundtrip)
+}
+
+fn canonical_price_rows_with_bounds(
+    quotes: &[PinnedQuoteRecord],
+    tokens: &[CanonicalToken],
+    min_roundtrip: f64,
+    max_roundtrip: f64,
+) -> Vec<tui::PriceRow> {
+    let token_meta: HashMap<Address, (&str, u8)> = tokens
+        .iter()
+        .map(|token| (token.address, (token.symbol.as_str(), token.decimals)))
+        .collect();
+    // Multiple V3 fee tiers may exist for the same directed pair. Keep the
+    // executable quote with the greatest output instead of whichever tier
+    // happened to be inserted first.
+    let mut best_rates: HashMap<(Address, Address, Venue), f64> = HashMap::new();
+
+    for quote in quotes {
+        let Some((_, decimals_in)) = token_meta.get(&quote.token_in) else {
+            continue;
+        };
+        let Some((_, decimals_out)) = token_meta.get(&quote.token_out) else {
+            continue;
+        };
+        let Ok(amount_in) = quote.amount_in.to_string().parse::<f64>() else {
+            continue;
+        };
+        let Ok(amount_out) = quote.amount_out.to_string().parse::<f64>() else {
+            continue;
+        };
+        let amount_in = amount_in / 10f64.powi(*decimals_in as i32);
+        let amount_out = amount_out / 10f64.powi(*decimals_out as i32);
+        if amount_in <= 0.0 || !amount_in.is_finite() || !amount_out.is_finite() {
+            continue;
+        }
+        let price = amount_out / amount_in;
+        if price > 0.0 && price.is_finite() {
+            best_rates
+                .entry((quote.token_in, quote.token_out, quote.venue))
+                .and_modify(|current| *current = current.max(price))
+                .or_insert(price);
+        }
+    }
+
+    // A single-direction quote from a dust pool can be technically valid
+    // while being useless as a market price. Require its best reverse quote
+    // on the same venue to produce a sane round-trip ratio. Presentation
+    // only: execution/economics continue to use exact integer quote chains.
+    let mut rows: HashMap<String, tui::PriceRow> = HashMap::new();
+    let mut filtered_outliers = 0usize;
+    for ((token_in, token_out, venue), price) in &best_rates {
+        let Some(reverse) = best_rates.get(&(*token_out, *token_in, *venue)) else {
+            filtered_outliers += 1;
+            continue;
+        };
+        let roundtrip = price * reverse;
+        if !roundtrip.is_finite() || roundtrip < min_roundtrip || roundtrip > max_roundtrip {
+            filtered_outliers += 1;
+            continue;
+        }
+        let Some((symbol_in, _)) = token_meta.get(token_in) else {
+            continue;
+        };
+        let Some((symbol_out, _)) = token_meta.get(token_out) else {
+            continue;
+        };
+        let pair = format!("{}/{}", symbol_in, symbol_out);
+        let row = rows.entry(pair.clone()).or_insert_with(|| tui::PriceRow {
+            pair,
+            quickswap: None,
+            sushiswap: None,
+            curve: None,
+            uniswap_v3: None,
+            net_usd: None,
+        });
+        match venue {
+            Venue::QuickSwap => row.quickswap = Some(*price),
+            Venue::SushiSwap => row.sushiswap = Some(*price),
+            Venue::Curve => row.curve = Some(*price),
+            Venue::UniswapV3 => row.uniswap_v3 = Some(*price),
+        }
+    }
+    tracing::info!(
+        target: "canonical_discovery",
+        raw_quotes = quotes.len(),
+        best_directed_rates = best_rates.len(),
+        filtered_outliers,
+        min_roundtrip,
+        max_roundtrip,
+        "canonical TUI quote normalization complete"
+    );
+
+    let mut rows: Vec<_> = rows.into_values().collect();
+    rows.sort_by(|a, b| a.pair.cmp(&b.pair));
+    rows
+}
+
+fn canonical_tui_economics(
+    rows: &mut [tui::PriceRow],
+    cost: &AdjCostParams,
+    top_n: usize,
+) -> (Vec<tui::TopSpreadRow>, f64, u32, u32) {
+    let mut prices: HashMap<String, HashMap<String, f64>> = HashMap::new();
+    for row in rows.iter() {
+        let pair = row.pair.replace('/', "-");
+        for (venue, price) in [
+            ("QuickSwap", row.quickswap),
+            ("SushiSwap", row.sushiswap),
+            ("Curve", row.curve),
+            ("UniswapV3", row.uniswap_v3),
+        ] {
+            if let Some(price) = price.filter(|value| value.is_finite() && *value > 0.0) {
+                prices
+                    .entry(venue.to_string())
+                    .or_default()
+                    .insert(pair.clone(), price);
+            }
+        }
+    }
+
+    let (_, _, economics, adj_cycles) = extract_edges(&prices, cost);
+    let ranked = compute_top_spreads(&prices, cost, top_n);
+    let mut net_by_pair: HashMap<String, f64> = HashMap::new();
+    for combo in &ranked {
+        if let Some(net) = combo.net_usd {
+            let key = tui::norm_pair(&combo.pair);
+            net_by_pair
+                .entry(key)
+                .and_modify(|current| *current = current.max(net))
+                .or_insert(net);
+        }
+    }
+    for row in rows {
+        row.net_usd = net_by_pair
+            .get(&tui::norm_pair(&row.pair.replace('/', "-")))
+            .copied();
+    }
+
+    for (rank, combo) in ranked.iter().enumerate() {
+        let leg1 = combo.leg1.as_ref();
+        let leg2 = combo.leg2.as_ref();
+        tracing::info!(
+            target: "canonical_discovery",
+            rank = rank + 1,
+            pair = %combo.pair,
+            buy_dex = %combo.buy_dex,
+            sell_dex = %combo.sell_dex,
+            leg1 = %leg1.map(|leg| format!(
+                "{}:{}>{}@{:.12}",
+                leg.venue, leg.token_in, leg.token_out, leg.rate
+            )).unwrap_or_default(),
+            leg2 = %leg2.map(|leg| format!(
+                "{}:{}>{}@{:.12}",
+                leg.venue, leg.token_in, leg.token_out, leg.rate
+            )).unwrap_or_default(),
+            cycle_rate = combo.cycle_rate.unwrap_or_default(),
+            gross_pct = combo.gross_pct.unwrap_or_default(),
+            net_usd = combo.net_usd.unwrap_or_default(),
+            distance_to_profit = combo.distance_to_profit,
+            executable = combo.executable,
+            "CANONICAL_DIRECT_PAIR_COMBO"
+        );
+    }
+    let top_spreads: Vec<tui::TopSpreadRow> =
+        ranked.into_iter().map(top_spread_row_from_info).collect();
+    let net_usd_total = adj_cycles
+        .iter()
+        .map(|cycle| cycle.net_profit_usd)
+        .filter(|net| *net > 0.0)
+        .sum();
+    tracing::info!(
+        target: "canonical_discovery",
+        top_combos = top_spreads.len(),
+        rows_with_net = net_by_pair.len(),
+        net_usd_total,
+        net_positive = economics.net_positive,
+        negative_cycles = economics.negative_cycles_found,
+        "canonical direct-pair TUI economics complete"
+    );
+    (
+        top_spreads,
+        net_usd_total,
+        economics.net_positive as u32,
+        economics.negative_cycles_found as u32,
+    )
+}
+
+fn u256_ratio(numerator: U256, denominator: U256) -> Option<f64> {
+    if denominator.is_zero() {
+        return None;
+    }
+    let numerator = numerator.to_string().parse::<f64>().ok()?;
+    let denominator = denominator.to_string().parse::<f64>().ok()?;
+    let ratio = numerator / denominator;
+    ratio.is_finite().then_some(ratio)
+}
+
+fn venue_abbreviation(venue: &str) -> &'static str {
+    match venue {
+        "QuickSwap" => "Q",
+        "SushiSwap" => "S",
+        "UniswapV3" => "U",
+        "Curve" => "C",
+        _ => "?",
+    }
+}
+
+/// Authoritative canonical Top Combo projection. Unlike the direct-pair
+/// diagnostic above, this consumes the same sequential Phase-B evidence and
+/// cost-adjusted net used by stability/risk gates.
+fn canonical_route_economics(
+    evidences: &[RoundEvidence],
+    routes: &BTreeMap<String, StructuralRoute>,
+    tokens: &[CanonicalToken],
+    cost: &AdjCostParams,
+    top_n: usize,
+) -> (Vec<tui::TopSpreadRow>, f64, u32, u32) {
+    let token_meta: HashMap<Address, (&str, u8)> = tokens
+        .iter()
+        .map(|token| (token.address, (token.symbol.as_str(), token.decimals)))
+        .collect();
+    let mut ranked = Vec::new();
+
+    for evidence in evidences {
+        let Some(economics) = evidence.economics.as_ref() else {
+            continue;
+        };
+        let Some(route) = routes.get(&evidence.structural_cycle_key) else {
+            continue;
+        };
+        let Some(cycle_rate) = u256_ratio(economics.final_amount_atomic, evidence.amount_in) else {
+            continue;
+        };
+        let gross_pct = (cycle_rate - 1.0) * 100.0;
+        let amount_in_f64 = evidence
+            .amount_in
+            .to_string()
+            .parse::<f64>()
+            .unwrap_or(f64::INFINITY);
+        // Mesma conversão atomic->USD do net_usd abaixo, aplicada aos
+        // componentes individuais de RouteSimulationResult. gross_pnl_atomic
+        // já é pós-fee do AMM (a cotação real/reuse local já embute o fee
+        // do pool — nunca subtraído de novo aqui). gas/flashloan_cost_atomic
+        // são as MESMAS quantias já subtraídas uma única vez dentro de
+        // net_pnl_atomic (StatefulRouteEvaluator::evaluate) — expor os
+        // componentes aqui não os deduz de novo, só os torna visíveis.
+        let atomic_to_usd = cost.notional_usd / amount_in_f64;
+        let net_fraction = economics.net_pnl_atomic as f64 / amount_in_f64;
+        let net_usd = net_fraction * cost.notional_usd;
+        let gross_pnl_usd = economics.gross_pnl_atomic as f64 * atomic_to_usd;
+        let gas_cost_usd = economics.gas_cost_atomic.as_u128() as f64 * atomic_to_usd;
+        let flashloan_cost_usd = economics.flashloan_cost_atomic.as_u128() as f64 * atomic_to_usd;
+        if !net_usd.is_finite()
+            || !sane_route_economics(cycle_rate, gross_pct, net_usd, cost.notional_usd)
+        {
+            // >80% de desvio é quase certamente glitch de cotação (leg com
+            // preço 10x+ fora do normal), não uma decisão econômica de borda.
+            // Achado 2026-08-16: pool WETH>USDT UniswapV3 fee=500
+            // (0xbb98b3d2b18aef63a3178023a920971cf5f29be4) respondeu por 93%
+            // (12841/13838) destas rejeições no histórico — mas o MESMO pool
+            // também aparece em CANONICAL_TOP_COMBO aceito com preço são
+            // (~1885 WETH/USDT), então não é pool morta para excluir; parece
+            // cotação intermitente (stale block / race). Rebaixado para
+            // DEBUG no caso extremo para não afogar o WARN de casos
+            // realmente de borda (50-80%) que merecem atenção do operador.
+            if gross_pct.abs() > 80.0 {
+                debug!(
+                    target: "canonical_discovery",
+                    structural_cycle_key = %evidence.structural_cycle_key,
+                    cycle_rate,
+                    gross_pct,
+                    net_usd,
+                    "canonical route rejected from operator metrics: economics outside sanity bounds (extreme, provável glitch de cotação)"
+                );
+            } else {
+                warn!(
+                    target: "canonical_discovery",
+                    structural_cycle_key = %evidence.structural_cycle_key,
+                    cycle_rate,
+                    gross_pct,
+                    net_usd,
+                    "canonical route rejected from operator metrics: economics outside sanity bounds"
+                );
+            }
+            continue;
+        }
+
+        let mut token_path = Vec::new();
+        if let Some(first) = route.legs.first() {
+            token_path.push(first.token_in.clone());
+            token_path.extend(route.legs.iter().map(|leg| leg.token_out.clone()));
+        }
+        let pair = token_path.join(">");
+        let venues: Vec<String> = route.legs.iter().map(|leg| leg.venue.clone()).collect();
+        let legs_label = venues
+            .iter()
+            .map(|venue| venue_abbreviation(venue))
+            .collect::<Vec<_>>()
+            .join("→");
+        let exact_legs = route
+            .legs
+            .iter()
+            .zip(&evidence.leg_quotes)
+            .map(|(leg, quote)| {
+                let (_, decimals_in) = token_meta.get(&quote.token_in).copied().unwrap_or(("?", 0));
+                let (_, decimals_out) = token_meta
+                    .get(&quote.token_out)
+                    .copied()
+                    .unwrap_or(("?", 0));
+                let atomic_rate = u256_ratio(quote.amount_out, quote.amount_in).unwrap_or_default();
+                let rate = atomic_rate * 10f64.powi(decimals_in as i32 - decimals_out as i32);
+                format!(
+                    "{}:{}>{}@{:.12}",
+                    leg.venue, leg.token_in, leg.token_out, rate
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+
+        ranked.push((
+            tui::TopSpreadRow {
+                hop_count: route.legs.len(),
+                pair,
+                tui_spread_pct: gross_pct,
+                buy_dex: venues.first().cloned().unwrap_or_default(),
+                sell_dex: venues.last().cloned().unwrap_or_default(),
+                legs_label: Some(legs_label),
+                cycle_rate: Some(cycle_rate),
+                net_usd: Some(net_usd),
+                distance_to_profit: (-net_usd).max(0.0),
+                executable: true,
+                has_curve_leg: venues.iter().any(|venue| venue == "Curve"),
+                outlier: None,
+                gross_pnl_usd: Some(gross_pnl_usd),
+                gas_cost_usd: Some(gas_cost_usd),
+                flashloan_cost_usd: Some(flashloan_cost_usd),
+            },
+            evidence.structural_cycle_key.clone(),
+            exact_legs,
+            economics.gross_pnl_atomic,
+            economics.net_pnl_atomic,
+        ));
+    }
+
+    ranked.sort_by(|a, b| {
+        b.0.net_usd
+            .unwrap_or(f64::NEG_INFINITY)
+            .partial_cmp(&a.0.net_usd.unwrap_or(f64::NEG_INFINITY))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.cmp(&b.1))
+    });
+    let net_positive = ranked
+        .iter()
+        .filter(|(row, ..)| row.net_usd.is_some_and(|net| net > 0.0))
+        .count() as u32;
+    let negative_cycles = ranked.len() as u32 - net_positive;
+    let net_usd_total = ranked
+        .iter()
+        .filter_map(|(row, ..)| row.net_usd.filter(|net| *net > 0.0))
+        .sum();
+
+    for (rank, (row, key, legs, gross_atomic, net_atomic)) in ranked.iter().take(top_n).enumerate()
+    {
+        info!(
+            target: "canonical_discovery",
+            rank = rank + 1,
+            structural_cycle_key = %key,
+            route = %row.pair,
+            legs = %legs,
+            cycle_rate = row.cycle_rate.unwrap_or_default(),
+            gross_pct = row.tui_spread_pct,
+            net_usd = row.net_usd.unwrap_or_default(),
+            gross_pnl_atomic = gross_atomic,
+            net_pnl_atomic = net_atomic,
+            executable = row.executable,
+            "CANONICAL_TOP_COMBO"
+        );
+    }
+    info!(
+        target: "canonical_discovery",
+        routes_evaluated = ranked.len(),
+        net_positive,
+        negative_cycles,
+        net_usd_total,
+        "canonical route economics projection complete"
+    );
+
+    (
+        ranked
+            .into_iter()
+            .take(top_n)
+            .map(|(row, ..)| row)
+            .collect(),
+        net_usd_total,
+        net_positive,
+        negative_cycles,
+    )
+}
+
+/// Presentation/risk guard for malformed quotes or decimal mismatches.
+/// These limits do not authorize execution; they prevent impossible economics
+/// from becoming operator KPIs or actionable-looking dashboard rows.
+fn sane_route_economics(cycle_rate: f64, gross_pct: f64, net_usd: f64, notional_usd: f64) -> bool {
+    cycle_rate.is_finite()
+        && gross_pct.is_finite()
+        && net_usd.is_finite()
+        && cycle_rate > 0.5
+        && cycle_rate < 1.5
+        && gross_pct.abs() <= 50.0
+        && net_usd.abs() <= notional_usd.abs().max(1.0) * 0.5
+}
+
+fn combine_top_combo_rows(
+    mut two_leg: Vec<tui::TopSpreadRow>,
+    triangular: Vec<tui::TopSpreadRow>,
+) -> Vec<tui::TopSpreadRow> {
+    two_leg.extend(triangular);
+    two_leg.sort_by(|a, b| {
+        b.net_usd
+            .unwrap_or(f64::NEG_INFINITY)
+            .partial_cmp(&a.net_usd.unwrap_or(f64::NEG_INFINITY))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.hop_count.cmp(&b.hop_count))
+            .then_with(|| a.pair.cmp(&b.pair))
+    });
+    two_leg
+}
+
 /// Mapeia `TopSpreadInfo` (radar, sync) → `TopSpreadRow` (TUI, subset sem TVL).
 fn top_spread_row_from_info(i: TopSpreadInfo) -> tui::TopSpreadRow {
     tui::TopSpreadRow {
+        hop_count: 2,
         pair: i.pair,
         tui_spread_pct: i.tui_spread_pct,
+        buy_dex: i.buy_dex,
+        sell_dex: i.sell_dex,
+        legs_label: None,
         cycle_rate: i.cycle_rate,
         net_usd: i.net_usd,
+        distance_to_profit: i.distance_to_profit,
         executable: i.executable,
         has_curve_leg: i.has_curve_leg,
         outlier: i.outlier,
+        // Direct-pair diagnostic path: no gas/flashloan cost breakdown
+        // available here (see canonical_route_economics for the path that
+        // does have it).
+        gross_pnl_usd: None,
+        gas_cost_usd: None,
+        flashloan_cost_usd: None,
     }
+}
+
+/// Guarda o JoinHandle da TUI e faz join com timeout no Drop. Isso garante
+/// que, em qualquer caminho de saída do main (Ok, Err, early return), o
+/// terminal seja restaurado antes do processo morrer. Sem isso, erros de
+/// startup deixavam a TUI thread órfã em raw mode.
+struct TuiGuard {
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Envia broadcast de shutdown quando dropped, assegurando que a thread da
+/// TUI saia do loop e execute o cleanup do terminal mesmo em caminhos de
+/// erro (retornos com `?`) que não dispararam shutdown explicitamente.
+struct ShutdownOnDrop(broadcast::Sender<()>);
+
+impl Drop for ShutdownOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
+
+impl TuiGuard {
+    fn join_with_timeout(&mut self, timeout: Duration) {
+        if let Some(handle) = self.handle.take() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = handle.join();
+                let _ = tx.send(());
+            });
+            if rx.recv_timeout(timeout).is_err() {
+                warn!("⚠️ TUI não finalizou em {:?} — prosseguindo.", timeout);
+            }
+        }
+    }
+}
+
+impl Drop for TuiGuard {
+    fn drop(&mut self) {
+        self.join_with_timeout(Duration::from_secs(5));
+    }
+}
+
+/// Restaura o terminal quando shutdown ocorre durante startup. A TUI thread
+/// já faz seu próprio cleanup ao sair do run_inner; este helper garante que
+/// esperemos ela por um curto prazo e registremos o estado de erro.
+fn graceful_startup_cleanup(
+    tui_guard: &mut TuiGuard,
+    tui_state: Arc<std::sync::RwLock<tui::TuiState>>,
+) -> Result<()> {
+    if let Ok(mut s) = tui_state.write() {
+        s.mark_startup_error("Shutdown solicitado durante inicialização".into());
+    }
+    tui_guard.join_with_timeout(Duration::from_secs(3));
+    Ok(())
+}
+
+/// Canonical branch: no wallet, signer middleware, ArbitrageClient,
+/// broadcaster, approval, or transaction sender is ever constructed here.
+/// This is the *sole* execution authority when `DISCOVERY_ENGINE=canonical`:
+/// `main()` returns straight into this loop before the legacy
+/// `PRIVATE_KEY`/`ArbitrageEngine`/`select_opportunities`/execution path is
+/// ever reached, so there is no route back into legacy from here — a
+/// rejected or failed canonical round is logged and dropped, never
+/// retried against the legacy engine.
+#[allow(clippy::too_many_arguments)]
+async fn run_canonical_mode<M>(
+    provider: Arc<M>,
+    cfg: Arc<Config>,
+    adj_cost: Arc<AdjCostParams>,
+    every_n_blocks: u64,
+    round_timeout: Duration,
+    tui_state: Arc<std::sync::RwLock<tui::TuiState>>,
+    history: Option<Arc<RoundHistory>>,
+    mut shutdown_rx: broadcast::Receiver<()>,
+    tui_guard: &mut TuiGuard,
+) -> Result<()>
+where
+    M: Middleware,
+    M::Error: 'static,
+{
+    let profile = match cfg.c2b_shadow.canonical_discovery_profile.as_str() {
+        "liquid" => CanonicalDiscoveryProfile::Liquid,
+        _ => CanonicalDiscoveryProfile::Base,
+    };
+    let discovery_config = CanonicalDiscoveryConfig::from_config(
+        &cfg,
+        profile,
+        ExecutionProfile {
+            chain_id: 137,
+            profile_label: MAIN_PENDING_DRY_RUN_PROFILE.into(),
+        },
+    )
+    .context("CANONICAL_DISCOVERY_CONFIG_INVALID")?;
+    info!(
+        profile = discovery_config.profile.label(),
+        token_count = discovery_config.token_count(),
+        "CANONICAL_DISCOVERY_PROFILE_RESOLVED"
+    );
+    let venue_count = discovery_config.venues.len();
+    let canonical_tokens = discovery_config.tokens.clone();
+    let top_n = cfg.log.top_spreads_n;
+    let service = CanonicalDiscoveryService::new(provider.clone(), 137, discovery_config);
+
+    // Dry-run-only thresholds. This phase never reaches a send/broadcast
+    // call under any strategy decision, so a mis-tuned economic threshold
+    // here only ever gates a pending `eth_call` simulation, never funds.
+    let risk_manager = RiskManager::new(cfg.risk.clone());
+    let canonical_risk_cfg = CanonicalRiskConfig {
+        absolute_min_profit_floor_raw: U256::zero(),
+        retention_bps: 0,
+        max_gas_raw: U256::from(50_000_000u64),
+        max_slippage_bps: 500,
+        max_anchor_age_blocks: 256,
+    };
+    // `executor_address` is a plain configured contract/EOA address used
+    // only as the pending `eth_call` `from` — never a wallet, never derived
+    // from a private key.
+    let executor_address: Address = cfg
+        .flashloan
+        .executor_address
+        .clone()
+        .unwrap_or_default()
+        .parse()
+        .unwrap_or_default();
+    let simulation_client = CanonicalSimulationClient::new(provider.clone(), executor_address);
+    let mut opportunity_source =
+        CanonicalC2BOpportunitySource::new(risk_manager, simulation_client, canonical_risk_cfg);
+
+    let mut last_scheduled: Option<(u64, H256)> = None;
+    let mut ticks = tokio::time::interval(Duration::from_secs(2));
+    let mut rounds_completed = 0u64;
+    info!(
+        "CANONICAL_STARTUP_WITHOUT_SIGNER=true CANONICAL_STARTUP_WITHOUT_BROADCASTER=true \
+         CANONICAL_MAX_CONCURRENT_ROUNDS=1 CANONICAL_PENDING_ANCHORS_MAX=1"
+    );
+    let result = 'worker: loop {
+        tokio::select! {
+            _ = shutdown_rx.recv() => {
+                info!("CANONICAL_SHUTDOWN_CANCELS_WORKER=true");
+                break 'worker Ok(());
+            }
+            _ = ticks.tick() => {
+                let block_number_result = tokio::select! {
+                    biased;
+                    _ = shutdown_rx.recv() => {
+                        info!("CANONICAL_SHUTDOWN_CANCELS_BLOCK_POLL=true");
+                        break 'worker Ok(());
+                    }
+                    result = provider.get_block_number() => result,
+                };
+                let number = match block_number_result {
+                    Ok(number) => number.as_u64(),
+                    Err(error) => { warn!(error = %error, "canonical block poll failed"); continue; }
+                };
+                let block_result = tokio::select! {
+                    biased;
+                    _ = shutdown_rx.recv() => {
+                        info!("CANONICAL_SHUTDOWN_CANCELS_BLOCK_READ=true");
+                        break 'worker Ok(());
+                    }
+                    result = provider.get_block(number) => result,
+                };
+                let block = match block_result {
+                    Ok(Some(block)) => block,
+                    Ok(None) => continue,
+                    Err(error) => { warn!(error = %error, "canonical get_block failed"); continue; }
+                };
+                let Some(hash) = block.hash else { continue; };
+
+                // A reorg at the last-scheduled block number invalidates
+                // any anchor we might otherwise re-derive from it.
+                let reorg_detected = last_scheduled
+                    .is_some_and(|(last_number, last_hash)| number == last_number && hash != last_hash);
+                if reorg_detected {
+                    warn!(block = number, "CANONICAL_REORG_DETECTED");
+                }
+
+                let anchor = AnchorBlock { number, hash, selected_from_head: number, confirmation_lag: 0 };
+                if !should_schedule_anchor(
+                    last_scheduled.map(|(scheduled_number, _)| scheduled_number),
+                    &anchor,
+                    every_n_blocks.max(1),
+                    reorg_detected,
+                ) {
+                    debug!(block = number, "CANONICAL_SKIP_REASON=PREVIOUS_ANCHOR_TOO_RECENT_OR_REORG");
+                    continue;
+                }
+                last_scheduled = Some((number, hash));
+                let round_started = std::time::Instant::now();
+
+                // Once a `select!` branch is chosen, its handler runs to
+                // completion; the outer shutdown branch cannot interrupt an
+                // in-flight discovery. Keep shutdown in the same select as
+                // the round future so all pending RPC/quote work is dropped
+                // immediately when the broadcast arrives.
+                let discovery_started = std::time::Instant::now();
+                let discovery_result = tokio::select! {
+                    biased;
+                    _ = shutdown_rx.recv() => {
+                        info!("CANONICAL_SHUTDOWN_CANCELS_IN_FLIGHT_ROUND=true");
+                        break 'worker Ok(());
+                    }
+                    result = tokio::time::timeout(
+                        round_timeout,
+                        service.discover_at(anchor.clone()),
+                    ) => result,
+                };
+                let discovery_ms = discovery_started.elapsed().as_millis() as u64;
+                match discovery_result {
+                    Ok(Ok(result)) => {
+                        rounds_completed += 1;
+                        let round_timing = result.timing;
+                        let round_evidence_count = result.round_evidence.len();
+                        let economically_positive = result.economically_positive.len();
+                        let mut last_prices = canonical_price_rows(&result.initial_quotes, &canonical_tokens);
+                        // Preserve direct-pair net on price rows as a diagnostic,
+                        // but source Top Combo and counters from authoritative
+                        // sequential canonical route evidence.
+                        let (
+                            two_leg_spreads,
+                            two_leg_net_usd_total,
+                            two_leg_net_positive,
+                            two_leg_negative_cycles,
+                        ) = canonical_tui_economics(&mut last_prices, &adj_cost, top_n);
+                        let (
+                            triangular_spreads,
+                            canonical_net_usd_total,
+                            canonical_net_positive,
+                            canonical_negative_cycles,
+                        ) =
+                            canonical_route_economics(
+                                &result.round_evidence,
+                                &result.structural_routes,
+                                &canonical_tokens,
+                                &adj_cost,
+                                top_n,
+                            );
+                        let two_leg_displayed = two_leg_spreads.len();
+                        let triangular_displayed = triangular_spreads.len();
+                        let top_spreads =
+                            combine_top_combo_rows(two_leg_spreads, triangular_spreads);
+                        let net_usd_total =
+                            two_leg_net_usd_total + canonical_net_usd_total;
+                        let net_positive =
+                            two_leg_net_positive.saturating_add(canonical_net_positive);
+                        let negative_cycles =
+                            two_leg_negative_cycles.saturating_add(canonical_negative_cycles);
+                        // Capturas p/ persistência ANTES do move p/ TUI state.
+                        let quotes_count = last_prices.len();
+                        let gross_positive_count = result
+                            .round_evidence
+                            .iter()
+                            .filter(|evidence| {
+                                evidence.gross_pnl_atomic.is_some_and(|gross| gross > 0)
+                            })
+                            .count();
+                        let top_spreads_for_history = top_spreads.clone();
+                        let economics_consistent =
+                            economically_positive == canonical_net_positive as usize;
+                        if !economics_consistent {
+                            error!(
+                                discovery_net_positive = economically_positive,
+                                canonical_projection_net_positive = canonical_net_positive,
+                                "CANONICAL_ECONOMICS_DIVERGENCE_FAIL_CLOSED"
+                            );
+                        }
+                        info!(
+                            two_leg_displayed,
+                            triangular_displayed,
+                            combined_displayed = top_spreads.len(),
+                            "CANONICAL_TUI_ROUTE_TYPES_READY"
+                        );
+                        if let Ok(mut state) = tui_state.write() {
+                            state.running = true;
+                            state.set_startup_phase(&format!(
+                                "em execução — round {rounds_completed} (anchor {number})"
+                            ));
+                            state.cycle_count = rounds_completed;
+                            state.dex_count = venue_count;
+                            state.pairs_count = last_prices.len();
+                            state.gross_positive = result
+                                .round_evidence
+                                .iter()
+                                .filter(|evidence| {
+                                    evidence.gross_pnl_atomic.is_some_and(|gross| gross > 0)
+                                })
+                                .count() as u32;
+                            state.net_positive = net_positive;
+                            state.negative_cycles = negative_cycles;
+                            state.net_usd_total = net_usd_total;
+                            state.economics_consistent = Some(economics_consistent);
+                            state.last_prices = last_prices;
+                            state.top_spreads = top_spreads;
+                            state.last_update = Some(std::time::Instant::now());
+                        }
+                        let evidence_for_shadow = if economics_consistent {
+                            result.round_evidence
+                        } else {
+                            Vec::new()
+                        };
+                        let shadow_started = std::time::Instant::now();
+                        let shadow_result = opportunity_source
+                            .run_evidence_round(anchor, evidence_for_shadow, &cfg, number, true)
+                            .await;
+                        let shadow_ms = shadow_started.elapsed().as_millis() as u64;
+                        info!(
+                            round = rounds_completed,
+                            anchor = number,
+                            round_evidence = round_evidence_count,
+                            economically_positive,
+                            economics_consistent,
+                            stable_opportunities = shadow_result.stable_opportunities.len(),
+                            risk_approved = shadow_result.risk_approvals.iter().filter(|(_, r)| r.is_ok()).count(),
+                            strategies_selected = shadow_result.strategy_decisions.len(),
+                            dry_run_results = shadow_result.execution_results.len(),
+                            discovery_ms,
+                            shadow_ms,
+                            duration_ms = round_started.elapsed().as_millis(),
+                            "CANONICAL_ROUND_COMPLETE"
+                        );
+                        persist_round(
+                            &history,
+                            rounds_completed,
+                            number,
+                            round_started,
+                            discovery_ms,
+                            shadow_ms,
+                            &top_spreads_for_history,
+                            quotes_count,
+                            u64::from(negative_cycles),
+                            gross_positive_count,
+                            u64::from(net_positive),
+                            net_usd_total,
+                            &shadow_result,
+                            round_timing,
+                        );
+                    }
+                    Ok(Err(error)) => warn!(error = %error, "canonical round rejected; no legacy fallback"),
+                    Err(_) => warn!("canonical round timed out; no legacy fallback"),
+                }
+            }
+        }
+    };
+    info!("CANONICAL_WORKER_STOPPED=true");
+    tui_guard.join_with_timeout(Duration::from_secs(3));
+    metrics::set_bot_status(0);
+    info!("CANONICAL_SHUTDOWN_COMPLETE=true");
+    result
 }
 
 // ============================================================
@@ -170,10 +1140,12 @@ async fn main() -> Result<()> {
         == "true";
 
     let env_filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into());
+    let headless = headless_mode();
 
     // TUI ocupa terminal inteiro (alternate screen). Logs direto no stdout
     // colidem com o buffer da TUI e aparecem como texto solto fora das boxes.
-    // Por isso logs vão sempre pra arquivo enquanto TUI roda.
+    // Por isso logs vão só pro arquivo quando a TUI roda. Em headless espelha
+    // também no stdout para o operador acompanhar o startup.
     std::fs::create_dir_all("logs").context("❌ Falha ao criar diretório logs/")?;
     let log_file = std::fs::OpenOptions::new()
         .create(true)
@@ -202,15 +1174,35 @@ async fn main() -> Result<()> {
             .with_target(false)
             .with_writer(writer);
 
+        let stdout_layer = if headless {
+            let stdout_writer =
+                std::sync::Mutex::new(std::io::stdout()).with_max_level(Level::INFO);
+            Some(
+                fmt::layer()
+                    .compact()
+                    .with_ansi(false)
+                    .with_target(false)
+                    .with_writer(stdout_writer),
+            )
+        } else {
+            None
+        };
+
         tracing_subscriber::registry()
             .with(filter)
             .with(fmt_layer)
+            .with(stdout_layer)
             .init();
     }
 
-    info!("🧾 Logging habilitado em logs/bot.log (TUI usa terminal).");
+    if headless {
+        info!("🧾 Headless: logs em logs/bot.log + stdout.");
+    } else {
+        info!("🧾 Logging habilitado em logs/bot.log (TUI usa terminal).");
+    }
 
     info!("🚀 Iniciando Flashloan DEX Arbitrage Bot v4.8.4-HYBRID-SAFE...");
+    flashloan_bot::core::pipeline_obs::print_diagnostic_banner();
 
     // ============================================================
     // 2️⃣ Carregamento de Configuração e Variáveis (.env)
@@ -231,7 +1223,10 @@ async fn main() -> Result<()> {
         let p = from_env.unwrap_or_else(|| "config/config.toml".to_string());
         PathBuf::from(p.replace('\\', "/"))
     };
-    info!("🧩 Usando arquivo de configuração: {}", config_path.display());
+    info!(
+        "🧩 Usando arquivo de configuração: {}",
+        config_path.display()
+    );
 
     let config = Config::from_file(config_path.clone()).with_context(|| {
         format!(
@@ -284,10 +1279,73 @@ async fn main() -> Result<()> {
     // Criado o mais cedo possível para que TUI, metrics, health-checker e
     // listener Ctrl+C independente possam se inscrever.
     let (shutdown_tx, _) = broadcast::channel::<()>(4);
-    emergency_shutdown::spawn_emergency_watchdog();
+    let _shutdown_on_drop = ShutdownOnDrop(shutdown_tx.clone());
+    let emergency_grace = Duration::from_secs(
+        std::env::var("BOT_EMERGENCY_SHUTDOWN_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value >= 5)
+            .unwrap_or(30),
+    );
+    emergency_shutdown::spawn_emergency_watchdog(emergency_grace);
+
+    // ── TUI sobe o mais cedo possível para dar feedback de startup ──
+    // Antes a TUI só aparecia depois de HTTP/WS/DexManager/Bot, então o
+    // operador via uma tela preta por segundos (ou indefinidamente se RPC
+    // travasse). Agora mostramos splash screen com a fase de inicialização.
+    let tui_state = Arc::new(std::sync::RwLock::new(tui::TuiState::default()));
+    let history = match std::env::var("OPERATOR_DB_PATH") {
+        Ok(path) if !path.trim().is_empty() => match RoundHistory::open(PathBuf::from(path)) {
+            Ok(db) => Some(db),
+            Err(error) => {
+                warn!(%error, "histórico SQLite indisponível — rodadas NÃO persistidas");
+                None
+            }
+        },
+        _ => match RoundHistory::open(PathBuf::from("data/operator.db")) {
+            Ok(db) => Some(db),
+            Err(error) => {
+                warn!(%error, "histórico SQLite indisponível — rodadas NÃO persistidas");
+                None
+            }
+        },
+    };
+    // API server: spawn ANTES do `return run_canonical_mode` (linha 1349)
+    // para o caminho canonical (dry-run, default) também ter API. Cria
+    // circuit_breaker local só para satisfazer assinatura 4-arg de serve();
+    // a instância "real" usada pelo pipeline está em seção 7.
+    let circuit_breaker = Arc::new(DexCircuitBreaker::new(5, 30));
+    {
+        let api_state = tui_state.clone();
+        let api_history = history.clone();
+        let api_shutdown = shutdown_tx.clone();
+        let api_cb = circuit_breaker.clone();
+        tokio::spawn(async move {
+            flashloan_bot::operator_api::serve(api_state, api_history, api_shutdown, Some(api_cb))
+                .await;
+        });
+        info!("🔌 Circuit breaker inicializado (5 falhas → cooldown 30s); exposto via /api/v1/snapshot.rpc");
+    }
+    let tui_enabled = !headless;
+    let mut tui_handle = TuiGuard {
+        handle: if tui_enabled {
+            Some(tui::spawn_tui(tui_state.clone(), shutdown_tx.clone()))
+        } else {
+            info!("📄 Headless: TUI desabilitado (logs em logs/bot.log)");
+            None
+        },
+    };
+
+    fn tui_phase(state: &Arc<std::sync::RwLock<tui::TuiState>>, phase: &str) {
+        if let Ok(mut s) = state.write() {
+            s.set_startup_phase(phase);
+        }
+    }
 
     // Listener Ctrl+C em runtime separado: se o runtime principal travar em RPC,
-    // este thread ainda consegue receber o sinal e forçar a saída.
+    // este thread ainda consegue receber o sinal. Agora ele primeiro tenta o
+    // shutdown gracioso via broadcast; só ativa a saída de emergência depois
+    // de uma janela maior, evitando que um Ctrl+C casual mate o processo em 5s.
     {
         let shutdown_tx = shutdown_tx.clone();
         std::thread::spawn(move || {
@@ -297,8 +1355,11 @@ async fn main() -> Result<()> {
             if let Ok(rt) = rt {
                 rt.block_on(async {
                     let _ = tokio::signal::ctrl_c().await;
-                    EMERGENCY_SHUTDOWN.store(true, std::sync::atomic::Ordering::Relaxed);
+                    warn!("🛑 Ctrl+C antecipado — solicitando shutdown gracioso.");
                     let _ = shutdown_tx.send(());
+                    // Arm immediately; the watchdog itself owns the grace
+                    // window, so there is a single, observable timeout.
+                    emergency_shutdown::request_emergency_shutdown();
                 });
             }
             // watchdog cuida do exit forçado
@@ -359,41 +1420,123 @@ async fn main() -> Result<()> {
         );
     }
 
+    // Incompatible canonical configuration fails startup outright — never a
+    // silent downgrade to a smaller scope or a silent fallback to legacy.
+    // A no-op when the resolved engine is `Legacy`.
+    cfg_unlocked
+        .c2b_shadow
+        .validate_canonical_startup()
+        .context("❌ CANONICAL_STARTUP_CONFIG_INVALID")?;
+
+    // Decide engine before touching PRIVATE_KEY. Canonical has no route to
+    // the legacy SignerMiddleware bootstrap below.
+    if DiscoveryEngine::resolve(&cfg_unlocked.c2b_shadow.discovery_engine)
+        == DiscoveryEngine::Canonical
+    {
+        let usable_endpoints: Vec<String> = rpc_endpoints
+            .iter()
+            .filter(|endpoint| is_usable_endpoint(endpoint))
+            .cloned()
+            .collect();
+        if usable_endpoints.is_empty() {
+            anyhow::bail!("canonical mode has no usable read-only RPC");
+        }
+        // Antes: pegava só o primeiro endpoint usável e criava um
+        // Provider::<Http> fixo pra vida toda do processo — sem failover.
+        // Descoberto 2026-08-16: QuickNode como primário bateu "-32003 daily
+        // request limit reached" após ~4h de uso solo e travou o canonical
+        // block-poll indefinidamente (nenhum outro endpoint da lista era
+        // tentado). RotatingHttpClient já existia (usado só pelo path legado
+        // signer-based) e é read-only-friendly — reaproveitado aqui.
+        let rpc_timeout = Duration::from_millis(cfg_unlocked.network.timeout_ms.max(1000));
+        let rotating = RotatingHttpClient::from_strings(&usable_endpoints, rpc_timeout)
+            .context("❌ falha ao construir RotatingHttpClient para o modo canonical")?;
+        let provider = Arc::new(Provider::new(rotating));
+        if let Ok(mut state) = tui_state.write() {
+            state.set_startup_phase("descoberta canônica em execução...");
+            state.mark_startup_done();
+        }
+        return run_canonical_mode(
+            provider,
+            cfg_unlocked.clone(),
+            adj_cost.clone(),
+            cfg_unlocked.c2b_shadow.shadow_every_n_blocks,
+            Duration::from_secs(cfg_unlocked.c2b_shadow.round_timeout_secs.max(1)),
+            tui_state.clone(),
+            history,
+            shutdown_tx.subscribe(),
+            &mut tui_handle,
+        )
+        .await;
+    }
+
     let private_key = std::env::var("PRIVATE_KEY").context("❌ PRIVATE_KEY ausente no .env")?;
 
-    let client_http = RpcProvider::connect_http_with_fallback(
-        &cfg_unlocked.network,
-        &private_key,
-        &rpc_endpoints,
-    )
-    .await
-    .context("❌ Falha ao conectar via HTTP (fallback esgotado)")?;
+    tui_phase(&tui_state, "conectando RPC HTTP...");
+    let client_http = {
+        let mut sd_rx = shutdown_tx.subscribe();
+        tokio::select! {
+            _ = sd_rx.recv() => {
+                info!("🔌 Shutdown durante conexão HTTP — abortando startup.");
+                return graceful_startup_cleanup(&mut tui_handle, tui_state);
+            }
+            res = RpcProvider::connect_http_with_fallback(
+                &cfg_unlocked.network,
+                &private_key,
+                &rpc_endpoints,
+            ) => res.context("❌ Falha ao conectar via HTTP (fallback esgotado)")?,
+        }
+    };
 
     let chain_id = client_http.get_chainid().await?.as_u64();
     info!("🌐 RPC HTTP conectado (chain_id = {}).", chain_id);
 
-    info!("📡 Conectando WebSocket...");
-    let client_ws: Arc<Provider<Ws>> = RpcProvider::connect_ws(&cfg_unlocked.network)
-        .await
-        .context("❌ Falha ao conectar via WebSocket")?;
+    tui_phase(&tui_state, "conectando WebSocket...");
+    let client_ws: Arc<Provider<Ws>> = {
+        let mut sd_rx = shutdown_tx.subscribe();
+        tokio::select! {
+            _ = sd_rx.recv() => {
+                info!("🔌 Shutdown durante conexão WS — abortando startup.");
+                return graceful_startup_cleanup(&mut tui_handle, tui_state);
+            }
+            res = RpcProvider::connect_ws(&cfg_unlocked.network) => {
+                res.context("❌ Falha ao conectar via WebSocket")?
+            }
+        }
+    };
     info!("✅ WebSocket conectado.");
 
     // ============================================================
     // 5️⃣ DexManager
     // ============================================================
-    let dex_manager = Arc::new(
-        DexManager::new(
-            client_http.clone(),
-            cfg_unlocked.clone(),
-        )
-        .await
-        .context("❌ Falha ao inicializar DexManager")?,
-    );
+    tui_phase(&tui_state, "inicializando DexManager...");
+    let dex_manager = Arc::new({
+        let mut sd_rx = shutdown_tx.subscribe();
+        tokio::select! {
+            _ = sd_rx.recv() => {
+                info!("🔌 Shutdown durante DexManager — abortando startup.");
+                return graceful_startup_cleanup(&mut tui_handle, tui_state);
+            }
+            res = DexManager::new(client_http.clone(), cfg_unlocked.clone()) => {
+                res.context("❌ Falha ao inicializar DexManager")?
+            }
+        }
+    });
     info!("🧩 DexManager inicializado com sucesso.");
     // Health-checker como task sinalizada: antes era tokio::spawn detached
     // sem shutdown_rx (leaked até o processo morrer). Agora recebe broadcast
     // e sai limpo no shutdown.
-    dex_manager.start_health_checker(shutdown_tx.subscribe()).await;
+    tui_phase(&tui_state, "iniciando health checker...");
+    {
+        let mut sd_rx = shutdown_tx.subscribe();
+        tokio::select! {
+            _ = sd_rx.recv() => {
+                info!("🔌 Shutdown durante health checker — abortando startup.");
+                return graceful_startup_cleanup(&mut tui_handle, tui_state);
+            }
+            _ = dex_manager.start_health_checker(shutdown_tx.subscribe()) => {}
+        }
+    }
 
     // ============================================================
     // 6️⃣ ExecutionEngine removido (codigo morto)
@@ -402,7 +1545,6 @@ async fn main() -> Result<()> {
     // descartados (_execution_engine). O bot executa via ArbitrageClient
     // diretamente (execute_direct/execute_flashloan/execute_wrapper).
     // Ver ESTADO_ATUAL.md secao 6.
-    
 
     // ============================================================
     // 7️⃣ Circuit Breaker
@@ -412,24 +1554,23 @@ async fn main() -> Result<()> {
     // ============================================================
     // 8️⃣ Inicialização do Bot
     // ============================================================
-    let bot = match Bot::init_with_engine(
-        client_http.clone(),
-        config.clone(),
-        telegram.clone(),
-        None,
-    )
-    .await
-    {
-        Ok(bot) => bot,
-        Err(e) => {
-            warn!("⚠️ Bot::init_with_engine() falhou: {:?}", e);
-            Bot::new_with_engine(
-                client_http.clone(),
-                config.clone(),
-                telegram.clone(),
-                None,
-            )
-            .await
+    tui_phase(&tui_state, "inicializando Bot...");
+    let bot = {
+        let mut sd_rx = shutdown_tx.subscribe();
+        tokio::select! {
+            _ = sd_rx.recv() => {
+                info!("🔌 Shutdown durante inicialização do Bot — abortando startup.");
+                return graceful_startup_cleanup(&mut tui_handle, tui_state);
+            }
+            res = async {
+                match Bot::init_with_engine(client_http.clone(), config.clone(), telegram.clone(), None).await {
+                    Ok(bot) => bot,
+                    Err(e) => {
+                        warn!("⚠️ Bot::init_with_engine() falhou: {:?}", e);
+                        Bot::new_with_engine(client_http.clone(), config.clone(), telegram.clone(), None).await
+                    }
+                }
+            } => res
         }
     };
 
@@ -467,18 +1608,6 @@ async fn main() -> Result<()> {
     // ============================================================
     let (price_tx, price_rx) = mpsc::channel::<HashMap<String, HashMap<String, f64>>>(256);
     let price_rx = Arc::new(Mutex::new(price_rx));
-
-    let tui_state = Arc::new(std::sync::RwLock::new(tui::TuiState::default()));
-    // Paper/headless: TUI precisa de TTY; skip quando PAPER_VALIDATION=1.
-    let tui_enabled = !flashloan_bot::core::paper_validation::env_paper_flag();
-    // JoinHandle da thread da TUI — guardado para o main() fazer join no
-    // shutdown e garantir restauração do terminal (ver spawn_tui doc).
-    let tui_handle: Option<std::thread::JoinHandle<()>> = if tui_enabled {
-        Some(tui::spawn_tui(tui_state.clone(), shutdown_tx.clone()))
-    } else {
-        info!("📄 PAPER mode: TUI desabilitado (headless)");
-        None
-    };
 
     let radar_task = {
         let mut client_ws = client_ws.clone();
@@ -606,12 +1735,46 @@ async fn main() -> Result<()> {
 
                             update_tui_state(&tui_state, &adj_cost, &prices, top_n, cycle_count);
 
-                            // Execução envolvida em timeout: se hung, o future
-                            // é droppado (bot_guard liberado no drop) e o loop
-                            // continua em vez de travar o bot_task pra sempre.
+                            // FASE 7: detecção (descoberta + seleção top-N) sob lock;
+                            // envio/confirmação de tx FORA do lock. O bot não segura
+                            // MutexGuard através de awaits longos de broadcast.
                             let exec = async {
-                                let mut bot_guard = bot.lock().await;
-                                bot_guard.process_prices(prices).await
+                                // (1) Descoberta + seleção sob lock (sem envio).
+                                let selected = {
+                                    let mut bot_guard = bot.lock().await;
+                                    bot_guard.select_opportunities(prices).await
+                                };
+
+                                match selected {
+                                    Ok(opps) if !opps.is_empty() => {
+                                        // (2) Clona client + telegram sob lock brevemente,
+                                        // libera, e executa fora do lock.
+                                        let (client, tg): (ArbitrageClient, Arc<TelegramNotifier>) = {
+                                            let bot_guard = bot.lock().await;
+                                            (bot_guard.arbitrage_client.clone(), bot_guard.telegram.clone())
+                                        };
+
+                                        // FASE 8: top-N. Tenta próxima só se pré-broadcast
+                                        // abort (sim/complexidade/rota). Broadcast/terminal para.
+                                        for opp in opps {
+                                            let res = execute_opportunity_standalone(&client, &tg, opp).await;
+                                            match res {
+                                                Ok(r) => {
+                                                    if !should_try_next_opp(&r) {
+                                                        break;
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    error!("❌ Erro ao executar oportunidade: {:?}", e);
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        Ok(())
+                                    }
+                                    Ok(_) => Ok(()),
+                                    Err(e) => Err(e),
+                                }
                             };
                             match tokio::time::timeout(EXEC_TIMEOUT, exec).await {
                                 Ok(Ok(())) => {}
@@ -662,10 +1825,10 @@ async fn main() -> Result<()> {
             // ── Espera UM sinal de encerramento ──
             #[cfg(unix)]
             {
-                let mut sigint = signal(SignalKind::interrupt())
-                    .expect("falha ao registrar handler SIGINT");
-                let mut sigterm = signal(SignalKind::terminate())
-                    .expect("falha ao registrar handler SIGTERM");
+                let mut sigint =
+                    signal(SignalKind::interrupt()).expect("falha ao registrar handler SIGINT");
+                let mut sigterm =
+                    signal(SignalKind::terminate()).expect("falha ao registrar handler SIGTERM");
 
                 tokio::select! {
                     _ = sigint.recv() => warn!("🛑 SIGINT recebido — encerrando..."),
@@ -675,7 +1838,9 @@ async fn main() -> Result<()> {
 
             #[cfg(not(unix))]
             {
-                tokio::signal::ctrl_c().await.expect("falha ao registrar Ctrl+C handler");
+                tokio::signal::ctrl_c()
+                    .await
+                    .expect("falha ao registrar Ctrl+C handler");
                 warn!("🛑 Ctrl-C recebido — encerrando...");
             }
 
@@ -685,7 +1850,8 @@ async fn main() -> Result<()> {
             let _ = tokio::time::timeout(
                 Duration::from_secs(5),
                 telegram.send_alert("Shutdown", "Sinal recebido - encerrando bot"),
-            ).await;
+            )
+            .await;
             let _ = shutdown_tx.send(());
             // NÃO faz process::exit nem loop: o watchdog de emergência
             // (emergency_shutdown.rs) cuida da saída forçada se o runtime
@@ -697,7 +1863,7 @@ async fn main() -> Result<()> {
     if tui_enabled {
         info!("🎯 TUI iniciado. Pressione 'q' no terminal da TUI para sair.");
     } else {
-        info!("🎯 Headless (paper) — Ctrl-C para sair.");
+        info!("🎯 Headless — Ctrl-C para sair.");
     }
 
     // ============================================================
@@ -716,7 +1882,13 @@ async fn main() -> Result<()> {
     // contando desde "Sistema pronto" — matava o bot em 180s mesmo sem ninguém
     // pedir shutdown. Agora o bloqueio abaixo só acontece APÓS o sinal, então
     // este valor só é gasto drenando tasks na saída.
-    let shutdown_timeout = Duration::from_secs(cfg_unlocked.general.shutdown_timeout.max(10) as u64);
+    let shutdown_timeout =
+        Duration::from_secs(cfg_unlocked.general.shutdown_timeout.max(10) as u64);
+
+    // Transição splash → dashboard.
+    if let Ok(mut s) = tui_state.write() {
+        s.mark_startup_done();
+    }
 
     info!("🎯 Sistema pronto (modo hot-reload).");
 
@@ -734,7 +1906,10 @@ async fn main() -> Result<()> {
     // em 180s desde o startup. Agora o bot roda indefinidamente até um sinal.
     let mut main_shutdown_rx = shutdown_tx.subscribe();
     let _ = main_shutdown_rx.recv().await;
-    info!("🛑 Shutdown solicitado — drenando tasks (teto {}s)...", shutdown_timeout.as_secs());
+    info!(
+        "🛑 Shutdown solicitado — drenando tasks (teto {}s)...",
+        shutdown_timeout.as_secs()
+    );
 
     // ── Drena as tasks com teto de tempo ──
     // Cada task responde ao broadcast: radar/bot quebram o loop no
@@ -749,21 +1924,16 @@ async fn main() -> Result<()> {
                 "⏰ Drenagem excedeu {}s — abortando tasks restantes (kill -9 não mais necessário).",
                 shutdown_timeout.as_secs()
             );
-            for a in &aborts { a.abort(); }
+            for a in &aborts {
+                a.abort();
+            }
         }
     }
 
-    // ── Restaura o terminal ──
-    // Join na thread da TUI: ela saiu do run_inner ao receber o broadcast de
-    // shutdown, momento em que run() já rodou o cleanup (disable_raw_mode +
-    // LeaveAlternateScreen). Sem este join, o processo podia sair com a TUI
-    // ainda em raw mode e o terminal do usuário ficava preso no alternate
-    // screen — nenhum comando respondia, precisava `reset`. Teto de 5s: se a
-    // TUI não sair (ex.: travou em draw), não penduramos o shutdown; o
-    // watchdog de emergência cuida do caso patológico.
-    if let Some(handle) = tui_handle {
-        let _ = handle.join();
-    }
+    // O join da thread da TUI (com timeout) é feito automaticamente pelo
+    // Drop de TuiGuard, garantindo restauração do terminal em qualquer caminho
+    // de saída. A TUI thread já rodou cleanup (disable_raw_mode +
+    // LeaveAlternateScreen) ao sair do run_inner.
 
     metrics::set_bot_status(0);
     info!("👋 Encerrando Flashloan Bot com segurança.");
@@ -772,4 +1942,102 @@ async fn main() -> Result<()> {
         .await;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod canonical_tui_tests {
+    use super::*;
+
+    fn quote(
+        venue: Venue,
+        token_in: Address,
+        token_out: Address,
+        amount_out: u64,
+    ) -> PinnedQuoteRecord {
+        PinnedQuoteRecord {
+            quote_id: H256::zero(),
+            anchor_block: 1,
+            anchor_hash: H256::zero(),
+            venue,
+            pool: Address::from_low_u64_be(99),
+            token_in,
+            token_out,
+            amount_in: U256::from(100_000_000u64),
+            amount_out: U256::from(amount_out),
+            pool_state_id: H256::zero(),
+            execution_metadata_id: H256::zero(),
+            adapter_version: "test".into(),
+            provenance_hash: H256::zero(),
+        }
+    }
+
+    #[test]
+    fn canonical_tui_selects_best_tier_and_filters_dust_pool() {
+        let token_a = Address::from_low_u64_be(1);
+        let token_b = Address::from_low_u64_be(2);
+        let tokens = vec![
+            CanonicalToken {
+                address: token_a,
+                decimals: 6,
+                symbol: "A".into(),
+            },
+            CanonicalToken {
+                address: token_b,
+                decimals: 6,
+                symbol: "B".into(),
+            },
+        ];
+        let quotes = vec![
+            quote(Venue::QuickSwap, token_a, token_b, 100_000_000),
+            quote(Venue::QuickSwap, token_b, token_a, 99_000_000),
+            quote(Venue::SushiSwap, token_a, token_b, 200_000),
+            quote(Venue::SushiSwap, token_b, token_a, 300_000),
+            quote(Venue::UniswapV3, token_a, token_b, 50_000_000),
+            quote(Venue::UniswapV3, token_a, token_b, 101_000_000),
+            quote(Venue::UniswapV3, token_b, token_a, 98_000_000),
+        ];
+
+        let mut rows = canonical_price_rows_with_bounds(&quotes, &tokens, 0.9, 1.05);
+        let forward = rows.iter().find(|row| row.pair == "A/B").unwrap();
+        assert_eq!(forward.quickswap, Some(1.0));
+        assert_eq!(forward.sushiswap, None);
+        assert_eq!(forward.uniswap_v3, Some(1.01));
+
+        let (top, _, _, _) = canonical_tui_economics(&mut rows, &AdjCostParams::default(), 8);
+        assert!(!top.is_empty());
+        assert!(top.iter().all(|combo| combo.hop_count == 2));
+        assert!(top.iter().all(|combo| combo.net_usd.is_some()));
+        assert!(rows.iter().any(|row| row.net_usd.is_some()));
+    }
+
+    #[test]
+    fn combined_top_combo_keeps_two_leg_and_triangular_routes() {
+        let base = tui::TopSpreadRow {
+            hop_count: 2,
+            pair: "USDT-WMATIC".into(),
+            tui_spread_pct: 0.1,
+            buy_dex: "QuickSwap".into(),
+            sell_dex: "UniswapV3".into(),
+            legs_label: Some("Q→U".into()),
+            cycle_rate: Some(1.001),
+            net_usd: Some(0.04),
+            distance_to_profit: 0.0,
+            executable: true,
+            has_curve_leg: false,
+            outlier: None,
+            gross_pnl_usd: None,
+            gas_cost_usd: None,
+            flashloan_cost_usd: None,
+        };
+        let mut triangular = base.clone();
+        triangular.hop_count = 3;
+        triangular.pair = "USDT>USDC>WMATIC>USDT".into();
+        triangular.legs_label = Some("U→Q→S".into());
+        triangular.net_usd = Some(0.02);
+
+        let combined = combine_top_combo_rows(vec![base], vec![triangular]);
+        assert_eq!(combined.len(), 2);
+        assert_eq!(combined[0].hop_count, 2);
+        assert_eq!(combined[1].hop_count, 3);
+    }
 }

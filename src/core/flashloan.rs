@@ -2,23 +2,24 @@
 // src/core/flashloan.rs — FINAL v7.4 — CORREÇÕES CRÍTICAS APLICADAS
 // ============================================================================
 
-use ethers::abi::Tokenizable;
 use crate::{
     config::Config,
     contracts::{FlashloanCaller, FlashloanExecutor, SwapStep as AbiSwapStep, ERC20},
     core::{
         arbitrage::ArbitrageEngine,
         economics,
+        executable_call::Venue,
+        executable_opportunity::ExecutableOpportunity,
         fixed_usd::{self, UsdE8},
         gas::{GasEstimator, GasStrategyKind},
         paper_validation::{self, PaperValidationHub},
-        types::{ArbitrageOpportunity, BundleResult},
+        risk::RiskApproval,
+        types::{ArbitrageOpportunity, BundleResult, ExecutionOutcome},
     },
     infra::metrics,
-    utils::{u256_to_f64},
+    utils::u256_to_f64,
     AppMiddleware,
 };
-
 use anyhow::{anyhow, bail, Context, Result};
 use ethers::{
     abi::{encode, Detokenize, Token},
@@ -31,7 +32,7 @@ use tokio::{
     sync::Mutex,
     time::{timeout, Duration},
 };
-use tracing::{warn, info, debug};
+use tracing::{debug, error, info, warn};
 
 const DEFAULT_AAVE_POOL_POLYGON: &str = "0x794a61358D6845594F94dc1DB02A252b5b4814aD";
 const FLASHLOAN_PREMIUM_ABI: &str = r#"[{"inputs":[],"name":"FLASHLOAN_PREMIUM_TOTAL","outputs":[{"type":"uint128"}],"stateMutability":"view","type":"function"}]"#;
@@ -47,6 +48,53 @@ pub enum ExecutionStrategy {
     Skip,
 }
 
+/// Decision made by the canonical shadow path. It is intentionally separate
+/// from the legacy `ExecutionStrategy`, whose paths may ultimately broadcast.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CanonicalStrategyDecision {
+    Direct,
+    Flashloan,
+    WrapperFlashloan,
+    Skip(CanonicalSkipReason),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CanonicalSkipReason {
+    UnsupportedVenue,
+    FlashloanDisabled,
+    WrapperDisabled,
+    InsufficientRiskApproval,
+}
+
+/// Pure strategy selection for canonical opportunities. This function only
+/// classifies a route; it has no client, signer, RPC, or broadcaster access.
+pub fn determine_execution_strategy_canonical(
+    opportunity: &ExecutableOpportunity,
+    approval: &RiskApproval,
+    cfg: &Config,
+) -> CanonicalStrategyDecision {
+    if approval.min_profit_raw.is_zero() || approval.max_gas_raw.is_zero() {
+        return CanonicalStrategyDecision::Skip(CanonicalSkipReason::InsufficientRiskApproval);
+    }
+    if opportunity.route_plan.legs.iter().any(|leg| {
+        !matches!(
+            leg.venue,
+            Venue::QuickSwap | Venue::SushiSwap | Venue::UniswapV3
+        )
+    }) {
+        return CanonicalStrategyDecision::Skip(CanonicalSkipReason::UnsupportedVenue);
+    }
+    if cfg.flashloan.enabled && cfg.execution.use_flashloan {
+        if cfg.wrapper.enabled {
+            CanonicalStrategyDecision::WrapperFlashloan
+        } else {
+            CanonicalStrategyDecision::Flashloan
+        }
+    } else {
+        CanonicalStrategyDecision::Direct
+    }
+}
+
 impl std::fmt::Display for ExecutionStrategy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:?}", self)
@@ -60,21 +108,57 @@ impl std::fmt::Display for ExecutionStrategy {
 pub enum FlashloanError {
     #[error("Route too complex: {0}")]
     RouteTooComplex(String),
-    
+
     #[error("Invalid route: {0}")]
     InvalidRoute(String),
-    
+
     #[error("Slippage too high: {0}")]
     SlippageTooHigh(String),
-    
+
     #[error("Insufficient profit: {0}")]
     InsufficientProfit(String),
-    
+
     #[error("Execution failed: {0}")]
     ExecutionFailed(String),
-    
+
     #[error("Configuration error: {0}")]
     ConfigError(String),
+}
+
+// ============================================================================
+// B4 — RBF re-bump de gas (underpriced / replacement)
+// ============================================================================
+/// Motivo de abort do re-bump acumulado.
+pub(super) enum RbfBumpAbort {
+    /// `max_replace_attempts` excedido — para de spamar replacement.
+    MaxAttempts,
+    /// `gas_ceiling_gwei` excedido — nunca paga gas acima do teto do operador.
+    CeilingExceeded,
+}
+
+/// B4 — re-bump acumulado (×`multiplier_bps`/100) de `max_fee` E `max_priority`,
+/// mesmo nonce. Saturating p/ não overflow. Retorna `Err` se exceder
+/// `max_replace_attempts` ou `gas_ceiling_wei`. Item fn pura (testável sem RPC).
+pub(super) fn rbf_bump_gas(
+    max_fee: &mut U256,
+    max_priority: &mut U256,
+    replacement_count: &mut u32,
+    multiplier_bps: U256,
+    max_replace_attempts: u32,
+    gas_ceiling_wei: Option<U256>,
+) -> Result<(), RbfBumpAbort> {
+    if *replacement_count >= max_replace_attempts {
+        return Err(RbfBumpAbort::MaxAttempts);
+    }
+    *max_fee = max_fee.saturating_mul(multiplier_bps) / U256::from(100u64);
+    *max_priority = max_priority.saturating_mul(multiplier_bps) / U256::from(100u64);
+    *replacement_count += 1;
+    if let Some(ceil) = gas_ceiling_wei {
+        if *max_fee > ceil {
+            return Err(RbfBumpAbort::CeilingExceeded);
+        }
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -87,26 +171,27 @@ pub struct ArbitrageClient {
     gas_estimator: GasEstimator<AppMiddleware>,
     config: Arc<Mutex<Config>>,
     pub last_exec_block: Arc<Mutex<Option<u64>>>,
-    pub execution_engine: Option<
-        Arc<crate::execution::ExecutionEngine<AppMiddleware, Wallet<SigningKey>>>
-    >,
+    pub execution_engine:
+        Option<Arc<crate::execution::ExecutionEngine<AppMiddleware, Wallet<SigningKey>>>>,
     /// Hub paper (CSV async). Lazy-init sob flag.
     paper_hub: Arc<Mutex<Option<Arc<PaperValidationHub>>>>,
     /// Premium Aave on-chain cache (M5), refreshed at most hourly.
     flashloan_fee_cache: Arc<Mutex<Option<(StdInstant, f64)>>>,
+    /// B7: ledger de finalidade de lucro (provisory/final + reorg + loss CB).
+    profit_ledger: Arc<tokio::sync::Mutex<crate::core::profit_ledger::ProfitLedger>>,
+    /// B8: nonce reaper (detecta/cancela nonces presos).
+    nonce_reaper: Arc<tokio::sync::Mutex<crate::core::nonce_reaper::NonceReaper>>,
 }
 
 impl ArbitrageClient {
-
     pub fn new(
         executor_address: Address,
         middleware: Arc<AppMiddleware>,
         config: Arc<Mutex<Config>>,
         execution_engine: Option<
-            Arc<crate::execution::ExecutionEngine<AppMiddleware, Wallet<SigningKey>>>
+            Arc<crate::execution::ExecutionEngine<AppMiddleware, Wallet<SigningKey>>>,
         >,
     ) -> Self {
-
         let executor = FlashloanExecutor::new(executor_address, middleware.clone());
         let gas_estimator = GasEstimator::new(middleware.clone(), config.clone());
 
@@ -130,6 +215,158 @@ impl ArbitrageClient {
             last_exec_block: Arc::new(Mutex::new(None)),
             paper_hub,
             flashloan_fee_cache: Arc::new(Mutex::new(None)),
+            // B7: threshold default; init_profit_ledger sobrescreve via config.
+            profit_ledger: Arc::new(tokio::sync::Mutex::new(
+                crate::core::profit_ledger::ProfitLedger::new(
+                    crate::config::default_loss_breaker_threshold(),
+                ),
+            )),
+            // B8: reaper de nonces presos.
+            nonce_reaper: Arc::new(tokio::sync::Mutex::new(
+                crate::core::nonce_reaper::NonceReaper::new(),
+            )),
+        }
+    }
+
+    /// B2: carrega o oráculo EWMA de gas do path configurado (`gas.gas_oracle_path`).
+    /// Chamar uma vez na inicialização (em contexto async). Idempotente: reload
+    /// sobrescreve o oráculo em memória — não chamar a cada execução.
+    pub async fn init_gas_oracle(&self) {
+        self.gas_estimator.load_gas_oracle().await;
+    }
+
+    /// B7: ajusta o threshold do circuit breaker de perda a partir da config.
+    /// Chamar uma vez na inicialização (async). profit_confirmations é lido em
+    /// cada promote (config pode mudar em runtime).
+    pub async fn init_profit_ledger(&self) {
+        let threshold = {
+            let cfg = self.config.lock().await;
+            cfg.execution.loss_breaker_threshold
+        };
+        let mut led = self.profit_ledger.lock().await;
+        led.set_loss_breaker_threshold(threshold);
+    }
+
+    /// B7: acesso ao ledger (para watcher / telemetria externa).
+    pub fn profit_ledger(
+        &self,
+    ) -> Arc<tokio::sync::Mutex<crate::core::profit_ledger::ProfitLedger>> {
+        self.profit_ledger.clone()
+    }
+
+    /// B8: acesso ao reaper (telemetria / kill switch check externo).
+    pub fn nonce_reaper(&self) -> Arc<tokio::sync::Mutex<crate::core::nonce_reaper::NonceReaper>> {
+        self.nonce_reaper.clone()
+    }
+
+    /// B8: reaper — verifica nonces presos e cancela o mais baixo com no-op
+    /// agressivo (self-transfer 0). Re-fetch fresco de eth_getTransactionCount
+    /// (pending) ANTES de cancelar — nunca reusa nonce sem confirmar a chain.
+    /// Chamar no início de cada ciclo (antes de reservar novo nonce).
+    /// Retorna true se cancelou um nonce (gap recuperado).
+    pub async fn reap_stuck_nonces(&self) -> bool {
+        let sender = match self.get_wallet_address() {
+            Ok(a) => a,
+            Err(_) => return false,
+        };
+        let nonce_stall_secs = {
+            let cfg = self.config.lock().await;
+            cfg.execution.nonce_stall_secs
+        };
+        // Re-fetch fresco: eth_getTransactionCount pending (on_chain).
+        let on_chain_pending = match self
+            .middleware
+            .get_transaction_count(sender, Some(BlockId::Number(BlockNumber::Pending)))
+            .await
+        {
+            Ok(n) => n.as_u64(),
+            Err(e) => {
+                warn!(error = %e, "B8 reaper: falha ao buscar on_chain_pending");
+                let tripped = self.nonce_reaper.lock().await.record_failure();
+                if tripped {
+                    crate::infra::metrics::inc_counter("nonce_reaper_kill_switch");
+                }
+                return false;
+            }
+        };
+        self.reap_decide(sender, on_chain_pending, nonce_stall_secs)
+            .await
+    }
+
+    async fn reap_decide(&self, sender: Address, on_chain_pending: u64, stall: u64) -> bool {
+        let now = std::time::Instant::now();
+        let (verdict, pending_local) = {
+            let reaper = self.nonce_reaper.lock().await;
+            let pending_local = on_chain_pending + reaper.in_flight_count() as u64;
+            (
+                reaper.verdict(pending_local, on_chain_pending, now, stall),
+                pending_local,
+            )
+        };
+        match verdict {
+            crate::core::nonce_reaper::ReapVerdict::NoGap => {
+                self.nonce_reaper.lock().await.record_success();
+                false
+            }
+            crate::core::nonce_reaper::ReapVerdict::GapStalling { lowest, .. } => {
+                debug!(
+                    lowest,
+                    pending_local, "B8 reaper: gap stalling, sem cancel ainda"
+                );
+                false
+            }
+            crate::core::nonce_reaper::ReapVerdict::Reap { lowest } => {
+                // No-op cancel: self-transfer 0, gas agressivo, nonce = lowest.
+                // Re-fetch fresco ANTES de assinar (nunca reusar sem confirmar).
+                let fresh = self
+                    .middleware
+                    .get_transaction_count(sender, Some(BlockId::Number(BlockNumber::Pending)))
+                    .await
+                    .map(|n| n.as_u64())
+                    .unwrap_or(on_chain_pending);
+                if fresh > lowest {
+                    // nonce já foi incluído — não cancelar.
+                    self.nonce_reaper.lock().await.note_canceled(lowest);
+                    self.nonce_reaper.lock().await.record_success();
+                    return false;
+                }
+                let mut tx_req = Eip1559TransactionRequest::new()
+                    .from(sender)
+                    .to(sender)
+                    .value(U256::zero())
+                    .nonce(lowest);
+                // Gas agressivo: populate_dynamic_gas + bump 1.5× para substituir.
+                if let Ok((max_fee, priority)) =
+                    self.gas_estimator.populate_dynamic_gas(&mut tx_req).await
+                {
+                    let bump = U256::from(150u64);
+                    tx_req = tx_req
+                        .max_fee_per_gas(max_fee.saturating_mul(bump) / U256::from(100u64))
+                        .max_priority_fee_per_gas(
+                            priority.saturating_mul(bump) / U256::from(100u64),
+                        );
+                }
+                match self.middleware.send_transaction(tx_req, None).await {
+                    Ok(pending) => {
+                        info!(
+                            nonce = lowest, tx_hash = ?pending.tx_hash(),
+                            "🧹 B8 reaper: no-op cancel enviado para nonce preso"
+                        );
+                        self.nonce_reaper.lock().await.note_canceled(lowest);
+                        self.nonce_reaper.lock().await.record_success();
+                        crate::infra::metrics::inc_nonce_gaps_recovered();
+                        true
+                    }
+                    Err(e) => {
+                        warn!(nonce = lowest, error = %e, "B8 reaper: no-op cancel falhou");
+                        let tripped = self.nonce_reaper.lock().await.record_failure();
+                        if tripped {
+                            crate::infra::metrics::inc_counter("nonce_reaper_kill_switch");
+                        }
+                        false
+                    }
+                }
+            }
         }
     }
 
@@ -151,35 +388,38 @@ impl ArbitrageClient {
         let address = pool_address
             .and_then(|raw| Address::from_str(raw).ok())
             .or_else(|| Address::from_str(DEFAULT_AAVE_POOL_POLYGON).ok());
-        let Some(address) = address else { return fallback_pct; };
+        let Some(address) = address else {
+            return fallback_pct;
+        };
         let Ok(abi) = serde_json::from_str::<ethers::abi::Abi>(FLASHLOAN_PREMIUM_ABI) else {
             return fallback_pct;
         };
         let pool = Contract::new(address, abi, self.middleware.clone());
         match pool.method::<_, U256>("FLASHLOAN_PREMIUM_TOTAL", ()) {
-            Ok(call) => {
-                match tokio::time::timeout(Duration::from_secs(10), call.call()).await {
-                    Ok(Ok(bps)) if bps <= U256::from(10_000u64) => {
-                        let pct = bps.as_u64() as f64 / 10_000.0;
-                        *self.flashloan_fee_cache.lock().await = Some((StdInstant::now(), pct));
-                        info!("Aave premium on-chain: {:.2} bps", pct * 10_000.0);
-                        pct
-                    }
-                    Ok(Ok(_)) => {
-                        warn!("⚠️ FLASHLOAN_PREMIUM_TOTAL fora do range; usando fallback");
-                        fallback_pct
-                    }
-                    Ok(Err(e)) => {
-                        warn!("⚠️ Falha ao ler FLASHLOAN_PREMIUM_TOTAL: {}; usando fallback", e);
-                        fallback_pct
-                    }
-                    Err(_) => {
-                        warn!("⏱️ Timeout ao ler FLASHLOAN_PREMIUM_TOTAL (>10s); usando fallback");
-                        crate::infra::metrics::inc_counter("rpc_call_timeout");
-                        fallback_pct
-                    }
+            Ok(call) => match tokio::time::timeout(Duration::from_secs(10), call.call()).await {
+                Ok(Ok(bps)) if bps <= U256::from(10_000u64) => {
+                    let pct = bps.as_u64() as f64 / 10_000.0;
+                    *self.flashloan_fee_cache.lock().await = Some((StdInstant::now(), pct));
+                    info!("Aave premium on-chain: {:.2} bps", pct * 10_000.0);
+                    pct
                 }
-            }
+                Ok(Ok(_)) => {
+                    warn!("⚠️ FLASHLOAN_PREMIUM_TOTAL fora do range; usando fallback");
+                    fallback_pct
+                }
+                Ok(Err(e)) => {
+                    warn!(
+                        "⚠️ Falha ao ler FLASHLOAN_PREMIUM_TOTAL: {}; usando fallback",
+                        e
+                    );
+                    fallback_pct
+                }
+                Err(_) => {
+                    warn!("⏱️ Timeout ao ler FLASHLOAN_PREMIUM_TOTAL (>10s); usando fallback");
+                    crate::infra::metrics::inc_counter("rpc_call_timeout");
+                    fallback_pct
+                }
+            },
             Err(_) => fallback_pct,
         }
     }
@@ -191,13 +431,17 @@ impl ArbitrageClient {
             (
                 cfg.flashloan.enabled,
                 cfg.flashloan.aave_pool_address.clone(),
-                cfg.flashloan.fee_pct.unwrap_or(economics::AAVE_V3_PREMIUM_PCT),
+                cfg.flashloan
+                    .fee_pct
+                    .unwrap_or(economics::AAVE_V3_PREMIUM_PCT),
             )
         };
         if !enabled {
             return;
         }
-        let pct = self.current_flashloan_fee_pct(pool.as_deref(), fallback).await;
+        let pct = self
+            .current_flashloan_fee_pct(pool.as_deref(), fallback)
+            .await;
         self.config.lock().await.flashloan.fee_pct = Some(pct);
     }
 
@@ -238,6 +482,7 @@ impl ArbitrageClient {
     /// Fee do flashloan em unidades de token.
     /// `fee_pct` vem de `config.flashloan.fee_pct` (ex.: 0.0005 = 5 bps Aave V3).
     /// TODO: opcionalmente ler `FLASHLOAN_PREMIUM_TOTAL` on-chain do Aave Pool.
+    #[allow(dead_code)]
     fn calculate_flashloan_fee(&self, amount: U256, fee_pct: f64) -> U256 {
         if amount.is_zero() || !fee_pct.is_finite() || fee_pct <= 0.0 {
             return U256::zero();
@@ -263,6 +508,7 @@ impl ArbitrageClient {
     /// onde `flashloan_fee_usd` já foi derivado de `config.flashloan.fee_pct`.
     /// NÃO recebe net pré-descontado — evita dupla dedução de gas/Aave.
     /// Slippage continua filtrada no engine (`recalculate_profitability`).
+    #[allow(dead_code)]
     fn validate_profit_after_fees(
         &self,
         gross_profit_usd: f64,
@@ -393,10 +639,7 @@ impl ArbitrageClient {
     }
 
     fn is_uniswap_v3_step(dex_name: &str) -> bool {
-        let n = dex_name
-            .to_lowercase()
-            .replace(' ', "")
-            .replace('_', "");
+        let n = dex_name.to_lowercase().replace(' ', "").replace('_', "");
         n.contains("uniswapv3") || n == "uniswapv3"
     }
 
@@ -406,14 +649,17 @@ impl ArbitrageClient {
         let fee = step.v3_fee_tier.ok_or_else(|| {
             anyhow!(
                 "V3 fee_tier ausente no step {}→{} — abort (não forçar 3000 / não re-query)",
-                step.token_in, step.token_out
+                step.token_in,
+                step.token_out
             )
         })?;
         Self::executable_v3_fee_tier(fee)
     }
 
     /// Monta `extraData`: V3 = abi.encode(uint24); V2/Curve = vazio.
-    pub(crate) fn build_extra_data_for_step(step: &crate::core::types::ArbitrageStep) -> Result<Bytes> {
+    pub(crate) fn build_extra_data_for_step(
+        step: &crate::core::types::ArbitrageStep,
+    ) -> Result<Bytes> {
         if Self::is_uniswap_v3_step(&step.dex_name) {
             let fee = Self::resolve_v3_fee_for_step(step)?;
             Ok(Self::encode_v3_fee_extra_data(fee))
@@ -427,36 +673,50 @@ impl ArbitrageClient {
         if steps.is_empty() {
             return Err(FlashloanError::InvalidRoute("Empty steps".into()));
         }
-        
+
         for (i, step) in steps.iter().enumerate() {
+            // A13: hop no-op (token_in == token_out) — `force_usdt` às vezes anexa
+            // `USDT→USDT`, que reverte on-chain como V2 IDENTICAL_ADDRESSES e
+            // queima gás. Rejeitar antes do broadcast.
+            if step.token_in == step.token_out {
+                return Err(FlashloanError::InvalidRoute(format!(
+                    "Step {}: no-op hop (token_in == token_out)",
+                    i
+                )));
+            }
             if step.amount_out_min.is_zero() {
-                return Err(FlashloanError::InvalidRoute(
-                    format!("Step {}: amount_out_min is zero", i)
-                ));
+                return Err(FlashloanError::InvalidRoute(format!(
+                    "Step {}: amount_out_min is zero",
+                    i
+                )));
             }
         }
-        
+
         self.validate_route_consistency(steps)?;
-        
+
         Ok(())
     }
 
     /// CORREÇÃO: Valida complexidade sem bloquear arbitragem triangular
-    fn validate_route_complexity(&self, steps: &[AbiSwapStep], config: &Config) -> Result<(), FlashloanError> {
+    fn validate_route_complexity(
+        &self,
+        steps: &[AbiSwapStep],
+        config: &Config,
+    ) -> Result<(), FlashloanError> {
         let route = &config.arbitrage.route_validation;
         let max_hops_allowed = if route.enabled {
             config.arbitrage.max_path_length.min(route.max_hops.max(1)) as usize
         } else {
             config.arbitrage.max_path_length as usize
         };
-        
+
         // CORREÇÃO: Permitir até 4 hops para arbitragem triangular
         if steps.len() > max_hops_allowed {
             let reason = format!("{} hops exceeds maximum {}", steps.len(), max_hops_allowed);
             self.log_route_rejection(steps, &reason);
             return Err(FlashloanError::RouteTooComplex(reason));
         }
-        
+
         if route.enabled && route.block_same_dex_consecutive {
             for pair in steps.windows(2) {
                 if pair[0].dex_type == pair[1].dex_type {
@@ -496,33 +756,43 @@ impl ArbitrageClient {
     fn validate_route_consistency(&self, steps: &[AbiSwapStep]) -> Result<(), FlashloanError> {
         for i in 0..steps.len() - 1 {
             if steps[i].token_out != steps[i + 1].token_in {
-                return Err(FlashloanError::InvalidRoute(
-                    format!("Step {}: token_out {:?} != next token_in {:?}", 
-                           i, steps[i].token_out, steps[i + 1].token_in)
-                ));
+                return Err(FlashloanError::InvalidRoute(format!(
+                    "Step {}: token_out {:?} != next token_in {:?}",
+                    i,
+                    steps[i].token_out,
+                    steps[i + 1].token_in
+                )));
             }
         }
-        
+
         // CORREÇÃO: Mantida validação de ciclo - importante para flashloan
         if steps[0].token_in != steps[steps.len() - 1].token_out {
-            return Err(FlashloanError::InvalidRoute(
-                format!("Route doesn't return to initial token: {:?} != {:?}", 
-                       steps[0].token_in, steps[steps.len() - 1].token_out)
-            ));
+            return Err(FlashloanError::InvalidRoute(format!(
+                "Route doesn't return to initial token: {:?} != {:?}",
+                steps[0].token_in,
+                steps[steps.len() - 1].token_out
+            )));
         }
-        
+
         Ok(())
     }
 
     /// Aplica filtros de complexidade
-    fn apply_complexity_filters(&self, steps: &[AbiSwapStep], config: &Config) -> Result<(), FlashloanError> {
+    fn apply_complexity_filters(
+        &self,
+        steps: &[AbiSwapStep],
+        config: &Config,
+    ) -> Result<(), FlashloanError> {
         self.validate_route_complexity(steps, config)?;
         self.validate_steps_critical(steps)?;
-        
+
         if config.arbitrage.advanced_filters_enabled && steps.len() >= 3 {
-            info!("🔍 Rota complexa detectada ({} hops) - monitorando", steps.len());
+            info!(
+                "🔍 Rota complexa detectada ({} hops) - monitorando",
+                steps.len()
+            );
         }
-        
+
         Ok(())
     }
 
@@ -537,12 +807,12 @@ impl ArbitrageClient {
         if steps.is_empty() {
             return "Empty".to_string();
         }
-        
+
         let mut route = format!("{:?}", steps[0].token_in);
         for step in steps {
             route.push_str(&format!(" → {:?}", step.token_out));
         }
-        
+
         route
     }
 
@@ -551,30 +821,44 @@ impl ArbitrageClient {
     // ========================================================================
     pub async fn execute_opportunity(
         &self,
-        opp: &mut ArbitrageOpportunity
+        opp: &mut ArbitrageOpportunity,
     ) -> Result<BundleResult> {
-
         // NOTE: update_execution_block() era chamado AQUI (antes da execução),
         // o que faria debounce_same_block() sempre retornar true se fosse
         // implementado. Movido para após TX confirmada em send_and_confirm_transaction.
-        let (strategy, min_profit, risk_cfg, slippage_bps, flashloan_decimals, configured_fee_pct, pool_address, max_premium_bps, adverse_move_bps) = {
+        let (
+            strategy,
+            min_profit,
+            risk_cfg,
+            slippage_bps,
+            flashloan_decimals,
+            configured_fee_pct,
+            pool_address,
+            max_premium_bps,
+            adverse_move_bps,
+        ) = {
             let cfg = self.config.lock().await;
 
             (
-    self.determine_execution_strategy(opp, &cfg).await,
-    cfg.arbitrage.min_profit_absolute.parse::<f64>().unwrap_or(0.0001),
-    cfg.risk.clone(),
-    cfg.flashloan.slippage_bps.unwrap_or(50) as u64,
-    // 6 decimais (USDC/USDT) — MESMO default dos outros dois call sites.
-    // Divergia (18 aqui, 6 nos demais): com o campo ausente no TOML a fee do
-    // flashloan saía dividida por 1e18 em vez de 1e6, virando ~zero.
-    cfg.flashloan.flashloan_decimals.unwrap_or(6) as u32,
-    // Mesma fonte do engine (`recalculate_profitability`); default 5 bps Aave V3.
-    cfg.flashloan.fee_pct.unwrap_or(economics::AAVE_V3_PREMIUM_PCT),
-    cfg.flashloan.aave_pool_address.clone(),
-    cfg.flashloan.max_premium_bps,
-    cfg.execution.adverse_move_bps,
-)
+                self.determine_execution_strategy(opp, &cfg).await,
+                cfg.arbitrage
+                    .min_profit_absolute
+                    .parse::<f64>()
+                    .unwrap_or(0.0001),
+                cfg.risk.clone(),
+                cfg.flashloan.slippage_bps.unwrap_or(50) as u64,
+                // 6 decimais (USDC/USDT) — MESMO default dos outros dois call sites.
+                // Divergia (18 aqui, 6 nos demais): com o campo ausente no TOML a fee do
+                // flashloan saía dividida por 1e18 em vez de 1e6, virando ~zero.
+                cfg.flashloan.flashloan_decimals.unwrap_or(6) as u32,
+                // Mesma fonte do engine (`recalculate_profitability`); default 5 bps Aave V3.
+                cfg.flashloan
+                    .fee_pct
+                    .unwrap_or(economics::AAVE_V3_PREMIUM_PCT),
+                cfg.flashloan.aave_pool_address.clone(),
+                cfg.flashloan.max_premium_bps,
+                cfg.execution.adverse_move_bps,
+            )
         };
 
         // Direct = capital próprio: sem premium Aave.
@@ -616,12 +900,16 @@ impl ArbitrageClient {
             return Ok(BundleResult::skipped().with_execution_mode("premium_cap"));
         }
 
-        // GAS — overhead Aave tipado por estratégia.
-        let n_hops = opp.steps.0.len().max(1);
+        // GAS — B1: venue-based route estimate. Flashloan path ⇒ AaveV3 overhead.
         let gas_kind = Self::gas_strategy_kind(&strategy);
+        let fl_provider = if gas_kind.include_flashloan_overhead() {
+            Some(crate::core::gas_profile::FlashloanProvider::AaveV3)
+        } else {
+            None
+        };
         let gas_cost = match self
             .gas_estimator
-            .estimate_gas_usd_for_hops(n_hops, gas_kind)
+            .estimate_gas_usd_for_route(&opp.steps.0, fl_provider)
             .await
         {
             Ok(v) => {
@@ -646,7 +934,9 @@ impl ArbitrageClient {
                 Ok(v) => v,
                 Err(e) => {
                     warn!("principal usd_e8 failed: {e}");
-                    return Ok(BundleResult::skipped().with_execution_mode("principal_usd_overflow"));
+                    return Ok(
+                        BundleResult::skipped().with_execution_mode("principal_usd_overflow")
+                    );
                 }
             };
         let flashloan_fee_e8 = match fixed_usd::flashloan_fee_usd_e8(principal_e8, fee_bps) {
@@ -690,8 +980,7 @@ impl ArbitrageClient {
         }
 
         let flashloan_fee_usd = flashloan_fee_e8.display_f64();
-        let net_e8 =
-            fixed_usd::net_profit_usd_e8(gross_e8, gas_e8, flashloan_fee_e8, adverse_e8);
+        let net_e8 = fixed_usd::net_profit_usd_e8(gross_e8, gas_e8, flashloan_fee_e8, adverse_e8);
         opp.net_profit_usd = net_e8.display_f64();
 
         let min_profit_e8 = match fixed_usd::usd_f64_to_e8_ceil(min_profit) {
@@ -736,8 +1025,11 @@ impl ArbitrageClient {
             }
         }
 
-        info!("🔄 Executando rota: {} hops | Profit: ${:.4}", 
-              opp.steps.0.len(), opp.net_profit_usd);
+        info!(
+            "🔄 Executando rota: {} hops | Profit: ${:.4}",
+            opp.steps.0.len(),
+            opp.net_profit_usd
+        );
 
         // EXEC
         match strategy {
@@ -774,7 +1066,9 @@ impl ArbitrageClient {
             let cfg = self.config.lock().await;
             (
                 cfg.flashloan.slippage_bps.unwrap_or(50) as u64,
-                cfg.flashloan.fee_pct.unwrap_or(economics::AAVE_V3_PREMIUM_PCT),
+                cfg.flashloan
+                    .fee_pct
+                    .unwrap_or(economics::AAVE_V3_PREMIUM_PCT),
                 cfg.flashloan.aave_pool_address.clone(),
                 cfg.flashloan.flashloan_decimals.unwrap_or(6) as u32,
                 cfg.execution.adverse_move_bps,
@@ -785,11 +1079,13 @@ impl ArbitrageClient {
             .current_flashloan_fee_pct(pool_address.as_deref(), configured_fee_pct)
             .await;
 
-        // A6: paper valida flashloan → overhead WithFlashloan.
-        let n_hops = opp.steps.0.len().max(1);
+        // A6/B1: paper valida flashloan → overhead AaveV3, venue-based route.
         let gas_cost = match self
             .gas_estimator
-            .estimate_gas_usd_for_hops(n_hops, GasStrategyKind::WithFlashloan)
+            .estimate_gas_usd_for_route(
+                &opp.steps.0,
+                Some(crate::core::gas_profile::FlashloanProvider::AaveV3),
+            )
             .await
         {
             Ok(v) => {
@@ -918,14 +1214,10 @@ impl ArbitrageClient {
         let block_id = paper_validation::block_id(block);
         let holder = paper_from;
 
-        let _bal_before = paper_validation::erc20_balance(
-            self.middleware.clone(),
-            asset,
-            holder,
-            block_id,
-        )
-        .await
-        .ok();
+        let _bal_before =
+            paper_validation::erc20_balance(self.middleware.clone(), asset, holder, block_id)
+                .await
+                .ok();
 
         let call = self
             .executor
@@ -936,7 +1228,8 @@ impl ArbitrageClient {
         let (sim_ok, revert_reason) = match timeout(Duration::from_secs(15), call.call()).await {
             Ok(Ok(true)) => (true, None),
             Ok(Ok(false)) => {
-                let params = self.encode_flashloan_callback_params(paper_from, &steps, U256::zero());
+                let params =
+                    self.encode_flashloan_callback_params(paper_from, &steps, U256::zero());
                 let state_ovr = if use_overrides {
                     Some(paper_validation::erc20_balance_state_override(
                         asset,
@@ -1043,13 +1336,13 @@ impl ArbitrageClient {
     }
 
     /// Fail-closed: `profitRecipient` resolvido deve == `owner()` on-chain.
-    async fn assert_profit_recipient_matches_owner(
-        &self,
-        profit_recipient: Address,
-    ) -> Result<()> {
-        let onchain_owner: Address = self.executor.owner().call().await.map_err(|e| {
-            anyhow!("ProfitRecipientPreflight: failed to read owner(): {e}")
-        })?;
+    async fn assert_profit_recipient_matches_owner(&self, profit_recipient: Address) -> Result<()> {
+        let onchain_owner: Address = self
+            .executor
+            .owner()
+            .call()
+            .await
+            .map_err(|e| anyhow!("ProfitRecipientPreflight: failed to read owner(): {e}"))?;
         Self::ensure_profit_recipient_matches_owner(profit_recipient, onchain_owner)
     }
 
@@ -1094,9 +1387,36 @@ impl ArbitrageClient {
     async fn update_execution_block(&self) {
         if let Ok(block) = self.middleware.get_block_number().await {
             let block = block.as_u64();
-            let mut guard = self.last_exec_block.lock().await;
-            *guard = Some(block);
-            debug!("📦 Bloco atualizado: {}", block);
+            {
+                let mut guard = self.last_exec_block.lock().await;
+                *guard = Some(block);
+            }
+            // B7: promove finalidade dos trades (Included→Confirmed→Final) e
+            // publica gauges de lucro provisório/final.
+            let profit_confirmations = {
+                let cfg = self.config.lock().await;
+                cfg.execution.profit_confirmations as u64
+            };
+            let (provisory, final_, breaker) = {
+                let mut led = self.profit_ledger.lock().await;
+                led.promote(block, profit_confirmations);
+                (
+                    led.provisory_profit_usd(),
+                    led.final_profit_usd(),
+                    led.breaker_tripped(),
+                )
+            };
+            crate::infra::metrics::set_profit_finality(provisory, final_);
+            if breaker {
+                error!(
+                    "🚨 B7 circuit breaker de perda tripped: perdas REALIZADAS FINAIS \
+                     consecutivas ≥ threshold — kill switch deve atuar"
+                );
+            }
+            debug!(
+                "📦 Bloco atualizado: {} (provisory=${:.4} final=${:.4})",
+                block, provisory, final_
+            );
         }
     }
 
@@ -1131,7 +1451,7 @@ impl ArbitrageClient {
     async fn determine_execution_strategy(
         &self,
         _opp: &ArbitrageOpportunity,
-        cfg: &Config
+        cfg: &Config,
     ) -> ExecutionStrategy {
         // `dry_run` NÃO é mais um curto-circuito aqui. Antes ele retornava `Skip`
         // antes de qualquer coisa, então `simulate_before_execute` nunca rodava — o
@@ -1158,21 +1478,27 @@ impl ArbitrageClient {
     pub async fn execute_direct(
         &self,
         opp: &ArbitrageOpportunity,
-        slippage_bps: u64
+        slippage_bps: u64,
     ) -> Result<BundleResult> {
-
         // CORREÇÃO: Anti-MEV não bloqueia mais
         if self.debounce_same_block().await? {
-            return Ok(BundleResult::skipped().with_execution_mode("same_block"));
+            return Ok(BundleResult::skipped()
+                .with_execution_mode("same_block")
+                .with_outcome(ExecutionOutcome::SameBlockRejected { tx_hash: None }));
         }
 
         let (dry, simulate, asset, amount, steps, flashloan_decimals, min_profit_raw) = {
             let cfg = self.config.lock().await;
-            let (asset, amount, steps) = self.extract_and_convert_opp_data(opp, &cfg, slippage_bps)?;
+            let (asset, amount, steps) =
+                self.extract_and_convert_opp_data(opp, &cfg, slippage_bps)?;
 
             if let Err(e) = self.apply_complexity_filters(&steps, &cfg) {
                 warn!("{}", e);
-                return Ok(BundleResult::skipped().with_execution_mode("complexity_reject"));
+                return Ok(BundleResult::skipped()
+                    .with_execution_mode("complexity_reject")
+                    .with_outcome(ExecutionOutcome::AbortedPreBroadcast {
+                        reason: "route complexity filter reject".into(),
+                    }));
             }
 
             let decimals = cfg.flashloan.flashloan_decimals.unwrap_or(6) as u32;
@@ -1180,7 +1506,11 @@ impl ArbitrageClient {
                 Ok(v) => v,
                 Err(e) => {
                     warn!(error = %e, "MissingProfitTokenPrice — abort Direct");
-                    return Ok(BundleResult::skipped().with_execution_mode("missing_token_price"));
+                    return Ok(BundleResult::skipped()
+                        .with_execution_mode("missing_token_price")
+                        .with_outcome(ExecutionOutcome::AbortedPreBroadcast {
+                            reason: "missing profit token price".into(),
+                        }));
                 }
             };
 
@@ -1199,13 +1529,22 @@ impl ArbitrageClient {
 
         // APPROVE
         if !dry {
-            if let Err(e) = self.approve_token_for_execution(asset, self.executor.address(), amount).await {
+            if let Err(e) = self
+                .approve_token_for_execution(asset, self.executor.address(), amount)
+                .await
+            {
                 warn!("❌ Approve falhou: {}", e);
-                return Ok(BundleResult::skipped().with_execution_mode("approve_failed"));
+                return Ok(BundleResult::skipped()
+                    .with_execution_mode("approve_failed")
+                    .with_outcome(ExecutionOutcome::AbortedPreBroadcast {
+                        reason: format!("approve failed: {e}"),
+                    }));
             }
         }
 
-        let direct = self.executor.execute_direct(asset, amount, steps.clone(), min_profit_raw);
+        let direct = self
+            .executor
+            .execute_direct(asset, amount, steps.clone(), min_profit_raw);
 
         if simulate {
             info!("🔬 Simulando Direct Arbitrage...");
@@ -1213,16 +1552,25 @@ impl ArbitrageClient {
                 Ok(_) => info!("✅ Simulação Direct: Sucesso"),
                 Err(e) => {
                     warn!("❌ Simulação Direct falhou: {}", e);
-                    return Ok(BundleResult::skipped().with_execution_mode("direct_sim_failed"));
+                    return Ok(BundleResult::skipped()
+                        .with_execution_mode("direct_sim_failed")
+                        .with_outcome(ExecutionOutcome::AbortedPreBroadcast {
+                            reason: format!("direct sim failed: {e}"),
+                        }));
                 }
             }
         }
 
         if dry {
-            return Ok(BundleResult::new(true, opp.estimated_profit_usd, opp.gas_cost_usd));
+            return Ok(BundleResult::new(
+                true,
+                opp.estimated_profit_usd,
+                opp.gas_cost_usd,
+            ));
         }
 
-        self.send_and_confirm_transaction(direct, opp, "direct", flashloan_decimals).await
+        self.send_and_confirm_transaction(direct, opp, "direct", flashloan_decimals)
+            .await
     }
 
     // ========================================================================
@@ -1231,21 +1579,27 @@ impl ArbitrageClient {
     pub async fn execute_flashloan(
         &self,
         opp: &ArbitrageOpportunity,
-        slippage_bps: u64
+        slippage_bps: u64,
     ) -> Result<BundleResult> {
-
         // CORREÇÃO: Anti-MEV não bloqueia mais
         if self.debounce_same_block().await? {
-            return Ok(BundleResult::skipped().with_execution_mode("same_block"));
+            return Ok(BundleResult::skipped()
+                .with_execution_mode("same_block")
+                .with_outcome(ExecutionOutcome::SameBlockRejected { tx_hash: None }));
         }
 
         let (dry, simulate, asset, amount, steps, flashloan_decimals, min_profit_raw) = {
             let cfg = self.config.lock().await;
-            let (asset, amount, steps) = self.extract_and_convert_opp_data(opp, &cfg, slippage_bps)?;
+            let (asset, amount, steps) =
+                self.extract_and_convert_opp_data(opp, &cfg, slippage_bps)?;
 
             if let Err(e) = self.apply_complexity_filters(&steps, &cfg) {
                 warn!("{}", e);
-                return Ok(BundleResult::skipped().with_execution_mode("complexity_reject"));
+                return Ok(BundleResult::skipped()
+                    .with_execution_mode("complexity_reject")
+                    .with_outcome(ExecutionOutcome::AbortedPreBroadcast {
+                        reason: "route complexity filter reject".into(),
+                    }));
             }
 
             let decimals = cfg.flashloan.flashloan_decimals.unwrap_or(6) as u32;
@@ -1253,7 +1607,11 @@ impl ArbitrageClient {
                 Ok(v) => v,
                 Err(e) => {
                     warn!(error = %e, "MissingProfitTokenPrice — abort Flashloan");
-                    return Ok(BundleResult::skipped().with_execution_mode("missing_token_price"));
+                    return Ok(BundleResult::skipped()
+                        .with_execution_mode("missing_token_price")
+                        .with_outcome(ExecutionOutcome::AbortedPreBroadcast {
+                            reason: "missing profit token price".into(),
+                        }));
                 }
             };
 
@@ -1269,7 +1627,9 @@ impl ArbitrageClient {
             )
         };
 
-        let call = self.executor.execute_flashloan(asset, amount, steps, min_profit_raw);
+        let call = self
+            .executor
+            .execute_flashloan(asset, amount, steps, min_profit_raw);
 
         if simulate {
             info!("🔬 Simulando Flashloan...");
@@ -1277,16 +1637,25 @@ impl ArbitrageClient {
                 Ok(_) => info!("✅ Simulação Flashloan: Sucesso"),
                 Err(e) => {
                     warn!("❌ Simulação Flashloan falhou: {}", e);
-                    return Ok(BundleResult::skipped().with_execution_mode("flashloan_sim_failed"));
+                    return Ok(BundleResult::skipped()
+                        .with_execution_mode("flashloan_sim_failed")
+                        .with_outcome(ExecutionOutcome::AbortedPreBroadcast {
+                            reason: format!("flashloan sim failed: {e}"),
+                        }));
                 }
             }
         }
 
         if dry {
-            return Ok(BundleResult::new(true, opp.estimated_profit_usd, opp.gas_cost_usd));
+            return Ok(BundleResult::new(
+                true,
+                opp.estimated_profit_usd,
+                opp.gas_cost_usd,
+            ));
         }
 
-        self.send_and_confirm_transaction(call, opp, "flashloan", flashloan_decimals).await
+        self.send_and_confirm_transaction(call, opp, "flashloan", flashloan_decimals)
+            .await
     }
 
     // ========================================================================
@@ -1295,28 +1664,48 @@ impl ArbitrageClient {
     pub async fn execute_wrapper(
         &self,
         opp: &ArbitrageOpportunity,
-        slippage_bps: u64
+        slippage_bps: u64,
     ) -> Result<BundleResult> {
-
         // CORREÇÃO: Anti-MEV não bloqueia mais
         if self.debounce_same_block().await? {
-            return Ok(BundleResult::skipped().with_execution_mode("same_block"));
+            return Ok(BundleResult::skipped()
+                .with_execution_mode("same_block")
+                .with_outcome(ExecutionOutcome::SameBlockRejected { tx_hash: None }));
         }
 
-        let (dry, simulate, wrapper_addr, asset, amount, steps, flashloan_decimals, min_profit_raw, profit_recipient) = {
+        let (
+            dry,
+            simulate,
+            wrapper_addr,
+            asset,
+            amount,
+            steps,
+            flashloan_decimals,
+            min_profit_raw,
+            profit_recipient,
+        ) = {
             let cfg = self.config.lock().await;
 
             let wrapper_addr = Address::from_str(&cfg.wrapper.address)?;
-            let (asset, amount, steps) = self.extract_and_convert_opp_data(opp, &cfg, slippage_bps)?;
+            let (asset, amount, steps) =
+                self.extract_and_convert_opp_data(opp, &cfg, slippage_bps)?;
 
             if let Err(e) = self.validate_wrapper_steps(&steps, asset) {
                 warn!("❌ Steps inválidos para wrapper: {}", e);
-                return Ok(BundleResult::skipped().with_execution_mode("wrapper_invalid_steps"));
+                return Ok(BundleResult::skipped()
+                    .with_execution_mode("wrapper_invalid_steps")
+                    .with_outcome(ExecutionOutcome::AbortedPreBroadcast {
+                        reason: format!("wrapper invalid steps: {e}"),
+                    }));
             }
 
             if let Err(e) = self.apply_complexity_filters(&steps, &cfg) {
                 warn!("{}", e);
-                return Ok(BundleResult::skipped().with_execution_mode("complexity_reject"));
+                return Ok(BundleResult::skipped()
+                    .with_execution_mode("complexity_reject")
+                    .with_outcome(ExecutionOutcome::AbortedPreBroadcast {
+                        reason: "route complexity filter reject".into(),
+                    }));
             }
 
             let decimals = cfg.flashloan.flashloan_decimals.unwrap_or(6) as u32;
@@ -1324,7 +1713,11 @@ impl ArbitrageClient {
                 Ok(v) => v,
                 Err(e) => {
                     warn!(error = %e, "MissingProfitTokenPrice — abort Wrapper");
-                    return Ok(BundleResult::skipped().with_execution_mode("missing_token_price"));
+                    return Ok(BundleResult::skipped()
+                        .with_execution_mode("missing_token_price")
+                        .with_outcome(ExecutionOutcome::AbortedPreBroadcast {
+                            reason: "missing profit token price".into(),
+                        }));
                 }
             };
             let profit_recipient = self.resolve_profit_recipient(&cfg)?;
@@ -1350,7 +1743,11 @@ impl ArbitrageClient {
             .await
         {
             warn!(error = %e, "wrapper abort: recipient != owner");
-            return Ok(BundleResult::skipped().with_execution_mode("profit_recipient_mismatch"));
+            return Ok(BundleResult::skipped()
+                .with_execution_mode("profit_recipient_mismatch")
+                .with_outcome(ExecutionOutcome::AbortedPreBroadcast {
+                    reason: format!("profit recipient mismatch: {e}"),
+                }));
         }
 
         let params = Self::encode_callback_data(profit_recipient, &steps, min_profit_raw);
@@ -1364,45 +1761,66 @@ impl ArbitrageClient {
                 Ok(_) => info!("✅ Simulação Wrapper: Sucesso"),
                 Err(e) => {
                     warn!("❌ Simulação Wrapper falhou: {}", e);
-                    return Ok(BundleResult::skipped().with_execution_mode("wrapper_sim_failed"));
+                    return Ok(BundleResult::skipped()
+                        .with_execution_mode("wrapper_sim_failed")
+                        .with_outcome(ExecutionOutcome::AbortedPreBroadcast {
+                            reason: format!("wrapper sim failed: {e}"),
+                        }));
                 }
             }
         }
 
         if dry {
-            return Ok(BundleResult::new(true, opp.estimated_profit_usd, opp.gas_cost_usd));
+            return Ok(BundleResult::new(
+                true,
+                opp.estimated_profit_usd,
+                opp.gas_cost_usd,
+            ));
         }
 
-        self.send_and_confirm_transaction(call, opp, "wrapper", flashloan_decimals).await
+        self.send_and_confirm_transaction(call, opp, "wrapper", flashloan_decimals)
+            .await
     }
 
     /// Valida steps para wrapper (igual contrato)
-    fn validate_wrapper_steps(&self, steps: &[AbiSwapStep], asset: Address) -> Result<(), FlashloanError> {
+    fn validate_wrapper_steps(
+        &self,
+        steps: &[AbiSwapStep],
+        asset: Address,
+    ) -> Result<(), FlashloanError> {
         if steps.is_empty() {
-            return Err(FlashloanError::InvalidRoute("Empty steps for wrapper".into()));
+            return Err(FlashloanError::InvalidRoute(
+                "Empty steps for wrapper".into(),
+            ));
         }
-        
+
         if steps[0].token_in != asset {
-            return Err(FlashloanError::InvalidRoute(
-                format!("First step token_in {:?} != flashloan asset {:?}", 
-                       steps[0].token_in, asset)
-            ));
+            return Err(FlashloanError::InvalidRoute(format!(
+                "First step token_in {:?} != flashloan asset {:?}",
+                steps[0].token_in, asset
+            )));
         }
-        
+
         if steps[steps.len() - 1].token_out != asset {
-            return Err(FlashloanError::InvalidRoute(
-                format!("Last step token_out {:?} != flashloan asset {:?}", 
-                       steps[steps.len() - 1].token_out, asset)
-            ));
+            return Err(FlashloanError::InvalidRoute(format!(
+                "Last step token_out {:?} != flashloan asset {:?}",
+                steps[steps.len() - 1].token_out,
+                asset
+            )));
         }
-        
+
         Ok(())
     }
 
     // ========================================================================
     // APPROVE
     // ========================================================================
-    async fn approve_token_for_execution(&self, token_addr: Address, spender: Address, amount: U256) -> Result<()> {
+    async fn approve_token_for_execution(
+        &self,
+        token_addr: Address,
+        spender: Address,
+        amount: U256,
+    ) -> Result<()> {
         {
             let cfg = self.config.lock().await;
             if paper_validation::sends_forbidden(&cfg) {
@@ -1414,9 +1832,12 @@ impl ArbitrageClient {
         let wallet_addr = self.get_wallet_address()?;
         let token_contract = ERC20::new(token_addr, self.middleware.clone());
 
-        let allowance: U256 = token_contract.allowance(wallet_addr, spender).call().await
+        let allowance: U256 = token_contract
+            .allowance(wallet_addr, spender)
+            .call()
+            .await
             .context("Failed to get allowance")?;
-        
+
         if allowance >= amount {
             return Ok(());
         }
@@ -1424,7 +1845,7 @@ impl ArbitrageClient {
         info!("🔓 Approving {:?} for spender {:?}", token_addr, spender);
         let call = token_contract.approve(spender, U256::MAX);
         let pending = call.send().await.context("Failed to send approve")?;
-        
+
         match timeout(Duration::from_secs(30), pending).await {
             Ok(Ok(Some(receipt))) => {
                 if receipt.status == Some(1.into()) {
@@ -1448,8 +1869,8 @@ impl ArbitrageClient {
     // SIMULAÇÃO
     // ========================================================================
     async fn simulate_transaction<T: Detokenize>(
-        &self, 
-        call: &ContractCall<AppMiddleware, T>
+        &self,
+        call: &ContractCall<AppMiddleware, T>,
     ) -> Result<()> {
         // Simular em `pending` inclui swaps concorrentes que o RPC já viu.
         // Se o nó não puder dar esta garantia, falhar fechado evita broadcast
@@ -1460,7 +1881,7 @@ impl ArbitrageClient {
             Ok(Err(e)) => {
                 let error_msg = self.decode_revert_reason(&e.to_string());
                 Err(anyhow!("Simulation failed: {}", error_msg))
-            },
+            }
             Err(_) => Err(anyhow!("Simulation timeout")),
         }
     }
@@ -1492,7 +1913,7 @@ impl ArbitrageClient {
             Ok(Err(e)) => {
                 let error_msg = self.decode_revert_reason(&e.to_string());
                 Err(anyhow!("Simulation failed: {}", error_msg))
-            },
+            }
             Err(_) => Err(anyhow!("Simulation timeout")),
         }
     }
@@ -1511,7 +1932,6 @@ impl ArbitrageClient {
         mode: &'static str,
         flashloan_decimals: u32,
     ) -> Result<BundleResult> {
-
         // HARD GATE: paper / dry_run_only / dry_run — fisicamente impossível broadcast.
         {
             let cfg = self.config.lock().await;
@@ -1524,101 +1944,522 @@ impl ArbitrageClient {
             }
         }
 
-        let mut tx_req = Eip1559TransactionRequest::new();
-        let (mut max_fee, mut max_priority) =
-            self.gas_estimator.populate_dynamic_gas(&mut tx_req).await?;
-
-        for attempt in 0..2 {
-            if attempt > 0 {
-                max_fee = max_fee * 120 / 100;
-                max_priority = max_priority * 120 / 100;
-                info!("🔄 Retry {} com gas boost: {:?} Gwei", attempt, max_fee);
+        // FASE 6 — relay privado obrigatório: se o operador exigir mempool privado
+        // e o caminho de envio via ExecutionEngine/BundleSender não estiver ativo,
+        // aborta pré-broadcast (fail-closed). Nunca cai no mempool público quando
+        // o relay é requisitado. (O routing via BundleSender é o ponto pendente;
+        // até estar wired, private_relay_required=true aborta todas as sends.)
+        {
+            let cfg = self.config.lock().await;
+            // A5: relay_url default = flashbots.net (Ethereum mainnet). Polygon não
+            // é coberto por esse relay. Se o operador liga mev.enabled sem trocar a
+            // URL p/ um relay Polygon válido, eth_sendBundle vai p/ relay errado e
+            // toda opp falha (ou rejeita silenciosamente). Fail-closed explícito —
+            // não inventa URL Polygon.
+            const DEFAULT_ETH_RELAY: &str = "https://relay.flashbots.net";
+            if cfg.mev.enabled && cfg.mev.relay_url == DEFAULT_ETH_RELAY {
+                warn!(
+                    "🚫 ABORT pre-broadcast: mev.enabled=true mas relay_url é o default \
+                     Ethereum (flashbots.net) — Polygon não coberto. Configure um relay \
+                     MEV Polygon válido ou desative mev.enabled"
+                );
+                return Ok(BundleResult::skipped()
+                    .with_execution_mode("mev_relay_url_default_eth")
+                    .with_outcome(ExecutionOutcome::AbortedPreBroadcast {
+                        reason: "mev.enabled com relay_url default Ethereum (flashbots.net) — \
+                             relay não cobre Polygon"
+                            .into(),
+                    }));
             }
+            if cfg.mev.private_relay_required {
+                let routing_active = cfg.mev.enabled && self.execution_engine.is_some();
+                if !routing_active {
+                    warn!(
+                        "🚫 ABORT pre-broadcast: private_relay_required=true mas routing via \
+                         BundleSender inativo (mev.enabled={}, engine={})",
+                        cfg.mev.enabled,
+                        self.execution_engine.is_some()
+                    );
+                    return Ok(BundleResult::skipped()
+                        .with_execution_mode("private_relay_unavailable")
+                        .with_outcome(ExecutionOutcome::AbortedPreBroadcast {
+                            reason: "private relay required but BundleSender routing inactive"
+                                .into(),
+                        }));
+                }
+            }
+            if !cfg.mev.enabled {
+                // B3 — fail-closed no ponto de broadcast: sem relay privado e sem
+                // opt-in explícito ao mempool público → aborta. Nunca transmite ao
+                // mempool público por default (custo de backrun/sandwich na Polygon ~0).
+                if !cfg.mev.allow_public_mempool {
+                    warn!(
+                        "🚫 ABORT pre-broadcast: NoPrivateRoute — relay privado off e \
+                         allow_public_mempool=false (fail-closed, zero broadcast)"
+                    );
+                    return Ok(BundleResult::skipped()
+                        .with_execution_mode("no_private_route")
+                        .with_outcome(ExecutionOutcome::AbortedPreBroadcast {
+                            reason: "NoPrivateRoute: relay privado indisponível e \
+                                 allow_public_mempool=false (fail-closed)"
+                                .into(),
+                        }));
+                }
+                info!(
+                    "⚠️ PublicMempoolDegraded: enviando via mempool público (relay privado off, \
+                     allow_public_mempool=true). private_relay_required={}",
+                    cfg.mev.private_relay_required
+                );
+            }
+        }
 
+        // Política de retry/RBF. Uma tentativa lógica = um nonce. Retry = replacement
+        // (mesmo nonce + gas maior), nunca nonce novo. Evita double execution: duas
+        // txs com nonces distintos que ambas incluem e ambas executam a arbitragem.
+        let (
+            max_retries,
+            replace_multiplier,
+            confirm_timeout,
+            max_replace_attempts,
+            gas_ceiling_wei,
+        ) = {
+            let cfg = self.config.lock().await;
+            // B4: default 1.15 (bump max_fee E max_priority). 1.12 era insuficiente
+            // p/ substituir tx underpriced em congestionamento na Polygon.
+            // SAFETY-EV: 1.12 falhava em re-bump (underpriced persistente); 1.15
+            // cobre o spread típico de priority fee entre blocos congestionados.
+            let m = cfg.execution.replace_multiplier.unwrap_or(1.15).max(1.0);
+            // max_retries limitado a 4 p/ não virar spam de replacement.
+            let retries = cfg.execution.max_retries.clamp(1, 4) as usize;
+            let max_replace = cfg.execution.max_replace_attempts.max(0);
+            // Teto de gwei → wei para comparar com max_fee (U256). None/0 = sem teto.
+            let ceiling_wei = cfg
+                .execution
+                .gas_ceiling_gwei
+                .filter(|g| *g > 0.0)
+                .map(|g| crate::core::gas::gwei_f64(g));
+            (
+                retries,
+                m,
+                Duration::from_secs(30),
+                max_replace,
+                ceiling_wei,
+            )
+        };
+        let send_timeout = Duration::from_secs(10);
+        let multiplier_bps = U256::from((replace_multiplier * 100.0).round() as u64);
+
+        // Reserva UM nonce para a tentativa lógica inteira. Buscar pending nonce
+        // aqui (uma vez) e fixá-lo no TypedTransaction faz ethers não re-fetch
+        // nonce em cada call.send() — que era a raiz do bug double-execution.
+        let sender = self.get_wallet_address()?;
+        // B8: reapa nonces presos antes de reservar um novo (libera o gap).
+        // Re-fetch fresco internamente — nunca reusa nonce sem confirmar chain.
+        self.reap_stuck_nonces().await;
+        let nonce = match self
+            .middleware
+            .get_transaction_count(sender, Some(BlockId::Number(BlockNumber::Pending)))
+            .await
+        {
+            Ok(n) => n,
+            Err(e) => {
+                warn!(error = %e, "nonce fetch falhou — abort pre-broadcast");
+                return Ok(BundleResult::skipped()
+                    .with_execution_mode("nonce_fetch_failed")
+                    .with_outcome(ExecutionOutcome::AbortedPreBroadcast {
+                        reason: format!("nonce fetch failed: {e}"),
+                    }));
+            }
+        };
+        // B8: registra nonce como in-flight p/ o reaper rastrear stall.
+        let nonce_u64 = nonce.as_u64();
+        self.nonce_reaper
+            .lock()
+            .await
+            .note_broadcast(nonce_u64, std::time::Instant::now());
+
+        let (mut max_fee, mut max_priority) = {
+            let mut tx_req = Eip1559TransactionRequest::new();
+            self.gas_estimator.populate_dynamic_gas(&mut tx_req).await?
+        };
+
+        let opp_id = opp.id.clone();
+        let mut latest_tx_hash: Option<H256> = None;
+        let mut replacement_count: u32 = 0;
+
+        // B4 — helper de re-bump acumulado (×replace_multiplier) com teto e cap.
+        // Retorna o motivo do abort se exceder max_replace_attempts ou gas_ceiling.
+        // Bump é inteiro (×100 → /100) p/ evitar drift de f64. Mesmo nonce sempre.
+        // Item fn (não closure) → não captura, evita borrow conflict no loop.
+
+        let mut skip_next_bump = false;
+        for attempt in 0..max_retries {
+            if attempt > 0 && !skip_next_bump {
+                // Bump integer (x100 → /100) p/ evitar drift de f64. Mesmo nonce.
+                if let Err(abort) = rbf_bump_gas(
+                    &mut max_fee,
+                    &mut max_priority,
+                    &mut replacement_count,
+                    multiplier_bps,
+                    max_replace_attempts,
+                    gas_ceiling_wei,
+                ) {
+                    let reason = match abort {
+                        RbfBumpAbort::MaxAttempts => {
+                            format!("max_replace_attempts ({}) excedido", max_replace_attempts)
+                        }
+                        RbfBumpAbort::CeilingExceeded => {
+                            "gas_ceiling_gwei excedido no re-bump".to_string()
+                        }
+                    };
+                    warn!(
+                        opp_id = %opp_id, nonce = ?nonce, replacement_count,
+                        max_fee = ?max_fee, "⏹️ RBF expirada: {} — tx pendente abandonada", reason
+                    );
+                    return Ok(BundleResult::skipped()
+                        .with_execution_mode("rbf_expired")
+                        .with_tx_hash(latest_tx_hash.map(|h| format!("{:?}", h)))
+                        .with_outcome(ExecutionOutcome::Expired {
+                            nonce,
+                            latest_tx_hash,
+                            reason,
+                        }));
+                }
+                info!(
+                    opp_id = %opp_id, mode, attempt, replacement_count,
+                    nonce = ?nonce, max_fee = ?max_fee, max_priority = ?max_priority,
+                    "🔄 RBF replacement: mesmo nonce, gas bumped"
+                );
+            }
+            skip_next_bump = false;
+
+            // Fixa nonce + gas no TypedTransaction do ContractCall. ethers skipa
+            // o fetch de nonce em send() quando o campo já está setado.
             if let Some(tx) = call.tx.as_eip1559_mut() {
+                tx.nonce = Some(nonce);
                 tx.max_fee_per_gas = Some(max_fee);
                 tx.max_priority_fee_per_gas = Some(max_priority);
+            } else {
+                // Policy exige EIP-1559. Tx legada = abort fail-closed.
+                return Ok(BundleResult::skipped()
+                    .with_execution_mode("non_eip1559_abort")
+                    .with_outcome(ExecutionOutcome::AbortedPreBroadcast {
+                        reason: "tx não é EIP-1559 — abort fail-closed".into(),
+                    }));
             }
 
-            info!("💸 Enviando TX (Mode: {}, Attempt: {}) | Gas: {:?} Gwei", 
-                  mode, attempt + 1, max_fee);
+            info!(
+                opp_id = %opp_id, mode, attempt = attempt + 1, max_retries,
+                nonce = ?nonce, max_fee = ?max_fee, max_priority = ?max_priority,
+                "💸 Enviando TX"
+            );
 
-            match timeout(Duration::from_secs(10), call.send()).await {
+            match timeout(send_timeout, call.send()).await {
                 Ok(Ok(pending)) => {
-                    info!("⏳ TX Enviada: {:?} - Aguardando confirmação...", pending.tx_hash());
-                    
-                    match timeout(Duration::from_secs(30), pending).await {
+                    let tx_hash = pending.tx_hash();
+                    latest_tx_hash = Some(tx_hash);
+                    info!(
+                        opp_id = %opp_id, nonce = ?nonce, tx_hash = ?tx_hash,
+                        "⏳ TX enviada — aguardando confirmação"
+                    );
+
+                    match timeout(confirm_timeout, pending).await {
                         Ok(Ok(Some(receipt))) => {
+                            let r_hash = receipt.transaction_hash;
                             if receipt.status == Some(1.into()) {
-                                info!("✅ TX Confirmada: {:?}", receipt.transaction_hash);
-
-                                // Anti-MEV: registrar bloco da execução bem-sucedida
-                                // para que debounce_same_block bloqueie tentativas
-                                // subsequentes no mesmo bloco (contrato exige).
+                                info!(opp_id = %opp_id, tx_hash = ?r_hash, "✅ TX confirmada");
+                                // Anti-MEV: registra bloco só após execução confirmada.
                                 self.update_execution_block().await;
-
                                 if let Some(gas_used) = receipt.gas_used {
                                     let gas_kind = if mode == "direct" {
                                         GasStrategyKind::Direct
                                     } else {
                                         GasStrategyKind::WithFlashloan
                                     };
+                                    let fl_provider = if gas_kind.include_flashloan_overhead() {
+                                        Some(crate::core::gas_profile::FlashloanProvider::AaveV3)
+                                    } else {
+                                        None
+                                    };
                                     self.gas_estimator
-                                        .observe_gas_used(
-                                            opp.steps.0.len().max(1),
-                                            gas_used,
-                                            gas_kind,
-                                        )
+                                        .observe_gas_used(&opp.steps.0, fl_provider, gas_used)
                                         .await;
                                 }
-
-                                let contract_profit = self
-                                    .extract_real_profit_from_receipt(&receipt, opp, flashloan_decimals)
-                                    .unwrap_or_else(|| {
-                                        // Projeção nunca é PnL realizado. Sem evento
-                                        // confiável, registrar limite inferior (zero
-                                        // antes do gás) evita contaminar calibração.
-                                        warn!("receipt sem evento de lucro; PnL será limite inferior");
-                                        0.0
-                                    });
-                                // Evento do executor mede lucro do ativo após o premium,
-                                // mas gás sai da wallet em POL. Métrica/PnL sem esta
-                                // subtração superestima exatamente o tipo de edge de cents
-                                // que este bot tenta capturar.
+                                // A1: sem evento de lucro decodificável (wrapper path
+                                // emite evento distinto, ou token_price ausente), usa
+                                // gross teórico do finder como fallback — NUNCA 0.0.
+                                // 0.0 viria `real_profit = 0 - gas` = ConfirmedLoss
+                                // falso sistemático. Marca PnL como estimado, não medido.
+                                let (contract_profit, profit_measured) = match self
+                                    .extract_real_profit_from_receipt(
+                                        &receipt,
+                                        opp,
+                                        flashloan_decimals,
+                                    ) {
+                                    Some(p) => (p, true),
+                                    None => {
+                                        warn!(
+                                            "receipt sem evento de lucro decodificável \
+                                             (wrapper path ou token_price ausente); PnL usará \
+                                             gross teórico do finder — NÃO é medição real"
+                                        );
+                                        (opp.estimated_profit_usd, false)
+                                    }
+                                };
                                 let real_profit = self
                                     .realized_net_profit_after_gas_usd(&receipt, contract_profit)
                                     .await;
+                                if !profit_measured {
+                                    warn!(
+                                        opp_id = %opp_id, tx_hash = ?r_hash,
+                                        real_profit = real_profit,
+                                        "PnL NÃO medido do receipt — estimativa teórica (gross finder - gas real)"
+                                    );
+                                }
                                 metrics::inc_arbitrage_executions();
                                 metrics::inc_exec_ok();
                                 metrics::set_last_profit(real_profit);
-                                
+                                // B7: registra no ledger de finalidade. 1 confirmação =
+                                // provisory (Included). profit_source: Realized se o PnL
+                                // veio do receipt (evento decodificado); Estimated se caiu
+                                // no fallback do gross do finder (A1). Estimated NÃO alimenta
+                                // o circuit breaker de perda.
+                                let inclusion_block =
+                                    receipt.block_number.map(|b| b.as_u64()).unwrap_or(0);
+                                let source = if profit_measured {
+                                    crate::core::profit_ledger::ProfitSource::Realized {
+                                        final_: false,
+                                    }
+                                } else {
+                                    crate::core::profit_ledger::ProfitSource::Estimated
+                                };
+                                {
+                                    let mut led = self.profit_ledger.lock().await;
+                                    led.record_included(
+                                        r_hash,
+                                        inclusion_block,
+                                        real_profit,
+                                        source,
+                                    );
+                                }
+                                let outcome = if real_profit >= 0.0 {
+                                    ExecutionOutcome::ConfirmedProfit {
+                                        tx_hash: r_hash,
+                                        realized_profit_usd: real_profit,
+                                        gas_used: receipt.gas_used.unwrap_or_default(),
+                                    }
+                                } else {
+                                    ExecutionOutcome::ConfirmedLoss {
+                                        tx_hash: r_hash,
+                                        realized_loss_usd: -real_profit,
+                                        gas_used: receipt.gas_used.unwrap_or_default(),
+                                    }
+                                };
                                 return Ok(BundleResult::new(true, real_profit, opp.gas_cost_usd)
                                     .with_execution_mode(mode)
-                                    .with_tx_hash(Some(format!("{:?}", receipt.transaction_hash))));
+                                    .with_tx_hash(Some(format!("{:?}", r_hash)))
+                                    .with_outcome(outcome));
                             } else {
-                                warn!("❌ TX Revertida: {:?}", receipt.transaction_hash);
-                                return Ok(BundleResult::skipped().with_execution_mode("tx_reverted"));
+                                // Revert: tx minerada com status 0. NUNCA skip.
+                                warn!(opp_id = %opp_id, tx_hash = ?r_hash, "❌ TX revertida");
+                                return Ok(BundleResult::skipped()
+                                    .with_execution_mode("tx_reverted")
+                                    .with_tx_hash(Some(format!("{:?}", r_hash)))
+                                    .with_outcome(ExecutionOutcome::Reverted {
+                                        tx_hash: r_hash,
+                                        reason: None,
+                                        gas_used: receipt.gas_used,
+                                    }));
                             }
-                        },
-                        _ => {
-                            warn!("⏰ Timeout na confirmação");
+                        }
+                        Ok(Ok(None)) => {
+                            // Receipt None: tx pode estar pending OU já minerada (nó
+                            // sem receipt ainda). Próximo attempt = replacement mesmo
+                            // nonce. Último attempt → distinguir stuck vs dropped via
+                            // pending nonce da rede.
+                            warn!(opp_id = %opp_id, nonce = ?nonce, "⏰ receipt None — tx possivelmente pending");
+                            if attempt + 1 >= max_retries {
+                                // A12: se pending nonce da rede já passou do nosso,
+                                // tx foi incluída — não está stuck, está sem receipt no
+                                // nosso nó. Classifica Dropped (nonce consumido) e deixa
+                                // o caller resyncar, em vez de prender o nonce como stuck.
+                                let net_nonce = self
+                                    .middleware
+                                    .get_transaction_count(
+                                        sender,
+                                        Some(BlockId::Number(BlockNumber::Pending)),
+                                    )
+                                    .await
+                                    .unwrap_or(nonce);
+                                if net_nonce > nonce {
+                                    warn!(
+                                        opp_id = %opp_id, our_nonce = ?nonce,
+                                        net_nonce = ?net_nonce,
+                                        "tx incluída mas sem receipt local — nonce consumido, \
+                                         classifica Dropped (não stuck)"
+                                    );
+                                    return Ok(BundleResult::skipped()
+                                        .with_execution_mode("no_receipt_nonce_consumed")
+                                        .with_tx_hash(latest_tx_hash.map(|h| format!("{:?}", h)))
+                                        .with_outcome(ExecutionOutcome::Dropped { nonce }));
+                                }
+                                return Ok(self.timeout_stuck_result(
+                                    &opp_id,
+                                    nonce,
+                                    latest_tx_hash,
+                                ));
+                            }
+                            continue;
+                        }
+                        Ok(Err(e)) => {
+                            warn!(opp_id = %opp_id, nonce = ?nonce, error = %e, "⏰ erro na confirmação");
+                            if attempt + 1 >= max_retries {
+                                return Ok(self.timeout_stuck_result(
+                                    &opp_id,
+                                    nonce,
+                                    latest_tx_hash,
+                                ));
+                            }
+                            continue;
+                        }
+                        Err(_) => {
+                            warn!(opp_id = %opp_id, nonce = ?nonce, "⏰ timeout na confirmação");
+                            if attempt + 1 >= max_retries {
+                                return Ok(self.timeout_stuck_result(
+                                    &opp_id,
+                                    nonce,
+                                    latest_tx_hash,
+                                ));
+                            }
                             continue;
                         }
                     }
-                },
+                }
                 Ok(Err(e)) => {
-                    warn!("❌ Erro ao enviar TX: {}", e);
-                    if attempt == 0 { continue; }
-                    return Ok(BundleResult::skipped().with_execution_mode("send_failed"));
-                },
+                    let s = e.to_string().to_lowercase();
+                    // B4: "replacement transaction underpriced" / "transaction
+                    // underpriced" → re-bump acumulado ×replace_multiplier no mesmo
+                    // nonce, até max_replace_attempts ou gas_ceiling_gwei. Não cria
+                    // nonce novo (evita double execution). skip_next_bump evita
+                    // double-bump no próximo iteration do loop.
+                    let underpriced = s.contains("underpriced");
+                    if underpriced {
+                        if let Err(abort) = rbf_bump_gas(
+                            &mut max_fee,
+                            &mut max_priority,
+                            &mut replacement_count,
+                            multiplier_bps,
+                            max_replace_attempts,
+                            gas_ceiling_wei,
+                        ) {
+                            let reason = match abort {
+                                RbfBumpAbort::MaxAttempts => format!(
+                                    "max_replace_attempts ({}) excedido em re-bump underpriced",
+                                    max_replace_attempts
+                                ),
+                                RbfBumpAbort::CeilingExceeded => {
+                                    "gas_ceiling_gwei excedido em re-bump underpriced".to_string()
+                                }
+                            };
+                            warn!(
+                                opp_id = %opp_id, nonce = ?nonce, replacement_count,
+                                max_fee = ?max_fee,
+                                "⏹️ RBF expirada (underpriced): {} — tx pendente abandonada",
+                                reason
+                            );
+                            return Ok(BundleResult::skipped()
+                                .with_execution_mode("rbf_expired")
+                                .with_tx_hash(latest_tx_hash.map(|h| format!("{:?}", h)))
+                                .with_outcome(ExecutionOutcome::Expired {
+                                    nonce,
+                                    latest_tx_hash,
+                                    reason,
+                                }));
+                        }
+                        info!(
+                            opp_id = %opp_id, nonce = ?nonce, replacement_count,
+                            max_fee = ?max_fee, max_priority = ?max_priority,
+                            "🔁 underpriced — re-bump acumulado, mesmo nonce (RBF)"
+                        );
+                        skip_next_bump = true;
+                        continue;
+                    }
+                    // A11: "nonce too low" significa tx com esse nonce JÁ foi
+                    // incluída na chain — não está pendente. Classifica Dropped
+                    // (nonce consumido) em vez de TimeoutStuck (que prenderia o
+                    // nonce e conflitaria com a próxima opp).
+                    let nonce_too_low = s.contains("nonce too low");
+                    // Sinais de que a tx já está na rede (already known,
+                    // replacement underpriced, known transaction): não recriar com
+                    // nonce novo. Último attempt → TimeoutStuck (assume pendente).
+                    let already_known = !nonce_too_low
+                        && (s.contains("already known")
+                            || s.contains("replacement")
+                            || s.contains("known transaction")
+                            || s.contains("nonce"));
+                    if attempt + 1 >= max_retries {
+                        let (mode_str, outcome) = if nonce_too_low {
+                            (
+                                "dropped_nonce_consumed",
+                                ExecutionOutcome::Dropped { nonce },
+                            )
+                        } else if already_known {
+                            (
+                                "timeout_stuck",
+                                ExecutionOutcome::TimeoutStuck {
+                                    nonce,
+                                    latest_tx_hash,
+                                },
+                            )
+                        } else {
+                            ("dropped", ExecutionOutcome::Dropped { nonce })
+                        };
+                        warn!(
+                            opp_id = %opp_id, nonce = ?nonce, already_known,
+                            error = %e, "❌ send falhou no último attempt"
+                        );
+                        return Ok(BundleResult::skipped()
+                            .with_execution_mode(mode_str)
+                            .with_tx_hash(latest_tx_hash.map(|h| format!("{:?}", h)))
+                            .with_outcome(outcome));
+                    }
+                    warn!(opp_id = %opp_id, nonce = ?nonce, error = %e, "❌ erro send — retry mesmo nonce");
+                    continue;
+                }
                 Err(_) => {
-                    warn!("⏰ Timeout no envio");
+                    // Timeout no envio: tx pode ter sido broadcast. Reenvio como
+                    // replacement mesmo nonce (RBF) no próximo attempt.
+                    warn!(opp_id = %opp_id, nonce = ?nonce, "⏰ timeout no envio — tentará replacement");
+                    if attempt + 1 >= max_retries {
+                        return Ok(self.timeout_stuck_result(&opp_id, nonce, latest_tx_hash));
+                    }
                     continue;
                 }
             }
         }
 
-        Ok(BundleResult::skipped().with_execution_mode("max_retries_exceeded"))
+        // Loop esgotado sem return defensivo — trata como stuck (não skip genérico).
+        Ok(self.timeout_stuck_result(&opp_id, nonce, latest_tx_hash))
+    }
+
+    /// Constrói BundleResult de TimeoutStuck com log estruturado único.
+    fn timeout_stuck_result(
+        &self,
+        opp_id: &str,
+        nonce: U256,
+        latest_tx_hash: Option<H256>,
+    ) -> BundleResult {
+        warn!(
+            opp_id = %opp_id, nonce = ?nonce, latest_tx_hash = ?latest_tx_hash,
+            outcome = "TimeoutStuck", "⏰ tentativa lógica esgotada — nonce possivelmente pendente, NÃO reusar"
+        );
+        BundleResult::skipped()
+            .with_execution_mode("timeout_stuck")
+            .with_tx_hash(latest_tx_hash.map(|h| format!("{:?}", h)))
+            .with_outcome(ExecutionOutcome::TimeoutStuck {
+                nonce,
+                latest_tx_hash,
+            })
     }
 
     /// C3: decodifica o profit REAL do evento `FlashLoanSuccess` emitido pelo
@@ -1649,7 +2490,9 @@ impl ArbitrageClient {
         ));
 
         for log in receipt.logs.iter() {
-            let Some(t0) = log.topics.first() else { continue };
+            let Some(t0) = log.topics.first() else {
+                continue;
+            };
             if (*t0 != flashloan_topic && *t0 != direct_topic)
                 || log.address != self.executor.address()
             {
@@ -1658,7 +2501,10 @@ impl ArbitrageClient {
             // Dados não-indexados: amount, premium, profit (3 × 32 bytes).
             let data = log.data.as_ref();
             if data.len() < 96 {
-                warn!("FlashLoanSuccess: log data curto ({} bytes) — decode skip", data.len());
+                warn!(
+                    "FlashLoanSuccess: log data curto ({} bytes) — decode skip",
+                    data.len()
+                );
                 continue;
             }
             let tokens = match ethers::abi::decode(
@@ -1679,7 +2525,19 @@ impl ArbitrageClient {
                 Some(Token::Uint(v)) => v,
                 _ => continue,
             };
-            let token_price = opp.token_price_usd.unwrap_or(0.0);
+            // A2: sem preço do token no opp, não dá p/ converter raw→USD.
+            // Retornar None (caller usa gross teórico) — NUNCA Some(0.0), que
+            // vira falso ConfirmedLoss sistemático.
+            let token_price = match opp.token_price_usd {
+                Some(p) if p.is_finite() && p > 0.0 => p,
+                _ => {
+                    warn!(
+                        "FlashLoanSuccess decodificado mas opp.token_price_usd ausente/inválido \
+                         — profit real não medido, PnL será estimativa teórica"
+                    );
+                    return None;
+                }
+            };
             let profit_usd =
                 self.token_amount_to_usd_display_f64(profit_raw, token_price, flashloan_decimals);
             info!(
@@ -1713,10 +2571,24 @@ impl ArbitrageClient {
 
         let gas_wei = gas_used.saturating_mul(effective_gas_price);
         let gas_pol = u256_to_f64(gas_wei, 18);
-        let pol_usd = crate::infra::price_feed::PRICE_FEED
-            .get_price("WMATIC")
+        // A3: PnL realizado (que calibra gas estimator + métricas) não pode usar
+        // fallback heurístico de POL silenciosamente — preço de gas errado distorce
+        // o net de forma não detectável. Tenta strict (qualquer entrada não-fallback
+        // do cache); só cai no fallback se não houver NADA, e loga warn explícito.
+        let pol_usd = match crate::infra::price_feed::PRICE_FEED
+            .get_price_strict("WMATIC", std::time::Duration::ZERO)
             .await
-            .unwrap_or_else(|_| crate::infra::price_feed::CachedPriceFeed::fallback_price("WMATIC"));
+        {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "PnL realizado: preço POL não-strict indisponível — usando fallback heurístico \
+                     (gas_usd PODE estar errado, métrica de calibração afetada)"
+                );
+                crate::infra::price_feed::CachedPriceFeed::fallback_price("WMATIC")
+            }
+        };
         let gas_usd = gas_pol * pol_usd;
         let net = contract_profit_usd - gas_usd;
         info!(
@@ -1735,7 +2607,6 @@ impl ArbitrageClient {
         cfg: &Config,
         _slippage_bps: u64,
     ) -> Result<(Address, U256, Vec<AbiSwapStep>)> {
-
         // M13: `USDC` e `USDC.e` são contratos distintos. Sanitiza com a
         // identidade de endereço resolvida da config, não pelo ticker.
         let steps = ArbitrageEngine::sanitize_steps_with_token_identity(&opp.steps.0, |symbol| {
@@ -1778,18 +2649,22 @@ impl ArbitrageClient {
     // MAP DEX
     // ========================================================================
     fn map_dex_type(&self, dex: &str) -> Result<u8> {
-        let normalized = dex.to_lowercase()
+        let normalized = dex
+            .to_lowercase()
             .replace(" ", "")
             .replace("_", "")
             .replace("v2", "")
             .replace("v3", "");
-        
+
         match normalized.as_str() {
             "quickswap" => Ok(0),
             "sushiswap" => Ok(1),
             "uniswap" => Ok(2),
             _ => {
-                warn!("⚠️ DEX não mapeada: '{}' (normalizada: '{}')", dex, normalized);
+                warn!(
+                    "⚠️ DEX não mapeada: '{}' (normalizada: '{}')",
+                    dex, normalized
+                );
                 Err(anyhow!("DEX não suportada: {}", dex))
             }
         }
@@ -1800,7 +2675,9 @@ impl ArbitrageClient {
             return Ok(*addr);
         }
 
-        let s = cfg.pairs.tokens
+        let s = cfg
+            .pairs
+            .tokens
             .get(symbol)
             .ok_or_else(|| anyhow!("Token não encontrado: {}", symbol))?;
 
@@ -1820,10 +2697,10 @@ impl ArbitrageClient {
 mod tests {
     use super::*;
 
+    use crate::infra::rotating_http_client::RotatingHttpClient;
     use ethers::providers::Provider;
     use ethers::signers::LocalWallet;
     use std::str::FromStr;
-    use crate::infra::rotating_http_client::RotatingHttpClient;
 
     // Chave de teste hardhat account #0 — bem conhecida, sem valor.
     const TEST_PK: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
@@ -1896,7 +2773,7 @@ mod tests {
     // extract_real_profit_from_receipt — C3
     // ------------------------------------------------------------------------
     fn flashloan_success_log(profit_raw: U256) -> ethers::types::Log {
-        use ethers::types::{Bytes, H256, Log};
+        use ethers::types::{Bytes, Log, H256};
         let topic0 = H256::from(ethers::utils::keccak256(
             b"FlashLoanSuccess(address,uint256,uint256,uint256,address)",
         ));
@@ -1915,7 +2792,7 @@ mod tests {
     }
 
     fn direct_execution_log(profit_raw: U256) -> ethers::types::Log {
-        use ethers::types::{Bytes, H256, Log};
+        use ethers::types::{Bytes, Log, H256};
         let topic0 = H256::from(ethers::utils::keccak256(
             b"DirectExecution(address,uint256,uint256,address,uint256)",
         ));
@@ -1955,7 +2832,9 @@ mod tests {
         let client = make_client();
         let receipt = TransactionReceipt::default();
         let opp = ArbitrageOpportunity::default();
-        assert!(client.extract_real_profit_from_receipt(&receipt, &opp, 6).is_none());
+        assert!(client
+            .extract_real_profit_from_receipt(&receipt, &opp, 6)
+            .is_none());
     }
 
     #[test]
@@ -1992,7 +2871,10 @@ mod tests {
     fn apply_slippage_full_amount_bps() {
         let client = make_client();
         // 10000 bps = 100% => 0
-        assert_eq!(client.apply_slippage(U256::from(1_000_000), 10000), U256::zero());
+        assert_eq!(
+            client.apply_slippage(U256::from(1_000_000), 10000),
+            U256::zero()
+        );
     }
 
     // ------------------------------------------------------------------------
@@ -2043,7 +2925,9 @@ mod tests {
         let gross = 10.0_f64;
         let gas = 1.0_f64;
         let fee = 0.5_f64;
-        assert!(client.validate_profit_after_fees(gross, gas, fee, 0.0).is_ok());
+        assert!(client
+            .validate_profit_after_fees(gross, gas, fee, 0.0)
+            .is_ok());
         let expected_net = gross - gas - fee;
         assert!((expected_net - 8.5).abs() < 1e-12);
         // Se subtraísse de novo (double), net ficaria 8.5 - 1 - 0.5 = 7.0 — gate
@@ -2060,7 +2944,9 @@ mod tests {
         let fee_tok = client.calculate_flashloan_fee(amount, 0.0005);
         let fee_usd = client.token_amount_to_usd_display_f64(fee_tok, 1.0, 6);
         assert!((fee_usd - 0.05).abs() < 1e-9, "fee_usd={fee_usd}");
-        assert!(client.validate_profit_after_fees(2.0, 0.1, fee_usd, 0.0).is_ok());
+        assert!(client
+            .validate_profit_after_fees(2.0, 0.1, fee_usd, 0.0)
+            .is_ok());
     }
 
     // ------------------------------------------------------------------------
@@ -2205,7 +3091,9 @@ mod tests {
             // token_in c != prev token_out b
             step(0, c, a, U256::from(99)),
         ];
-        let err = client.validate_route_consistency(&steps).expect_err("cadeia quebrada");
+        let err = client
+            .validate_route_consistency(&steps)
+            .expect_err("cadeia quebrada");
         assert!(matches!(err, FlashloanError::InvalidRoute(_)));
     }
 
@@ -2221,7 +3109,9 @@ mod tests {
         // Quebra o ciclo: último token_out != primeiro token_in
         let mut broken = steps.clone();
         broken[1].token_out = Address::from_low_u64_be(3);
-        let err = client.validate_route_consistency(&broken).expect_err("não fecha ciclo");
+        let err = client
+            .validate_route_consistency(&broken)
+            .expect_err("não fecha ciclo");
         assert!(err.to_string().contains("return to initial token"));
     }
 
@@ -2231,7 +3121,9 @@ mod tests {
     #[test]
     fn steps_critical_rejects_empty() {
         let client = make_client();
-        let err = client.validate_steps_critical(&[]).expect_err("steps vazios");
+        let err = client
+            .validate_steps_critical(&[])
+            .expect_err("steps vazios");
         assert!(matches!(err, FlashloanError::InvalidRoute(_)));
         assert!(err.to_string().contains("Empty steps"));
     }
@@ -2245,8 +3137,25 @@ mod tests {
             step(0, a, b, U256::zero()), // amount_out_min zero
             step(0, b, a, U256::from(99)),
         ];
-        let err = client.validate_steps_critical(&steps).expect_err("amount_out_min zero");
+        let err = client
+            .validate_steps_critical(&steps)
+            .expect_err("amount_out_min zero");
         assert!(err.to_string().contains("amount_out_min is zero"));
+    }
+
+    #[test]
+    fn steps_critical_rejects_noop_hop() {
+        // A13: force_usdt às vezes anexa USDT→USDT — reverte on-chain como
+        // IDENTICAL_ADDRESSES e queima gás. Deve ser rejeitado pré-broadcast.
+        let client = make_client();
+        let a = Address::from_low_u64_be(1);
+        let steps = vec![
+            step(0, a, a, U256::from(100)), // no-op: token_in == token_out
+        ];
+        let err = client
+            .validate_steps_critical(&steps)
+            .expect_err("no-op hop");
+        assert!(err.to_string().contains("no-op hop"));
     }
 
     #[test]
@@ -2292,7 +3201,8 @@ mod tests {
             step(0, c, d, U256::from(98)),
             step(0, d, a, U256::from(97)),
         ];
-        let err = client.validate_route_complexity(&steps, &cfg)
+        let err = client
+            .validate_route_complexity(&steps, &cfg)
             .expect_err("excede max hops");
         assert!(matches!(err, FlashloanError::RouteTooComplex(_)));
         assert!(err.to_string().contains("exceeds maximum"));
@@ -2321,7 +3231,8 @@ mod tests {
         let steps = vec![
             step(0, b, asset, U256::from(99)), // token_in != asset
         ];
-        let err = client.validate_wrapper_steps(&steps, asset)
+        let err = client
+            .validate_wrapper_steps(&steps, asset)
             .expect_err("primeiro step não casa com asset");
         assert!(err.to_string().contains("First step token_in"));
     }
@@ -2336,7 +3247,8 @@ mod tests {
             step(0, asset, b, U256::from(100)),
             step(0, b, c, U256::from(99)), // token_out != asset
         ];
-        let err = client.validate_wrapper_steps(&steps, asset)
+        let err = client
+            .validate_wrapper_steps(&steps, asset)
             .expect_err("último step não fecha no asset");
         assert!(err.to_string().contains("Last step token_out"));
     }
@@ -2345,7 +3257,9 @@ mod tests {
     fn wrapper_steps_rejects_empty() {
         let client = make_client();
         let asset = Address::from_low_u64_be(1);
-        let err = client.validate_wrapper_steps(&[], asset).expect_err("steps vazios");
+        let err = client
+            .validate_wrapper_steps(&[], asset)
+            .expect_err("steps vazios");
         assert!(err.to_string().contains("Empty steps"));
     }
 
@@ -2418,7 +3332,10 @@ mod tests {
     fn decode_revert_panic_selector() {
         let client = make_client();
         let msg = client.decode_revert_reason("execution reverted: data: 0x4e487b71");
-        assert!(msg.contains("Panic") || msg.contains("4e487b71"), "msg={msg}");
+        assert!(
+            msg.contains("Panic") || msg.contains("4e487b71"),
+            "msg={msg}"
+        );
     }
 
     #[test]
@@ -2491,10 +3408,7 @@ mod tests {
         let cfg = Config::default();
         let a = Address::from_low_u64_be(1);
         let b = Address::from_low_u64_be(2);
-        let steps = vec![
-            step(0, a, b, U256::zero()),
-            step(0, b, a, U256::from(99)),
-        ];
+        let steps = vec![step(0, a, b, U256::zero()), step(0, b, a, U256::from(99))];
         assert!(client.apply_complexity_filters(&steps, &cfg).is_err());
     }
 
@@ -2639,7 +3553,8 @@ mod tests {
         ];
 
         for (recipient, min_profit, name) in cases {
-            let encoded = ArbitrageClient::encode_callback_data(recipient, &[step.clone()], min_profit);
+            let encoded =
+                ArbitrageClient::encode_callback_data(recipient, &[step.clone()], min_profit);
             let decoded = decode(&params, encoded.as_ref()).expect(name);
             assert_eq!(decoded.len(), 3, "{name}");
             match &decoded[0] {
@@ -2700,10 +3615,7 @@ mod tests {
         let err = ArbitrageClient::ensure_profit_recipient_matches_owner(wallet, owner)
             .expect_err("wallet != owner must abort");
         let msg = format!("{err:#}");
-        assert!(
-            msg.contains("ProfitRecipientMismatch"),
-            "got: {msg}"
-        );
+        assert!(msg.contains("ProfitRecipientMismatch"), "got: {msg}");
         assert!(msg.contains("abort before broadcast"), "got: {msg}");
     }
 
@@ -2764,16 +3676,226 @@ mod tests {
         }
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test/fixtures");
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("callback_abi_hex.json"), serde_json::to_string_pretty(&out).unwrap())
-            .unwrap();
+        fs::write(
+            dir.join("callback_abi_hex.json"),
+            serde_json::to_string_pretty(&out).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// B4 — re-bump acumulado ×1.15 (115 bps) de max_fee E max_priority.
+    /// Cenário underpriced: 1º bump habilitado (cap=3), gas cresce, 2º send
+    /// teria gas maior (sucesso). 4º bump → MaxAttempts. Ceiling → abort.
+    #[test]
+    fn b4_rbf_bump_gas_accumulates_and_caps() {
+        let multiplier_bps = U256::from(115u64); // 1.15
+        let mut max_fee = U256::from(100_000_000_000u64); // 100 gwei
+        let mut max_priority = U256::from(10_000_000_000u64); // 10 gwei
+        let mut count: u32 = 0;
+
+        // 1º bump (underpriced no attempt 1) → ok, gas ×1.15.
+        assert!(rbb_bump_ok(
+            &mut max_fee,
+            &mut max_priority,
+            &mut count,
+            multiplier_bps,
+            3,
+            None
+        ));
+        assert_eq!(max_fee, U256::from(115_000_000_000u64)); // 115 gwei
+        assert_eq!(max_priority, U256::from(11_500_000_000u64));
+        assert_eq!(count, 1);
+
+        // 2º e 3º bumps → ok (cap=3 permite 3 bumps).
+        assert!(rbf_bump_gas(
+            &mut max_fee,
+            &mut max_priority,
+            &mut count,
+            multiplier_bps,
+            3,
+            None
+        )
+        .is_ok());
+        assert!(rbf_bump_gas(
+            &mut max_fee,
+            &mut max_priority,
+            &mut count,
+            multiplier_bps,
+            3,
+            None
+        )
+        .is_ok());
+        assert_eq!(count, 3);
+
+        // 4º bump → MaxAttempts.
+        let err = rbf_bump_gas(
+            &mut max_fee,
+            &mut max_priority,
+            &mut count,
+            multiplier_bps,
+            3,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, RbfBumpAbort::MaxAttempts));
+
+        // Ceiling: teto 120 gwei. 1 bump de 100→115 ok; 2º 115→132.25 > 120 → abort.
+        let mut mf = U256::from(100_000_000_000u64);
+        let mut mp = U256::from(1_000_000_000u64);
+        let mut c: u32 = 0;
+        let ceil = Some(U256::from(120_000_000_000u64));
+        assert!(rbf_bump_gas(&mut mf, &mut mp, &mut c, multiplier_bps, 10, ceil).is_ok()); // 115
+        let err2 = rbf_bump_gas(&mut mf, &mut mp, &mut c, multiplier_bps, 10, ceil).unwrap_err();
+        assert!(matches!(err2, RbfBumpAbort::CeilingExceeded));
+    }
+
+    fn rbb_bump_ok(
+        max_fee: &mut U256,
+        max_priority: &mut U256,
+        count: &mut u32,
+        multiplier_bps: U256,
+        max_attempts: u32,
+        ceil: Option<U256>,
+    ) -> bool {
+        rbf_bump_gas(
+            max_fee,
+            max_priority,
+            count,
+            multiplier_bps,
+            max_attempts,
+            ceil,
+        )
+        .is_ok()
+    }
+
+    /// B10: cenário mock-RPC "underpriced" — re-bump compõe exatamente 1.15^k
+    /// por tentativa. b4 checa o 1º bump exato e os 2º/3º só is_ok; aqui
+    /// verificamos o valor composto do 2º (132.25 gwei) p/ travar a fórmula.
+    #[test]
+    fn b10_rbf_underpriced_compounds_exact_15pct() {
+        let multiplier_bps = U256::from(115u64); // 1.15
+        let mut max_fee = U256::from(100_000_000_000u64); // 100 gwei
+        let mut max_priority = U256::from(10_000_000_000u64); // 10 gwei
+        let mut count: u32 = 0;
+        let ceil: Option<U256> = None;
+
+        // 1º bump: 100 → 115 gwei (×1.15 exato).
+        assert!(rbf_bump_gas(
+            &mut max_fee,
+            &mut max_priority,
+            &mut count,
+            multiplier_bps,
+            5,
+            ceil
+        )
+        .is_ok());
+        assert_eq!(max_fee, U256::from(115_000_000_000u64));
+        assert_eq!(max_priority, U256::from(11_500_000_000u64));
+        assert_eq!(count, 1);
+
+        // 2º bump: 115 → 132.25 gwei. 115e9 * 115 / 100 = 132.25e9.
+        assert!(rbf_bump_gas(
+            &mut max_fee,
+            &mut max_priority,
+            &mut count,
+            multiplier_bps,
+            5,
+            ceil
+        )
+        .is_ok());
+        assert_eq!(max_fee, U256::from(132_250_000_000u64));
+        assert_eq!(max_priority, U256::from(13_225_000_000u64));
+        assert_eq!(count, 2);
+    }
+
+    // ------------------------------------------------------------------------
+    // B10: proptest — validate_steps_critical como oráculo de rejeição de rota
+    // ------------------------------------------------------------------------
+    // Random routes (1-5 hops, venues variados, tokens repetidos/no-op) devem
+    // ser classificadas corretamente: Ok só se a rota for bem-formada; Err com
+    // a razão certa senão. Caracteriza as 4 guardas em ordem de prioridade:
+    //   1. no-op hop (token_in == token_out)
+    //   2. amount_out_min == 0
+    //   3. path desconexo (token_out[i] != token_in[i+1])
+    //   4. não retorna ao token inicial (ciclo aberto)
+    // Decimals (6/8/18) não aparecem em AbiSwapStep — validação é agnóstica a
+    // decimals; o gerador ignora esse eixo aqui (documentado, não inventado).
+    mod proptest_routes {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Prediz a primeira guarda que dispara, espelhando a ordem exata de
+        /// `validate_steps_critical` + `validate_route_consistency`. Retorna
+        /// `None` ⇒ espera-se `Ok(())`.
+        fn predict(steps: &[AbiSwapStep]) -> Option<&'static str> {
+            if steps.is_empty() {
+                return Some("Empty steps");
+            }
+            // Mesma ordem do loop em validate_steps_critical: por step, no-op
+            // checado antes de zero, e step i inteiro antes de step i+1.
+            for s in steps {
+                if s.token_in == s.token_out {
+                    return Some("no-op hop");
+                }
+                if s.amount_out_min.is_zero() {
+                    return Some("amount_out_min is zero");
+                }
+            }
+            // Chain
+            for i in 0..steps.len() - 1 {
+                if steps[i].token_out != steps[i + 1].token_in {
+                    return Some("token_out");
+                }
+            }
+            // Cycle
+            if steps[0].token_in != steps[steps.len() - 1].token_out {
+                return Some("return to initial token");
+            }
+            None
+        }
+
+        fn any_step() -> impl Strategy<Value = AbiSwapStep> {
+            (
+                0u8..6u8, // dex_type (venue variado)
+                0u8..4u8, // token_in idx
+                0u8..4u8, // token_out idx
+                0u8..4u8, // amount_out_min: 0 ⇒ zero
+            )
+                .prop_map(|(dex, ti, to, amt)| AbiSwapStep {
+                    dex_type: dex,
+                    token_in: Address::from_low_u64_be(ti as u64 + 1),
+                    token_out: Address::from_low_u64_be(to as u64 + 1),
+                    amount_out_min: if amt == 0 {
+                        U256::zero()
+                    } else {
+                        U256::from(amt as u64)
+                    },
+                    extra_data: Bytes::new(),
+                })
+        }
+
+        proptest! {
+            #[test]
+            fn b10_validate_steps_critical_classifies_random_routes(
+                n_hops in 1u32..=5,
+                steps in proptest::collection::vec(any_step(), 1..=5),
+            ) {
+                let _ = n_hops; // tamanho real = steps.len()
+                let client = make_client();
+                let got = client.validate_steps_critical(&steps);
+                match predict(&steps) {
+                    None => {
+                        prop_assert!(got.is_ok(), "esperava Ok, got Err: {:?} steps={:?}", got, steps);
+                    }
+                    Some(needle) => {
+                        let err = got.expect_err(&format!("esperava Err({needle}) steps={steps:?}"));
+                        prop_assert!(
+                            err.to_string().contains(needle),
+                            "needle={needle} err={err} steps={steps:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
-
-
-
-
-
-
-
-
-

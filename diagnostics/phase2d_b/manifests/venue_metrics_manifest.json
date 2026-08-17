@@ -1,0 +1,18 @@
+{
+  "base_sources": [
+    "diagnostics/phase2d_b/base/scan_001/dex_metrics.json",
+    "diagnostics/phase2d_b/base/scan_002/dex_metrics.json",
+    "diagnostics/phase2d_b/base/scan_003/dex_metrics.json"
+  ],
+  "base_venue_metrics_scans_expected": 3,
+  "liquid_sources": [
+    "diagnostics/phase2d_b/liquid/scan_001/dex_metrics.json",
+    "diagnostics/phase2d_b/liquid/scan_002/dex_metrics.json",
+    "diagnostics/phase2d_b/liquid/scan_003/dex_metrics.json",
+    "diagnostics/phase2d_b/liquid/scan_004/dex_metrics.json",
+    "diagnostics/phase2d_b/liquid/scan_005/dex_metrics.json"
+  ],
+  "liquid_venue_metrics_scans_expected": 5,
+  "venue_metrics_coverage": "COMPLETE",
+  "venue_metrics_duplicate_scans": 0
+}

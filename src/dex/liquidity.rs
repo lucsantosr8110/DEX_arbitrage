@@ -71,7 +71,8 @@ pub fn min_pool_liquidity_usd(cfg: &Config) -> f64 {
 /// genérico, daí o override por venue. A chave já existia no TOML mas não era
 /// lida — todo venue usava o global.
 pub fn min_pool_liquidity_usd_for_dex(cfg: &Config, dex_name: &str) -> f64 {
-    let dex_threshold = cfg.dex
+    let dex_threshold = cfg
+        .dex
         .iter()
         .find(|d| d.name.eq_ignore_ascii_case(dex_name))
         .and_then(|d| d.liquidity_threshold_usd)
@@ -118,7 +119,12 @@ fn pool_cache_key(dex: &str, token_a: &str, token_b: &str, fee_tier: u32) -> Str
     format!("{}:{}-{}:{}", dex, x, y, fee_tier)
 }
 
-pub fn cached_pool_address(dex: &str, token_a: &str, token_b: &str, fee_tier: u32) -> Option<Address> {
+pub fn cached_pool_address(
+    dex: &str,
+    token_a: &str,
+    token_b: &str,
+    fee_tier: u32,
+) -> Option<Address> {
     let key = pool_cache_key(dex, token_a, token_b, fee_tier);
     let g = POOL_ADDR_CACHE.read().ok()?;
     let (pool, at) = g.get(&key)?;
@@ -434,8 +440,7 @@ where
             continue;
         }
 
-        let tvl_e8 = match pool_tvl_usd_e8_from_balances(bal_a, it.dec_a, pa, bal_b, it.dec_b, pb)
-        {
+        let tvl_e8 = match pool_tvl_usd_e8_from_balances(bal_a, it.dec_a, pa, bal_b, it.dec_b, pb) {
             Ok(v) => v,
             Err(e) => {
                 debug!(
@@ -680,8 +685,7 @@ mod tests {
     fn liquidity_gate_uses_e8_not_display_saturation() {
         let bal_usdc = U256::from(1_000_000_000u64);
         let bal_weth = U256::from(2u64) * U256::exp10(18);
-        let tvl_e8 =
-            pool_tvl_usd_e8_from_balances(bal_usdc, 6, 1.0, bal_weth, 18, 2000.0).unwrap();
+        let tvl_e8 = pool_tvl_usd_e8_from_balances(bal_usdc, 6, 1.0, bal_weth, 18, 2000.0).unwrap();
         let min = crate::core::fixed_usd::usd_f64_to_e8_ceil(5000.0).unwrap();
         assert!(passes_liquidity_gate_e8(tvl_e8, min));
     }

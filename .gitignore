@@ -1,7 +1,9 @@
 /target
+/target-*/
 node_modules
 .env
 .env.*
+.worktrees/
 
 # Hardhat files
 /cache
@@ -22,6 +24,9 @@ ignition/deployments/chain-31337
 /logs/
 *.log
 
+# Runtime db (sqlite round history)
+/data/
+
 # Audits and logs
 /audits/
 *.csv
@@ -36,3 +41,7 @@ ignition/deployments/chain-31337
 .mimocode/
 commit_msg.txt
 rpc_healthcheck.local.cjs
+/diagnostics/
+
+# Frontend build output
+/src/frontend/dist

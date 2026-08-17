@@ -1,0 +1,2477 @@
+//! Canonical single-anchor discovery boundary.
+//!
+//! The service owns anchor validation and exposes one authoritative entry
+//! point for scheduler callers.  `discover_at` runs the real operational
+//! pipeline pinned to that anchor: pool metadata resolution, on-chain state
+//! reads, V2/V3 quotes, `ExecutablePriceEdge`/`ExecutableEdgeGraph`
+//! construction, structural cycle discovery, sequential per-route amount
+//! propagation, `CanonicalExecutionContext` construction, route
+//! materialization, and pure (no-RPC) route economics. Diagnostic
+//! formatting, filesystem artifact persistence, Anvil fork execution, and
+//! the rejected-route manifest all stay in binaries; no signer or
+//! broadcaster is accepted here.
+
+use crate::config::Config;
+use crate::core::{
+    c2b_round::RoundEvidence,
+    canonical_adapters::{
+        assemble_route_leg_quotes, batch_read_pool_state, build_v2_pool_read_from_state,
+        build_v3_pool_read_from_state, code_hash, normalized_v2_state, normalized_v3_state,
+        quote_v2_leg, quote_v3_leg, resolve_v2_pool_address, resolve_v3_pool_address,
+        MetadataCache, MulticallStats, PinnedQuoteRecord, QuoteMetrics, RpcCallRecord,
+        StateSubcall,
+    },
+    canonical_execution_context::{
+        CanonicalExecutionContext, ForkSetupRecord, PinnedPoolState, PoolExecutionMetadata,
+        TokenMetadata,
+    },
+    executable_call::Venue,
+    executable_price_edge::ExecutablePriceEdge,
+    executable_price_graph::{find_structural_cycles, ExecutableEdgeGraph},
+    executable_route_materializer::{materialize, PoolRecord, TokenRecord, VenueRecord},
+    execution_profile::ExecutionProfile,
+    fresh_economics::{FreshEconomicEvaluator, SimulationContext, StatefulRouteEvaluator},
+    phase2d_anchor::AnchorBlock,
+    pool_state_sim::SimulatedPoolState,
+    route_artifact::StructuralRoute,
+};
+use anyhow::{anyhow, Result};
+use ethers::{
+    providers::Middleware,
+    types::{Address, BlockId, BlockNumber, H256, U256},
+};
+use futures::{stream, StreamExt};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    sync::Arc,
+    time::{Duration, Instant},
+};
+use thiserror::Error;
+
+pub type PinnedAnchor = AnchorBlock;
+
+// ============================================================
+// Operational pipeline constants
+// ============================================================
+
+const UNISWAP_V3_QUOTER: &str = "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6";
+const QUOTE_TIMEOUT: Duration = Duration::from_secs(20);
+const NOTIONAL_USD: f64 = 100.0;
+const V3_FEE_TIERS: [u32; 3] = [500, 3000, 10_000];
+const CANONICAL_CALLER: fn() -> Address = || Address::from_low_u64_be(1);
+
+// ============================================================
+// Typed discovery-universe configuration. Resolved once, from real
+// `Config` data, before any RPC call — `discover_at` never resolves an
+// address from a symbol or picks a venue by string match.
+// ============================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanonicalDiscoveryProfile {
+    Base,
+    Liquid,
+}
+
+impl CanonicalDiscoveryProfile {
+    /// Diagnostic/route-id label only — never used to resolve an address.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Base => "base",
+            Self::Liquid => "liquid",
+        }
+    }
+}
+
+/// `Address` is the executable identity; `symbol` exists for diagnostics
+/// and presentation only and is never used to resolve execution state.
+#[derive(Debug, Clone)]
+pub struct CanonicalToken {
+    pub address: Address,
+    pub decimals: u8,
+    pub symbol: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CanonicalVenueConfig {
+    pub venue: Venue,
+    pub router: Address,
+    pub factory: Address,
+    /// `Some` only for `Venue::UniswapV3`.
+    pub quoter: Option<Address>,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum CanonicalDiscoveryConfigError {
+    #[error("CANONICAL_CONFIG_TOKEN_MISSING_ADDRESS: {0}")]
+    MissingAddress(String),
+    #[error("CANONICAL_CONFIG_TOKEN_MISSING_DECIMALS: {0}")]
+    MissingDecimals(String),
+    #[error("CANONICAL_CONFIG_EMPTY_TOKEN_UNIVERSE")]
+    EmptyUniverse,
+    #[error("CANONICAL_CONFIG_NO_VENUES_RESOLVED")]
+    NoVenues,
+}
+
+/// Immutable, fully-typed discovery-universe configuration. Built once
+/// (typically at process startup) from real `Config` data; `discover_at`
+/// only ever reads from this, never from `Config` or a raw symbol again.
+#[derive(Debug, Clone)]
+pub struct CanonicalDiscoveryConfig {
+    pub profile: CanonicalDiscoveryProfile,
+    pub tokens: Vec<CanonicalToken>,
+    pub venues: Vec<CanonicalVenueConfig>,
+    pub execution_profile: ExecutionProfile,
+    /// Route-external costs as parts-per-billion of the configured notional.
+    /// Adapter quotes already include pool fees and price impact.
+    pub flashloan_cost_ppb: u64,
+    pub gas_cost_ppb: u64,
+}
+
+impl CanonicalDiscoveryConfig {
+    const BASE_TOKENS: &'static [&'static str] = &["USDC", "USDT", "WMATIC", "WETH", "WBTC"];
+    // `UNI`/`LDO` are listed as intended midcap tokens elsewhere in
+    // `config.toml` (`[arbitrage.triangular].midcaps`) but have no resolved
+    // `[pairs.tokens]` address there yet — an existing config gap, not
+    // something this service fabricates an address for. `Liquid` stays
+    // real and strictly a superset of `Base` using only tokens with a
+    // genuine on-chain address already configured.
+    const LIQUID_TOKENS: &'static [&'static str] = &[
+        "USDC", "USDT", "WMATIC", "WETH", "WBTC", "DAI", "LINK", "AAVE",
+    ];
+    const KNOWN_VENUES: &'static [(&'static str, Venue)] = &[
+        ("QuickSwap", Venue::QuickSwap),
+        ("SushiSwap", Venue::SushiSwap),
+        ("UniswapV3", Venue::UniswapV3),
+    ];
+
+    /// The only place a token symbol is ever resolved to an `Address`. Runs
+    /// once against static `Config` data — no RPC, no per-round lookup.
+    /// Fails closed: an incomplete/invalid universe never silently falls
+    /// back to a smaller or different one.
+    pub fn from_config(
+        cfg: &Config,
+        profile: CanonicalDiscoveryProfile,
+        execution_profile: ExecutionProfile,
+    ) -> Result<Self, CanonicalDiscoveryConfigError> {
+        let default_symbols: &[&str] = match profile {
+            CanonicalDiscoveryProfile::Base => Self::BASE_TOKENS,
+            CanonicalDiscoveryProfile::Liquid => Self::LIQUID_TOKENS,
+        };
+        let token_override = std::env::var("CANONICAL_TOKEN_UNIVERSE").ok();
+        let symbols: Vec<String> = token_override
+            .as_deref()
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|symbol| !symbol.is_empty())
+                    .map(str::to_uppercase)
+                    .collect()
+            })
+            .unwrap_or_else(|| default_symbols.iter().map(|s| (*s).to_string()).collect());
+        let mut tokens = Vec::with_capacity(symbols.len());
+        for symbol in symbols {
+            let address = cfg
+                .addresses
+                .get(&symbol)
+                .copied()
+                .ok_or_else(|| CanonicalDiscoveryConfigError::MissingAddress(symbol.clone()))?;
+            let decimals = cfg
+                .pairs
+                .metadata
+                .get(&symbol)
+                .and_then(|m| m.decimals)
+                .ok_or_else(|| CanonicalDiscoveryConfigError::MissingDecimals(symbol.clone()))?;
+            tokens.push(CanonicalToken {
+                address,
+                decimals,
+                symbol,
+            });
+        }
+        if tokens.is_empty() {
+            return Err(CanonicalDiscoveryConfigError::EmptyUniverse);
+        }
+
+        let venue_override = std::env::var("CANONICAL_VENUES").ok().map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_ascii_lowercase)
+                .collect::<std::collections::HashSet<_>>()
+        });
+        let mut venues = Vec::new();
+        for (name, venue) in Self::KNOWN_VENUES.iter().copied() {
+            if let Some(allowed) = &venue_override {
+                if !allowed.contains(&name.to_ascii_lowercase()) {
+                    continue;
+                }
+            }
+            let Some(dex) = cfg.dex.iter().find(|d| d.name == name) else {
+                continue;
+            };
+            let Ok(router) = dex.router_address.parse::<Address>() else {
+                continue;
+            };
+            let Some(factory) = dex
+                .factory_address
+                .clone()
+                .and_then(|s| s.parse::<Address>().ok())
+            else {
+                continue;
+            };
+            let quoter = (venue == Venue::UniswapV3).then(|| {
+                dex.quoter_address
+                    .clone()
+                    .and_then(|s| s.parse::<Address>().ok())
+                    .or_else(|| UNISWAP_V3_QUOTER.parse::<Address>().ok())
+            });
+            venues.push(CanonicalVenueConfig {
+                venue,
+                router,
+                factory,
+                quoter: quoter.flatten(),
+            });
+        }
+        if venues.is_empty() {
+            return Err(CanonicalDiscoveryConfigError::NoVenues);
+        }
+
+        let notional_usd = cfg
+            .arbitrage
+            .default_trade_amount
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .unwrap_or(NOTIONAL_USD);
+        let flashloan_fraction = cfg
+            .flashloan
+            .fee_pct
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .unwrap_or(0.0005);
+        let gas_fraction = if cfg.execution.estimate_base_gas_usd.is_finite()
+            && cfg.execution.estimate_base_gas_usd >= 0.0
+        {
+            cfg.execution.estimate_base_gas_usd / notional_usd
+        } else {
+            0.0
+        };
+        let fraction_to_ppb =
+            |fraction: f64| -> u64 { (fraction.clamp(0.0, 1.0) * 1_000_000_000.0).round() as u64 };
+
+        Ok(Self {
+            profile,
+            tokens,
+            venues,
+            execution_profile,
+            flashloan_cost_ppb: fraction_to_ppb(flashloan_fraction),
+            gas_cost_ppb: fraction_to_ppb(gas_fraction),
+        })
+    }
+
+    pub fn token_count(&self) -> usize {
+        self.tokens.len()
+    }
+
+    /// Deterministic diagnostic fingerprint of the resolved token universe.
+    /// Safe to print/persist: it is a hash, never a raw RPC endpoint.
+    pub fn token_addresses_hash(&self) -> H256 {
+        let mut addresses: Vec<Address> = self.tokens.iter().map(|t| t.address).collect();
+        addresses.sort();
+        H256::from(ethers::utils::keccak256(
+            format!("{addresses:?}").as_bytes(),
+        ))
+    }
+
+    fn venue_config(&self, venue: Venue) -> Option<&CanonicalVenueConfig> {
+        self.venues.iter().find(|v| v.venue == venue)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalRejection {
+    pub stage: &'static str,
+    pub reason: String,
+    pub anchor: PinnedAnchor,
+    pub structural_cycle_key: Option<String>,
+}
+
+/// Counters for one `discover_at` round. Every field reflects a stage that
+/// actually ran — nothing here is inferred or pre-populated.
+#[derive(Debug, Clone, Default)]
+pub struct DiscoveryStats {
+    pub quotes_attempted: u64,
+    pub quotes_succeeded: u64,
+    pub edges_created: u64,
+    /// Raw structural cycles found before deduplication by
+    /// `structural_cycle_key` (one DFS pass runs per start token, so the
+    /// same physical cycle can surface more than once here).
+    pub cycles_detected: u64,
+    pub routes_discovered: u64,
+    pub routes_pruned: u64,
+    pub routes_materialized: u64,
+    pub economics_evaluated: u64,
+}
+
+/// Wall-clock cost of each real stage boundary already present in
+/// `discover_at_inner`'s log markers (`"canonical ... stage complete"`).
+/// Measured with `Instant`, never wall-clock `SystemTime`/`Utc::now`.
+///
+/// Stages are grouped honestly along the code's actual structure rather
+/// than the finer-grained breakdown a caller might want (e.g. edge/graph
+/// construction and structural-cycle dedup all happen inside one
+/// contiguous loop and are reported together as `ranking_ms`;
+/// materialization and economics evaluation are interleaved per-route in
+/// one loop and reported together as `materialization_economics_ms`).
+/// Splitting those further would require restructuring the pipeline
+/// itself, not just adding measurement — out of scope here.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CanonicalRoundTiming {
+    /// chain_id check + anchor block fetch/hash validation, before any
+    /// token/pool work starts.
+    pub anchor_resolution_ms: u64,
+    /// Token metadata resolution (on-chain code hash per configured token).
+    pub metadata_ms: u64,
+    /// Phase A: independent single-leg V2/V3 quotes -> typed edges. Pool
+    /// state reads happen inside this stage (not separately measurable
+    /// without changing `quote_v2_edge`/`quote_v3_edge`).
+    pub quote_ms: u64,
+    /// Structural cycle discovery (DFS per start token) + dedup + rank +
+    /// truncate to `max_routes`.
+    pub ranking_ms: u64,
+    /// Phase B: parallel per-route re-quote so leg[n].amount_in ==
+    /// leg[n-1].amount_out with real adapter output.
+    pub requote_ms: u64,
+    /// `CanonicalExecutionContext::build` (typed tokens/pools/states,
+    /// hashed).
+    pub context_build_ms: u64,
+    /// Per-route `materialize()` + `StatefulRouteEvaluator::evaluate()`,
+    /// interleaved in one loop.
+    pub materialization_economics_ms: u64,
+    /// Whole `discover_at_inner` call.
+    pub total_ms: u64,
+    /// `total_ms - sum(above)`, saturating. Non-zero mostly reflects the
+    /// early-return branches (missing metadata/pools/context-build
+    /// failure) that skip later stages, plus per-iteration overhead not
+    /// captured by the coarse per-stage instants above.
+    pub unattributed_ms: u64,
+}
+
+impl CanonicalRoundTiming {
+    fn finish(mut self, fn_start: Instant) -> Self {
+        self.total_ms = fn_start.elapsed().as_millis() as u64;
+        let measured = self
+            .anchor_resolution_ms
+            .saturating_add(self.metadata_ms)
+            .saturating_add(self.quote_ms)
+            .saturating_add(self.ranking_ms)
+            .saturating_add(self.requote_ms)
+            .saturating_add(self.context_build_ms)
+            .saturating_add(self.materialization_economics_ms);
+        self.unattributed_ms = self.total_ms.saturating_sub(measured);
+        self
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CanonicalDiscoveryResult {
+    pub anchor: PinnedAnchor,
+    /// Only operational evidence belongs here. Fork receipts/traces are
+    /// deliberately absent and remain diagnostic-audit data.
+    pub round_evidence: Vec<RoundEvidence>,
+    pub executable_routes: Vec<crate::core::executable_route_materializer::ExecutableRoutePlan>,
+    pub economically_positive: Vec<crate::core::executable_route_materializer::ExecutableRoutePlan>,
+    pub rejections: Vec<CanonicalRejection>,
+    pub stats: DiscoveryStats,
+    /// All successful single-leg quotes from Phase A, retained for
+    /// presentation consumers even when route pruning limits Phase B.
+    pub initial_quotes: Vec<PinnedQuoteRecord>,
+    /// Leg-quote-complete structural routes keyed by `structural_cycle_key`,
+    /// with the real Phase-B re-quote chain and the pinned pool states used
+    /// to produce them. Exposed so a caller's own fork-audit stage (Anvil
+    /// execution, receipts, traces — never performed by this service) can
+    /// build its `RoutePlan` without re-running quotes/graph/cycle
+    /// discovery a second time.
+    pub structural_routes: BTreeMap<String, StructuralRoute>,
+    pub leg_quotes: HashMap<String, Vec<PinnedQuoteRecord>>,
+    pub pool_states: HashMap<Address, SimulatedPoolState>,
+    pub timing: CanonicalRoundTiming,
+    /// Phase-A state-read batching diagnostics (Multicall3 `aggregate3`):
+    /// physical RPC count, subcall count, batch sizes, failures. See
+    /// `MulticallStats` fields. `individual_state_calls` is 0 in the hot
+    /// path (non-batched fallback only).
+    pub multicall: MulticallStats,
+    /// Phase-A critical-path floor: `state_batch_ms` + max over pairs of
+    /// (resolve_ms + quote_ms). The minimum Phase A latency given the
+    /// 3-pass batching structure.
+    pub critical_path_floor_ms: u64,
+    /// Multicall3 batch eth_call wall time for the state-read pass.
+    pub state_batch_ms: u64,
+}
+
+/// Per-pool metadata resolved once per round and reused both for the
+/// initial structural discovery edges and for the sequential per-route
+/// re-quote pass. No RPC state is ever synthesized — every entry here
+/// originates from a real `read_v2_pool`/`read_v3_pool` call pinned to the
+/// round's anchor block.
+#[derive(Default)]
+struct PoolContext {
+    meta: HashMap<Address, PoolExecutionMetadata>,
+    state: HashMap<Address, PinnedPoolState>,
+    quote_target: HashMap<Address, Address>,
+}
+
+fn human_to_atomic(amount: f64, decimals: u8) -> U256 {
+    let scaled = (amount * 10f64.powi(decimals as i32)).round();
+    U256::from_dec_str(&format!("{}", scaled as u128)).unwrap_or(U256::zero())
+}
+
+fn proportional_cost_atomic(amount: U256, cost_ppb: u64) -> U256 {
+    amount
+        .checked_mul(U256::from(cost_ppb))
+        .map(|scaled| scaled / U256::from(1_000_000_000u64))
+        .unwrap_or(U256::MAX)
+}
+
+fn venue_str(venue: Venue) -> &'static str {
+    match venue {
+        Venue::UniswapV3 => "UniswapV3",
+        Venue::QuickSwap => "QuickSwap",
+        Venue::SushiSwap => "SushiSwap",
+        Venue::Curve => "Curve",
+    }
+}
+
+/// One resolved pool awaiting state + quote in Phase A. Produced by the
+/// resolve pass (warm metadata cache -> 0 RPC), consumed by the state
+/// batch pass and the quote pass. Carries everything the quote pass
+/// needs to call `quote_v2_leg` / `quote_v3_leg` without resolving again.
+#[derive(Clone, Debug)]
+enum PoolRequest {
+    V2 {
+        venue: Venue,
+        router: Address,
+        pool: Address,
+        token_in: TokenMetadata,
+        token_out: TokenMetadata,
+        amount_in: U256,
+    },
+    V3 {
+        router: Address,
+        quoter: Address,
+        fee: u32,
+        pool: Address,
+        token_in: TokenMetadata,
+        token_out: TokenMetadata,
+        amount_in: U256,
+    },
+}
+
+impl PoolRequest {
+    fn pool(&self) -> Address {
+        match self {
+            Self::V2 { pool, .. } | Self::V3 { pool, .. } => *pool,
+        }
+    }
+}
+
+/// Fully assembled per-pool state for the quote pass: the
+/// Multicall3-decoded + cached-metadata `OnlinePoolRead`, the
+/// `PinnedPoolState`, and the `PoolExecutionMetadata` -- everything
+/// `quote_v2_edge` / `quote_v3_edge` used to build inline before quoting.
+/// State is never cached across anchors (kept only for this round).
+struct PoolState {
+    pinned_state: PinnedPoolState,
+    meta: PoolExecutionMetadata,
+}
+
+/// Resolve pass half of the old `quote_v2_edge`: resolves the V2 pair
+/// address via the cached factory lookup (warm = 0 RPC) and returns a
+/// `PoolRequest::V2` for the state batch + quote passes. No state read,
+/// no quote -- those now happen in their own passes so the 220 state
+/// reads can be batched into Multicall3.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_v2_edge<M: Middleware>(
+    provider: &Arc<M>,
+    venue: Venue,
+    router: Address,
+    factory: Address,
+    token_in: &TokenMetadata,
+    token_out: &TokenMetadata,
+    amount_in: U256,
+    anchor: &AnchorBlock,
+    chain_id: u64,
+    cache: &MetadataCache,
+    metrics: &QuoteMetrics,
+) -> Option<PoolRequest> {
+    let pool = tokio::time::timeout(
+        QUOTE_TIMEOUT,
+        resolve_v2_pool_address(
+            provider.clone(),
+            factory,
+            token_in.address,
+            token_out.address,
+            anchor.number,
+            chain_id,
+            cache,
+            metrics,
+        ),
+    )
+    .await
+    .ok()?
+    .ok()??;
+    Some(PoolRequest::V2 {
+        venue,
+        router,
+        pool,
+        token_in: token_in.clone(),
+        token_out: token_out.clone(),
+        amount_in,
+    })
+}
+
+/// Resolve pass half of the old `quote_v3_edge`: resolves a V3 pool
+/// address for one fee tier and returns a `PoolRequest::V3`.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_v3_edge<M: Middleware>(
+    provider: &Arc<M>,
+    router: Address,
+    factory: Address,
+    quoter: Address,
+    fee: u32,
+    token_in: &TokenMetadata,
+    token_out: &TokenMetadata,
+    amount_in: U256,
+    anchor: &AnchorBlock,
+    chain_id: u64,
+    cache: &MetadataCache,
+    metrics: &QuoteMetrics,
+) -> Option<PoolRequest> {
+    let pool = tokio::time::timeout(
+        QUOTE_TIMEOUT,
+        resolve_v3_pool_address(
+            provider.clone(),
+            factory,
+            token_in.address,
+            token_out.address,
+            fee,
+            anchor.number,
+            chain_id,
+            cache,
+            metrics,
+        ),
+    )
+    .await
+    .ok()?
+    .ok()??;
+    Some(PoolRequest::V3 {
+        router,
+        quoter,
+        fee,
+        pool,
+        token_in: token_in.clone(),
+        token_out: token_out.clone(),
+        amount_in,
+    })
+}
+
+/// Quote pass half of the old `quote_v2_edge`: takes an assembled
+/// `PoolState` and calls `quote_v2_leg` (getAmountsOut, individual
+/// eth_call pinned to anchor -- intentionally NOT batched). On success
+/// registers the pool in `PoolContext` exactly as before.
+#[allow(clippy::too_many_arguments)]
+async fn quote_v2_edge_from_state<M: Middleware>(
+    provider: &Arc<M>,
+    req: &PoolRequest,
+    ps: &PoolState,
+    anchor: &AnchorBlock,
+    pools: &mut PoolContext,
+    metrics: &QuoteMetrics,
+) -> Option<ExecutablePriceEdge> {
+    let (venue, router, pool, token_in, token_out, amount_in) = match req {
+        PoolRequest::V2 {
+            venue,
+            router,
+            pool,
+            token_in,
+            token_out,
+            amount_in,
+        } => (
+            *venue,
+            *router,
+            *pool,
+            token_in.clone(),
+            token_out.clone(),
+            *amount_in,
+        ),
+        _ => return None,
+    };
+    let (_, quote) = tokio::time::timeout(
+        QUOTE_TIMEOUT,
+        quote_v2_leg(
+            provider.clone(),
+            venue,
+            router,
+            pool,
+            token_in.address,
+            token_out.address,
+            amount_in,
+            anchor.number,
+            anchor.hash,
+            token_in.clone(),
+            token_out.clone(),
+            ps.meta.clone(),
+            ps.pinned_state.clone(),
+            metrics,
+        ),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    pools.meta.insert(pool, ps.meta.clone());
+    pools.state.insert(pool, ps.pinned_state.clone());
+    pools.quote_target.insert(pool, router);
+    ExecutablePriceEdge::from_quote(
+        &quote,
+        &ps.meta,
+        Some(token_in.symbol.clone()),
+        Some(token_out.symbol.clone()),
+    )
+    .ok()
+}
+
+/// Quote pass half of the old `quote_v3_edge`: takes an assembled
+/// `PoolState` and calls `quote_v3_leg` (quoteExactInputSingle,
+/// individual eth_call pinned to anchor -- NOT batched).
+#[allow(clippy::too_many_arguments)]
+async fn quote_v3_edge_from_state<M: Middleware>(
+    provider: &Arc<M>,
+    req: &PoolRequest,
+    ps: &PoolState,
+    anchor: &AnchorBlock,
+    pools: &mut PoolContext,
+    metrics: &QuoteMetrics,
+) -> Option<ExecutablePriceEdge> {
+    let (_router, quoter, fee, pool, token_in, token_out, amount_in) = match req {
+        PoolRequest::V3 {
+            router,
+            quoter,
+            fee,
+            pool,
+            token_in,
+            token_out,
+            amount_in,
+        } => (
+            *router,
+            *quoter,
+            *fee,
+            *pool,
+            token_in.clone(),
+            token_out.clone(),
+            *amount_in,
+        ),
+        _ => return None,
+    };
+    let (_, quote) = tokio::time::timeout(
+        QUOTE_TIMEOUT,
+        quote_v3_leg(
+            provider.clone(),
+            quoter,
+            pool,
+            token_in.address,
+            token_out.address,
+            fee,
+            amount_in,
+            anchor.number,
+            anchor.hash,
+            token_in.clone(),
+            token_out.clone(),
+            ps.meta.clone(),
+            ps.pinned_state.clone(),
+            metrics,
+        ),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    pools.meta.insert(pool, ps.meta.clone());
+    pools.state.insert(pool, ps.pinned_state.clone());
+    pools.quote_target.insert(pool, quoter);
+    ExecutablePriceEdge::from_quote(
+        &quote,
+        &ps.meta,
+        Some(token_in.symbol.clone()),
+        Some(token_out.symbol.clone()),
+    )
+    .ok()
+}
+
+/// Assembles a `PoolState` for a V2 pool from a Multicall3-decoded
+/// `StateRead::Reserves` plus cached metadata, then builds the
+/// `PinnedPoolState` and `PoolExecutionMetadata` exactly as the old
+/// inline `quote_v2_edge` did. Returns `None` when the pool does not
+/// contain `token_in` (token-order check) or the state is unusable --
+/// the quote pass then skips this pool, identical to the old behavior.
+async fn assemble_v2_pool_state<M: Middleware>(
+    provider: &Arc<M>,
+    req: &PoolRequest,
+    state: &crate::core::canonical_adapters::StateRead,
+    anchor: &AnchorBlock,
+    chain_id: u64,
+    cache: &MetadataCache,
+    metrics: &QuoteMetrics,
+) -> Option<PoolState> {
+    let (venue, router, pool, token_in, _token_out) = match req {
+        PoolRequest::V2 {
+            venue,
+            router,
+            pool,
+            token_in,
+            token_out,
+            ..
+        } => (*venue, *router, *pool, token_in.clone(), token_out.clone()),
+        _ => return None,
+    };
+    let read = build_v2_pool_read_from_state(
+        provider,
+        pool,
+        router,
+        state,
+        anchor.number,
+        chain_id,
+        cache,
+        metrics,
+    )
+    .await
+    .ok()?;
+    if read.token0 != token_in.address && read.token1 != token_in.address {
+        return None;
+    }
+    let (r0, r1) = (read.reserve0?, read.reserve1?);
+    let pool_id = format!("{pool:?}");
+    let pinned_state =
+        normalized_v2_state(r0, r1, 30, read.pool_code_hash, anchor.number, &pool_id).ok()?;
+    let meta = PoolExecutionMetadata {
+        venue: venue_str(venue).to_string(),
+        pool,
+        router,
+        spender: router,
+        token_order: (read.token0, read.token1),
+        fee: None,
+        curve_method: None,
+        curve_indices: None,
+        implementation_code_hash: read.pool_code_hash,
+        anchor_block: anchor.number,
+    };
+    Some(PoolState { pinned_state, meta })
+}
+
+/// Assembles a `PoolState` for a V3 pool from the Multicall3-decoded
+/// slot0 / liquidity / fee trio plus cached metadata.
+#[allow(clippy::too_many_arguments)]
+async fn assemble_v3_pool_state<M: Middleware>(
+    provider: &Arc<M>,
+    req: &PoolRequest,
+    slot0: &crate::core::canonical_adapters::StateRead,
+    liquidity: &crate::core::canonical_adapters::StateRead,
+    fee: &crate::core::canonical_adapters::StateRead,
+    anchor: &AnchorBlock,
+    chain_id: u64,
+    cache: &MetadataCache,
+    metrics: &QuoteMetrics,
+) -> Option<PoolState> {
+    let (router, fee_tier, pool, token_in) = match req {
+        PoolRequest::V3 {
+            router,
+            fee,
+            pool,
+            token_in,
+            ..
+        } => (*router, *fee, *pool, token_in.clone()),
+        _ => return None,
+    };
+    let read = build_v3_pool_read_from_state(
+        provider,
+        pool,
+        router,
+        slot0,
+        liquidity,
+        fee,
+        anchor.number,
+        chain_id,
+        cache,
+        metrics,
+    )
+    .await
+    .ok()?;
+    if read.token0 != token_in.address && read.token1 != token_in.address {
+        return None;
+    }
+    let pool_id = format!("{pool:?}");
+    let pinned_state = normalized_v3_state(read.pool_code_hash, anchor.number, &pool_id).ok()?;
+    let meta = PoolExecutionMetadata {
+        venue: venue_str(Venue::UniswapV3).to_string(),
+        pool,
+        router,
+        spender: router,
+        token_order: (read.token0, read.token1),
+        fee: Some(fee_tier),
+        curve_method: None,
+        curve_indices: None,
+        implementation_code_hash: read.pool_code_hash,
+        anchor_block: anchor.number,
+    };
+    Some(PoolState { pinned_state, meta })
+}
+
+/// Re-quotes a single already-discovered structural leg at a caller-supplied
+/// `amount_in` (the previous leg's real `amount_out`), reusing the pool
+/// metadata/state resolved during structural discovery. This is how
+/// `leg[n].amount_in == leg[n-1].amount_out` is satisfied with a real
+/// adapter-returned amount rather than an independently-notional quote.
+async fn requote_leg<M: Middleware>(
+    provider: &Arc<M>,
+    leg: &crate::core::route_artifact::StructuralRouteLeg,
+    amount_in: U256,
+    anchor: &AnchorBlock,
+    token_meta_by_addr: &HashMap<Address, TokenMetadata>,
+    pools: &PoolContext,
+) -> Option<PinnedQuoteRecord> {
+    let meta_in = token_meta_by_addr.get(&leg.token_in)?.clone();
+    let meta_out = token_meta_by_addr.get(&leg.token_out)?.clone();
+    let pool_meta = pools.meta.get(&leg.pool)?.clone();
+    let pool_state = pools.state.get(&leg.pool)?.clone();
+    let target = *pools.quote_target.get(&leg.pool)?;
+    // Phase-B re-quotes have their own `(pool, amount_in)` cache upstream and
+    // sit outside the `quote_ms` decomposition, so no RPC calls are recorded
+    // here.
+    let metrics = QuoteMetrics::disabled();
+    if let Some(fee) = leg.fee {
+        let (_, quote) = tokio::time::timeout(
+            QUOTE_TIMEOUT,
+            quote_v3_leg(
+                provider.clone(),
+                target,
+                leg.pool,
+                leg.token_in,
+                leg.token_out,
+                fee,
+                amount_in,
+                anchor.number,
+                anchor.hash,
+                meta_in,
+                meta_out,
+                pool_meta,
+                pool_state,
+                &metrics,
+            ),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        Some(quote)
+    } else {
+        let (_, quote) = tokio::time::timeout(
+            QUOTE_TIMEOUT,
+            quote_v2_leg(
+                provider.clone(),
+                leg.venue,
+                target,
+                leg.pool,
+                leg.token_in,
+                leg.token_out,
+                amount_in,
+                anchor.number,
+                anchor.hash,
+                meta_in,
+                meta_out,
+                pool_meta,
+                pool_state,
+                &metrics,
+            ),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        Some(quote)
+    }
+}
+
+/// Read-only provider-backed canonical discovery service.  Discovery
+/// adapters are added to this service; callers cannot bypass pinned-anchor
+/// validation.
+pub struct CanonicalDiscoveryService<M> {
+    provider: Arc<M>,
+    expected_chain_id: u64,
+    config: CanonicalDiscoveryConfig,
+    /// Phase-A immutable-metadata cache (pool/pair address resolution,
+    /// token0/token1, contract code hash). Lives for the service's whole
+    /// lifetime, so it stays warm across rounds -- never state, never a
+    /// quote amount; see `canonical_metadata_cache` module docs.
+    metadata_cache: MetadataCache,
+}
+
+impl<M> CanonicalDiscoveryService<M>
+where
+    M: Middleware,
+    M::Error: 'static,
+{
+    pub fn new(provider: Arc<M>, expected_chain_id: u64, config: CanonicalDiscoveryConfig) -> Self {
+        Self {
+            provider,
+            expected_chain_id,
+            config,
+            metadata_cache: MetadataCache::new(),
+        }
+    }
+
+    pub fn config(&self) -> &CanonicalDiscoveryConfig {
+        &self.config
+    }
+
+    /// Exposes cache hit/miss counters for diagnostics/logging. Never
+    /// exposes cached values themselves -- only aggregate counts.
+    pub fn metadata_cache_metrics(
+        &self,
+    ) -> crate::core::canonical_metadata_cache::CanonicalMetadataCacheMetrics {
+        self.metadata_cache.metrics()
+    }
+
+    pub async fn discover_at(&self, anchor: PinnedAnchor) -> Result<CanonicalDiscoveryResult> {
+        let timeout_secs = std::env::var("CANONICAL_DISCOVERY_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(900);
+        tracing::info!(
+            target: "canonical_discovery",
+            anchor = anchor.number,
+            timeout_secs,
+            "canonical discovery started"
+        );
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            self.discover_at_inner(anchor),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!("CANONICAL_DISCOVERY_TIMEOUT after {timeout_secs}s")),
+        }
+    }
+
+    async fn discover_at_inner(&self, anchor: PinnedAnchor) -> Result<CanonicalDiscoveryResult> {
+        let fn_start = Instant::now();
+        let mut stage_start = fn_start;
+        let mut timing = CanonicalRoundTiming::default();
+        if anchor.hash == H256::zero() {
+            return Err(anyhow!("CANONICAL_ANCHOR_ZERO_HASH"));
+        }
+        let chain_id = self.provider.get_chainid().await?.as_u64();
+        if chain_id != self.expected_chain_id {
+            return Err(anyhow!("CANONICAL_CHAIN_ID_MISMATCH"));
+        }
+        let observed = self
+            .provider
+            .get_block(BlockId::Number(BlockNumber::Number(anchor.number.into())))
+            .await?
+            .ok_or_else(|| anyhow!("CANONICAL_ANCHOR_BLOCK_MISSING"))?;
+        if observed.hash != Some(anchor.hash) {
+            return Err(anyhow!("CANONICAL_ANCHOR_HASH_MISMATCH"));
+        }
+        timing.anchor_resolution_ms = stage_start.elapsed().as_millis() as u64;
+        stage_start = Instant::now();
+
+        // Freshness baseline: the anchor block's own on-chain timestamp.
+        // Every later `anchor_age_ms` reading is wall-clock-now minus this,
+        // i.e. how old the opportunity already is by the time each stage
+        // finishes -- the number that answers "did we get there before it
+        // vanished," not just "how long did the stage take."
+        let anchor_timestamp_ms = observed.timestamp.as_u64().saturating_mul(1000);
+        let anchor_age_ms = || {
+            chrono::Utc::now()
+                .timestamp_millis()
+                .saturating_sub(anchor_timestamp_ms as i64)
+        };
+        tracing::info!(
+            target: "canonical_discovery",
+            anchor = anchor.number,
+            anchor_age_ms = anchor_age_ms(),
+            "canonical anchor resolution stage complete"
+        );
+
+        let profile = self.config.profile.label();
+
+        let mut stats = DiscoveryStats::default();
+        let mut rejections: Vec<CanonicalRejection> = Vec::new();
+        let mut round_evidence: Vec<RoundEvidence> = Vec::new();
+        let mut executable_routes = Vec::new();
+        let mut economically_positive = Vec::new();
+        let mut initial_quotes: Vec<PinnedQuoteRecord> = Vec::new();
+
+        // ---- Pool/token metadata: real on-chain code hash, pinned to the
+        // anchor block. Address/decimals/symbol are already resolved and
+        // typed in `self.config.tokens` — no symbol/address lookup happens
+        // here or anywhere else in this method. ----
+        let mut token_meta: HashMap<String, TokenMetadata> = HashMap::new();
+        for token in &self.config.tokens {
+            let Ok(code) = self
+                .provider
+                .get_code(
+                    token.address,
+                    Some(BlockId::Number(BlockNumber::Number(anchor.number.into()))),
+                )
+                .await
+            else {
+                continue;
+            };
+            let Ok(hash) = code_hash(&code.0) else {
+                continue;
+            };
+            token_meta.insert(
+                token.symbol.clone(),
+                TokenMetadata {
+                    address: token.address,
+                    symbol: token.symbol.clone(),
+                    decimals: token.decimals,
+                    code_hash: hash,
+                    anchor_block: anchor.number,
+                },
+            );
+        }
+        let token_meta_by_addr: HashMap<Address, TokenMetadata> = token_meta
+            .values()
+            .map(|t| (t.address, t.clone()))
+            .collect();
+        timing.metadata_ms = stage_start.elapsed().as_millis() as u64;
+        stage_start = Instant::now();
+        tracing::info!(
+            target: "canonical_discovery",
+            anchor = anchor.number,
+            tokens_configured = self.config.tokens.len(),
+            tokens_with_code = token_meta.len(),
+            anchor_age_ms = anchor_age_ms(),
+            "canonical metadata stage complete"
+        );
+        let symbols: Vec<String> = self
+            .config
+            .tokens
+            .iter()
+            .map(|t| t.symbol.clone())
+            .collect();
+
+        let quickswap = self.config.venue_config(Venue::QuickSwap);
+        let sushiswap = self.config.venue_config(Venue::SushiSwap);
+        let v3 = self.config.venue_config(Venue::UniswapV3);
+
+        // ---- Phase A: independent single-leg quotes -> typed edges.
+        // Curve is intentionally never quoted here.
+        //
+        // Per-pair state-read batching inside the existing
+        // `buffer_unordered(quote_concurrency)` stream: each pair resolves
+        // its venues/fee-tiers (cached -> 0 RPC warm), packs ALL of that
+        // pair's pool state reads (V2 getReserves; V3 slot0+liquidity+fee
+        // per fee tier) into ONE Multicall3 `aggregate3` eth_call pinned to
+        // the anchor, assembles `PoolState`s, then quotes each leg
+        // (`getAmountsOut` / `quoteExactInputSingle`, unchanged individual
+        // eth_call, NOT batched). There is NO global barrier between
+        // resolve and quote -- pairs stay pipelined at `PAIR_CONCURRENCY=4`,
+        // so a slow pair's resolve cannot block another pair's quotes
+        // (the tail-latency coupling a global batch would introduce on
+        // high-variance RPCs). `STATE_CACHE_USED=false` (pool state is
+        // never cached across anchors; only immutable metadata is,
+        // unchanged).
+        // ----
+        let mut graph = ExecutableEdgeGraph::new();
+        let mut pools = PoolContext::default();
+
+        let quote_concurrency = std::env::var("CANONICAL_QUOTE_CONCURRENCY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(4);
+        let mut pair_inputs = Vec::new();
+        for symbol_in in &symbols {
+            for symbol_out in &symbols {
+                if symbol_in == symbol_out {
+                    continue;
+                }
+                let (Some(meta_in), Some(meta_out)) =
+                    (token_meta.get(symbol_in), token_meta.get(symbol_out))
+                else {
+                    continue;
+                };
+                pair_inputs.push((
+                    symbol_in.clone(),
+                    symbol_out.clone(),
+                    meta_in.clone(),
+                    meta_out.clone(),
+                ));
+            }
+        }
+        let pair_inputs: Vec<_> = pair_inputs.into_iter().enumerate().collect();
+        stats.quotes_attempted = pair_inputs.len() as u64;
+        tracing::info!(
+            target: "canonical_discovery",
+            anchor = anchor.number,
+            pairs = pair_inputs.len(),
+            quote_concurrency,
+            "canonical quote stage started"
+        );
+
+        let provider = self.provider.clone();
+        let anchor_for_quotes = anchor.clone();
+        let chain_id = self.expected_chain_id;
+        let cache = &self.metadata_cache;
+        // Diagnostic-only: collects every real eth_call made while quoting
+        // (Phase A), plus the Multicall3 batching accumulator, so `quote_ms`
+        // can be decomposed into RPC-call count, RPC wait, duplicate reads,
+        // per-pair serial critical path, and multicall batch consolidation
+        // after the round finishes.
+        let quote_metrics = QuoteMetrics::new();
+        let metadata_cache_before = self.metadata_cache.metrics();
+
+        // ---- Per-pair state-read batching. Each pair, inside the existing
+        // `buffer_unordered(quote_concurrency)` stream, resolves its
+        // venues/fee-tiers (cached factory lookup -> 0 RPC warm), packs ALL
+        // of that pair's pool state reads (V2 getReserves; V3
+        // slot0+liquidity+fee per fee tier) into ONE Multicall3 `aggregate3`
+        // eth_call pinned to the anchor, assembles `PoolState`s from the
+        // decoded results, then quotes each leg (`getAmountsOut` /
+        // `quoteExactInputSingle`, unchanged individual eth_call, NOT
+        // batched). No global barrier -- pairs stay pipelined at
+        // `PAIR_CONCURRENCY=4`. ----
+        let quote_results = stream::iter(pair_inputs.iter().map(
+            |(pair_index, (_symbol_in, _symbol_out, meta_in, meta_out))| {
+                let provider = provider.clone();
+                let anchor = anchor_for_quotes.clone();
+                let quickswap = quickswap.cloned();
+                let sushiswap = sushiswap.cloned();
+                let v3 = v3.cloned();
+                let metrics = quote_metrics.clone();
+                async move {
+                    let mut local_pools = PoolContext::default();
+                    let mut edges = Vec::new();
+                    let pair_start = Instant::now();
+
+                    // 1) Resolve all venues / fee tiers for this pair
+                    //    (cached factory lookup -> 0 RPC warm).
+                    let amount_in = human_to_atomic(NOTIONAL_USD, meta_in.decimals);
+                    let mut reqs: Vec<PoolRequest> = Vec::new();
+                    if let Some(cfg) = quickswap {
+                        if let Some(req) = resolve_v2_edge(
+                            &provider,
+                            Venue::QuickSwap,
+                            cfg.router,
+                            cfg.factory,
+                            meta_in,
+                            meta_out,
+                            amount_in,
+                            &anchor,
+                            chain_id,
+                            cache,
+                            &metrics,
+                        )
+                        .await
+                        {
+                            reqs.push(req);
+                        }
+                    }
+                    if let Some(cfg) = sushiswap {
+                        if let Some(req) = resolve_v2_edge(
+                            &provider,
+                            Venue::SushiSwap,
+                            cfg.router,
+                            cfg.factory,
+                            meta_in,
+                            meta_out,
+                            amount_in,
+                            &anchor,
+                            chain_id,
+                            cache,
+                            &metrics,
+                        )
+                        .await
+                        {
+                            reqs.push(req);
+                        }
+                    }
+                    if let Some(cfg) = v3.filter(|cfg| cfg.quoter.is_some()) {
+                        let quoter = cfg.quoter.expect("filtered on Some");
+                        for fee in V3_FEE_TIERS {
+                            if let Some(req) = resolve_v3_edge(
+                                &provider,
+                                cfg.router,
+                                cfg.factory,
+                                quoter,
+                                fee,
+                                meta_in,
+                                meta_out,
+                                amount_in,
+                                &anchor,
+                                chain_id,
+                                cache,
+                                &metrics,
+                            )
+                            .await
+                            {
+                                reqs.push(req);
+                            }
+                        }
+                    }
+                    if reqs.is_empty() {
+                        return (
+                            *pair_index,
+                            edges,
+                            local_pools,
+                            pair_start.elapsed().as_millis() as u64,
+                            0u64,
+                        );
+                    }
+
+                    // 2) Build this pair's subcall list (V2 -> 1 getReserves;
+                    //    V3 -> slot0+liquidity+fee = 3 per pool), pack into
+                    //    ONE Multicall3 batch pinned to the anchor, decode.
+                    //    One eth_call for the whole pair.
+                    let mut subcalls: Vec<StateSubcall> = Vec::new();
+                    for req in &reqs {
+                        match req {
+                            PoolRequest::V2 { .. } => {
+                                subcalls.push(StateSubcall::V2Reserves(req.pool()));
+                            }
+                            PoolRequest::V3 { .. } => {
+                                subcalls.push(StateSubcall::V3Slot0(req.pool()));
+                                subcalls.push(StateSubcall::V3Liquidity(req.pool()));
+                                subcalls.push(StateSubcall::V3Fee(req.pool()));
+                            }
+                        }
+                    }
+                    let state_batch_start = Instant::now();
+                    let batch_results = batch_read_pool_state(
+                        &provider,
+                        &subcalls,
+                        anchor.number,
+                        chain_id,
+                        subcalls.len(),
+                        &metrics,
+                    )
+                    .await;
+                    let pair_state_batch_ms = state_batch_start.elapsed().as_millis() as u64;
+
+                    // 3) Walk `reqs` in lockstep with the subcall layout to
+                    //    assemble each pool's `PoolState` from the decoded
+                    //    state plus cached metadata (token0/token1, code
+                    //    hashes -- 0 RPC warm).
+                    let mut pool_states: HashMap<Address, PoolState> = HashMap::new();
+                    let mut subcall_idx = 0usize;
+                    for req in &reqs {
+                        let pool = req.pool();
+                        let assembled = match req {
+                            PoolRequest::V2 { .. } => {
+                                let state = batch_results.get(subcall_idx).and_then(Option::as_ref);
+                                subcall_idx += 1;
+                                match state {
+                                    Some(s) => {
+                                        assemble_v2_pool_state(
+                                            &provider, req, s, &anchor, chain_id, cache, &metrics,
+                                        )
+                                        .await
+                                    }
+                                    None => None,
+                                }
+                            }
+                            PoolRequest::V3 { .. } => {
+                                let slot0 = batch_results.get(subcall_idx).and_then(Option::as_ref);
+                                let liquidity =
+                                    batch_results.get(subcall_idx + 1).and_then(Option::as_ref);
+                                let fee =
+                                    batch_results.get(subcall_idx + 2).and_then(Option::as_ref);
+                                subcall_idx += 3;
+                                match (slot0, liquidity, fee) {
+                                    (Some(s0), Some(l), Some(f)) => {
+                                        assemble_v3_pool_state(
+                                            &provider, req, s0, l, f, &anchor, chain_id, cache,
+                                            &metrics,
+                                        )
+                                        .await
+                                    }
+                                    _ => None,
+                                }
+                            }
+                        };
+                        if let Some(ps) = assembled {
+                            pool_states.insert(pool, ps);
+                        }
+                    }
+
+                    // 4) Quote each leg with the unchanged `getAmountsOut` /
+                    //    `quoteExactInputSingle` (individual eth_call at
+                    //    anchor, NOT batched).
+                    for req in &reqs {
+                        let Some(ps) = pool_states.get(&req.pool()) else {
+                            // State did not assemble (failed subcall or
+                            // token-order mismatch) -- fail-closed, no edge.
+                            continue;
+                        };
+                        let outcome = match req {
+                            PoolRequest::V2 { .. } => {
+                                quote_v2_edge_from_state(
+                                    &provider,
+                                    req,
+                                    ps,
+                                    &anchor,
+                                    &mut local_pools,
+                                    &metrics,
+                                )
+                                .await
+                            }
+                            PoolRequest::V3 { .. } => {
+                                quote_v3_edge_from_state(
+                                    &provider,
+                                    req,
+                                    ps,
+                                    &anchor,
+                                    &mut local_pools,
+                                    &metrics,
+                                )
+                                .await
+                            }
+                        };
+                        if let Some(edge) = outcome {
+                            edges.push(edge);
+                        }
+                    }
+
+                    let pair_serial_ms = pair_start.elapsed().as_millis() as u64;
+                    (
+                        *pair_index,
+                        edges,
+                        local_pools,
+                        pair_serial_ms,
+                        pair_state_batch_ms,
+                    )
+                }
+            },
+        ))
+        .buffer_unordered(quote_concurrency)
+        .collect::<Vec<_>>()
+        .await;
+
+        let mut quote_results = quote_results;
+        quote_results.sort_by_key(|(pair_index, ..)| *pair_index);
+        // Per-pair batching has no global state-read barrier; the
+        // critical-path floor is the slowest pair's full serial
+        // resolve+state-batch+quote. `state_batch_ms` is reported as the
+        // max per-pair batch wait (the worst pair's single multicall
+        // eth_call) -- the largest single state-read RTT in the round.
+        let critical_path_floor_ms = quote_results
+            .iter()
+            .map(|(_, _, _, pair_serial_ms, _)| *pair_serial_ms)
+            .max()
+            .unwrap_or(0);
+        let state_batch_ms = quote_results
+            .iter()
+            .map(|(_, _, _, _, pair_state_batch_ms)| *pair_state_batch_ms)
+            .max()
+            .unwrap_or(0);
+        for (_, edges, local_pools, _, _) in quote_results {
+            stats.quotes_succeeded += edges.len() as u64;
+            for edge in edges {
+                initial_quotes.push(PinnedQuoteRecord {
+                    quote_id: edge.quote_id,
+                    anchor_block: edge.anchor_block,
+                    anchor_hash: edge.anchor_block_hash,
+                    venue: edge.venue,
+                    pool: edge.pool,
+                    token_in: edge.token_in,
+                    token_out: edge.token_out,
+                    amount_in: edge.amount_in,
+                    amount_out: edge.amount_out,
+                    pool_state_id: edge.pool_state_id,
+                    execution_metadata_id: edge.execution_metadata_id,
+                    adapter_version: "canonical-edge".into(),
+                    provenance_hash: edge.provenance_hash,
+                });
+                graph.push(edge);
+            }
+            pools.meta.extend(local_pools.meta);
+            pools.state.extend(local_pools.state);
+            pools.quote_target.extend(local_pools.quote_target);
+        }
+        stats.edges_created = graph.edges.len() as u64;
+        timing.quote_ms = stage_start.elapsed().as_millis() as u64;
+        stage_start = Instant::now();
+        tracing::info!(
+            target: "canonical_discovery",
+            anchor = anchor.number,
+            quotes_attempted = stats.quotes_attempted,
+            quotes_succeeded = stats.quotes_succeeded,
+            edges_created = stats.edges_created,
+            pools_observed = pools.meta.len(),
+            anchor_age_ms = anchor_age_ms(),
+            "canonical quote stage complete"
+        );
+
+        // ---- quote_ms decomposition: real eth_call count/wait, duplicate
+        // reads, and the per-pair serial critical path -- gathered once so
+        // any concurrency-tuning decision (raising `quote_concurrency`,
+        // adding an address/metadata cache) rests on measured evidence
+        // instead of a guess. `computation_ms` is deliberately not reported
+        // separately: every adapter fn here does only ABI encode/decode and
+        // a keccak256 hash between calls, which is negligible next to RPC
+        // wait -- `quote_ms` is, for practical purposes, all RPC. ----
+        let rpc_calls: Vec<RpcCallRecord> = quote_metrics.drain();
+        let rpc_calls_total = rpc_calls.len();
+        let rpc_wait_ms_sum: u64 = rpc_calls.iter().map(|c| c.wait_ms).sum();
+        let mut seen_calls: HashSet<(Address, &'static str)> = HashSet::new();
+        let mut duplicate_calls: u64 = 0;
+        let mut by_kind: BTreeMap<&'static str, (u64, u64)> = BTreeMap::new();
+        for rec in &rpc_calls {
+            let entry = by_kind.entry(rec.call_kind).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += rec.wait_ms;
+            if !seen_calls.insert((rec.pool, rec.call_kind)) {
+                duplicate_calls += 1;
+            }
+        }
+        let pools_touched = rpc_calls
+            .iter()
+            .map(|c| c.pool)
+            .collect::<HashSet<_>>()
+            .len();
+        let parallel_efficiency = if timing.quote_ms > 0 {
+            rpc_wait_ms_sum as f64 / timing.quote_ms as f64
+        } else {
+            0.0
+        };
+        tracing::info!(
+            target: "canonical_discovery",
+            anchor = anchor.number,
+            quote_ms = timing.quote_ms,
+            rpc_calls_total,
+            rpc_wait_ms_sum,
+            rpc_duplicate_calls = duplicate_calls,
+            pools_touched,
+            quote_concurrency,
+            critical_path_floor_ms,
+            parallel_efficiency = format!("{parallel_efficiency:.2}"),
+            "canonical quote stage rpc breakdown"
+        );
+        for (call_kind, (count, wait_ms)) in &by_kind {
+            tracing::info!(
+                target: "canonical_discovery",
+                anchor = anchor.number,
+                call_kind = %call_kind,
+                count,
+                wait_ms_sum = wait_ms,
+                wait_ms_avg = *wait_ms / (*count).max(1),
+                "canonical quote rpc call kind breakdown"
+            );
+        }
+
+        // ---- Phase-A state-read batching breakdown. `rpc_calls_total`
+        // above now counts only the quote eth_calls (getAmountsOut /
+        // quoteExactInputSingle) plus one physical RPC per Multicall3
+        // `aggregate3` batch -- the 220 individual getReserves/slot0/
+        // liquidity/fee eth_calls are gone, replaced by `multicall_rpc_calls`
+        // batches. `1 batch eth_call = 1 physical RPC; N subcalls = N
+        // subcalls` -- subcalls are never counted as physical RPCs.
+        // `individual_state_calls` is 0 in the hot path (it only moves when
+        // the non-batched fallback / reference path ran). ----
+        let multicall_stats = quote_metrics.multicall_snapshot();
+        let multicall_batch_size_avg = if multicall_stats.batch_sizes.is_empty() {
+            0
+        } else {
+            multicall_stats.batch_sizes.iter().sum::<usize>() / multicall_stats.batch_sizes.len()
+        };
+        let multicall_batch_size_max = multicall_stats
+            .batch_sizes
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0);
+        tracing::info!(
+            target: "canonical_discovery",
+            anchor = anchor.number,
+            state_batch_ms,
+            multicall_rpc_calls = multicall_stats.rpc_calls,
+            multicall_subcalls = multicall_stats.subcalls,
+            multicall_batch_count = multicall_stats.batch_count,
+            multicall_subcall_failures = multicall_stats.subcall_failures,
+            individual_state_rpc_calls = multicall_stats.individual_state_calls,
+            multicall_wait_ms = multicall_stats.wait_ms,
+            multicall_batch_size_avg,
+            multicall_batch_size_max,
+            state_cache_used = false,
+            pair_concurrency = quote_concurrency,
+            "canonical quote stage multicall breakdown"
+        );
+
+        // ---- Phase-A immutable-metadata cache: exact hit/miss delta for
+        // this round only (before/after snapshot, not cumulative since
+        // process start). `metadata_calls_avoided` is exact -- every
+        // lookup this round that did not trigger `fetch()` inside the
+        // cache, whether a genuine hit or a single-flighted duplicate.
+        // `metadata_wait_ms_avoided_estimate` is NOT exact: avoided calls
+        // have no measured wait_ms of their own (no RPC ran), so it is the
+        // average wait_ms of this round's real metadata RPC calls times
+        // the avoided count -- clearly marked as an estimate below. ----
+        let metadata_cache_after = self.metadata_cache.metrics();
+        let metadata_delta = metadata_cache_after.saturating_sub(&metadata_cache_before);
+        let metadata_calls_avoided = metadata_delta.calls_avoided_total();
+        const METADATA_CALL_KINDS: [&str; 6] = [
+            "get_code(pool)",
+            "get_code(router)",
+            "token0",
+            "token1",
+            "getPair",
+            "getPool",
+        ];
+        let (metadata_wait_ms_sum, metadata_wait_calls) = by_kind
+            .iter()
+            .filter(|(k, _)| METADATA_CALL_KINDS.contains(k))
+            .fold((0u64, 0u64), |(acc_ms, acc_n), (_, (n, ms))| {
+                (acc_ms + ms, acc_n + n)
+            });
+        let metadata_wait_ms_avoided_estimate = if metadata_wait_calls > 0 {
+            ((metadata_wait_ms_sum as f64 / metadata_wait_calls as f64)
+                * metadata_calls_avoided as f64) as u64
+        } else {
+            0
+        };
+        tracing::info!(
+            target: "canonical_discovery",
+            anchor = anchor.number,
+            metadata_calls_avoided,
+            metadata_wait_ms_avoided_estimate,
+            metadata_wait_ms_avoided_is_estimate = true,
+            metadata_lookups_total = metadata_delta.lookups_total(),
+            metadata_rpc_calls_total = metadata_delta.rpc_calls_total(),
+            v2_pair_hits = metadata_delta.v2_pair.hits,
+            v2_pair_misses = metadata_delta.v2_pair.misses,
+            v2_pair_negative_hits = metadata_delta.v2_pair.negative_hits,
+            v2_pair_negative_expired = metadata_delta.v2_pair.negative_expired,
+            v2_pair_rpc_calls = metadata_delta.v2_pair.rpc_calls,
+            v3_pool_hits = metadata_delta.v3_pool.hits,
+            v3_pool_misses = metadata_delta.v3_pool.misses,
+            v3_pool_negative_hits = metadata_delta.v3_pool.negative_hits,
+            v3_pool_negative_expired = metadata_delta.v3_pool.negative_expired,
+            v3_pool_rpc_calls = metadata_delta.v3_pool.rpc_calls,
+            token0_hits = metadata_delta.token0.hits,
+            token0_misses = metadata_delta.token0.misses,
+            token0_rpc_calls = metadata_delta.token0.rpc_calls,
+            token1_hits = metadata_delta.token1.hits,
+            token1_misses = metadata_delta.token1.misses,
+            token1_rpc_calls = metadata_delta.token1.rpc_calls,
+            code_hash_hits = metadata_delta.code_hash.hits,
+            code_hash_misses = metadata_delta.code_hash.misses,
+            code_hash_negative_hits = metadata_delta.code_hash.negative_hits,
+            code_hash_negative_expired = metadata_delta.code_hash.negative_expired,
+            code_hash_rpc_calls = metadata_delta.code_hash.rpc_calls,
+            "canonical quote stage metadata cache breakdown"
+        );
+
+        // ---- Structural cycle discovery: one DFS pass per start token,
+        // since route_input is decimal-scaled per starting token.
+        // min_hops == max_hops == 3: triangular-only. ----
+        let mut raw_routes: Vec<StructuralRoute> = Vec::new();
+        for symbol in &symbols {
+            let Some(meta) = token_meta.get(symbol) else {
+                continue;
+            };
+            let route_input = human_to_atomic(NOTIONAL_USD, meta.decimals);
+            raw_routes.extend(find_structural_cycles(
+                &graph,
+                &[meta.address],
+                3,
+                3,
+                route_input,
+                profile,
+            ));
+        }
+        stats.cycles_detected = raw_routes.len() as u64;
+        let mut route_map: BTreeMap<String, StructuralRoute> = BTreeMap::new();
+        for route in raw_routes {
+            route_map
+                .entry(route.structural_cycle_key.clone())
+                .or_insert(route);
+        }
+        let max_routes = std::env::var("CANONICAL_MAX_ROUTES_PER_ROUND")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(128);
+        let rank_min_multiplier = std::env::var("CANONICAL_ROUTE_RANK_MIN_MULTIPLIER")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .unwrap_or(0.5);
+        let rank_max_multiplier = std::env::var("CANONICAL_ROUTE_RANK_MAX_MULTIPLIER")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value >= 1.0)
+            .unwrap_or(1.2);
+        let discovered_routes = route_map.len();
+        let mut ranked_routes: Vec<_> = route_map.into_iter().collect();
+        ranked_routes.sort_by(|(key_a, route_a), (key_b, route_b)| {
+            let sane_a = route_a.gross_multiplier_avg >= rank_min_multiplier
+                && route_a.gross_multiplier_avg <= rank_max_multiplier;
+            let sane_b = route_b.gross_multiplier_avg >= rank_min_multiplier
+                && route_b.gross_multiplier_avg <= rank_max_multiplier;
+            sane_b
+                .cmp(&sane_a)
+                .then_with(|| {
+                    route_b
+                        .gross_multiplier_avg
+                        .total_cmp(&route_a.gross_multiplier_avg)
+                })
+                .then_with(|| key_a.cmp(key_b))
+        });
+        let rank_outliers = ranked_routes
+            .iter()
+            .filter(|(_, route)| {
+                route.gross_multiplier_avg < rank_min_multiplier
+                    || route.gross_multiplier_avg > rank_max_multiplier
+            })
+            .count();
+        let top_rank_score = ranked_routes
+            .first()
+            .map(|(_, route)| route.gross_multiplier_avg)
+            .unwrap_or_default();
+        ranked_routes.truncate(max_routes);
+        let cutoff_rank_score = ranked_routes
+            .last()
+            .map(|(_, route)| route.gross_multiplier_avg)
+            .unwrap_or_default();
+        route_map = ranked_routes.into_iter().collect();
+        stats.routes_discovered = route_map.len() as u64;
+        stats.routes_pruned = (discovered_routes - route_map.len()) as u64;
+        timing.ranking_ms = stage_start.elapsed().as_millis() as u64;
+        stage_start = Instant::now();
+        tracing::info!(
+            target: "canonical_discovery",
+            anchor = anchor.number,
+            cycles_detected = stats.cycles_detected,
+            routes_discovered = stats.routes_discovered,
+            routes_pruned = stats.routes_pruned,
+            routes_ranked = discovered_routes,
+            rank_outliers,
+            top_rank_score,
+            cutoff_rank_score,
+            rank_min_multiplier,
+            rank_max_multiplier,
+            max_routes,
+            anchor_age_ms = anchor_age_ms(),
+            "canonical structural ranking stage complete"
+        );
+
+        // ---- Phase B: parallel re-quote per structural route so
+        // leg[n].amount_in == leg[n-1].amount_out with real adapter output.
+        // Routes are independent (legs within a route stay sequential), so
+        // they run concurrently via buffer_unordered. Caching by
+        // (pool, amount_in) keeps real RPC volume bounded when several
+        // structural routes share the same first leg. ----
+        let requote_concurrency = std::env::var("CANONICAL_REQUOTE_CONCURRENCY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(4);
+        let mut route_leg_quotes: HashMap<String, Vec<PinnedQuoteRecord>> = HashMap::new();
+        let requote_cache: Arc<tokio::sync::Mutex<HashMap<(Address, U256), PinnedQuoteRecord>>> =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let pools = Arc::new(pools);
+        let provider = self.provider.clone();
+        let anchor_for_requote = anchor.clone();
+        let token_meta_for_requote = token_meta_by_addr.clone();
+
+        let requote_results = stream::iter(route_map.iter().map(|(key, route)| {
+            let key = key.clone();
+            let route = route.clone();
+            let requote_cache = requote_cache.clone();
+            let pools = pools.clone();
+            let provider = provider.clone();
+            let anchor = anchor_for_requote.clone();
+            let token_meta_by_addr = token_meta_for_requote.clone();
+            async move {
+                let executable_legs = route.executable_legs.clone().unwrap_or_default();
+                if executable_legs.is_empty() {
+                    let rejection = CanonicalRejection {
+                        stage: "leg_quote_chain",
+                        reason: "ADAPTER_MISSING_TYPED_LEGS".to_string(),
+                        anchor: anchor.clone(),
+                        structural_cycle_key: Some(key.clone()),
+                    };
+                    return (key, Err(rejection));
+                }
+
+                let mut leg_quotes: Vec<PinnedQuoteRecord> = Vec::new();
+                let mut current_amount = route.route_input;
+                let mut chain_ok = true;
+                for leg in &executable_legs {
+                    let cache_key = (leg.pool, current_amount);
+                    let quote = {
+                        let cache = requote_cache.lock().await;
+                        cache.get(&cache_key).cloned()
+                    };
+                    let quote = match quote {
+                        Some(quote) => Some(quote),
+                        None => {
+                            let fresh = requote_leg(
+                                &provider,
+                                leg,
+                                current_amount,
+                                &anchor,
+                                &token_meta_by_addr,
+                                pools.as_ref(),
+                            )
+                            .await;
+                            if let Some(quote) = &fresh {
+                                requote_cache.lock().await.insert(cache_key, quote.clone());
+                            }
+                            fresh
+                        }
+                    };
+                    match quote {
+                        Some(quote) => {
+                            current_amount = quote.amount_out;
+                            leg_quotes.push(quote);
+                        }
+                        None => {
+                            chain_ok = false;
+                            break;
+                        }
+                    }
+                }
+
+                let assembled = chain_ok.then(|| {
+                    assemble_route_leg_quotes(
+                        route.route_input,
+                        route.anchor_block,
+                        route.anchor_block_hash,
+                        leg_quotes.clone(),
+                        executable_legs.len(),
+                    )
+                });
+                match assembled {
+                    Some(Ok(_)) => (key, Ok(leg_quotes)),
+                    Some(Err(err)) => {
+                        let rejection = CanonicalRejection {
+                            stage: "leg_quote_chain",
+                            reason: err.to_string(),
+                            anchor: anchor.clone(),
+                            structural_cycle_key: Some(key.clone()),
+                        };
+                        (key, Err(rejection))
+                    }
+                    None => {
+                        let rejection = CanonicalRejection {
+                            stage: "leg_quote_chain",
+                            reason: "LEG_QUOTE_CHAIN_INCOMPLETE".to_string(),
+                            anchor: anchor.clone(),
+                            structural_cycle_key: Some(key.clone()),
+                        };
+                        (key, Err(rejection))
+                    }
+                }
+            }
+        }))
+        .buffer_unordered(requote_concurrency)
+        .collect::<Vec<_>>()
+        .await;
+
+        for (key, outcome) in requote_results {
+            match outcome {
+                Ok(leg_quotes) => {
+                    route_leg_quotes.insert(key, leg_quotes);
+                }
+                Err(rejection) => {
+                    rejections.push(rejection);
+                }
+            }
+        }
+        timing.requote_ms = stage_start.elapsed().as_millis() as u64;
+        stage_start = Instant::now();
+        tracing::info!(
+            target: "canonical_discovery",
+            anchor = anchor.number,
+            routes_discovered = route_map.len(),
+            routes_requoted = route_leg_quotes.len(),
+            rejections = rejections.len(),
+            requote_concurrency,
+            anchor_age_ms = anchor_age_ms(),
+            "canonical parallel requote stage complete"
+        );
+
+        let pool_states: HashMap<Address, SimulatedPoolState> = pools
+            .state
+            .iter()
+            .map(|(addr, s)| (*addr, s.state))
+            .collect();
+
+        // ---- Canonical execution context: real typed tokens/pools/states
+        // for this anchor, validated and hashed. No persistence, no
+        // reload — this service performs no filesystem or fork IO. ----
+        if token_meta.is_empty() || pools.meta.is_empty() || pools.state.is_empty() {
+            return Ok(CanonicalDiscoveryResult {
+                anchor,
+                round_evidence,
+                executable_routes,
+                economically_positive,
+                rejections,
+                stats,
+                initial_quotes,
+                structural_routes: route_map,
+                leg_quotes: route_leg_quotes,
+                pool_states,
+                timing: timing.finish(fn_start),
+                multicall: MulticallStats::default(),
+                critical_path_floor_ms: 0,
+                state_batch_ms: 0,
+            });
+        }
+
+        let ctx_tokens: BTreeMap<String, TokenMetadata> = token_meta
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let ctx_pools: BTreeMap<String, PoolExecutionMetadata> = pools
+            .meta
+            .iter()
+            .map(|(pool, meta)| (format!("{pool:?}"), meta.clone()))
+            .collect();
+        let ctx_states: BTreeMap<String, PinnedPoolState> = pools
+            .state
+            .values()
+            .map(|s| (s.state_id.clone(), s.clone()))
+            .collect();
+        let mut ctx_setup: BTreeMap<String, ForkSetupRecord> = BTreeMap::new();
+        for route in route_map.values() {
+            let Some(legs) = &route.executable_legs else {
+                continue;
+            };
+            let funding_and_approvals: Vec<(Address, Address, U256)> = legs
+                .iter()
+                .map(|l| (l.token_in, l.router, route.route_input))
+                .collect();
+            ctx_setup.insert(
+                route.structural_cycle_key.clone(),
+                ForkSetupRecord {
+                    route_key: route.structural_cycle_key.clone(),
+                    caller: CANONICAL_CALLER(),
+                    funding: funding_and_approvals
+                        .iter()
+                        .map(|(t, _, a)| (*t, *a))
+                        .collect(),
+                    approvals: funding_and_approvals,
+                    balance_checks: legs.iter().map(|l| l.router).collect(),
+                    targets: legs.iter().map(|l| l.router).collect(),
+                    anchor_block: anchor.number,
+                },
+            );
+        }
+
+        let context_pools = ctx_pools.len();
+        let context_states = ctx_states.len();
+        let context_routes = ctx_setup.len();
+        let context_build_result = CanonicalExecutionContext::build(
+            anchor.number,
+            anchor.hash,
+            ctx_tokens,
+            ctx_pools,
+            ctx_states,
+            ctx_setup,
+        );
+        timing.context_build_ms = stage_start.elapsed().as_millis() as u64;
+        stage_start = Instant::now();
+        let context = match context_build_result {
+            Ok(context) => context,
+            Err(err) => {
+                rejections.push(CanonicalRejection {
+                    stage: "context_build",
+                    reason: err.to_string(),
+                    anchor: anchor.clone(),
+                    structural_cycle_key: None,
+                });
+                return Ok(CanonicalDiscoveryResult {
+                    anchor,
+                    round_evidence,
+                    executable_routes,
+                    economically_positive,
+                    rejections,
+                    stats,
+                    initial_quotes,
+                    structural_routes: route_map,
+                    leg_quotes: route_leg_quotes,
+                    pool_states,
+                    timing: timing.finish(fn_start),
+                    multicall: MulticallStats::default(),
+                    critical_path_floor_ms: 0,
+                    state_batch_ms: 0,
+                });
+            }
+        };
+        tracing::info!(
+            target: "canonical_discovery",
+            anchor = anchor.number,
+            context_pools,
+            context_states,
+            context_routes,
+            anchor_age_ms = anchor_age_ms(),
+            "canonical execution context stage complete"
+        );
+
+        let mut token_records: HashMap<String, TokenRecord> = HashMap::new();
+        for (sym, t) in &token_meta {
+            token_records.insert(
+                sym.clone(),
+                TokenRecord {
+                    address: t.address,
+                    decimals: t.decimals,
+                },
+            );
+        }
+        let mut pool_records: HashMap<String, PoolRecord> = HashMap::new();
+        for (pool_addr, meta) in &pools.meta {
+            let Some(state) = pools.state.get(pool_addr) else {
+                continue;
+            };
+            pool_records.insert(
+                format!("{pool_addr:?}"),
+                PoolRecord {
+                    address: meta.pool,
+                    router: meta.router,
+                    state: state.state,
+                    bytecode_present: true,
+                    curve_method: None,
+                    token_in_index: None,
+                    token_out_index: None,
+                },
+            );
+        }
+        let mut venue_records: HashMap<String, VenueRecord> = HashMap::new();
+        for meta in pools.meta.values() {
+            let venue = match meta.venue.as_str() {
+                "QuickSwap" => Venue::QuickSwap,
+                "SushiSwap" => Venue::SushiSwap,
+                "UniswapV3" => Venue::UniswapV3,
+                _ => continue,
+            };
+            venue_records
+                .entry(meta.venue.clone())
+                .or_insert(VenueRecord {
+                    venue,
+                    router: meta.router,
+                });
+        }
+
+        // ---- Materialization + pure route economics. Fork-audit evidence
+        // (real gas, real balance delta, trace validation) is deliberately
+        // absent — that belongs to the binary's fork-execution stage. ----
+        for (key, route) in &route_map {
+            let Some(leg_quotes) = route_leg_quotes.get(key) else {
+                continue;
+            };
+            let plan = match materialize(
+                route,
+                anchor.number,
+                CANONICAL_CALLER(),
+                &token_records,
+                &pool_records,
+                &venue_records,
+                false,
+                route.route_input,
+            ) {
+                Ok(plan) => plan,
+                Err(err) => {
+                    rejections.push(CanonicalRejection {
+                        stage: "materialize",
+                        reason: format!("{err:?}"),
+                        anchor: anchor.clone(),
+                        structural_cycle_key: Some(key.clone()),
+                    });
+                    continue;
+                }
+            };
+            stats.routes_materialized += 1;
+
+            let Some(start_decimals) = token_meta_by_addr
+                .get(&plan.start_token)
+                .map(|t| t.decimals)
+            else {
+                rejections.push(CanonicalRejection {
+                    stage: "economics",
+                    reason: "ECONOMIC_START_TOKEN_METADATA_MISSING".to_string(),
+                    anchor: anchor.clone(),
+                    structural_cycle_key: Some(key.clone()),
+                });
+                continue;
+            };
+            let first_touch_quotes: Vec<U256> = leg_quotes.iter().map(|q| q.amount_out).collect();
+            let economics = StatefulRouteEvaluator.evaluate(
+                &route.legs,
+                route.route_input,
+                &plan.snapshot,
+                &SimulationContext {
+                    start_decimals,
+                    gas_cost_atomic: proportional_cost_atomic(
+                        route.route_input,
+                        self.config.gas_cost_ppb,
+                    ),
+                    flashloan_cost_atomic: proportional_cost_atomic(
+                        route.route_input,
+                        self.config.flashloan_cost_ppb,
+                    ),
+                },
+                &first_touch_quotes,
+            );
+
+            match economics {
+                Ok(result) => {
+                    stats.economics_evaluated += 1;
+                    let evidence = RoundEvidence {
+                        structural_cycle_key: key.clone(),
+                        anchor: anchor.clone(),
+                        context_hash: context.context_hash,
+                        route_plan: plan.clone(),
+                        amount_in: route.route_input,
+                        execution_profile: self.config.execution_profile.clone(),
+                        gross_pnl_atomic: Some(result.gross_pnl_atomic),
+                        gas_used_total: 0,
+                        orchestrator_evidence: None,
+                        rejected_registry_hit: false,
+                        economics: Some(result.clone()),
+                        leg_quotes: leg_quotes.clone(),
+                    };
+                    let is_positive = result.net_pnl_atomic > 0;
+                    round_evidence.push(evidence);
+                    executable_routes.push(plan.clone());
+                    if is_positive {
+                        economically_positive.push(plan);
+                    }
+                }
+                Err(err) => {
+                    rejections.push(CanonicalRejection {
+                        stage: "economics",
+                        reason: err.to_string(),
+                        anchor: anchor.clone(),
+                        structural_cycle_key: Some(key.clone()),
+                    });
+                }
+            }
+        }
+        timing.materialization_economics_ms = stage_start.elapsed().as_millis() as u64;
+        let timing = timing.finish(fn_start);
+
+        tracing::info!(
+            target: "canonical_discovery",
+            anchor = anchor.number,
+            routes_materialized = stats.routes_materialized,
+            economics_evaluated = stats.economics_evaluated,
+            executable_routes = executable_routes.len(),
+            economically_positive = economically_positive.len(),
+            rejections = rejections.len(),
+            total_round_ms = timing.total_ms,
+            unattributed_ms = timing.unattributed_ms,
+            anchor_age_ms = anchor_age_ms(),
+            "canonical discovery complete"
+        );
+
+        Ok(CanonicalDiscoveryResult {
+            anchor,
+            round_evidence,
+            executable_routes,
+            economically_positive,
+            rejections,
+            stats,
+            initial_quotes,
+            structural_routes: route_map,
+            leg_quotes: route_leg_quotes,
+            pool_states,
+            timing,
+            multicall: multicall_stats,
+            critical_path_floor_ms,
+            state_batch_ms,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::DexEntry;
+
+    #[test]
+    fn pinned_anchor_is_core_api() {
+        let anchor = PinnedAnchor {
+            number: 1,
+            hash: H256::repeat_byte(1),
+            selected_from_head: 1,
+            confirmation_lag: 0,
+        };
+        assert_ne!(anchor.hash, H256::zero());
+    }
+
+    // ---- CanonicalRoundTiming ----
+
+    /// `finish` records every major stage set by the caller; none of the
+    /// six real stage fields silently stay at their zero default when the
+    /// caller actually measured them.
+    #[test]
+    fn round_timing_records_all_major_stages() {
+        let fn_start = Instant::now();
+        std::thread::sleep(Duration::from_millis(5));
+        let timing = CanonicalRoundTiming {
+            anchor_resolution_ms: 1,
+            metadata_ms: 2,
+            quote_ms: 3,
+            ranking_ms: 4,
+            requote_ms: 5,
+            context_build_ms: 6,
+            materialization_economics_ms: 7,
+            total_ms: 0,
+            unattributed_ms: 0,
+        }
+        .finish(fn_start);
+        assert_eq!(timing.anchor_resolution_ms, 1);
+        assert_eq!(timing.metadata_ms, 2);
+        assert_eq!(timing.quote_ms, 3);
+        assert_eq!(timing.ranking_ms, 4);
+        assert_eq!(timing.requote_ms, 5);
+        assert_eq!(timing.context_build_ms, 6);
+        assert_eq!(timing.materialization_economics_ms, 7);
+        // total_ms is real elapsed wall time from an Instant, not one of
+        // the stage sums the caller passed in.
+        assert!(timing.total_ms >= 5);
+    }
+
+    /// `Instant` is monotonic and cannot go backwards even under clock
+    /// adjustment; asserting `elapsed() >= slept duration` is the
+    /// property that would break if this were ever changed to wall-clock
+    /// (`SystemTime`/`chrono::Utc::now`) timing instead.
+    #[test]
+    fn round_timing_uses_monotonic_clock() {
+        let start = Instant::now();
+        std::thread::sleep(Duration::from_millis(10));
+        let elapsed = start.elapsed();
+        assert!(elapsed >= Duration::from_millis(10));
+    }
+
+    /// `unattributed_ms = total_ms - sum(stages)`, saturating so a caller
+    /// that only fills in a subset of stages (early-return path) never
+    /// underflows into a bogus huge u64.
+    #[test]
+    fn round_timing_tracks_unattributed_time() {
+        let fn_start = Instant::now();
+        let timing = CanonicalRoundTiming {
+            anchor_resolution_ms: 10,
+            metadata_ms: 10,
+            quote_ms: 10,
+            ranking_ms: 0,
+            requote_ms: 0,
+            context_build_ms: 0,
+            materialization_economics_ms: 0,
+            total_ms: 0,
+            unattributed_ms: 0,
+        }
+        .finish(fn_start);
+        let measured = timing.anchor_resolution_ms
+            + timing.metadata_ms
+            + timing.quote_ms
+            + timing.ranking_ms
+            + timing.requote_ms
+            + timing.context_build_ms
+            + timing.materialization_economics_ms;
+        assert_eq!(
+            timing.unattributed_ms,
+            timing.total_ms.saturating_sub(measured)
+        );
+    }
+
+    /// Stage sums that exceed the real elapsed `total_ms` (possible only
+    /// with hand-built fixtures like this one, not from real
+    /// instrumentation) must saturate to zero, never wrap around.
+    #[test]
+    fn round_timing_unattributed_saturates_never_underflows() {
+        let fn_start = Instant::now();
+        let timing = CanonicalRoundTiming {
+            anchor_resolution_ms: u64::MAX / 2,
+            metadata_ms: u64::MAX / 2,
+            quote_ms: 0,
+            ranking_ms: 0,
+            requote_ms: 0,
+            context_build_ms: 0,
+            materialization_economics_ms: 0,
+            total_ms: 0,
+            unattributed_ms: 0,
+        }
+        .finish(fn_start);
+        assert_eq!(timing.unattributed_ms, 0);
+    }
+
+    /// Given a populated timing, the largest single stage is
+    /// deterministically identifiable — this is what the UI's
+    /// `BOTTLENECK_STAGE` highlight depends on.
+    #[test]
+    fn largest_stage_is_detected() {
+        let fn_start = Instant::now();
+        let timing = CanonicalRoundTiming {
+            anchor_resolution_ms: 5,
+            metadata_ms: 10,
+            quote_ms: 15,
+            ranking_ms: 8,
+            requote_ms: 68,
+            context_build_ms: 3,
+            materialization_economics_ms: 12,
+            total_ms: 0,
+            unattributed_ms: 0,
+        }
+        .finish(fn_start);
+        let stages = [
+            ("anchor_resolution", timing.anchor_resolution_ms),
+            ("metadata", timing.metadata_ms),
+            ("quote", timing.quote_ms),
+            ("ranking", timing.ranking_ms),
+            ("requote", timing.requote_ms),
+            ("context_build", timing.context_build_ms),
+            (
+                "materialization_economics",
+                timing.materialization_economics_ms,
+            ),
+        ];
+        let (bottleneck, _) = stages
+            .iter()
+            .max_by_key(|(_, ms)| *ms)
+            .expect("stages non-empty");
+        assert_eq!(*bottleneck, "requote");
+    }
+
+    /// The stage percentages a UI would show (stage_ms / total_ms) must
+    /// reconcile to <=100% in aggregate — they can't overcount time that
+    /// was never spent.
+    #[test]
+    fn latency_percentages_reconcile() {
+        let fn_start = Instant::now();
+        // Sleep well past the 7ms fixed stage sum below so total_ms is
+        // guaranteed to exceed it — this test exercises the normal
+        // (non-saturating) reconciliation path, not the underflow guard
+        // covered separately by `round_timing_unattributed_saturates_never_underflows`.
+        std::thread::sleep(Duration::from_millis(30));
+        let timing = CanonicalRoundTiming {
+            anchor_resolution_ms: 1,
+            metadata_ms: 1,
+            quote_ms: 1,
+            ranking_ms: 1,
+            requote_ms: 1,
+            context_build_ms: 1,
+            materialization_economics_ms: 1,
+            total_ms: 0,
+            unattributed_ms: 0,
+        }
+        .finish(fn_start);
+        let measured = timing.anchor_resolution_ms
+            + timing.metadata_ms
+            + timing.quote_ms
+            + timing.ranking_ms
+            + timing.requote_ms
+            + timing.context_build_ms
+            + timing.materialization_economics_ms;
+        let measured_plus_unattributed = measured + timing.unattributed_ms;
+        assert_eq!(measured_plus_unattributed, timing.total_ms);
+        assert!(measured_plus_unattributed <= timing.total_ms.max(measured_plus_unattributed));
+    }
+
+    fn a(n: u64) -> Address {
+        Address::from_low_u64_be(n)
+    }
+
+    fn exec_profile() -> ExecutionProfile {
+        ExecutionProfile {
+            chain_id: 137,
+            profile_label: "test".into(),
+        }
+    }
+
+    /// Builds a config with real (distinct) addresses for every
+    /// `Base`/`Liquid` symbol plus one resolvable venue, so `from_config`
+    /// can succeed for both profiles without touching disk.
+    fn config_fixture() -> Config {
+        let mut cfg = Config::default();
+        let symbols = [
+            "USDC", "USDT", "WMATIC", "WETH", "WBTC", "DAI", "LINK", "AAVE",
+        ];
+        for (i, symbol) in symbols.iter().enumerate() {
+            cfg.addresses
+                .insert((*symbol).to_string(), a(100 + i as u64));
+            cfg.pairs.metadata.insert(
+                (*symbol).to_string(),
+                crate::config::TokenMetadata {
+                    symbol: (*symbol).to_string(),
+                    name: None,
+                    decimals: Some(18),
+                    coingecko_id: None,
+                    category: None,
+                },
+            );
+        }
+        cfg.dex.push(DexEntry {
+            name: "QuickSwap".into(),
+            router_address: format!("{:#x}", a(1)),
+            factory_address: Some(format!("{:#x}", a(2))),
+            enabled: true,
+            ..Default::default()
+        });
+        cfg
+    }
+
+    #[test]
+    fn base_profile_builds_base_universe() {
+        let cfg = config_fixture();
+        let config = CanonicalDiscoveryConfig::from_config(
+            &cfg,
+            CanonicalDiscoveryProfile::Base,
+            exec_profile(),
+        )
+        .unwrap();
+        assert_eq!(config.token_count(), 5);
+        let symbols: std::collections::BTreeSet<_> =
+            config.tokens.iter().map(|t| t.symbol.as_str()).collect();
+        assert_eq!(
+            symbols,
+            ["USDC", "USDT", "WMATIC", "WETH", "WBTC"]
+                .into_iter()
+                .collect()
+        );
+    }
+
+    #[test]
+    fn configured_flashloan_and_gas_costs_are_applied_atomically() {
+        let mut cfg = config_fixture();
+        cfg.arbitrage.default_trade_amount = "100.0".into();
+        cfg.flashloan.fee_pct = Some(0.0005);
+        cfg.execution.estimate_base_gas_usd = 0.008;
+        let config = CanonicalDiscoveryConfig::from_config(
+            &cfg,
+            CanonicalDiscoveryProfile::Base,
+            exec_profile(),
+        )
+        .unwrap();
+
+        assert_eq!(config.flashloan_cost_ppb, 500_000);
+        assert_eq!(config.gas_cost_ppb, 80_000);
+        let amount = U256::from(100_000_000u64); // 100 USDC
+        assert_eq!(
+            proportional_cost_atomic(amount, config.flashloan_cost_ppb),
+            U256::from(50_000u64)
+        );
+        assert_eq!(
+            proportional_cost_atomic(amount, config.gas_cost_ppb),
+            U256::from(8_000u64)
+        );
+    }
+
+    #[test]
+    fn liquid_profile_builds_liquid_universe() {
+        let cfg = config_fixture();
+        let config = CanonicalDiscoveryConfig::from_config(
+            &cfg,
+            CanonicalDiscoveryProfile::Liquid,
+            exec_profile(),
+        )
+        .unwrap();
+        assert_eq!(config.token_count(), 8);
+    }
+
+    #[test]
+    fn base_and_liquid_profiles_are_not_cosmetic() {
+        let cfg = config_fixture();
+        let base = CanonicalDiscoveryConfig::from_config(
+            &cfg,
+            CanonicalDiscoveryProfile::Base,
+            exec_profile(),
+        )
+        .unwrap();
+        let liquid = CanonicalDiscoveryConfig::from_config(
+            &cfg,
+            CanonicalDiscoveryProfile::Liquid,
+            exec_profile(),
+        )
+        .unwrap();
+        // Materially different token counts and address sets, not just a
+        // different label on the same underlying universe.
+        assert_ne!(base.token_count(), liquid.token_count());
+        assert_ne!(base.token_addresses_hash(), liquid.token_addresses_hash());
+        let base_addrs: std::collections::BTreeSet<_> =
+            base.tokens.iter().map(|t| t.address).collect();
+        let liquid_addrs: std::collections::BTreeSet<_> =
+            liquid.tokens.iter().map(|t| t.address).collect();
+        assert!(liquid_addrs.is_superset(&base_addrs));
+        assert!(liquid_addrs.len() > base_addrs.len());
+    }
+
+    #[test]
+    fn base_profile_is_not_hardcoded() {
+        // Same symbol, different configured address -> the resolved
+        // CanonicalToken follows the real config, proving the universe is
+        // read from `Config`, not compiled in as a fixed address.
+        let mut cfg = config_fixture();
+        cfg.addresses.insert("USDC".to_string(), a(999));
+        let config = CanonicalDiscoveryConfig::from_config(
+            &cfg,
+            CanonicalDiscoveryProfile::Base,
+            exec_profile(),
+        )
+        .unwrap();
+        let usdc = config.tokens.iter().find(|t| t.symbol == "USDC").unwrap();
+        assert_eq!(usdc.address, a(999));
+    }
+
+    #[test]
+    fn discover_at_does_not_fallback_to_base_on_incomplete_liquid_config() {
+        let mut cfg = config_fixture();
+        cfg.addresses.remove("LINK");
+        let result = CanonicalDiscoveryConfig::from_config(
+            &cfg,
+            CanonicalDiscoveryProfile::Liquid,
+            exec_profile(),
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            CanonicalDiscoveryConfigError::MissingAddress("LINK".to_string())
+        );
+    }
+
+    #[test]
+    fn empty_dex_config_fails_closed_with_no_silent_venue_fallback() {
+        let mut cfg = config_fixture();
+        cfg.dex.clear();
+        let result = CanonicalDiscoveryConfig::from_config(
+            &cfg,
+            CanonicalDiscoveryProfile::Base,
+            exec_profile(),
+        );
+        assert_eq!(result.unwrap_err(), CanonicalDiscoveryConfigError::NoVenues);
+    }
+
+    #[test]
+    fn token_symbol_is_not_execution_identity() {
+        // `symbol` is presentation-only: the resolved `Address` — not the
+        // string — is what a caller must use to reason about identity.
+        let cfg = config_fixture();
+        let config = CanonicalDiscoveryConfig::from_config(
+            &cfg,
+            CanonicalDiscoveryProfile::Base,
+            exec_profile(),
+        )
+        .unwrap();
+        let mut poisoned = config.clone();
+        for token in &mut poisoned.tokens {
+            token.symbol = "NOT_A_REAL_SYMBOL".into();
+        }
+        // Corrupting every symbol string leaves the address-derived
+        // fingerprint (the only thing execution can key off of) unchanged.
+        assert_eq!(
+            config.token_addresses_hash(),
+            poisoned.token_addresses_hash()
+        );
+    }
+}

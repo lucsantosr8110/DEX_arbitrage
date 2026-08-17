@@ -5,6 +5,11 @@
 // ✅ Log "GasOracleSync" detalhado
 // ✅ Mantém hot-reload e microprofit tuning
 // ============================================================
+// B9 (gas/money): aritmética inteira deny(arithmetic_side_effects); casts
+// f64↔int em gwei/gas warn (valores < 2^52). Falha de checked_* em caminho de
+// execução aborta a opp (nunca silent saturate).
+#![deny(clippy::arithmetic_side_effects)]
+#![warn(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
 use anyhow::Result;
 use ethers::{
@@ -66,9 +71,9 @@ struct PolygonGasTier {
 #[derive(Deserialize, Debug, Clone)]
 struct PolygonGasOracle {
     #[serde(rename = "safeLow")]
-    safe_low: PolygonGasTier,
+    _safe_low: PolygonGasTier,
     standard: PolygonGasTier,
-    fast: PolygonGasTier,
+    _fast: PolygonGasTier,
 }
 
 // ============================================================
@@ -83,6 +88,9 @@ pub struct GasEstimator<M> {
     oracle_cache: Arc<RwLock<Option<(PolygonGasOracle, Instant)>>>,
     /// EWMA de gas real/estimado, aprendido de receipts confirmados.
     gas_unit_multiplier: Arc<RwLock<f64>>,
+    /// B2: oráculo EWMA por venue, persistido em disco.
+    gas_oracle: Arc<RwLock<crate::core::gas_oracle::GasOracle>>,
+    gas_oracle_path: Arc<RwLock<Option<std::path::PathBuf>>>,
     http: Client,
 }
 
@@ -98,7 +106,30 @@ where
             base_fee_cache: Arc::new(RwLock::new(None)),
             oracle_cache: Arc::new(RwLock::new(None)),
             gas_unit_multiplier: Arc::new(RwLock::new(1.0)),
-            http: Client::builder().timeout(Duration::from_secs(3)).build().unwrap(),
+            gas_oracle: Arc::new(RwLock::new(crate::core::gas_oracle::GasOracle::default())),
+            gas_oracle_path: Arc::new(RwLock::new(None)),
+            http: Client::builder()
+                .timeout(Duration::from_secs(3))
+                .build()
+                .unwrap(),
+        }
+    }
+
+    /// B2: carrega o oráculo EWMA do path configurado (`gas.gas_oracle_path`).
+    /// Deve ser chamado após `new` (em init, antes do loop de execução). Se o
+    /// path for `None`, opera só em memória (sem persistência).
+    pub async fn load_gas_oracle(&self) {
+        let path = {
+            let cfg = self.config.lock().await;
+            cfg.gas
+                .gas_oracle_path
+                .as_ref()
+                .map(|p| std::path::PathBuf::from(p))
+        };
+        if let Some(p) = &path {
+            let oracle = crate::core::gas_oracle::GasOracle::load(Some(p.clone()));
+            *self.gas_oracle.write().await = oracle;
+            *self.gas_oracle_path.write().await = Some(p.clone());
         }
     }
 
@@ -131,7 +162,8 @@ where
                 let max_fee = gwei_f64(max_fee_gwei);
                 let priority_fee = gwei_f64(prio_gwei);
 
-                self.set_cached_gas(&cache_key, max_fee, priority_fee, base_fee).await;
+                self.set_cached_gas(&cache_key, max_fee, priority_fee, base_fee)
+                    .await;
                 // M7: popular base_fee_cache com o base_fee derivado do oracle
                 // (max_fee − priority). Antes ia p/ campo `_base_fee` (unused) e o
                 // custo fazia SEGUNDA RPC `get_cached_base_fee`. Agora quem ler
@@ -158,11 +190,15 @@ where
         // ============================================================
         // 🧩 Fallback via RPC BaseFee
         // ============================================================
-        let base_fee =
-            self.get_cached_base_fee(ttl).await?.unwrap_or(gwei(gas.default_gas_price_gwei as u64));
+        let base_fee = self
+            .get_cached_base_fee(ttl)
+            .await?
+            .unwrap_or(gwei(gas.default_gas_price_gwei as u64));
 
         let priority_fee = self.calculate_dynamic_priority_fee(&cfg, base_fee).await?;
-        let max_fee = self.calculate_dynamic_max_fee(&cfg, base_fee, priority_fee).await?;
+        let max_fee = self
+            .calculate_dynamic_max_fee(&cfg, base_fee, priority_fee)
+            .await?;
 
         self.set_cached_gas(&cache_key, max_fee, priority_fee, base_fee)
             .await;
@@ -228,11 +264,7 @@ where
     // ============================================================
     // 🧮 Cálculos Dinâmicos (fallback)
     // ============================================================
-    async fn calculate_dynamic_priority_fee(
-        &self,
-        cfg: &Config,
-        base_fee: U256,
-    ) -> Result<U256> {
+    async fn calculate_dynamic_priority_fee(&self, cfg: &Config, base_fee: U256) -> Result<U256> {
         let base_fee_gwei = u256_to_f64(base_fee, 9);
         let mut priority = cfg.gas.priority_gwei;
         let max_priority = cfg.gas.max_priority_gwei;
@@ -279,10 +311,13 @@ where
     /// executa opps que dão prejuízo. Agora escala: `base_per_hop × n_hops +
     /// flashloan_overhead`, derivando `base_per_hop` de `estimated_gas_units`
     /// (interpretado como rota de 3 hops) menos `flashloan.gas_overhead`.
-    pub async fn estimate_gas_usd_for_hops(
+    /// Custo de gas em USD para uma rota concreta (B1). Substitui o modelo
+    /// linear `n_hops * GAS_PER_HOP` por soma por venue via
+    /// [`gas_profile::estimate_gas_units`]. `provider = None` ⇒ rota direct.
+    pub async fn estimate_gas_usd_for_route(
         &self,
-        n_hops: usize,
-        strategy: GasStrategyKind,
+        steps: &[crate::core::types::ArbitrageStep],
+        provider: Option<crate::core::gas_profile::FlashloanProvider>,
     ) -> Result<f64> {
         let cfg = self.config.lock().await.clone();
         let gas_cfg = &cfg.gas;
@@ -291,9 +326,9 @@ where
 
         // M7: populate_dynamic_gas pode popular base_fee_cache via oracle, evitando
         // a segunda RPC `get_cached_base_fee` que antes sempre rodava.
-        let (_, priority_fee) =
-            self.populate_dynamic_gas(&mut Eip1559TransactionRequest::default())
-                .await?;
+        let (max_fee, priority_fee) = self
+            .populate_dynamic_gas(&mut Eip1559TransactionRequest::default())
+            .await?;
         let base_fee = self
             .get_cached_base_fee(ttl)
             .await?
@@ -301,21 +336,59 @@ where
 
         let base_fee_gwei = u256_to_f64(base_fee, 9);
         let priority_gwei = u256_to_f64(priority_fee, 9);
-        let eff = base_fee_gwei * 1.05 + priority_gwei;
+        let max_fee_gwei = u256_to_f64(max_fee, 9);
+        // B6: projeta base_fee `n` blocos à frente em 1.125^n (EIP-1559 max
+        // 12.5%/bloco) — buffer de 5% (A7) não cobre saltos entre blocos em
+        // congestionamento. n = expected_inclusion_blocks (default 2 → 1.2656×).
+        // Só precifica o CUSTO no EV; o max_fee enviado vem de populate_dynamic_gas.
+        // ceiling = max(projected, max_fee) — conserva o teto A7 como piso.
+        let n = gas_cfg.expected_inclusion_blocks;
+        let projected_base = base_fee_gwei * crate::core::economics::pow_bps(11_250, n)
+            / crate::core::economics::pow_bps(10_000, n);
+        let projected = projected_base + priority_gwei;
+        let eff = projected.max(max_fee_gwei);
 
-        let baseline_units = Self::gas_units_for_hops(gas_cfg, &cfg, n_hops, strategy);
+        // B1/B2: gas units por venue, calibrado pelo oráculo EWMA quando houver
+        // ≥20 amostras do venue (max(estático, ewma_p75); nunca abaixo do estático).
+        let oracle = self.gas_oracle.read().await;
+        let baseline_units =
+            crate::core::gas_oracle::estimate_gas_units_calibrated(steps, provider, &oracle) as f64;
+        drop(oracle);
         let multiplier = *self.gas_unit_multiplier.read().await;
         let gas_units = baseline_units * multiplier;
 
         // Preço do POL (token de gás da Polygon) via Coingecko com cache de 2 min.
-        let matic_price = crate::infra::price_feed::PRICE_FEED
-            .get_price("WMATIC")
-            .await
-            .unwrap_or_else(|_| crate::infra::price_feed::CachedPriceFeed::fallback_price("WMATIC"));
+        //
+        // Fail-closed opcional: se `require_fresh_native_price`, rejeita opp quando
+        // o preço for fallback/stale/ausente em vez de cair no fallback heurístico
+        // (que poderia subestimar gás e aprovar opp inviável). Validade numérica
+        // (finito, > 0) é sempre checada — defesa em profundidade contra preço 0.
+        let matic_price = if gas_cfg.require_fresh_native_price {
+            let max_stale = Duration::from_secs(gas_cfg.native_price_max_stale_secs);
+            crate::infra::price_feed::PRICE_FEED
+                .get_price_strict("WMATIC", max_stale)
+                .await?
+        } else {
+            crate::infra::price_feed::PRICE_FEED
+                .get_price("WMATIC")
+                .await
+                .unwrap_or_else(|_| {
+                    crate::infra::price_feed::CachedPriceFeed::fallback_price("WMATIC")
+                })
+        };
+        if !matic_price.is_finite() || matic_price <= 0.0 {
+            anyhow::bail!(
+                "preço de native token (WMATIC) inválido: {} — fail-closed",
+                matic_price
+            );
+        }
         let cost = gas_units * (eff * 1e-9) * matic_price;
 
-        // Finder guarda referência canônica de 3 hops; publicar uma rota de
-        // 2/4 hops e depois escalá-la de novo distorce custo por 33%.
+        // A6: publicamos por n_hops — cada contagem de hops tem seu live,
+        // o finder pega o da rota certa sem escalar.
+        let n_hops = steps.len().max(1);
+        crate::core::economics::publish_live_gas_usd_for_hops(cost, n_hops);
+        // Mantém legado (default 3) p/ risk.rs e callers sem n_hops.
         if n_hops == 3 {
             crate::core::economics::publish_live_gas_usd(cost);
         }
@@ -328,62 +401,54 @@ where
         Ok(cost)
     }
 
-    /// Backward-compat: custo para rota de 3 hops flashloan (referência do
-    /// `estimated_gas_units`). Callers sem `n_hops` explícito caem aqui.
-    pub async fn estimate_arbitrage_gas_usd(&self) -> Result<f64> {
-        self.estimate_gas_usd_for_hops(3, GasStrategyKind::WithFlashloan)
-            .await
-    }
-
-    /// `gas_units` escalado por hops (M4). Deriva `base_per_hop` de
-    /// `estimated_gas_units` (rota de 3 hops) e `flashloan.gas_overhead`.
-    /// `GasStrategyKind::Direct` omite overhead Aave. Sem `estimated_gas_units`,
-    /// cai em `default_gas_limit`/`max_gas_limit` (teto).
-    fn gas_units_for_hops(
-        gas_cfg: &crate::config::GasConfig,
-        cfg: &Config,
-        n_hops: usize,
-        strategy: GasStrategyKind,
-    ) -> f64 {
-        let hops = n_hops.max(1) as f64;
-        if gas_cfg.estimated_gas_units > 0 {
-            let overhead = cfg
-                .flashloan
-                .gas_overhead
-                .unwrap_or(100_000)
-                .min(gas_cfg.estimated_gas_units);
-            let base_per_hop = (gas_cfg.estimated_gas_units - overhead) as f64 / 3.0;
-            let applied_overhead = if strategy.include_flashloan_overhead() {
-                overhead as f64
-            } else {
-                0.0
-            };
-            return base_per_hop * hops + applied_overhead;
-        }
-        if gas_cfg.default_gas_limit == 0 {
-            gas_cfg.max_gas_limit as f64
-        } else {
-            gas_cfg.default_gas_limit as f64
-        }
-    }
-
     /// Aprende do receipt sem deixar uma tx atípica distorcer a estimativa.
+    /// B1/B2: estima via perfil por venue e alimenta o oráculo EWMA por venue.
     pub async fn observe_gas_used(
         &self,
-        n_hops: usize,
+        steps: &[crate::core::types::ArbitrageStep],
+        provider: Option<crate::core::gas_profile::FlashloanProvider>,
         actual_units: U256,
-        strategy: GasStrategyKind,
     ) {
         let actual = actual_units.as_u64() as f64;
-        if actual <= 0.0 { return; }
-        let cfg = self.config.lock().await.clone();
-        let estimated = Self::gas_units_for_hops(&cfg.gas, &cfg, n_hops, strategy);
-        if estimated <= 0.0 { return; }
+        if actual <= 0.0 {
+            return;
+        }
+        let estimated = crate::core::gas_profile::estimate_gas_units(steps, provider) as f64;
+        if estimated <= 0.0 {
+            return;
+        }
         let mut multiplier = self.gas_unit_multiplier.write().await;
         // EWMA 20% observação / 80% histórico, limitado para segurança.
         *multiplier = next_gas_multiplier(*multiplier, actual, estimated);
         crate::infra::metrics::record_gas_calibration(estimated, actual);
-        info!("⛽ [GasCalibration] hops={} estimated={:.0} actual={:.0} multiplier={:.3}", n_hops, estimated, actual, *multiplier);
+        info!(
+            "⛽ [GasCalibration] hops={} estimated={:.0} actual={:.0} multiplier={:.3}",
+            steps.len(),
+            estimated,
+            actual,
+            *multiplier
+        );
+        drop(multiplier);
+
+        // B2: alimenta oráculo EWMA por venue com gas real atribuído
+        // proporcionalmente ao perfil estático de cada hop.
+        let venues: Vec<crate::core::gas_profile::VenueKind> = steps
+            .iter()
+            .map(crate::core::gas_profile::classify_step)
+            .collect();
+        {
+            let mut oracle = self.gas_oracle.write().await;
+            oracle.record_route(&venues, actual_units.as_u64());
+            let path = self.gas_oracle_path.read().await.clone();
+            oracle.save(path.as_ref());
+        }
+        // Métrica de erro de estimativa por venue (bps).
+        let err_bps = if estimated > 0.0 {
+            ((estimated - actual) / estimated).abs() * 10_000.0
+        } else {
+            0.0
+        };
+        crate::infra::metrics::observe_gas_estimate_error_bps(err_bps);
     }
 
     // ============================================================
@@ -437,11 +502,19 @@ where
 // ============================================================
 
 fn gwei(n: u64) -> U256 {
-    U256::from(n) * U256::exp10(9)
+    // SAFETY-EV: n em gwei (≤ ~500 na prática); *1e9 não estoura U256, mas
+    // saturating p/ fail-safe em vez de overflow silencioso.
+    U256::from(n)
+        .checked_mul(U256::exp10(9))
+        .unwrap_or(U256::MAX)
 }
 
 fn next_gas_multiplier(previous: f64, actual_units: f64, estimated_units: f64) -> f64 {
-    if !actual_units.is_finite() || !estimated_units.is_finite() || actual_units <= 0.0 || estimated_units <= 0.0 {
+    if !actual_units.is_finite()
+        || !estimated_units.is_finite()
+        || actual_units <= 0.0
+        || estimated_units <= 0.0
+    {
         return previous.clamp(0.8, 1.5);
     }
     let ratio = (actual_units / estimated_units).clamp(0.5, 2.0);
@@ -452,7 +525,7 @@ fn next_gas_multiplier(previous: f64, actual_units: f64, estimated_units: f64) -
 ///
 /// `gwei(x as u64)` descartava a fração: um oracle devolvendo 30.7 gwei virava
 /// 30, e uma priority de 0.6 gwei virava **0** (tx que nunca entra em bloco).
-fn gwei_f64(n: f64) -> U256 {
+pub(crate) fn gwei_f64(n: f64) -> U256 {
     if !n.is_finite() || n <= 0.0 {
         return U256::zero();
     }
@@ -464,9 +537,11 @@ fn gwei_f64(n: f64) -> U256 {
 }
 
 pub fn u256_to_f64(value: U256, decimals: u32) -> f64 {
+    // SAFETY-EV: divisor = exp10(decimals), decimals≥0 → divisor≥1 (never 0).
+    // checked_div/checked_rem: divisor>0 → Some; unwrap seguro.
     let divisor = U256::exp10(decimals as usize);
-    let integer = value / divisor;
-    let fractional = value % divisor;
+    let integer = value.checked_div(divisor).expect("divisor >= 1");
+    let fractional = value.checked_rem(divisor).expect("divisor >= 1");
     integer.as_u64() as f64 + (fractional.as_u64() as f64 / 10f64.powi(decimals as i32))
 }
 
@@ -511,6 +586,8 @@ impl<M> Clone for GasEstimator<M> {
             oracle_cache: self.oracle_cache.clone(),
             gas_unit_multiplier: self.gas_unit_multiplier.clone(),
             http: self.http.clone(),
+            gas_oracle: self.gas_oracle.clone(),
+            gas_oracle_path: self.gas_oracle_path.clone(),
         }
     }
 }
@@ -547,26 +624,9 @@ mod tests {
         );
     }
 
-    /// M4: gas_units escala por hops reais, não fixo. Rota de 3 hops = referência
-    /// (estimated_gas_units). 4 hops > 3 hops > 2 hops.
-    #[test]
-    fn gas_units_scale_with_hops() {
-        let gas_cfg = crate::config::GasConfig::default();
-        let cfg = crate::config::Config::default();
-        let u3 = GasEstimator::<ethers::providers::Provider<ethers::providers::Http>>::gas_units_for_hops(&gas_cfg, &cfg, 3, GasStrategyKind::WithFlashloan);
-        let u2 = GasEstimator::<ethers::providers::Provider<ethers::providers::Http>>::gas_units_for_hops(&gas_cfg, &cfg, 2, GasStrategyKind::WithFlashloan);
-        let u4 = GasEstimator::<ethers::providers::Provider<ethers::providers::Http>>::gas_units_for_hops(&gas_cfg, &cfg, 4, GasStrategyKind::WithFlashloan);
-        // 3 hops flashloan deve reproduzir o estimated_gas_units de referência.
-        assert!((u3 - gas_cfg.estimated_gas_units as f64).abs() < 1e-6, "3 hops={u3} ref={}", gas_cfg.estimated_gas_units);
-        assert!(u4 > u3, "4 hops ({u4}) deve custar mais que 3 ({u3})");
-        assert!(u2 < u3, "2 hops ({u2}) deve custar menos que 3 ({u3})");
-        // 0 hops (degen) não divide por zero — clamp em 1.
-        let u0 = GasEstimator::<ethers::providers::Provider<ethers::providers::Http>>::gas_units_for_hops(&gas_cfg, &cfg, 0, GasStrategyKind::WithFlashloan);
-        assert!(u0.is_finite() && u0 > 0.0);
-        // Direct: sem overhead Aave — 3 hops < referência flashloan.
-        let u3_direct = GasEstimator::<ethers::providers::Provider<ethers::providers::Http>>::gas_units_for_hops(&gas_cfg, &cfg, 3, GasStrategyKind::Direct);
-        assert!(u3_direct < u3, "Direct 3 hops ({u3_direct}) < flashloan 3 hops ({u3})");
-    }
+    /// B1: gas_units por venue (soma), não linear por hop. Removido
+    /// `gas_units_for_hops` (modelo linear). Cobertura de perfil está em
+    /// `gas_profile::tests`.
 
     #[test]
     fn calibration_ewma_tracks_receipt_without_outlier_jump() {

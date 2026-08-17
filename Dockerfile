@@ -1,7 +1,7 @@
 # ----------------------
 # 📦 Builder Stage
 # ----------------------
-FROM rust:1.82 as builder
+FROM rust:1.88 AS builder
 
 # Instala dependências para build
 RUN apt-get update && apt-get install -y \
@@ -10,8 +10,6 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     git \
     gettext-base \
-    nodejs \
-    npm \
 && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /usr/src/app
@@ -25,10 +23,6 @@ RUN mkdir src && echo 'fn main() {}' > src/main.rs && \
 # Override .cargo/config.toml (target-cpu=native) para imagem portavel
 COPY . .
 RUN RUSTFLAGS="-C target-cpu=x86-64" cargo build --release
-
-# Instala dependências do Node.js (para Hardhat)
-COPY package.json package-lock.json ./
-RUN npm install
 
 # ----------------------
 # 🚀 Runtime Stage

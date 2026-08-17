@@ -43,8 +43,8 @@ impl UltraRateLimiter {
     // ============================================================
     // 🔐 Controle de aquisição — com backoff adaptativo
     // ============================================================
-    
-    // ⬇️ CORREÇÃO E0277: O tipo de erro foi alterado de 
+
+    // ⬇️ CORREÇÃO E0277: O tipo de erro foi alterado de
     // `Box<dyn std::error::Error>` para `anyhow::Error` (via `use anyhow::Result`)
     // para satisfazer os requisitos de Send + Sync do Tokio e do anyhow.
     pub async fn acquire(&self) -> Result<()> {

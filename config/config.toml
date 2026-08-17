@@ -43,7 +43,7 @@ min_profit_percent = "0.0001"
 # Piso adicional ao gás no contrato. O executor exige gás atual + este valor.
 min_profit_absolute = "0.05"
 min_spread_percent = "0.10"
-min_liquidity = "20000"
+min_liquidity = "10000"  # F-1: reduzido de 20k para incluir Sushi/Quick thin pools (esperado +5x rounds)
 min_volume_24h = "1000.0"
 max_slippage = "1.5"
 default_trade_amount = "100.0"

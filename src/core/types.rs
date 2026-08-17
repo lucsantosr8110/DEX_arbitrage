@@ -1,6 +1,87 @@
-use ethers::types::{Address, Bytes, U256};
+use ethers::types::{Address, Bytes, H256, U256};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+
+// ============================================================================
+// 🧾 ExecutionOutcome — estado explícito de uma tentativa lógica de execução
+// ============================================================================
+//
+// Uma tentativa lógica de arbitragem (uma oportunidade, uma decisão de envio)
+// produz exatamente um destes estados. Estados distintos jamais colapsam em
+// "skipped":
+//   - Reverted        = tx minerada com status 0 (queimou gás). NUNCA skip.
+//   - SameBlockRejected = bloqueada pelo anti-MEV (mesmo bloco). Distinto de
+//     Reverted (nem chegou a ser minerada como arbitragem).
+//   - TimeoutStuck    = tx broadcast mas sem receipt; nonce possivelmente
+//     pendente. Reenvio só como replacement (mesmo nonce), nunca nonce novo.
+//   - Dropped         = tx rejeitada antes de entrar na rede; nonce liberado.
+//   - AbortedPreBroadcast = abortada antes de qualquer broadcast (gate, simulação).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ExecutionOutcome {
+    ConfirmedProfit {
+        tx_hash: H256,
+        realized_profit_usd: f64,
+        gas_used: U256,
+    },
+    ConfirmedLoss {
+        tx_hash: H256,
+        realized_loss_usd: f64,
+        gas_used: U256,
+    },
+    Reverted {
+        tx_hash: H256,
+        reason: Option<String>,
+        gas_used: Option<U256>,
+    },
+    SameBlockRejected {
+        tx_hash: Option<H256>,
+    },
+    TimeoutStuck {
+        nonce: U256,
+        latest_tx_hash: Option<H256>,
+    },
+    Dropped {
+        nonce: U256,
+    },
+    /// B4: tx broadcast mas o re-bump de gas (RBF underpriced) ultrapassou o teto
+    /// `gas_ceiling_gwei` ou esgotou `max_replace_attempts`. A tx pendente foi
+    /// abandonada (não substituída por gas maior) — nonce ainda pode estar na
+    /// rede; o nonce reaper (B8) cuida da recuperação. Não conta como executada.
+    Expired {
+        nonce: U256,
+        latest_tx_hash: Option<H256>,
+        reason: String,
+    },
+    AbortedPreBroadcast {
+        reason: String,
+    },
+}
+
+impl ExecutionOutcome {
+    /// True quando o estado NÃO representa uma execuição broadcast+minerada
+    /// (portanto não deve contar como sucesso nem como execução realizada).
+    pub fn is_executed_onchain(&self) -> bool {
+        matches!(
+            self,
+            ExecutionOutcome::ConfirmedProfit { .. }
+                | ExecutionOutcome::ConfirmedLoss { .. }
+                | ExecutionOutcome::Reverted { .. }
+        )
+    }
+
+    /// True quando a tx foi minerada com sucesso (status 1).
+    pub fn is_confirmed(&self) -> bool {
+        matches!(
+            self,
+            ExecutionOutcome::ConfirmedProfit { .. } | ExecutionOutcome::ConfirmedLoss { .. }
+        )
+    }
+
+    /// Revert é execução on-chain falha — distinto de skip/abort.
+    pub fn is_reverted(&self) -> bool {
+        matches!(self, ExecutionOutcome::Reverted { .. })
+    }
+}
 
 // ============================================================================
 // 🔹 Arbitrage Step — passo real de rota
@@ -86,8 +167,7 @@ impl ArbitrageOpportunity {
         if self.estimated_profit_usd <= 0.0 {
             return 0.0;
         }
-        self.estimated_profit_usd
-            / (self.estimated_volume_usd + self.gas_cost_usd.max(1e-9))
+        self.estimated_profit_usd / (self.estimated_volume_usd + self.gas_cost_usd.max(1e-9))
     }
 
     // ------------------------------------------------------------
@@ -329,6 +409,11 @@ pub struct BundleResult {
     pub risk_assessment: Option<RiskAssessment>,
     #[serde(default)]
     pub execution_mode: Option<String>,
+    /// Estado explícito da tentativa lógica de execução. `None` só em paths
+    /// legados que ainda não foram migrados (paper/dry_run). Nunca colapsar
+    /// `Reverted`/`TimeoutStuck`/`Dropped` em `None` ou em "skipped".
+    #[serde(default)]
+    pub outcome: Option<ExecutionOutcome>,
 }
 
 impl BundleResult {
@@ -341,6 +426,7 @@ impl BundleResult {
             accepted: success && profit > 0.0,
             risk_assessment: None,
             execution_mode: None,
+            outcome: None,
         }
     }
 
@@ -353,6 +439,7 @@ impl BundleResult {
             gas_cost: 0.0,
             risk_assessment: None,
             execution_mode: Some("skipped".to_string()),
+            outcome: None,
         }
     }
 
@@ -368,6 +455,14 @@ impl BundleResult {
 
     pub fn with_risk_assessment(mut self, assessment: Option<RiskAssessment>) -> Self {
         self.risk_assessment = assessment;
+        self
+    }
+
+    /// Anexa o outcome explícito. `success`/`execution_mode` continuam como
+    /// estavam para compat com telemetry legada, mas `outcome` é a fonte de
+    /// verdade para classificação de execução.
+    pub fn with_outcome(mut self, o: ExecutionOutcome) -> Self {
+        self.outcome = Some(o);
         self
     }
 }
@@ -428,5 +523,80 @@ impl From<Vec<ArbitrageStep>> for SerializableSteps {
 impl From<SerializableSteps> for Vec<ArbitrageStep> {
     fn from(s: SerializableSteps) -> Self {
         s.0
+    }
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::*;
+
+    #[test]
+    fn revert_is_not_skipped_and_distinct_from_same_block() {
+        let h = H256::repeat_byte(0xAB);
+        let reverted = ExecutionOutcome::Reverted {
+            tx_hash: h,
+            reason: Some("execution reverted".into()),
+            gas_used: Some(U256::from(21_000)),
+        };
+        let same_block = ExecutionOutcome::SameBlockRejected { tx_hash: None };
+
+        // Revert é execução on-chain falha — NUNCA skip.
+        assert!(reverted.is_executed_onchain());
+        assert!(reverted.is_reverted());
+        assert!(!reverted.is_confirmed());
+        // SameBlock é distinto de Reverted: não é execução on-chain.
+        assert!(!same_block.is_executed_onchain());
+        assert!(!same_block.is_reverted());
+        assert_ne!(reverted, same_block);
+    }
+
+    #[test]
+    fn confirmed_vs_loss_classified_by_sign() {
+        let h = H256::repeat_byte(0x01);
+        let profit = ExecutionOutcome::ConfirmedProfit {
+            tx_hash: h,
+            realized_profit_usd: 0.5,
+            gas_used: U256::from(200_000),
+        };
+        let loss = ExecutionOutcome::ConfirmedLoss {
+            tx_hash: h,
+            realized_loss_usd: 0.1,
+            gas_used: U256::from(200_000),
+        };
+        assert!(profit.is_confirmed());
+        assert!(loss.is_confirmed());
+        assert!(!profit.is_reverted());
+        assert_ne!(profit, loss);
+    }
+
+    #[test]
+    fn timeout_stuck_and_dropped_carry_nonce_distinct() {
+        let n = U256::from(7);
+        let stuck = ExecutionOutcome::TimeoutStuck {
+            nonce: n,
+            latest_tx_hash: None,
+        };
+        let dropped = ExecutionOutcome::Dropped { nonce: n };
+        // Ambos carregam o nonce reservado (não sumiu); estados distintos.
+        assert_ne!(stuck, dropped);
+        assert!(!stuck.is_executed_onchain());
+        assert!(!dropped.is_executed_onchain());
+    }
+
+    #[test]
+    fn bundle_result_with_reverted_outcome_is_not_a_plain_skip() {
+        let h = H256::repeat_byte(0x02);
+        let res = BundleResult::skipped()
+            .with_execution_mode("tx_reverted")
+            .with_tx_hash(Some(format!("{:?}", h)))
+            .with_outcome(ExecutionOutcome::Reverted {
+                tx_hash: h,
+                reason: None,
+                gas_used: None,
+            });
+        // success/accepted falsos (não foi lucro), mas outcome explícito = Reverted.
+        assert!(!res.success);
+        assert_eq!(res.execution_mode.as_deref(), Some("tx_reverted"));
+        assert!(res.outcome.as_ref().unwrap().is_reverted());
     }
 }

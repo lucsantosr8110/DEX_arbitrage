@@ -1,0 +1,182 @@
+[
+  {
+    "key": {
+      "dex_name": "QuickSwap",
+      "protocol_version": "V2",
+      "token_in_symbol": "USDC",
+      "token_out_symbol": "USDT",
+      "pool_address": null,
+      "fee_tier": null
+    },
+    "attempts": 10,
+    "accepted": 0,
+    "rejected_reciprocity": 10,
+    "rejection_rate": 100.0,
+    "min_reciprocity_ratio": "UNAVAILABLE",
+    "max_reciprocity_ratio": "UNAVAILABLE",
+    "avg_reciprocity_ratio": "UNAVAILABLE",
+    "pairing_class": "UNKNOWN_POOL"
+  },
+  {
+    "key": {
+      "dex_name": "QuickSwap",
+      "protocol_version": "V2",
+      "token_in_symbol": "USDC",
+      "token_out_symbol": "WBTC",
+      "pool_address": null,
+      "fee_tier": null
+    },
+    "attempts": 10,
+    "accepted": 0,
+    "rejected_reciprocity": 10,
+    "rejection_rate": 100.0,
+    "min_reciprocity_ratio": "UNAVAILABLE",
+    "max_reciprocity_ratio": "UNAVAILABLE",
+    "avg_reciprocity_ratio": "UNAVAILABLE",
+    "pairing_class": "UNKNOWN_POOL"
+  },
+  {
+    "key": {
+      "dex_name": "QuickSwap",
+      "protocol_version": "V2",
+      "token_in_symbol": "USDC",
+      "token_out_symbol": "WMATIC",
+      "pool_address": null,
+      "fee_tier": null
+    },
+    "attempts": 10,
+    "accepted": 0,
+    "rejected_reciprocity": 10,
+    "rejection_rate": 100.0,
+    "min_reciprocity_ratio": "UNAVAILABLE",
+    "max_reciprocity_ratio": "UNAVAILABLE",
+    "avg_reciprocity_ratio": "UNAVAILABLE",
+    "pairing_class": "UNKNOWN_POOL"
+  },
+  {
+    "key": {
+      "dex_name": "QuickSwap",
+      "protocol_version": "V2",
+      "token_in_symbol": "USDT",
+      "token_out_symbol": "USDC",
+      "pool_address": null,
+      "fee_tier": null
+    },
+    "attempts": 10,
+    "accepted": 0,
+    "rejected_reciprocity": 10,
+    "rejection_rate": 100.0,
+    "min_reciprocity_ratio": "UNAVAILABLE",
+    "max_reciprocity_ratio": "UNAVAILABLE",
+    "avg_reciprocity_ratio": "UNAVAILABLE",
+    "pairing_class": "UNKNOWN_POOL"
+  },
+  {
+    "key": {
+      "dex_name": "QuickSwap",
+      "protocol_version": "V2",
+      "token_in_symbol": "USDT",
+      "token_out_symbol": "WBTC",
+      "pool_address": null,
+      "fee_tier": null
+    },
+    "attempts": 10,
+    "accepted": 0,
+    "rejected_reciprocity": 10,
+    "rejection_rate": 100.0,
+    "min_reciprocity_ratio": "UNAVAILABLE",
+    "max_reciprocity_ratio": "UNAVAILABLE",
+    "avg_reciprocity_ratio": "UNAVAILABLE",
+    "pairing_class": "UNKNOWN_POOL"
+  },
+  {
+    "key": {
+      "dex_name": "QuickSwap",
+      "protocol_version": "V2",
+      "token_in_symbol": "WBTC",
+      "token_out_symbol": "USDC",
+      "pool_address": null,
+      "fee_tier": null
+    },
+    "attempts": 10,
+    "accepted": 0,
+    "rejected_reciprocity": 10,
+    "rejection_rate": 100.0,
+    "min_reciprocity_ratio": "UNAVAILABLE",
+    "max_reciprocity_ratio": "UNAVAILABLE",
+    "avg_reciprocity_ratio": "UNAVAILABLE",
+    "pairing_class": "UNKNOWN_POOL"
+  },
+  {
+    "key": {
+      "dex_name": "QuickSwap",
+      "protocol_version": "V2",
+      "token_in_symbol": "WBTC",
+      "token_out_symbol": "USDT",
+      "pool_address": null,
+      "fee_tier": null
+    },
+    "attempts": 10,
+    "accepted": 0,
+    "rejected_reciprocity": 10,
+    "rejection_rate": 100.0,
+    "min_reciprocity_ratio": "UNAVAILABLE",
+    "max_reciprocity_ratio": "UNAVAILABLE",
+    "avg_reciprocity_ratio": "UNAVAILABLE",
+    "pairing_class": "UNKNOWN_POOL"
+  },
+  {
+    "key": {
+      "dex_name": "QuickSwap",
+      "protocol_version": "V2",
+      "token_in_symbol": "WBTC",
+      "token_out_symbol": "WMATIC",
+      "pool_address": null,
+      "fee_tier": null
+    },
+    "attempts": 10,
+    "accepted": 0,
+    "rejected_reciprocity": 10,
+    "rejection_rate": 100.0,
+    "min_reciprocity_ratio": "UNAVAILABLE",
+    "max_reciprocity_ratio": "UNAVAILABLE",
+    "avg_reciprocity_ratio": "UNAVAILABLE",
+    "pairing_class": "UNKNOWN_POOL"
+  },
+  {
+    "key": {
+      "dex_name": "QuickSwap",
+      "protocol_version": "V2",
+      "token_in_symbol": "WMATIC",
+      "token_out_symbol": "USDC",
+      "pool_address": null,
+      "fee_tier": null
+    },
+    "attempts": 10,
+    "accepted": 0,
+    "rejected_reciprocity": 10,
+    "rejection_rate": 100.0,
+    "min_reciprocity_ratio": "UNAVAILABLE",
+    "max_reciprocity_ratio": "UNAVAILABLE",
+    "avg_reciprocity_ratio": "UNAVAILABLE",
+    "pairing_class": "UNKNOWN_POOL"
+  },
+  {
+    "key": {
+      "dex_name": "QuickSwap",
+      "protocol_version": "V2",
+      "token_in_symbol": "WMATIC",
+      "token_out_symbol": "WBTC",
+      "pool_address": null,
+      "fee_tier": null
+    },
+    "attempts": 10,
+    "accepted": 0,
+    "rejected_reciprocity": 10,
+    "rejection_rate": 100.0,
+    "min_reciprocity_ratio": "UNAVAILABLE",
+    "max_reciprocity_ratio": "UNAVAILABLE",
+    "avg_reciprocity_ratio": "UNAVAILABLE",
+    "pairing_class": "UNKNOWN_POOL"
+  }
+]

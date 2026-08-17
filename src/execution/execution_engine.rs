@@ -67,7 +67,10 @@ impl NonceManager {
             .context("Falha ao buscar nonce inicial (pending)")?
             .as_u64();
 
-        info!("NonceManager(HYBRID) iniciado — nonce inicial = {}", initial_nonce);
+        info!(
+            "NonceManager(HYBRID) iniciado — nonce inicial = {}",
+            initial_nonce
+        );
 
         Ok(Arc::new(Self {
             local_nonce: Arc::new(AtomicU64::new(initial_nonce)),
@@ -84,11 +87,7 @@ impl NonceManager {
         Ok(self.local_nonce.fetch_add(1, Ordering::SeqCst))
     }
 
-    pub async fn trigger_resync<M: Middleware + 'static>(
-        &self,
-        provider: Arc<M>,
-        sender: Address,
-    ) {
+    pub async fn trigger_resync<M: Middleware + 'static>(&self, provider: Arc<M>, sender: Address) {
         if let Ok(_guard) = self.resync_lock.try_lock() {
             self.is_resyncing.store(true, Ordering::SeqCst);
             warn!("⟲ Iniciando resync de nonce (pending)...");
@@ -160,7 +159,11 @@ impl ExecutionTracker {
             let elapsed = last.elapsed();
             if elapsed < self.cooldown {
                 let remaining = self.cooldown - elapsed;
-                warn!("⏳ (atomic) '{}' ainda em cooldown — faltam {:.2}s", key, remaining.as_secs_f64());
+                warn!(
+                    "⏳ (atomic) '{}' ainda em cooldown — faltam {:.2}s",
+                    key,
+                    remaining.as_secs_f64()
+                );
                 return Err(remaining);
             }
         }
@@ -324,11 +327,7 @@ where
         let pair_key = ExecutionTracker::normalize_pair_key(pair_label);
         info!(
             "→ Enviando bundle [pair='{}' profit=${:.6} nonce={} block={} tx={:?}]",
-            pair_key,
-            estimated_profit_usd,
-            nonce_u64,
-            current_block,
-            local_hash
+            pair_key, estimated_profit_usd, nonce_u64, current_block, local_hash
         );
 
         match self
@@ -337,7 +336,10 @@ where
             .await
         {
             Ok(_ack) => {
-                info!("✅ Bundle MEV submetido com sucesso. tx_local={:?}", local_hash);
+                info!(
+                    "✅ Bundle MEV submetido com sucesso. tx_local={:?}",
+                    local_hash
+                );
                 Ok(local_hash)
             }
             Err(e) => {
@@ -348,6 +350,30 @@ where
                 Err(e)
             }
         }
+    }
+
+    /// A4: bundle ack do relay ≠ confirmação on-chain. O relay pode aceitar o
+    /// bundle e ele não ser incluído no bloco alvo (perdeu leilão, gás baixo,
+    /// conditions não atendidas). `execute_opportunity` retorna só o hash local
+    /// no ack — o caller DEVE chamar `confirm_bundle_receipt` para classificar o
+    /// resultado antes de reportar sucesso.
+    ///
+    /// Polla `get_transaction_receipt(tx_hash)` até `timeout` ou achar receipt.
+    /// Retorna `Ok(Some(receipt))` se incluída, `Ok(None)` se timeout (bundle
+    /// aceito mas não incluído — caller trata como TimeoutStuck).
+    pub async fn confirm_bundle_receipt(
+        &self,
+        tx_hash: H256,
+        timeout: Duration,
+    ) -> Result<Option<ethers::types::TransactionReceipt>> {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if let Ok(Some(receipt)) = self.provider.get_transaction_receipt(tx_hash).await {
+                return Ok(Some(receipt));
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        Ok(None)
     }
 
     pub async fn check_cooldown(&self, pair: &str) -> Option<f64> {

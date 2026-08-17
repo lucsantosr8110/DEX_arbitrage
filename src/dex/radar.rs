@@ -10,21 +10,22 @@
 use crate::{
     config::Config,
     core::{
+        pipeline_obs::{pipeline_counters, ScanCycle},
         replay_cross_model::{route_all_legs_executable, venue_curve_model, CurveModel},
         smart_retry::SmartRetryManager,
     },
     dex::{
-        circuit_breaker::DexCircuitBreaker,
         cached_fee_tier,
+        circuit_breaker::DexCircuitBreaker,
         liquidity::min_pool_liquidity_usd_for_dex,
         manager::DexManager,
         rate_limiter::{ALCHEMY_RATE_LIMITER, DEX_RATE_LIMITER},
     },
 };
+use anyhow::{anyhow, Result};
 use chrono::Utc;
 use ethers::providers::{Middleware, Provider, Ws};
 use futures_util::StreamExt;
-use anyhow::{anyhow, Result};
 use std::{
     collections::HashMap,
     fs::{self, OpenOptions},
@@ -231,8 +232,12 @@ impl HighHitRateFilter {
             return true;
         }
 
-        let Some(cur) = previous.get(dex_name) else { return true };
-        let Some(&prev_price) = cur.get(canon_pair) else { return true };
+        let Some(cur) = previous.get(dex_name) else {
+            return true;
+        };
+        let Some(&prev_price) = cur.get(canon_pair) else {
+            return true;
+        };
 
         // M19: mediana dos outros DEX. Média deixa um pool raso/outlier puxar
         // referência e pode pular uma divergência saudável ou cotar ruído.
@@ -251,7 +256,11 @@ impl HighHitRateFilter {
         }
 
         let reference = median(&others);
-        if reference <= 0.0 || !reference.is_finite() || !prev_price.is_finite() || prev_price <= 0.0 {
+        if reference <= 0.0
+            || !reference.is_finite()
+            || !prev_price.is_finite()
+            || prev_price <= 0.0
+        {
             return true;
         }
         let spread = ((reference - prev_price).abs() / prev_price) * 100.0;
@@ -287,7 +296,6 @@ async fn collect_dex_prices(
     retry: SmartRetryManager,
     quote_block: ethers::types::U64,
 ) -> Result<(String, HashMap<String, f64>)> {
-
     let mut filtered = vec![];
     for p in pairs {
         if qf.should_analyze_dex_pair(&adapter, &p, &previous, &cb) {
@@ -313,8 +321,7 @@ async fn collect_dex_prices(
 
     // Gate de liquidez (TVL proxy) — multicall balanceOf no mesmo ciclo do batch.
     // Threshold do venue (`[[dex]].liquidity_threshold_usd`) com fallback global.
-    let min_liq =
-        crate::dex::liquidity::min_pool_liquidity_usd_for_dex(dm.config_ref(), &adapter);
+    let min_liq = crate::dex::liquidity::min_pool_liquidity_usd_for_dex(dm.config_ref(), &adapter);
     let n_before = result.len();
     let result = dm
         .filter_prices_by_liquidity(&adapter, result, min_liq)
@@ -487,7 +494,11 @@ impl AdjCostParams {
 impl Default for AdjCostParams {
     fn default() -> Self {
         // Defaults alinhados ao config (Aave 5 bps, gas base $0.008, notional $100).
-        Self { notional_usd: 100.0, flashloan_fee_pct: 0.0005, gas_usd_est: 0.008 }
+        Self {
+            notional_usd: 100.0,
+            flashloan_fee_pct: 0.0005,
+            gas_usd_est: 0.008,
+        }
     }
 }
 
@@ -660,7 +671,12 @@ fn best_two_hop(
             let rate = buy_price * sell_price;
             if rate > best_rate {
                 best_rate = rate;
-                best = Some((buy_venue.clone(), *buy_price, sell_venue.clone(), *sell_price));
+                best = Some((
+                    buy_venue.clone(),
+                    *buy_price,
+                    sell_venue.clone(),
+                    *sell_price,
+                ));
             }
         }
     }
@@ -714,7 +730,8 @@ pub fn extract_edges(
             None => None,
         };
 
-        let Some((best_buy_dex, best_buy_price, best_sell_dex, best_sell_price, best_cycle_rate)) = best
+        let Some((best_buy_dex, best_buy_price, best_sell_dex, best_sell_price, best_cycle_rate)) =
+            best
         else {
             // Sem reverso disponível — não há como avaliar ciclo
             continue;
@@ -757,8 +774,7 @@ pub fn extract_edges(
             let has_curve_leg = legs
                 .iter()
                 .any(|l| venue_curve_model(&l.venue) == CurveModel::StableSwap);
-            let executable =
-                route_all_legs_executable(legs.iter().map(|l| l.venue.as_str()));
+            let executable = route_all_legs_executable(legs.iter().map(|l| l.venue.as_str()));
             let cycle_key = legs
                 .iter()
                 .map(|l| format!("{}|{}>{}", l.venue, l.token_in, l.token_out))
@@ -914,14 +930,37 @@ pub struct TopSpreadInfo {
     pub pair: String,
     /// Spread% single-dir do TUI: (max-min)/min*100 das cotações forward.
     pub tui_spread_pct: f64,
+    pub buy_dex: String,
+    pub sell_dex: String,
     pub leg1: Option<TopSpreadLeg>, // forward (buy), None se sem reverse
     pub leg2: Option<TopSpreadLeg>, // reverse (sell), None se sem reverse
     pub cycle_rate: Option<f64>,    // None se não há 2-hop buy≠sell
     pub gross_pct: Option<f64>,
     pub net_usd: Option<f64>,
+    /// Quanto falta para o net projetado virar positivo (0 se já lucrativo).
+    pub distance_to_profit: f64,
     pub outlier: Option<String>, // venue que destoa da mediana forward (suspeito raso)
     pub executable: bool,
     pub has_curve_leg: bool,
+}
+
+/// Chave canônica para dedup de espelhos em TopSpreadInfo. Mesmo round-trip
+/// econômico (A-B/B-A com mesmas venues) colide aqui.
+fn top_spread_canonical_key(info: &TopSpreadInfo) -> Option<String> {
+    let legs = info.leg1.iter().chain(info.leg2.iter()).collect::<Vec<_>>();
+    if legs.is_empty() {
+        return None;
+    }
+    let mut venues: Vec<&str> = legs.iter().map(|l| l.venue.as_str()).collect();
+    venues.sort();
+    venues.dedup();
+    let mut tokens: Vec<&str> = legs
+        .iter()
+        .flat_map(|l| [l.token_in.as_str(), l.token_out.as_str()])
+        .collect();
+    tokens.sort();
+    tokens.dedup();
+    Some(format!("{}|{}", venues.join("|"), tokens.join("|")))
 }
 
 /// Spread% single-dir idêntico à coluna do TUI (`tui.rs:221-224`).
@@ -954,7 +993,11 @@ fn median(values: &[f64]) -> f64 {
     if values.is_empty() {
         return 0.0;
     }
-    let mut v: Vec<f64> = values.iter().copied().filter(|x| x.is_finite() && *x > 0.0).collect();
+    let mut v: Vec<f64> = values
+        .iter()
+        .copied()
+        .filter(|x| x.is_finite() && *x > 0.0)
+        .collect();
     v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     if v.is_empty() {
         return 0.0;
@@ -979,7 +1022,10 @@ fn outlier_venue(forward: &[(String, f64)]) -> Option<String> {
         .iter()
         .filter(|(_, p)| p.is_finite() && *p > 0.0)
         .max_by(|(_, a), (_, b)| {
-            (a - med).abs().partial_cmp(&(b - med).abs()).unwrap_or(std::cmp::Ordering::Equal)
+            (a - med)
+                .abs()
+                .partial_cmp(&(b - med).abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
         })
         .map(|(v, _)| v.clone())
 }
@@ -993,40 +1039,78 @@ pub fn analyze_pair_spread(
 ) -> TopSpreadInfo {
     let tui_spread_pct = tui_spread_pct(forward);
     let best = best_two_hop(forward, reverse);
-    let (leg1, leg2, cycle_rate, gross_pct, net_usd, executable, has_curve_leg) = match best {
-        Some((bv, bp, sv, sp, rate)) => {
-            let (a, b) = pair.split_once('-').unwrap_or((pair, ""));
-            let leg1 = TopSpreadLeg {
-                venue: bv.clone(),
-                token_in: a.to_string(),
-                token_out: b.to_string(),
-                rate: bp,
-            };
-            let leg2 = TopSpreadLeg {
-                venue: sv.clone(),
-                token_in: b.to_string(),
-                token_out: a.to_string(),
-                rate: sp,
-            };
-            let gross = (rate - 1.0) * 100.0;
-            let net = cost.net_usd(gross);
-            let venues = [leg1.venue.as_str(), leg2.venue.as_str()];
-            let executable = route_all_legs_executable(venues.into_iter());
-            let has_curve = venues
-                .iter()
-                .any(|v| venue_curve_model(v) == CurveModel::StableSwap);
-            (Some(leg1), Some(leg2), Some(rate), Some(gross), Some(net), executable, has_curve)
-        }
-        None => (None, None, None, None, None, false, false),
+    let (buy_dex, sell_dex, leg1, leg2, cycle_rate, gross_pct, net_usd, executable, has_curve_leg) =
+        match best {
+            Some((bv, bp, sv, sp, rate)) => {
+                let (a, b) = pair.split_once('-').unwrap_or((pair, ""));
+                let leg1 = TopSpreadLeg {
+                    venue: bv.clone(),
+                    token_in: a.to_string(),
+                    token_out: b.to_string(),
+                    rate: bp,
+                };
+                let leg2 = TopSpreadLeg {
+                    venue: sv.clone(),
+                    token_in: b.to_string(),
+                    token_out: a.to_string(),
+                    rate: sp,
+                };
+                let gross = (rate - 1.0) * 100.0;
+                let net = cost.net_usd(gross);
+                let _distance = if net < 0.0 { -net } else { 0.0 };
+                let venues = [leg1.venue.as_str(), leg2.venue.as_str()];
+                let executable = route_all_legs_executable(venues.into_iter());
+                let has_curve = venues
+                    .iter()
+                    .any(|v| venue_curve_model(v) == CurveModel::StableSwap);
+                (
+                    bv,
+                    sv,
+                    Some(leg1),
+                    Some(leg2),
+                    Some(rate),
+                    Some(gross),
+                    Some(net),
+                    executable,
+                    has_curve,
+                )
+            }
+            None => (
+                String::new(),
+                String::new(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                false,
+            ),
+        };
+    let sane_economics = gross_pct.zip(net_usd).is_some_and(|(gross, net)| {
+        gross.is_finite()
+            && net.is_finite()
+            && gross.abs() <= 50.0
+            && net.abs() <= cost.notional_usd.abs().max(1.0) * 0.5
+    });
+    let (gross_pct, net_usd, executable) = if sane_economics {
+        (gross_pct, net_usd, executable)
+    } else {
+        (None, None, false)
     };
     TopSpreadInfo {
         pair: pair.to_string(),
         tui_spread_pct,
+        buy_dex,
+        sell_dex,
         leg1,
         leg2,
         cycle_rate,
         gross_pct,
         net_usd,
+        distance_to_profit: net_usd
+            .map(|n| if n < 0.0 { -n } else { 0.0 })
+            .unwrap_or(f64::INFINITY),
         outlier: outlier_venue(forward),
         executable,
         has_curve_leg,
@@ -1065,9 +1149,7 @@ pub fn compute_top_spreads(
         .filter(|(_, v)| v.len() >= 2)
         .map(|(p, v)| {
             let fwd = v.clone();
-            let reverse = p
-                .split_once('-')
-                .map(|(a, b)| format!("{}-{}", b, a));
+            let reverse = p.split_once('-').map(|(a, b)| format!("{}-{}", b, a));
             let rev: Vec<(String, f64)> = reverse
                 .as_ref()
                 .and_then(|r| forward_by_pair.get(r))
@@ -1090,7 +1172,23 @@ pub fn compute_top_spreads(
             })
     });
 
-    ranked.into_iter().take(n).collect()
+    // Dedup espelhos A-B/B-A: mesmo round-trip econômico vira 1 linha no TUI.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut deduped: Vec<TopSpreadInfo> = Vec::new();
+    for mut info in ranked {
+        if let Some(key) = top_spread_canonical_key(&info) {
+            if !seen.insert(key) {
+                continue;
+            }
+            // Normaliza label do par para forma canônica (direção-agnóstica).
+            if let Some((a, b)) = info.pair.split_once('-') {
+                info.pair = canonical_pair_name(a, b);
+            }
+        }
+        deduped.push(info);
+    }
+
+    deduped.into_iter().take(n).collect()
 }
 
 /// Formata TVL USD compacto: $1.2M / $340k / $123. None/inválido → "tvl=?".
@@ -1142,9 +1240,7 @@ async fn log_top_n_spreads(
         .filter(|(_, v)| v.len() >= 2)
         .map(|(p, v)| {
             let fwd = v.clone();
-            let reverse = p
-                .split_once('-')
-                .map(|(a, b)| format!("{}-{}", b, a));
+            let reverse = p.split_once('-').map(|(a, b)| format!("{}-{}", b, a));
             let rev: Vec<(String, f64)> = reverse
                 .as_ref()
                 .and_then(|r| forward_by_pair.get(r))
@@ -1166,6 +1262,21 @@ async fn log_top_n_spreads(
             })
     });
 
+    // Dedup espelhos A-B/B-A no log assíncrono também.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut deduped: Vec<TopSpreadInfo> = Vec::new();
+    for mut info in ranked {
+        if let Some(key) = top_spread_canonical_key(&info) {
+            if !seen.insert(key) {
+                continue;
+            }
+            if let Some((a, b)) = info.pair.split_once('-') {
+                info.pair = canonical_pair_name(a, b);
+            }
+        }
+        deduped.push(info);
+    }
+
     let cfg = dm.config_ref();
     // A10: fee_hint por perna. Antes `unwrap_or(0)` quando venue sem `fee_tier` no
     // config — p/ V3 (tiers 100/500/3000/10000) fee=0 resolve pool inexistente ou
@@ -1173,16 +1284,15 @@ async fn log_top_n_spreads(
     // Agora: fee_tier real do adapter (cache populado pelo multicall best-fee do
     // V3) → fallback config.fee_tier → None (fail-open, TVL não lida) em vez de 0.
     let fee_for = |venue: &str, token_in: &str, token_out: &str| -> Option<u32> {
-        cached_fee_tier(venue, token_in, token_out)
-            .or_else(|| {
-                cfg.dex
-                    .iter()
-                    .find(|d| d.name.eq_ignore_ascii_case(venue))
-                    .and_then(|d| d.fee_tier)
-            })
+        cached_fee_tier(venue, token_in, token_out).or_else(|| {
+            cfg.dex
+                .iter()
+                .find(|d| d.name.eq_ignore_ascii_case(venue))
+                .and_then(|d| d.fee_tier)
+        })
     };
 
-    for info in ranked.into_iter().take(n) {
+    for info in deduped.into_iter().take(n) {
         let tui_spread = info.tui_spread_pct;
 
         // TVL read-only de cada perna do melhor 2-hop. None = fail-open (Curve, fee
@@ -1224,7 +1334,11 @@ async fn log_top_n_spreads(
         let leg1_str = match &info.leg1 {
             Some(l) => format!(
                 "leg1={}:{}→{}@{:.6}({}{})",
-                l.venue, l.token_in, l.token_out, l.rate, tvl1_str,
+                l.venue,
+                l.token_in,
+                l.token_out,
+                l.rate,
+                tvl1_str,
                 if shallow1 { " SHALLOW" } else { "" }
             ),
             None => "leg1=NONE".to_string(),
@@ -1232,7 +1346,11 @@ async fn log_top_n_spreads(
         let leg2_str = match &info.leg2 {
             Some(l) => format!(
                 "leg2={}:{}→{}@{:.6}({}{})",
-                l.venue, l.token_in, l.token_out, l.rate, tvl2_str,
+                l.venue,
+                l.token_in,
+                l.token_out,
+                l.rate,
+                tvl2_str,
                 if shallow2 { " SHALLOW" } else { "" }
             ),
             None => "leg2=NONE".to_string(),
@@ -1307,7 +1425,12 @@ fn log_edge_summary(edges: &[EdgeInfo], cycle: u64) {
     let top3: Vec<String> = edges
         .iter()
         .take(3)
-        .map(|e| format!("{} {:.4}% {}→{}", e.pair, e.spread_pct, e.buy_dex, e.sell_dex))
+        .map(|e| {
+            format!(
+                "{} {:.4}% {}→{}",
+                e.pair, e.spread_pct, e.buy_dex, e.sell_dex
+            )
+        })
         .collect();
 
     info!(
@@ -1337,7 +1460,10 @@ fn log_edge_audit(edges: &[EdgeInfo], cycle: u64) {
 
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(fp) {
         if !exists {
-            let _ = writeln!(f, "timestamp,cycle,pair,buy_dex,sell_dex,spread_pct,buy_price,sell_price");
+            let _ = writeln!(
+                f,
+                "timestamp,cycle,pair,buy_dex,sell_dex,spread_pct,buy_price,sell_price"
+            );
         }
         for e in edges {
             let _ = writeln!(
@@ -1365,6 +1491,9 @@ async fn execute_radar_cycle(
     retry: &SmartRetryManager,
     cycle: u64,
 ) -> Result<(usize, Vec<EdgeInfo>)> {
+    // Pipeline observability: start scan cycle
+    let scan_cycle = ScanCycle::new(cycle, 0, 0); // block numbers not available here
+    let counters = pipeline_counters();
 
     let (pairs, qf_enabled, min_spread, top_n) = {
         let cfg = cfg.lock().await;
@@ -1375,6 +1504,9 @@ async fn execute_radar_cycle(
             cfg.log.top_spreads_n,
         )
     };
+
+    // Record configured pairs
+    counters.add(&counters.configured_pairs, pairs.len() as u64);
 
     let adapters = get_healthy_adapters(dm, &cb).await;
     let qf = HighHitRateFilter::new(qf_enabled, min_spread);
@@ -1422,6 +1554,23 @@ async fn execute_radar_cycle(
 
     let total: usize = out.values().map(|m| m.len()).sum();
     let (_signals, edges, economics, adj_cycles) = extract_edges(&out, adj_cost);
+
+    // Pipeline observability: record price map assembly
+    counters.add(&counters.price_map_dexes, out.len() as u64);
+    counters.add(&counters.price_map_pairs, total as u64);
+    counters.add(&counters.raw_quotes, total as u64);
+    counters.add(&counters.accepted_quotes, total as u64);
+
+    // Record graph construction metrics (approximate from price map)
+    let vertex_count = out.values().flat_map(|m| m.keys()).count();
+    counters.add(&counters.graph_vertices, vertex_count as u64);
+    // edges ≈ pairs * avg_dexes_per_pair (rough estimate)
+    let edge_estimate = out.values().map(|m| m.len()).sum::<usize>();
+    counters.add(&counters.graph_edges, edge_estimate as u64);
+
+    // Record Bellman-Ford cycle detection
+    counters.add(&counters.bf_cycles_raw, adj_cycles.len() as u64);
+    counters.add(&counters.bf_cycles_unique, adj_cycles.len() as u64);
 
     log_price_audit(&out, cycle);
     log_edge_summary(&edges, cycle);
@@ -1506,17 +1655,22 @@ async fn execute_radar_cycle(
         let mut pair_prices: HashMap<String, Vec<(&String, &f64)>> = HashMap::new();
         for (dex, dex_map) in &out {
             for (pair, price) in dex_map {
-                pair_prices.entry(pair.clone()).or_default().push((dex, price));
+                pair_prices
+                    .entry(pair.clone())
+                    .or_default()
+                    .push((dex, price));
             }
         }
         // Mostra apenas pares com cotação de ≥2 DEXes (candidatos a arbitragem)
-        let mut cross_dex: Vec<_> = pair_prices.iter()
+        let mut cross_dex: Vec<_> = pair_prices
+            .iter()
             .filter(|(_, prices)| prices.len() >= 2)
             .collect();
         cross_dex.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
 
         for (pair, prices) in cross_dex.iter().take(8) {
-            let mut parts: Vec<String> = prices.iter()
+            let mut parts: Vec<String> = prices
+                .iter()
                 .map(|(dex, price)| format!("{}={:.8}", dex, price))
                 .collect();
             parts.sort();
@@ -1533,6 +1687,9 @@ async fn execute_radar_cycle(
         price_tx.send(out).await?;
     }
 
+    // Pipeline observability: emit scan summary
+    scan_cycle.finish();
+
     Ok((total, edges))
 }
 
@@ -1548,9 +1705,8 @@ pub async fn start_high_hit_rate_radar(
     adj_cost: Arc<AdjCostParams>,
     cb: Arc<DexCircuitBreaker>,
     price_tx: mpsc::Sender<HashMap<String, HashMap<String, f64>>>,
-    mut shutdown_rx: broadcast::Receiver<()>
+    mut shutdown_rx: broadcast::Receiver<()>,
 ) -> Result<()> {
-
     let mut stream = ws.subscribe_blocks().await?;
     let retry = SmartRetryManager::new(2, Duration::from_millis(35)).with_jitter(0.2);
     let mut previous: HashMap<String, HashMap<String, f64>> = HashMap::new();
@@ -1759,10 +1915,7 @@ mod tests {
         // Ciclo CAIXA: cross QuickSwap×SushiSwap no par AAA-BBB.
         // buy=QuickSwap(AAA>BBB 1.01) × sell=SushiSwap(BBB>AAA 1.0) = 1.01 → adj,
         // has_curve_leg=false, executable=true.
-        pr.insert(
-            "SushiSwap".into(),
-            m(&[("AAA-BBB", 1.0), ("BBB-AAA", 1.0)]),
-        );
+        pr.insert("SushiSwap".into(), m(&[("AAA-BBB", 1.0), ("BBB-AAA", 1.0)]));
 
         let (_n, _edges, econ, adj) = extract_edges(&pr, &AdjCostParams::default());
 
@@ -1822,25 +1975,42 @@ mod tests {
         // com ordem de iteração distinta → mesmo cycle_key → mesmo hash. Ambas DEXes
         // cotam as duas direções (extract_edges exige ≥2 DEXes no par forward).
         let mut pr_a: HashMap<String, HashMap<String, f64>> = HashMap::new();
-        pr_a.insert("Curve".into(), m(&[("USDC-USDT", 1.0001), ("USDT-USDC", 1.0)]));
-        pr_a.insert("QuickSwap".into(), m(&[("USDC-USDT", 1.0), ("USDT-USDC", 1.0001)]));
+        pr_a.insert(
+            "Curve".into(),
+            m(&[("USDC-USDT", 1.0001), ("USDT-USDC", 1.0)]),
+        );
+        pr_a.insert(
+            "QuickSwap".into(),
+            m(&[("USDC-USDT", 1.0), ("USDT-USDC", 1.0001)]),
+        );
 
         let mut pr_b: HashMap<String, HashMap<String, f64>> = HashMap::new();
         // Inserção em ordem trocada — iteração pode variar, mas o ciclo é o mesmo.
-        pr_b.insert("QuickSwap".into(), m(&[("USDC-USDT", 1.0), ("USDT-USDC", 1.0001)]));
-        pr_b.insert("Curve".into(), m(&[("USDC-USDT", 1.0001), ("USDT-USDC", 1.0)]));
+        pr_b.insert(
+            "QuickSwap".into(),
+            m(&[("USDC-USDT", 1.0), ("USDT-USDC", 1.0001)]),
+        );
+        pr_b.insert(
+            "Curve".into(),
+            m(&[("USDC-USDT", 1.0001), ("USDT-USDC", 1.0)]),
+        );
 
         let (_, _, _, adj_a) = extract_edges(&pr_a, &AdjCostParams::default());
         let (_, _, _, adj_b) = extract_edges(&pr_b, &AdjCostParams::default());
 
         let ka = adj_a.iter().find(|a| a.pair == "USDC-USDT").unwrap();
         let kb = adj_b.iter().find(|a| a.pair == "USDC-USDT").unwrap();
-        assert_eq!(ka.cycle_key, kb.cycle_key, "cycle_key deve ser igual p/ mesmo ciclo");
+        assert_eq!(
+            ka.cycle_key, kb.cycle_key,
+            "cycle_key deve ser igual p/ mesmo ciclo"
+        );
         assert_eq!(adj_key_hash(&ka.cycle_key), adj_key_hash(&kb.cycle_key));
 
         // Hash determinístico p/ string fixa (snapshot estável entre runs).
-        assert_eq!(adj_key_hash("Curve|USDC>USDT||QuickSwap|USDT>USDC"),
-                   adj_key_hash("Curve|USDC>USDT||QuickSwap|USDT>USDC"));
+        assert_eq!(
+            adj_key_hash("Curve|USDC>USDT||QuickSwap|USDT>USDC"),
+            adj_key_hash("Curve|USDC>USDT||QuickSwap|USDT>USDC")
+        );
         // 4 hex chars.
         let h = adj_key_hash("Curve|USDC>USDT||QuickSwap|USDT>USDC");
         assert_eq!(h.len(), 4);
@@ -1873,28 +2043,43 @@ mod tests {
         );
         // Ciclo 2 (caixa, net-POSITIVO): QuickSwap×SushiSwap AAA-BBB cycle_rate 1.01.
         //   gross = 1% × $100 = $1.00; cost = $0.058 → net = $0.942.
-        pr.insert(
-            "SushiSwap".into(),
-            m(&[("AAA-BBB", 1.0), ("BBB-AAA", 1.0)]),
-        );
+        pr.insert("SushiSwap".into(), m(&[("AAA-BBB", 1.0), ("BBB-AAA", 1.0)]));
 
         let (_n, _edges, econ, adj) = extract_edges(&pr, &AdjCostParams::default());
 
         // Sem dedup seriam 4 adj (2 espelhos × 2 ciclos). Dedup colapsa espelhos → 2.
-        assert_eq!(adj.len(), 2, "espelhos A-B/B-A devem colapsar em 1 adj cada");
+        assert_eq!(
+            adj.len(),
+            2,
+            "espelhos A-B/B-A devem colapsar em 1 adj cada"
+        );
 
         // gross/adj contam ÚNICOS pós-dedup (2 ciclos), não 4 direções.
-        assert_eq!(econ.gross_positive, 2, "gross_positive pós-dedup = 2 ciclos únicos");
-        assert_eq!(econ.venue_fee_adjusted_positive, 2, "adj == gross por construção");
+        assert_eq!(
+            econ.gross_positive, 2,
+            "gross_positive pós-dedup = 2 ciclos únicos"
+        );
+        assert_eq!(
+            econ.venue_fee_adjusted_positive, 2,
+            "adj == gross por construção"
+        );
 
         // net_positive: só o ciclo 2 (AAA-BBB) tem net>0. Ciclo 1 é net-negativo.
         assert_eq!(econ.net_positive, 1, "só 1 ciclo com net projetado > 0");
 
         // O ciclo net-positivo tem net>0; o net-negativo tem net<0.
         let caxas = adj.iter().find(|a| a.pair == "AAA-BBB").unwrap();
-        assert!(caxas.net_profit_usd > 0.0, "AAA-BBB net={:.4} deve ser > 0", caxas.net_profit_usd);
+        assert!(
+            caxas.net_profit_usd > 0.0,
+            "AAA-BBB net={:.4} deve ser > 0",
+            caxas.net_profit_usd
+        );
         let vitrine = adj.iter().find(|a| a.pair == "USDC-USDT").unwrap();
-        assert!(vitrine.net_profit_usd < 0.0, "USDC-USDT net={:.4} deve ser < 0", vitrine.net_profit_usd);
+        assert!(
+            vitrine.net_profit_usd < 0.0,
+            "USDC-USDT net={:.4} deve ser < 0",
+            vitrine.net_profit_usd
+        );
     }
 
     /// M12: round-trip negativo visto em A-B e B-A é um único ciclo econômico.
@@ -1927,10 +2112,7 @@ mod tests {
         let mut pr: HashMap<String, HashMap<String, f64>> = HashMap::new();
         // buy Sushi A-B=1.01, sell Quick B-A=1.0 → cycle=1.01 → spread 1%
         // Se ainda deduzisse (0.997)^2, spread cairia ~0.4%.
-        pr.insert(
-            "QuickSwap".into(),
-            m(&[("AAA-BBB", 1.0), ("BBB-AAA", 1.0)]),
-        );
+        pr.insert("QuickSwap".into(), m(&[("AAA-BBB", 1.0), ("BBB-AAA", 1.0)]));
         pr.insert(
             "SushiSwap".into(),
             m(&[("AAA-BBB", 1.01), ("BBB-AAA", 1.0)]),
@@ -1958,10 +2140,7 @@ mod tests {
         // Segundo "venue" sintético: usamos Sushi só como perna sell (preços fee-inclusive).
         // Para V3×V3 puro precisaríamos 2 mapas UniswapV3 — o radar exige buy_dex != sell_dex
         // por nome, então o segundo mapa simula outro venue com quotes já inclusive.
-        pr.insert(
-            "QuickSwap".into(),
-            m(&[("CCC-DDD", 1.0), ("DDD-CCC", 1.0)]),
-        );
+        pr.insert("QuickSwap".into(), m(&[("CCC-DDD", 1.0), ("DDD-CCC", 1.0)]));
 
         let (_n, edges, _, _adj) = extract_edges(&pr, &AdjCostParams::default());
         assert!(!edges.is_empty());
@@ -1979,20 +2158,22 @@ mod tests {
     fn monitor_com_stable_stable_gera_pares_direcionais_para_curve() {
         let mut cfg = Config::default();
         cfg.pairs.liquidity_allowlist = vec!["USDC".into(), "USDT".into(), "DAI".into()];
-        cfg.pairs.monitor = vec![
-            "USDC-USDT".into(),
-            "DAI-USDC".into(),
-            "DAI-USDT".into(),
-        ];
+        cfg.pairs.monitor = vec!["USDC-USDT".into(), "DAI-USDC".into(), "DAI-USDT".into()];
         let pares = generate_full_pair_list(&cfg);
 
         // Curve precisa das DUAS direções (get_dy(i,j) e get_dy(j,i)).
         for esperado in [
-            "USDC-USDT", "USDT-USDC",
-            "DAI-USDC", "USDC-DAI",
-            "DAI-USDT", "USDT-DAI",
+            "USDC-USDT",
+            "USDT-USDC",
+            "DAI-USDC",
+            "USDC-DAI",
+            "DAI-USDT",
+            "USDT-DAI",
         ] {
-            assert!(pares.contains(&esperado.to_string()), "falta {esperado} (Curve não cota)");
+            assert!(
+                pares.contains(&esperado.to_string()),
+                "falta {esperado} (Curve não cota)"
+            );
         }
     }
 
@@ -2009,7 +2190,10 @@ mod tests {
         ];
         let spread = tui_spread_pct(&fwd);
         let expected = (0.000279 - 0.000271) / 0.000271 * 100.0;
-        assert!((spread - expected).abs() < 1e-9, "spread={spread} expected={expected}");
+        assert!(
+            (spread - expected).abs() < 1e-9,
+            "spread={spread} expected={expected}"
+        );
         // <2 venues → 0 (igual TUI).
         assert_eq!(tui_spread_pct(&[("A".into(), 1.0)]), 0.0);
     }
@@ -2022,15 +2206,27 @@ mod tests {
         // reverse: WETH→DAI = 3648.0 → cycle_rate = 0.000274 × 3648.0 = 0.999552 (<1)
         let reverse = vec![("SushiSwap".to_string(), 3648.0)];
         let info = analyze_pair_spread("DAI-WETH", &forward, &reverse, &AdjCostParams::default());
-        assert!(info.leg1.is_some(), "leg1 deve existir mesmo com cycle_rate < 1");
+        assert!(
+            info.leg1.is_some(),
+            "leg1 deve existir mesmo com cycle_rate < 1"
+        );
         assert!(info.leg2.is_some(), "leg2 deve existir");
         let cr = info.cycle_rate.expect("cycle_rate");
-        assert!(cr < 1.0, "cycle_rate={cr} deve ser < 1 (revela não-fechamento)");
+        assert!(
+            cr < 1.0,
+            "cycle_rate={cr} deve ser < 1 (revela não-fechamento)"
+        );
         assert!(info.gross_pct.unwrap() < 0.0, "gross deve ser negativo");
         // extract_edges NÃO emite edge <1, mas analyze_pair_spread retorna o ciclo.
         let mut pr: HashMap<String, HashMap<String, f64>> = HashMap::new();
-        pr.insert("QuickSwap".into(), m(&[("DAI-WETH", 0.000274), ("WETH-DAI", 3700.0)]));
-        pr.insert("SushiSwap".into(), m(&[("DAI-WETH", 0.000274), ("WETH-DAI", 3648.0)]));
+        pr.insert(
+            "QuickSwap".into(),
+            m(&[("DAI-WETH", 0.000274), ("WETH-DAI", 3700.0)]),
+        );
+        pr.insert(
+            "SushiSwap".into(),
+            m(&[("DAI-WETH", 0.000274), ("WETH-DAI", 3648.0)]),
+        );
         let (_n, edges, _, _) = extract_edges(&pr, &AdjCostParams::default());
         // Com cycle_rate < 1 (best = 0.000274 × 3648 = 0.9996), extract_edges não push.
         assert!(edges.iter().all(|e| e.spread_pct > 0.0));
@@ -2091,14 +2287,23 @@ mod tests {
     fn best_two_hop_shared_with_extract_edges() {
         let mut pr: HashMap<String, HashMap<String, f64>> = HashMap::new();
         pr.insert("QuickSwap".into(), m(&[("AAA-BBB", 1.0), ("BBB-AAA", 1.0)]));
-        pr.insert("SushiSwap".into(), m(&[("AAA-BBB", 1.01), ("BBB-AAA", 1.0)]));
+        pr.insert(
+            "SushiSwap".into(),
+            m(&[("AAA-BBB", 1.01), ("BBB-AAA", 1.0)]),
+        );
         let (n, edges, econ, adj) = extract_edges(&pr, &AdjCostParams::default());
         assert!(!edges.is_empty(), "best_two_hop compartilhado mantém edges");
         assert_eq!(adj.len(), 1, "1 ciclo único (dedup mirror)");
         assert_eq!(econ.gross_positive, 1);
         // best_two_hop direto no mesmo forward/reverse dá o mesmo cycle_rate.
-        let fwd = vec![("QuickSwap".to_string(), 1.0), ("SushiSwap".to_string(), 1.01)];
-        let rev = vec![("QuickSwap".to_string(), 1.0), ("SushiSwap".to_string(), 1.0)];
+        let fwd = vec![
+            ("QuickSwap".to_string(), 1.0),
+            ("SushiSwap".to_string(), 1.01),
+        ];
+        let rev = vec![
+            ("QuickSwap".to_string(), 1.0),
+            ("SushiSwap".to_string(), 1.0),
+        ];
         let best = best_two_hop(&fwd, &rev);
         let (bv, _bp, sv, _sp, rate) = best.unwrap();
         assert_eq!(bv, "SushiSwap");

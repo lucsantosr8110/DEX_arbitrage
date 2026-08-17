@@ -116,10 +116,7 @@ pub fn u256_to_f64(value: U256, decimals: u32) -> f64 {
     if amount_18 > U256::from(u128::MAX) {
         // Display path: escalate via string rather than silent economic clip.
         let as_tokens = amount_18 / U256::exp10(18);
-        return as_tokens
-            .to_string()
-            .parse::<f64>()
-            .unwrap_or(f64::MAX);
+        return as_tokens.to_string().parse::<f64>().unwrap_or(f64::MAX);
     }
     let amt = amount_18.as_u128() as f64 / 1e18;
     if amt.is_finite() {
@@ -522,14 +519,17 @@ pub fn is_realistic_price(price: f64, token_pair: &str) -> bool {
 
     // Stablecoins entre si (USDT, USDC, DAI)
     if (pair_lower.contains("usdt") || pair_lower.contains("usdc") || pair_lower.contains("dai"))
-        && (pair_lower.contains("usdt") || pair_lower.contains("usdc") || pair_lower.contains("dai"))
+        && (pair_lower.contains("usdt")
+            || pair_lower.contains("usdc")
+            || pair_lower.contains("dai"))
     {
         return price >= 0.8 && price <= 1.2;
     }
 
     // WETH ↔ qualquer stable (USDT, USDC, DAI) — ✅ AGORA COBRE WETH-DAI
     if pair_lower.contains("weth") {
-        if pair_lower.contains("usdt") || pair_lower.contains("usdc") || pair_lower.contains("dai") {
+        if pair_lower.contains("usdt") || pair_lower.contains("usdc") || pair_lower.contains("dai")
+        {
             return price >= 1000.0 && price <= 10000.0;
         }
 
@@ -541,7 +541,8 @@ pub fn is_realistic_price(price: f64, token_pair: &str) -> bool {
 
     // WMATIC ↔ qualquer stable
     if pair_lower.contains("wmatic") || pair_lower.contains("matic") {
-        if pair_lower.contains("usdt") || pair_lower.contains("usdc") || pair_lower.contains("dai") {
+        if pair_lower.contains("usdt") || pair_lower.contains("usdc") || pair_lower.contains("dai")
+        {
             return price >= 0.05 && price <= 10.0;
         }
     }

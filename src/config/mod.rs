@@ -1,16 +1,19 @@
 use crate::core::types::RiskConfig;
 use anyhow::{Context, Result};
 use ethers::types::Address;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::default::Default;
+use std::path::Path;
 use std::{
-    collections::{BTreeSet, HashMap}, fs, path::PathBuf, sync::Arc,
-    time::{Instant, Duration, SystemTime}
+    collections::{BTreeSet, HashMap},
+    fs,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info, warn};
-use std::path::Path;
-use std::default::Default;
-use regex::Regex;
 
 pub mod token_cache;
 
@@ -69,15 +72,178 @@ impl Default for PairsConfig {
 pub struct WrapperConfig {
     pub enabled: bool,
     pub address: String,
-    #[serde(default)] pub owner_address: Option<String>,
-    #[serde(default)] pub executor_allowed: bool,
-    #[serde(default)] pub auto_authorize_executor: bool,
-    #[serde(default)] pub authorization_check_enabled: bool,
-    #[serde(default)] pub healthcheck_interval_sec: u32,
-    #[serde(default)] pub max_failed_calls: u32,
-    #[serde(default)] pub auto_recover_on_fail: bool,
-    #[serde(default)] pub log_reverts: bool,
-    #[serde(default)] pub contract_type: String,
+    #[serde(default)]
+    pub owner_address: Option<String>,
+    #[serde(default)]
+    pub executor_allowed: bool,
+    #[serde(default)]
+    pub auto_authorize_executor: bool,
+    #[serde(default)]
+    pub authorization_check_enabled: bool,
+    #[serde(default)]
+    pub healthcheck_interval_sec: u32,
+    #[serde(default)]
+    pub max_failed_calls: u32,
+    #[serde(default)]
+    pub auto_recover_on_fail: bool,
+    #[serde(default)]
+    pub log_reverts: bool,
+    #[serde(default)]
+    pub contract_type: String,
+}
+
+/// Opt-in-only configuration for the isolated canonical C2B shadow service.
+/// Primary execution and broadcast are deliberately ignored by this phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscoveryEngine {
+    Canonical,
+    Legacy,
+}
+
+impl DiscoveryEngine {
+    pub fn resolve(configured: &str) -> Self {
+        match std::env::var("DISCOVERY_ENGINE")
+            .ok()
+            .as_deref()
+            .unwrap_or(configured)
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "legacy" => Self::Legacy,
+            _ => Self::Canonical,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct C2bShadowConfig {
+    /// `canonical` is production discovery authority for dry-run only.
+    /// `legacy` is explicit rollback; no automatic fallback is permitted.
+    #[serde(default = "default_discovery_engine")]
+    pub discovery_engine: String,
+    #[serde(default)]
+    pub shadow_enabled: bool,
+    #[serde(default)]
+    pub primary_enabled: bool,
+    #[serde(default)]
+    pub broadcast_enabled: bool,
+    #[serde(default = "default_shadow_every_n_blocks")]
+    pub shadow_every_n_blocks: u64,
+    #[serde(default = "default_round_timeout_secs")]
+    pub round_timeout_secs: u64,
+    #[serde(default)]
+    pub dedicated_rpc_url: Option<String>,
+    /// Token universe the live canonical-primary loop scans: `base` or
+    /// `liquid`. The diagnostic binary has its own `--profile` flag and
+    /// does not read this field.
+    #[serde(default = "default_canonical_discovery_profile")]
+    pub canonical_discovery_profile: String,
+    /// Structural invariant, not a tuning knob: canonical scheduling never
+    /// starts a new round while one is in flight. Any value other than `1`
+    /// fails startup rather than silently being ignored.
+    #[serde(default = "default_canonical_max_concurrent_rounds")]
+    pub canonical_max_concurrent_rounds: u32,
+    /// Same invariant for the pending-anchor queue: capacity is exactly
+    /// one by design (`CANONICAL_SKIP_REASON=PREVIOUS_ROUND_IN_FLIGHT`
+    /// covers everything beyond that), never a backlog.
+    #[serde(default = "default_canonical_pending_anchors_max")]
+    pub canonical_pending_anchors_max: u32,
+}
+
+fn default_discovery_engine() -> String {
+    "canonical".to_string()
+}
+
+fn default_shadow_every_n_blocks() -> u64 {
+    32
+}
+fn default_round_timeout_secs() -> u64 {
+    // 60s era curto demais: round real médio observado em produção é ~38s,
+    // com picos >100s sob RPC lento. config.dryrun.toml já sobrescrevia para
+    // 900s; alinhando o default para não deixar config.toml/midtier expostos
+    // ao mesmo timeout que já causou failover/reconexão espúrios.
+    900
+}
+fn default_canonical_discovery_profile() -> String {
+    "base".to_string()
+}
+fn default_canonical_max_concurrent_rounds() -> u32 {
+    1
+}
+fn default_canonical_pending_anchors_max() -> u32 {
+    1
+}
+
+impl Default for C2bShadowConfig {
+    fn default() -> Self {
+        Self {
+            discovery_engine: default_discovery_engine(),
+            shadow_enabled: false,
+            primary_enabled: false,
+            broadcast_enabled: false,
+            shadow_every_n_blocks: default_shadow_every_n_blocks(),
+            round_timeout_secs: default_round_timeout_secs(),
+            dedicated_rpc_url: None,
+            canonical_discovery_profile: default_canonical_discovery_profile(),
+            canonical_max_concurrent_rounds: default_canonical_max_concurrent_rounds(),
+            canonical_pending_anchors_max: default_canonical_pending_anchors_max(),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum CanonicalStartupError {
+    #[error("CANONICAL_BROADCAST_ENABLED_INCOMPATIBLE: c2b_shadow.broadcast_enabled must be false in canonical mode")]
+    BroadcastEnabled,
+    #[error("CANONICAL_MAX_CONCURRENT_ROUNDS_INVALID: must be 1, got {0}")]
+    MaxConcurrentRounds(u32),
+    #[error("CANONICAL_PENDING_ANCHORS_MAX_INVALID: must be 1, got {0}")]
+    PendingAnchorsMax(u32),
+    #[error("CANONICAL_DISCOVERY_PROFILE_INVALID: {0:?} (expected \"base\" or \"liquid\")")]
+    UnknownProfile(String),
+}
+
+impl C2bShadowConfig {
+    /// C2C has no primary or broadcast mode. A config requesting either is
+    /// treated as disabled rather than as an escalation request.
+    pub fn shadow_runtime_enabled(&self) -> bool {
+        self.shadow_enabled && !self.primary_enabled && !self.broadcast_enabled
+    }
+
+    pub fn canonical_primary_enabled(&self) -> bool {
+        DiscoveryEngine::resolve(&self.discovery_engine) == DiscoveryEngine::Canonical
+            && !self.broadcast_enabled
+    }
+
+    /// Fails startup on any canonical-mode misconfiguration instead of
+    /// silently downgrading to a smaller scope or falling back to legacy.
+    /// Only runs when `DISCOVERY_ENGINE` actually resolves to `Canonical` —
+    /// legacy mode is unaffected by these invariants.
+    pub fn validate_canonical_startup(&self) -> Result<(), CanonicalStartupError> {
+        if DiscoveryEngine::resolve(&self.discovery_engine) != DiscoveryEngine::Canonical {
+            return Ok(());
+        }
+        if self.broadcast_enabled {
+            return Err(CanonicalStartupError::BroadcastEnabled);
+        }
+        if self.canonical_max_concurrent_rounds != 1 {
+            return Err(CanonicalStartupError::MaxConcurrentRounds(
+                self.canonical_max_concurrent_rounds,
+            ));
+        }
+        if self.canonical_pending_anchors_max != 1 {
+            return Err(CanonicalStartupError::PendingAnchorsMax(
+                self.canonical_pending_anchors_max,
+            ));
+        }
+        if !matches!(self.canonical_discovery_profile.as_str(), "base" | "liquid") {
+            return Err(CanonicalStartupError::UnknownProfile(
+                self.canonical_discovery_profile.clone(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -226,67 +392,109 @@ impl Default for ValidationConfig {
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct AnalyticsConfig {
     pub enabled: bool,
-    #[serde(default)] pub export_csv: bool,
-    #[serde(default)] pub export_path: String,
-    #[serde(default)] pub save_interval_sec: u64,
-    #[serde(default)] pub include_gas_costs: bool,
-    #[serde(default)] pub include_slippage: bool,
-    #[serde(default)] pub include_profitability: bool,
-    #[serde(default)] pub daily_summary_enabled: bool,
-    #[serde(default)] pub weekly_summary_enabled: bool,
-    #[serde(default)] pub report_currency: String,
-    #[serde(default)] pub dashboard: AnalyticsDashboardConfig,
+    #[serde(default)]
+    pub export_csv: bool,
+    #[serde(default)]
+    pub export_path: String,
+    #[serde(default)]
+    pub save_interval_sec: u64,
+    #[serde(default)]
+    pub include_gas_costs: bool,
+    #[serde(default)]
+    pub include_slippage: bool,
+    #[serde(default)]
+    pub include_profitability: bool,
+    #[serde(default)]
+    pub daily_summary_enabled: bool,
+    #[serde(default)]
+    pub weekly_summary_enabled: bool,
+    #[serde(default)]
+    pub report_currency: String,
+    #[serde(default)]
+    pub dashboard: AnalyticsDashboardConfig,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct AnalyticsDashboardConfig {
     pub enabled: bool,
-    #[serde(default)] pub port: u16,
-    #[serde(default)] pub auto_open_browser: bool,
-    #[serde(default)] pub refresh_interval_sec: u64,
-    #[serde(default)] pub theme: String,
-    #[serde(default)] pub show_flashloan_stats: bool,
-    #[serde(default)] pub show_profit_chart: bool,
-    #[serde(default)] pub show_rpc_health: bool,
+    #[serde(default)]
+    pub port: u16,
+    #[serde(default)]
+    pub auto_open_browser: bool,
+    #[serde(default)]
+    pub refresh_interval_sec: u64,
+    #[serde(default)]
+    pub theme: String,
+    #[serde(default)]
+    pub show_flashloan_stats: bool,
+    #[serde(default)]
+    pub show_profit_chart: bool,
+    #[serde(default)]
+    pub show_rpc_health: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct AlertsConfig {
     pub enabled: bool,
-    #[serde(default)] pub threshold_profit_usd: f64,
-    #[serde(default)] pub threshold_loss_usd: f64,
-    #[serde(default)] pub alert_on_rpc_fail: bool,
-    #[serde(default)] pub alert_on_revert: bool,
-    #[serde(default)] pub alert_on_liquidity_drop: bool,
-    #[serde(default)] pub alert_on_profit_spike: bool,
-    #[serde(default)] pub cooldown_seconds: u64,
-    #[serde(default)] pub send_to_telegram: bool,
-    #[serde(default)] pub send_to_log: bool,
+    #[serde(default)]
+    pub threshold_profit_usd: f64,
+    #[serde(default)]
+    pub threshold_loss_usd: f64,
+    #[serde(default)]
+    pub alert_on_rpc_fail: bool,
+    #[serde(default)]
+    pub alert_on_revert: bool,
+    #[serde(default)]
+    pub alert_on_liquidity_drop: bool,
+    #[serde(default)]
+    pub alert_on_profit_spike: bool,
+    #[serde(default)]
+    pub cooldown_seconds: u64,
+    #[serde(default)]
+    pub send_to_telegram: bool,
+    #[serde(default)]
+    pub send_to_log: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct DebugConfig {
     pub enabled: bool,
-    #[serde(default)] pub show_flashloan_steps: bool,
-    #[serde(default)] pub show_tx_input_data: bool,
-    #[serde(default)] pub log_contract_calls: bool,
-    #[serde(default)] pub trace_failed_tx: bool,
-    #[serde(default)] pub record_events: bool,
-    #[serde(default)] pub save_simulation_results: bool,
-    #[serde(default)] pub max_log_size_mb: u32,
+    #[serde(default)]
+    pub show_flashloan_steps: bool,
+    #[serde(default)]
+    pub show_tx_input_data: bool,
+    #[serde(default)]
+    pub log_contract_calls: bool,
+    #[serde(default)]
+    pub trace_failed_tx: bool,
+    #[serde(default)]
+    pub record_events: bool,
+    #[serde(default)]
+    pub save_simulation_results: bool,
+    #[serde(default)]
+    pub max_log_size_mb: u32,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 pub struct SummaryConfig {
-    #[serde(default)] pub show_startup_banner: bool,
-    #[serde(default)] pub show_dex_summary: bool,
-    #[serde(default)] pub show_pairs_summary: bool,
-    #[serde(default)] pub show_flashloan_summary: bool,
-    #[serde(default)] pub show_limits: bool,
-    #[serde(default)] pub log_execution_mode: bool,
-    #[serde(default)] pub colorize_output: bool,
-    #[serde(default)] pub compact_mode: bool,
-    #[serde(default)] pub display_timestamps: bool,
+    #[serde(default)]
+    pub show_startup_banner: bool,
+    #[serde(default)]
+    pub show_dex_summary: bool,
+    #[serde(default)]
+    pub show_pairs_summary: bool,
+    #[serde(default)]
+    pub show_flashloan_summary: bool,
+    #[serde(default)]
+    pub show_limits: bool,
+    #[serde(default)]
+    pub log_execution_mode: bool,
+    #[serde(default)]
+    pub colorize_output: bool,
+    #[serde(default)]
+    pub compact_mode: bool,
+    #[serde(default)]
+    pub display_timestamps: bool,
 }
 // ===============================
 // MEV (opcional) + defaults
@@ -295,11 +503,42 @@ pub struct SummaryConfig {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct MevConfig {
     pub enabled: bool,
-    #[serde(default)] pub relay_url: String,
-    #[serde(default)] pub signer_address: String,
-    #[serde(default)] pub min_tip_matic: String,
-    #[serde(default)] pub target_block_offset: u64,
-    #[serde(default)] pub timeout_seconds: u64,
+    #[serde(default)]
+    pub relay_url: String,
+    #[serde(default)]
+    pub signer_address: String,
+    #[serde(default)]
+    pub min_tip_matic: String,
+    #[serde(default)]
+    pub target_block_offset: u64,
+    #[serde(default)]
+    pub timeout_seconds: u64,
+
+    /// Se true, execução só pode seguir por relay privado (BundleSender). Se o
+    /// relay estiver indisponível (mev.enabled=false ou ExecutionEngine ausente),
+    /// a opp é abortada pré-broadcast (fail-closed) — nunca cai no mempool público.
+    #[serde(default)]
+    pub private_relay_required: bool,
+
+    /// No modo degradado (mempool público, relay indisponível), teto de slippage
+    /// por hop mais apertado que `max_slippage_bps`. Default 20 bps.
+    #[serde(default = "default_public_mempool_degraded_slippage_bps")]
+    pub public_mempool_degraded_slippage_bps: u32,
+
+    /// No modo degradado, edge mínimo (em bps) abaixo do qual a opp é rejeitada
+    /// — mempool público exige edge maior p/ compensar exposição a MEV.
+    // SAFETY-EV: 10 bps em mempool público na Polygon é backrun garantido;
+    // custo do atacante ~0. Default 45 bps exige edge real antes de se expor.
+    #[serde(default = "default_public_mempool_min_edge_bps")]
+    pub public_mempool_min_edge_bps: u32,
+
+    /// Se false (default), o bot NÃO transmite ao mempool público quando o relay
+    /// privado está indisponível — aborta fail-closed (NoPrivateRoute) em vez de
+    /// se expor a MEV. Flip explícito para true libera o modo degradado.
+    // SAFETY-EV: default false — mempool público na Polygon é observado em tempo
+    /// real por sandwichers; nunca degradar sem opt-in do operador.
+    #[serde(default)]
+    pub allow_public_mempool: bool,
 }
 impl Default for MevConfig {
     fn default() -> Self {
@@ -310,37 +549,77 @@ impl Default for MevConfig {
             min_tip_matic: "0.1".to_string(),
             target_block_offset: 1,
             timeout_seconds: 10,
+            private_relay_required: false,
+            public_mempool_degraded_slippage_bps: default_public_mempool_degraded_slippage_bps(),
+            public_mempool_min_edge_bps: default_public_mempool_min_edge_bps(),
+            allow_public_mempool: false,
         }
     }
+}
+
+fn default_public_mempool_degraded_slippage_bps() -> u32 {
+    20
+}
+fn default_public_mempool_min_edge_bps() -> u32 {
+    45
 }
 
 // ===============================
 // Cooldown, rate limiting e deduplicacao
 // ===============================
 
-fn default_global_cooldown_ms() -> u64 { 8000 }
-fn default_pair_cooldown_ms() -> u64 { 20000 }
-fn default_strategy_cooldown_ms() -> u64 { 15000 }
-fn default_revert_penalty_ms() -> u64 { 45000 }
-fn default_max_concurrent_executions() -> u32 { 2 }
+fn default_global_cooldown_ms() -> u64 {
+    8000
+}
+fn default_pair_cooldown_ms() -> u64 {
+    20000
+}
+fn default_strategy_cooldown_ms() -> u64 {
+    15000
+}
+fn default_revert_penalty_ms() -> u64 {
+    45000
+}
+fn default_max_concurrent_executions() -> u32 {
+    2
+}
 
-fn default_max_executions_per_minute() -> u32 { 6 }
-fn default_min_interval_between_trades_ms() -> u64 { 10000 }
-fn default_burst_size() -> u32 { 1 }
+fn default_max_executions_per_minute() -> u32 {
+    6
+}
+fn default_min_interval_between_trades_ms() -> u64 {
+    10000
+}
+fn default_burst_size() -> u32 {
+    1
+}
 
-fn default_same_pair_timeout_ms() -> u64 { 15000 }
-fn default_similar_profit_threshold() -> f64 { 0.1 }
-fn default_remember_reverted_txs() -> bool { true }
-fn default_revert_blacklist_duration_ms() -> u64 { 30000 }
+fn default_same_pair_timeout_ms() -> u64 {
+    15000
+}
+fn default_similar_profit_threshold() -> f64 {
+    0.1
+}
+fn default_remember_reverted_txs() -> bool {
+    true
+}
+fn default_revert_blacklist_duration_ms() -> u64 {
+    30000
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CooldownConfig {
     pub enabled: bool,
-    #[serde(default = "default_global_cooldown_ms")] pub global_ms: u64,
-    #[serde(default = "default_pair_cooldown_ms")] 	pub pair_ms: u64,
-    #[serde(default = "default_strategy_cooldown_ms")] pub strategy_ms: u64,
-    #[serde(default = "default_revert_penalty_ms")]  pub revert_penalty_ms: u64,
-    #[serde(default = "default_max_concurrent_executions")] pub max_concurrent_executions: u32,
+    #[serde(default = "default_global_cooldown_ms")]
+    pub global_ms: u64,
+    #[serde(default = "default_pair_cooldown_ms")]
+    pub pair_ms: u64,
+    #[serde(default = "default_strategy_cooldown_ms")]
+    pub strategy_ms: u64,
+    #[serde(default = "default_revert_penalty_ms")]
+    pub revert_penalty_ms: u64,
+    #[serde(default = "default_max_concurrent_executions")]
+    pub max_concurrent_executions: u32,
 }
 impl Default for CooldownConfig {
     fn default() -> Self {
@@ -358,9 +637,12 @@ impl Default for CooldownConfig {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ExecutionRateLimitingConfig {
     pub enabled: bool,
-    #[serde(default = "default_max_executions_per_minute")] pub max_executions_per_minute: u32,
-    #[serde(default = "default_min_interval_between_trades_ms")] pub min_interval_between_trades_ms: u64,
-    #[serde(default = "default_burst_size")] pub burst_size: u32,
+    #[serde(default = "default_max_executions_per_minute")]
+    pub max_executions_per_minute: u32,
+    #[serde(default = "default_min_interval_between_trades_ms")]
+    pub min_interval_between_trades_ms: u64,
+    #[serde(default = "default_burst_size")]
+    pub burst_size: u32,
 }
 impl Default for ExecutionRateLimitingConfig {
     fn default() -> Self {
@@ -376,10 +658,14 @@ impl Default for ExecutionRateLimitingConfig {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ArbitrageDeduplicationConfig {
     pub enabled: bool,
-    #[serde(default = "default_same_pair_timeout_ms")] pub same_pair_timeout_ms: u64,
-    #[serde(default = "default_similar_profit_threshold")] pub similar_profit_threshold: f64,
-    #[serde(default = "default_remember_reverted_txs")] pub remember_reverted_txs: bool,
-    #[serde(default = "default_revert_blacklist_duration_ms")] pub revert_blacklist_duration_ms: u64,
+    #[serde(default = "default_same_pair_timeout_ms")]
+    pub same_pair_timeout_ms: u64,
+    #[serde(default = "default_similar_profit_threshold")]
+    pub similar_profit_threshold: f64,
+    #[serde(default = "default_remember_reverted_txs")]
+    pub remember_reverted_txs: bool,
+    #[serde(default = "default_revert_blacklist_duration_ms")]
+    pub revert_blacklist_duration_ms: u64,
 }
 impl Default for ArbitrageDeduplicationConfig {
     fn default() -> Self {
@@ -432,15 +718,25 @@ impl CooldownManager {
         }
     }
 
-    pub async fn can_execute(&self, pair: &str, strategy: &str, current_block: Option<u64>) -> Result<bool, String> {
-        if !self.config.enabled { return Ok(true); }
+    pub async fn can_execute(
+        &self,
+        pair: &str,
+        strategy: &str,
+        current_block: Option<u64>,
+    ) -> Result<bool, String> {
+        if !self.config.enabled {
+            return Ok(true);
+        }
         let now = Instant::now();
         let mut state = self.state.write().await;
         self.cleanup_old_data(&mut state, now);
 
         if let Some(block_num) = current_block {
             if state.executed_blocks.contains_key(&block_num) {
-                return Err(format!("execution already recorded for block {}", block_num));
+                return Err(format!(
+                    "execution already recorded for block {}",
+                    block_num
+                ));
             }
             if let Some(last_block) = state.last_block_number {
                 if block_num == last_block {
@@ -465,7 +761,10 @@ impl CooldownManager {
         if let Some(last_global) = state.last_global_execution {
             let elapsed = now.duration_since(last_global);
             if elapsed < Duration::from_millis(self.config.global_ms) {
-                let remain = self.config.global_ms.saturating_sub(elapsed.as_millis() as u64);
+                let remain = self
+                    .config
+                    .global_ms
+                    .saturating_sub(elapsed.as_millis() as u64);
                 return Err(format!("global cooldown {} ms", remain));
             }
         }
@@ -473,7 +772,10 @@ impl CooldownManager {
         if let Some(revert_time) = state.reverted_pairs.get(pair) {
             let elapsed = now.duration_since(*revert_time);
             if elapsed < Duration::from_millis(self.config.revert_penalty_ms) {
-                let remain = self.config.revert_penalty_ms.saturating_sub(elapsed.as_millis() as u64);
+                let remain = self
+                    .config
+                    .revert_penalty_ms
+                    .saturating_sub(elapsed.as_millis() as u64);
                 return Err(format!("revert penalty for {}: {} ms", pair, remain));
             } else {
                 state.reverted_pairs.remove(pair);
@@ -483,7 +785,10 @@ impl CooldownManager {
         if let Some(last_pair) = state.last_pair_execution.get(pair) {
             let elapsed = now.duration_since(*last_pair);
             if elapsed < Duration::from_millis(self.config.pair_ms) {
-                let remain = self.config.pair_ms.saturating_sub(elapsed.as_millis() as u64);
+                let remain = self
+                    .config
+                    .pair_ms
+                    .saturating_sub(elapsed.as_millis() as u64);
                 return Err(format!("pair cooldown {}: {} ms", pair, remain));
             }
         }
@@ -491,7 +796,10 @@ impl CooldownManager {
         if let Some(last_strategy) = state.last_strategy_execution.get(strategy) {
             let elapsed = now.duration_since(*last_strategy);
             if elapsed < Duration::from_millis(self.config.strategy_ms) {
-                let remain = self.config.strategy_ms.saturating_sub(elapsed.as_millis() as u64);
+                let remain = self
+                    .config
+                    .strategy_ms
+                    .saturating_sub(elapsed.as_millis() as u64);
                 return Err(format!("strategy cooldown {}: {} ms", strategy, remain));
             }
         }
@@ -503,28 +811,43 @@ impl CooldownManager {
         let mut state = self.state.write().await;
         state.last_global_execution = Some(now);
         state.last_pair_execution.insert(pair.to_string(), now);
-        state.last_strategy_execution.insert(strategy.to_string(), now);
+        state
+            .last_strategy_execution
+            .insert(strategy.to_string(), now);
         state.execution_timestamps.push(now);
         state.execution_count += 1;
         if let Some(block_num) = block_number {
             state.executed_blocks.insert(block_num, now);
             state.last_block_number = Some(block_num);
         }
-        state.execution_timestamps.retain(|&ts| now.duration_since(ts) < Duration::from_secs(120));
+        state
+            .execution_timestamps
+            .retain(|&ts| now.duration_since(ts) < Duration::from_secs(120));
     }
 
     fn cleanup_old_data(&self, state: &mut CooldownState, now: Instant) {
-        state.executed_blocks.retain(|_, t| now.duration_since(*t) < Duration::from_secs(300));
-        state.last_pair_execution.retain(|_, t| now.duration_since(*t) < Duration::from_secs(600));
-        state.last_strategy_execution.retain(|_, t| now.duration_since(*t) < Duration::from_secs(600));
-        state.reverted_pairs.retain(|_, t| now.duration_since(*t) < Duration::from_secs(600));
+        state
+            .executed_blocks
+            .retain(|_, t| now.duration_since(*t) < Duration::from_secs(300));
+        state
+            .last_pair_execution
+            .retain(|_, t| now.duration_since(*t) < Duration::from_secs(600));
+        state
+            .last_strategy_execution
+            .retain(|_, t| now.duration_since(*t) < Duration::from_secs(600));
+        state
+            .reverted_pairs
+            .retain(|_, t| now.duration_since(*t) < Duration::from_secs(600));
     }
 
     pub async fn record_revert(&self, pair: &str) {
         let now = Instant::now();
         let mut state = self.state.write().await;
         state.reverted_pairs.insert(pair.to_string(), now);
-        debug!("revert recorded for {} (penalty {} ms)", pair, self.config.revert_penalty_ms);
+        debug!(
+            "revert recorded for {} (penalty {} ms)",
+            pair, self.config.revert_penalty_ms
+        );
     }
 
     pub async fn get_stats(&self) -> CooldownStats {
@@ -593,36 +916,61 @@ impl Default for FlashloanMinimumAmountsConfig {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FlashloanConfig {
     pub enabled: bool,
-    #[serde(default)] pub max_routes: u32,
-    #[serde(default)] pub max_depth: u32,
-    #[serde(default)] pub capital_usd: f64,
-    #[serde(default)] pub min_profit_usd: Option<f64>,
-    #[serde(default)] pub wrapper_address: Option<String>,
-    #[serde(default)] pub executor_address: Option<String>,
-    #[serde(default)] pub aave_pool_address: Option<String>,
-    #[serde(default)] pub max_amount_usdc: Option<f64>,
-    #[serde(default)] pub flashloan_asset: Option<String>,
-    #[serde(default)] pub flashloan_asset_address: Option<String>,
-    #[serde(default)] pub flashloan_decimals: Option<u8>,
-    #[serde(default)] pub max_amount_wmatic: Option<f64>,
-    #[serde(default)] pub slippage_bps: Option<u32>,
-    #[serde(default)] pub premium_multiplier: Option<f64>,
-    #[serde(default)] pub gas_overhead: Option<u64>,
-    #[serde(default)] pub provider: Option<String>,
-    #[serde(default)] pub preferred_mode: Option<String>,
-    #[serde(default)] pub auto_failover: Option<bool>,
-    #[serde(default)] pub track_metrics: Option<bool>,
-    #[serde(default)] pub simulate_before_execute: Option<bool>,
-    #[serde(default)] pub revert_on_negative_profit: Option<bool>,
-    #[serde(default)] pub minimum_amounts: FlashloanMinimumAmountsConfig,
-    #[serde(default)] pub slippage_tolerance_pct: Option<f64>,
+    #[serde(default)]
+    pub max_routes: u32,
+    #[serde(default)]
+    pub max_depth: u32,
+    #[serde(default)]
+    pub capital_usd: f64,
+    #[serde(default)]
+    pub min_profit_usd: Option<f64>,
+    #[serde(default)]
+    pub wrapper_address: Option<String>,
+    #[serde(default)]
+    pub executor_address: Option<String>,
+    #[serde(default)]
+    pub aave_pool_address: Option<String>,
+    #[serde(default)]
+    pub max_amount_usdc: Option<f64>,
+    #[serde(default)]
+    pub flashloan_asset: Option<String>,
+    #[serde(default)]
+    pub flashloan_asset_address: Option<String>,
+    #[serde(default)]
+    pub flashloan_decimals: Option<u8>,
+    #[serde(default)]
+    pub max_amount_wmatic: Option<f64>,
+    #[serde(default)]
+    pub slippage_bps: Option<u32>,
+    #[serde(default)]
+    pub premium_multiplier: Option<f64>,
+    #[serde(default)]
+    pub gas_overhead: Option<u64>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub preferred_mode: Option<String>,
+    #[serde(default)]
+    pub auto_failover: Option<bool>,
+    #[serde(default)]
+    pub track_metrics: Option<bool>,
+    #[serde(default)]
+    pub simulate_before_execute: Option<bool>,
+    #[serde(default)]
+    pub revert_on_negative_profit: Option<bool>,
+    #[serde(default)]
+    pub minimum_amounts: FlashloanMinimumAmountsConfig,
+    #[serde(default)]
+    pub slippage_tolerance_pct: Option<f64>,
 
     /// Teto de segurança para premium do provedor, em bps. A execução recusa
     /// config cujo `fee_pct` exceda este valor.
-    #[serde(default)] pub max_premium_bps: Option<u32>,
+    #[serde(default)]
+    pub max_premium_bps: Option<u32>,
 
     // NEW: fee percentage charged by flashloan provider (e.g. 0.0009 = 0.09%)
-    #[serde(default)] pub fee_pct: Option<f64>,
+    #[serde(default)]
+    pub fee_pct: Option<f64>,
 }
 impl Default for FlashloanConfig {
     fn default() -> Self {
@@ -669,8 +1017,10 @@ pub struct GeneralConfig {
     pub max_parallel_requests: u32,
     pub health_check_interval: u32,
     pub shutdown_timeout: u32,
-    #[serde(default)] pub enable_frontend: Option<bool>,
-    #[serde(default)] pub expand_env: bool,
+    #[serde(default)]
+    pub enable_frontend: Option<bool>,
+    #[serde(default)]
+    pub expand_env: bool,
 }
 impl Default for GeneralConfig {
     fn default() -> Self {
@@ -739,20 +1089,31 @@ impl Default for LoggingConfig {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct LogConfig {
-    #[serde(default)] pub show_opportunities: bool,
-    #[serde(default)] pub show_best_paths: bool,
-    #[serde(default)] pub show_rejections: bool,
-    #[serde(default)] pub show_profit_estimates: bool,
-    #[serde(default)] pub show_gas_details: bool,
-    #[serde(default)] pub show_dex_responses: bool,
-    #[serde(default)] pub export_prices_csv: bool,
-    #[serde(default)] pub export_trades_csv: bool,
+    #[serde(default)]
+    pub show_opportunities: bool,
+    #[serde(default)]
+    pub show_best_paths: bool,
+    #[serde(default)]
+    pub show_rejections: bool,
+    #[serde(default)]
+    pub show_profit_estimates: bool,
+    #[serde(default)]
+    pub show_gas_details: bool,
+    #[serde(default)]
+    pub show_dex_responses: bool,
+    #[serde(default)]
+    pub export_prices_csv: bool,
+    #[serde(default)]
+    pub export_trades_csv: bool,
     /// Top-N spreads (por Spread% do TUI, desc) logados por scan no `[TOPSPREAD]`.
     /// Revela cycle_rate real bidirecional + TVL de cada pool do melhor 2-hop.
     /// 0 = desliga. Default 5.
-    #[serde(default = "default_top_spreads_n")] pub top_spreads_n: usize,
+    #[serde(default = "default_top_spreads_n")]
+    pub top_spreads_n: usize,
 }
-fn default_top_spreads_n() -> usize { 5 }
+fn default_top_spreads_n() -> usize {
+    5
+}
 impl Default for LogConfig {
     fn default() -> Self {
         Self {
@@ -781,17 +1142,28 @@ pub struct NetworkConfig {
     pub timeout_ms: u64,
     pub max_reorg_depth: u32,
     pub chain_monitoring: bool,
-    #[serde(default)] pub max_pending_requests: u32,
-    #[serde(default)] pub rotate_on_error: bool,
-    #[serde(default)] pub fallback_timeout_ms: u64,
-    #[serde(default)] pub health_check_interval: u32,
-    #[serde(default)] pub consecutive_failures_before_switch: u32,
-    #[serde(default)] pub enable_request_batching: bool,
-    #[serde(default)] pub batch_size: u32,
-    #[serde(default)] pub max_concurrent_requests: u32,
-    #[serde(default)] pub connection_pool_size: u32,
-    #[serde(default)] pub keep_alive: bool,
-    #[serde(default)] pub compression: bool,
+    #[serde(default)]
+    pub max_pending_requests: u32,
+    #[serde(default)]
+    pub rotate_on_error: bool,
+    #[serde(default)]
+    pub fallback_timeout_ms: u64,
+    #[serde(default)]
+    pub health_check_interval: u32,
+    #[serde(default)]
+    pub consecutive_failures_before_switch: u32,
+    #[serde(default)]
+    pub enable_request_batching: bool,
+    #[serde(default)]
+    pub batch_size: u32,
+    #[serde(default)]
+    pub max_concurrent_requests: u32,
+    #[serde(default)]
+    pub connection_pool_size: u32,
+    #[serde(default)]
+    pub keep_alive: bool,
+    #[serde(default)]
+    pub compression: bool,
 }
 impl Default for NetworkConfig {
     fn default() -> Self {
@@ -829,7 +1201,11 @@ pub struct WalletMultisigConfig {
 }
 impl Default for WalletMultisigConfig {
     fn default() -> Self {
-        Self { enabled: false, address: String::new(), threshold: 0 }
+        Self {
+            enabled: false,
+            address: String::new(),
+            threshold: 0,
+        }
     }
 }
 
@@ -843,7 +1219,8 @@ pub struct WalletConfig {
     pub sweep_threshold: String,
     pub max_tx_value: String,
     pub multisig: WalletMultisigConfig,
-    #[serde(default)] pub max_tx_fee_usd: f64,
+    #[serde(default)]
+    pub max_tx_fee_usd: f64,
 }
 impl Default for WalletConfig {
     fn default() -> Self {
@@ -868,8 +1245,10 @@ pub struct ExecutorConfig {
     pub max_flashloan_premium: u64,
     pub contract_type: String,
     pub timeout_seconds: u32,
-    #[serde(default)] pub use_direct_calls: bool,
-    #[serde(default)] pub skip_wrapper_validation: bool,
+    #[serde(default)]
+    pub use_direct_calls: bool,
+    #[serde(default)]
+    pub skip_wrapper_validation: bool,
 }
 impl Default for ExecutorConfig {
     fn default() -> Self {
@@ -889,18 +1268,27 @@ impl Default for ExecutorConfig {
 pub struct DexEntry {
     pub name: String,
     pub router_address: String,
-    #[serde(default)] pub factory_address: Option<String>,
-    #[serde(default)] pub quoter_address: Option<String>,
-    #[serde(default)] pub approval_type: Option<u8>,
-    #[serde(default)] pub enabled: bool,
-    #[serde(default)] pub priority: Option<u32>,
-    #[serde(default)] pub max_slippage: Option<f64>,
-    #[serde(default)] pub fee_tier: Option<u32>,
+    #[serde(default)]
+    pub factory_address: Option<String>,
+    #[serde(default)]
+    pub quoter_address: Option<String>,
+    #[serde(default)]
+    pub approval_type: Option<u8>,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub priority: Option<u32>,
+    #[serde(default)]
+    pub max_slippage: Option<f64>,
+    #[serde(default)]
+    pub fee_tier: Option<u32>,
     /// Gate B2 de TVL específico deste venue (USD). `None` = usa o global
     /// `arbitrage.min_liquidity`. Estava no TOML mas não existia aqui: os valores
     /// por DEX eram descartados em silêncio e só o global valia.
-    #[serde(default)] pub liquidity_threshold_usd: Option<f64>,
-    #[serde(default)] pub extra: HashMap<String, toml::Value>,
+    #[serde(default)]
+    pub liquidity_threshold_usd: Option<f64>,
+    #[serde(default)]
+    pub extra: HashMap<String, toml::Value>,
 }
 
 // ===============================
@@ -990,9 +1378,55 @@ pub struct RouteValidationConfig {
     pub block_same_dex_consecutive: bool,
 }
 
-fn default_true() -> bool { true }
-fn default_route_max_hops() -> u32 { 3 }
-fn default_route_max_cumulative_slippage() -> f64 { 2.0 }
+fn default_true() -> bool {
+    true
+}
+fn default_route_max_hops() -> u32 {
+    3
+}
+fn default_route_max_cumulative_slippage() -> f64 {
+    2.0
+}
+
+/// Margem padrão de 1 bps reservada do edge antes de autorizar slippage.
+fn default_edge_safety_margin_bps() -> u32 {
+    1
+}
+
+/// Default top-N: 1 (executa só a melhor; >1 habilita fallback pré-broadcast).
+fn default_top_n_opportunities() -> u32 {
+    1
+}
+
+/// B4: número máximo de re-bumps acumulados ao receber "underpriced".
+fn default_max_replace_attempts() -> u32 {
+    3
+}
+
+/// B5: haircut de drift quote→exec por hop (default 5 bps).
+fn default_adverse_move_bps() -> u32 {
+    5
+}
+
+/// B6: blocos esperados até inclusão (default 2).
+fn default_expected_inclusion_blocks() -> u32 {
+    2
+}
+
+/// B7: confirmações para lucro final (default 24).
+fn default_profit_confirmations() -> u32 {
+    24
+}
+
+/// B7: perdas realizadas finais consecutivas → circuit breaker (default 3).
+pub(crate) fn default_loss_breaker_threshold() -> u32 {
+    3
+}
+
+/// B8: stall de nonce antes do reaper cancelar (default 45s).
+fn default_nonce_stall_secs() -> u64 {
+    45
+}
 
 impl Default for RouteValidationConfig {
     fn default() -> Self {
@@ -1010,9 +1444,12 @@ impl Default for RouteValidationConfig {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ArbitrageConfig {
     pub enabled: bool,
-    #[serde(default)] pub executor_address: Option<String>,
-    #[serde(default)] pub min_profit_threshold_usd: Option<f64>,
-    #[serde(default)] pub min_profit_percent: Option<String>,
+    #[serde(default)]
+    pub executor_address: Option<String>,
+    #[serde(default)]
+    pub min_profit_threshold_usd: Option<f64>,
+    #[serde(default)]
+    pub min_profit_percent: Option<String>,
     pub min_profit_absolute: String,
     pub min_spread_percent: String,
     pub advanced_filters_enabled: bool,
@@ -1029,8 +1466,10 @@ pub struct ArbitrageConfig {
     pub min_volume_24h: String,
     pub triangular: ArbitrageTriangularConfig,
     pub cross_dex: ArbitrageCrossDexConfig,
-    #[serde(default)] pub route_validation: RouteValidationConfig,
-    #[serde(default)] pub deduplication: ArbitrageDeduplicationConfig,
+    #[serde(default)]
+    pub route_validation: RouteValidationConfig,
+    #[serde(default)]
+    pub deduplication: ArbitrageDeduplicationConfig,
 }
 
 impl Default for ArbitrageConfig {
@@ -1038,7 +1477,7 @@ impl Default for ArbitrageConfig {
         Self {
             enabled: true,
             executor_address: None,
-            min_profit_threshold_usd: Some(0.10),
+            min_profit_threshold_usd: Some(0.0015),
             min_profit_percent: Some("0.05".to_string()),
             min_profit_absolute: "0.10".to_string(),
             min_spread_percent: "0.05".to_string(),
@@ -1065,11 +1504,21 @@ impl Default for ArbitrageConfig {
 // Gas config (Polygon) + defaults
 // ===============================
 
-fn default_cache_ttl() -> u64 { 30 }
-fn default_dynamic_multiplier() -> f64 { 1.25 }
-fn default_max_priority_gwei() -> f64 { 300.0 }
-fn default_min_priority_gwei() -> f64 { 5.0 }
-fn default_use_polygon_oracle() -> bool { true }
+fn default_cache_ttl() -> u64 {
+    30
+}
+fn default_dynamic_multiplier() -> f64 {
+    1.25
+}
+fn default_max_priority_gwei() -> f64 {
+    300.0
+}
+fn default_min_priority_gwei() -> f64 {
+    5.0
+}
+fn default_use_polygon_oracle() -> bool {
+    true
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct GasStationsConfig {
@@ -1126,17 +1575,50 @@ pub struct GasConfig {
     pub eip1559_enabled: bool,
     pub stations: GasStationsConfig,
     pub optimization: GasOptimizationConfig,
-    #[serde(default = "default_use_polygon_oracle")] pub use_polygon_oracle: bool,
-    #[serde(default = "default_cache_ttl")]          pub cache_ttl: u64,
-    #[serde(default = "default_dynamic_multiplier")] pub dynamic_multiplier: f64,
-    #[serde(default = "default_max_priority_gwei")]  pub max_priority_gwei: f64,
-    #[serde(default)] pub auto_adjust: bool,
-    #[serde(default)] pub auto_bargain: bool,
-    #[serde(default)] pub max_fee_multiplier: Option<f64>,
-    #[serde(default = "default_min_priority_gwei")]  pub min_priority_gwei: f64,
+    #[serde(default = "default_use_polygon_oracle")]
+    pub use_polygon_oracle: bool,
+    #[serde(default = "default_cache_ttl")]
+    pub cache_ttl: u64,
+    #[serde(default = "default_dynamic_multiplier")]
+    pub dynamic_multiplier: f64,
+    #[serde(default = "default_max_priority_gwei")]
+    pub max_priority_gwei: f64,
+    #[serde(default)]
+    pub auto_adjust: bool,
+    #[serde(default)]
+    pub auto_bargain: bool,
+    #[serde(default)]
+    pub max_fee_multiplier: Option<f64>,
+    #[serde(default = "default_min_priority_gwei")]
+    pub min_priority_gwei: f64,
     /// Consumo de gás ESPERADO da rota (não o teto). 0 = cai em `default_gas_limit`.
     /// Usar o teto para precificar custo infla o hurdle de lucro.
-    #[serde(default)] pub estimated_gas_units: u64,
+    #[serde(default)]
+    pub estimated_gas_units: u64,
+
+    /// B6: número de blocos esperados até inclusão da tx. Projeta o base_fee
+    /// forward em `1.125^n` (EIP-1559 max 12.5%/bloco) para precificar o custo
+    /// de gas no EV. Default 2. Só afeta o EV (custo), nunca o `max_fee` enviado.
+    #[serde(default = "default_expected_inclusion_blocks")]
+    pub expected_inclusion_blocks: u32,
+
+    /// Fail-closed em preço de native token (POL): quando true, `estimate_gas_usd`
+    /// rejeita opp se o preço do WMATIC for fallback heurístico, stale ou ausente,
+    /// em vez de cair no fallback. Default false preserva comportamento; ligar é
+    /// recomendado para segurança econômica (evita subestimar gás com preço 0).
+    #[serde(default)]
+    pub require_fresh_native_price: bool,
+
+    /// Idade máxima (segundos) do preço de native token no cache antes de considerar
+    /// stale. 0 = sem limite de idade extra (só o TTL normal do cache valem).
+    #[serde(default)]
+    pub native_price_max_stale_secs: u64,
+
+    /// B2: path do arquivo JSON do oráculo EWMA de gas por venue. Se `None`,
+    /// o oráculo opera só em memória (sem persistência entre restarts). Sem
+    /// default inventado — persistência exige opt-in do operador.
+    #[serde(default)]
+    pub gas_oracle_path: Option<String>,
 }
 impl Default for GasConfig {
     fn default() -> Self {
@@ -1164,6 +1646,10 @@ impl Default for GasConfig {
             min_priority_gwei: default_min_priority_gwei(),
             // flashloan Aave + 3 swaps ≈ 400k gás queimado
             estimated_gas_units: 400_000,
+            expected_inclusion_blocks: default_expected_inclusion_blocks(),
+            require_fresh_native_price: false,
+            native_price_max_stale_secs: 0,
+            gas_oracle_path: None,
         }
     }
 }
@@ -1182,11 +1668,11 @@ pub struct ExecutionSimulationConfig {
 
 impl Default for ExecutionSimulationConfig {
     fn default() -> Self {
-        Self { 
-            enabled: true, 
-            max_simulations: 2, 
-            simulation_timeout: 2500, 
-            revert_on_fail: true 
+        Self {
+            enabled: true,
+            max_simulations: 2,
+            simulation_timeout: 2500,
+            revert_on_fail: true,
         }
     }
 }
@@ -1200,21 +1686,26 @@ pub struct ExecutionBackrunProtectionConfig {
 
 impl Default for ExecutionBackrunProtectionConfig {
     fn default() -> Self {
-        Self { 
-            enabled: true, 
-            max_slippage_increase: 0.05, 
-            min_block_confirmations: 2 
+        Self {
+            enabled: true,
+            max_slippage_increase: 0.05,
+            min_block_confirmations: 2,
         }
     }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ExecutionPriorityConfig {
-    #[serde(default)] pub dynamic_mode: bool,
-    #[serde(default)] pub gas_boost_threshold: f64,
-    #[serde(default)] pub adaptive_fee_increment: f64,
-    #[serde(default)] pub auto_reprice_failed_tx: bool,
-    #[serde(default)] pub fallback_mode: String,
+    #[serde(default)]
+    pub dynamic_mode: bool,
+    #[serde(default)]
+    pub gas_boost_threshold: f64,
+    #[serde(default)]
+    pub adaptive_fee_increment: f64,
+    #[serde(default)]
+    pub auto_reprice_failed_tx: bool,
+    #[serde(default)]
+    pub fallback_mode: String,
 }
 
 impl Default for ExecutionPriorityConfig {
@@ -1231,10 +1722,14 @@ impl Default for ExecutionPriorityConfig {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ExecutionLoggingConfig {
-    #[serde(default)] pub enable_tx_traces: bool,
-    #[serde(default)] pub save_failed_txs: bool,
-    #[serde(default)] pub log_broadcasts: bool,
-    #[serde(default)] pub log_confirmations: bool,
+    #[serde(default)]
+    pub enable_tx_traces: bool,
+    #[serde(default)]
+    pub save_failed_txs: bool,
+    #[serde(default)]
+    pub log_broadcasts: bool,
+    #[serde(default)]
+    pub log_confirmations: bool,
 }
 
 impl Default for ExecutionLoggingConfig {
@@ -1261,31 +1756,101 @@ pub struct ExecutionConfig {
     pub tx_timeout_seconds: u32,
     pub simulation: ExecutionSimulationConfig,
     pub backrun_protection: ExecutionBackrunProtectionConfig,
-    #[serde(default)] pub priority: Option<ExecutionPriorityConfig>,
-    #[serde(default)] pub logging: Option<ExecutionLoggingConfig>,
-    #[serde(default)] pub auto_replace_tx: bool,
-    #[serde(default)] pub replace_multiplier: Option<f64>,
-    #[serde(default)] pub replace_max_retries: Option<u8>,
-    #[serde(default)] pub force_flashloan: bool,
-    #[serde(default)] pub enabled: bool,
-    #[serde(default)] pub execution_mode: Option<String>,
-    #[serde(default)] pub cooldown: CooldownConfig,
-    #[serde(default)] pub rate_limiting: ExecutionRateLimitingConfig,
+    #[serde(default)]
+    pub priority: Option<ExecutionPriorityConfig>,
+    #[serde(default)]
+    pub logging: Option<ExecutionLoggingConfig>,
+    #[serde(default)]
+    pub auto_replace_tx: bool,
+    #[serde(default)]
+    pub replace_multiplier: Option<f64>,
+    #[serde(default)]
+    pub replace_max_retries: Option<u8>,
+
+    /// B4: número máximo de re-bumps acumulados (×1.15) ao receber erro
+    /// "replacement transaction underpriced" / "transaction underpriced".
+    /// Default 3. Cada re-bump multiplica max_fee E max_priority por
+    /// `replace_multiplier`. Excedido → abort (tx expirada, não spam de RBF).
+    #[serde(default = "default_max_replace_attempts")]
+    pub max_replace_attempts: u32,
+
+    /// B4: teto absoluto de gwei para max_fee. Se um re-bump ultrapassar,
+    /// aborta (Expired) — nunca paga gas acima do teto do operador. Default
+    /// 500 gwei (Polygon raramente passa de ~3k gwei em spikes; 500 é
+    /// conservador para evitar sangria em congestionamento extremo).
+    /// `None`/0 = sem teto explícito (não recomendado).
+    #[serde(default)]
+    pub gas_ceiling_gwei: Option<f64>,
+    #[serde(default)]
+    pub force_flashloan: bool,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub execution_mode: Option<String>,
+    #[serde(default)]
+    pub cooldown: CooldownConfig,
+    #[serde(default)]
+    pub rate_limiting: ExecutionRateLimitingConfig,
 
     // NEW fields for dex/impact/slippage defaults and overrides (no hardcodes in code)
-    #[serde(default)] pub default_dex_fee_bps: u32,
-    #[serde(default)] pub default_price_impact_bps: u32,
-    #[serde(default)] pub dex_fee_bps_map: HashMap<String, u32>,
-    #[serde(default)] pub dex_price_impact_bps_map: HashMap<String, u32>,
-    #[serde(default)] pub hop_slippage_increase_bps: u32,
-    #[serde(default)] pub safety_margin_bps: u32,
-    #[serde(default)] pub estimate_base_gas_usd: f64,
+    #[serde(default)]
+    pub default_dex_fee_bps: u32,
+    #[serde(default)]
+    pub default_price_impact_bps: u32,
+    #[serde(default)]
+    pub dex_fee_bps_map: HashMap<String, u32>,
+    #[serde(default)]
+    pub dex_price_impact_bps_map: HashMap<String, u32>,
+    #[serde(default)]
+    pub hop_slippage_increase_bps: u32,
+    #[serde(default)]
+    pub safety_margin_bps: u32,
+    #[serde(default)]
+    pub estimate_base_gas_usd: f64,
 
-    /// Buffer de drift quote→execução, em bps do notional. **Default 0.**
+    /// Margem de segurança em BPS reservada do orçamento de edge antes de
+    /// autorizar slippage. `used_slippage ≤ budget_bps − edge_safety_margin_bps`.
+    /// Se `budget_bps ≤ edge_safety_margin_bps`, a rota é rejeitada (fail-closed).
+    /// **Distinto de `safety_margin_bps`** (que é fator 0..=10000 para
+    /// `apply_slippage_safe`); este é uma reserva direta em BPS do edge.
+    #[serde(default = "default_edge_safety_margin_bps")]
+    pub edge_safety_margin_bps: u32,
+
+    /// Buffer de drift quote→execução, em bps do notional **por hop**, aplicado
+    /// como haircut composto sobre o expected_out (B5). Default 5.
     ///
     /// NÃO é price impact: quotes já são impact-inclusive (ver `core::economics`).
-    /// Só ligue isto se quiser pagar explicitamente por risco de latência.
-    #[serde(default)] pub adverse_move_bps: u32,
+    /// 0 = opt-out explícito (sem haircut de latência).
+    // SAFETY-EV: ~2s entre simulação e inclusão na Polygon; drift médio
+    /// observado. 5 bps/hop cobre a latência típica sem rejeitar edge real.
+    #[serde(default = "default_adverse_move_bps")]
+    pub adverse_move_bps: u32,
+
+    /// Top-N oportunidades a tentar por ciclo, em ordem descrescente de net profit.
+    /// Se a primeira falhar em validação pré-broadcast/simulação, tenta a próxima.
+    /// Após uma oportunidade ser ENVIADA (outcome não-Aborted), o loop para.
+    #[serde(default = "default_top_n_opportunities")]
+    pub top_n_opportunities: u32,
+
+    /// B7: confirmações necessárias p/ considerar lucro final (irreversível).
+    /// Polygon PoS finalidade ~512 blocos, mas 24 blocos já cobre reorgs rasos
+    /// observados (<8 blocos). Default 24. Abaixo disso, lucro é provisório.
+    // SAFETY-EV: Polygon reorga <8 blocos na prática; 24 dá folga segura sem
+    /// prender contabilidade por tempo excessivo.
+    #[serde(default = "default_profit_confirmations")]
+    pub profit_confirmations: u32,
+
+    /// B7: perdas REALIZADAS FINAIS consecutivas que tripam o circuit breaker
+    /// de perda (kill switch consome). Estimated NÃO conta. Default 3.
+    #[serde(default = "default_loss_breaker_threshold")]
+    pub loss_breaker_threshold: u32,
+
+    /// B8: segundos que um nonce preso (gap pending_local > on_chain_pending)
+    /// persiste sem inclusão antes do reaper cancelá-lo com no-op agressivo.
+    // SAFETY-EV: Polygon ~2s/bloco; 45s ≈ 22 blocos sem inclusão = claramente
+    /// preso (não só lento). Abaixo disso cancelaria tx ainda válida.
+    #[serde(default = "default_nonce_stall_secs")]
+    pub nonce_stall_secs: u64,
 }
 
 impl Default for ExecutionConfig {
@@ -1305,8 +1870,10 @@ impl Default for ExecutionConfig {
             priority: Some(ExecutionPriorityConfig::default()),
             logging: Some(ExecutionLoggingConfig::default()),
             auto_replace_tx: true,
-            replace_multiplier: Some(1.12),
+            replace_multiplier: Some(1.15),
             replace_max_retries: Some(5),
+            max_replace_attempts: default_max_replace_attempts(),
+            gas_ceiling_gwei: Some(500.0),
             force_flashloan: false,
             enabled: true,
             execution_mode: Some("direct".to_string()),
@@ -1317,14 +1884,19 @@ impl Default for ExecutionConfig {
             // NOTA: default_dex_fee_bps e default_price_impact_bps NÃO entram no
             // cálculo de net profit — quotes já são fee+impact-inclusive.
             // Ver core::economics. Mantidos só para overrides de simulação legada.
-            default_dex_fee_bps: 30,            // 0.30%
-            default_price_impact_bps: 50,       // 0.50%
-            adverse_move_bps: 0,                // opt-in; ver core::economics
+            default_dex_fee_bps: 30,                      // 0.30%
+            default_price_impact_bps: 50,                 // 0.50%
+            adverse_move_bps: default_adverse_move_bps(), // B5: 5 bps/hop compounded
             dex_fee_bps_map: HashMap::new(),
             dex_price_impact_bps_map: HashMap::new(),
-            hop_slippage_increase_bps: 5,       // 5 bps = 0.05% por hop adicional
-            safety_margin_bps: 9800,            // 98% safety (BPS-like)
+            hop_slippage_increase_bps: 5, // 5 bps = 0.05% por hop adicional
+            safety_margin_bps: 9800,      // 98% safety (BPS-like)
             estimate_base_gas_usd: 0.02,
+            edge_safety_margin_bps: default_edge_safety_margin_bps(),
+            top_n_opportunities: default_top_n_opportunities(),
+            profit_confirmations: default_profit_confirmations(),
+            loss_breaker_threshold: default_loss_breaker_threshold(),
+            nonce_stall_secs: default_nonce_stall_secs(),
         }
     }
 }
@@ -1334,11 +1906,16 @@ impl Default for ExecutionConfig {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct OptimizationPredictiveConfig {
-    #[serde(default)] pub window_size: u32,
-    #[serde(default)] pub update_interval: u32,
-    #[serde(default)] pub learning_rate: f64,
-    #[serde(default)] pub confidence_threshold: f64,
-    #[serde(default)] pub fallback_on_low_confidence: bool,
+    #[serde(default)]
+    pub window_size: u32,
+    #[serde(default)]
+    pub update_interval: u32,
+    #[serde(default)]
+    pub learning_rate: f64,
+    #[serde(default)]
+    pub confidence_threshold: f64,
+    #[serde(default)]
+    pub fallback_on_low_confidence: bool,
 }
 impl Default for OptimizationPredictiveConfig {
     fn default() -> Self {
@@ -1355,22 +1932,37 @@ impl Default for OptimizationPredictiveConfig {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct OptimizationConfig {
     pub quick_filter_enabled: bool,
-    #[serde(default)] pub pre_filter_opportunities: bool,
-    #[serde(default)] pub adaptive_radar_mode: bool,
-    #[serde(default)] pub spread_decay_window: u32,
-    #[serde(default)] pub batch_processing_size: u32,
-    #[serde(default)] pub ultra_fast_mode: bool,
-    #[serde(default)] pub auto_tune_execution: bool,
-    #[serde(default)] pub auto_retry_failed_swaps: bool,
-    #[serde(default)] pub retry_limit: u32,
+    #[serde(default)]
+    pub pre_filter_opportunities: bool,
+    #[serde(default)]
+    pub adaptive_radar_mode: bool,
+    #[serde(default)]
+    pub spread_decay_window: u32,
+    #[serde(default)]
+    pub batch_processing_size: u32,
+    #[serde(default)]
+    pub ultra_fast_mode: bool,
+    #[serde(default)]
+    pub auto_tune_execution: bool,
+    #[serde(default)]
+    pub auto_retry_failed_swaps: bool,
+    #[serde(default)]
+    pub retry_limit: u32,
     pub min_spread_percent: f64,
-    #[serde(default)] pub min_profit_after_gas: f64,
-    #[serde(default)] pub max_gas_ratio: f64,
-    #[serde(default)] pub min_profit_per_tx: f64,
-    #[serde(default)] pub dynamic_slippage_enabled: bool,
-    #[serde(default)] pub slippage_multiplier: f64,
-    #[serde(default)] pub cooldown_after_fail_seconds: u64,
-    #[serde(default)] pub predictive: Option<OptimizationPredictiveConfig>,
+    #[serde(default)]
+    pub min_profit_after_gas: f64,
+    #[serde(default)]
+    pub max_gas_ratio: f64,
+    #[serde(default)]
+    pub min_profit_per_tx: f64,
+    #[serde(default)]
+    pub dynamic_slippage_enabled: bool,
+    #[serde(default)]
+    pub slippage_multiplier: f64,
+    #[serde(default)]
+    pub cooldown_after_fail_seconds: u64,
+    #[serde(default)]
+    pub predictive: Option<OptimizationPredictiveConfig>,
 }
 impl Default for OptimizationConfig {
     fn default() -> Self {
@@ -1448,48 +2040,81 @@ impl Default for TelegramConfig {
     }
 }
 
-fn default_monitoring_enabled() -> bool { true }
-fn default_monitoring_interval() -> u64 { 30 }
+fn default_monitoring_enabled() -> bool {
+    true
+}
+fn default_monitoring_interval() -> u64 {
+    30
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct MonitoringConfig {
-    #[serde(default = "default_monitoring_enabled")] pub enabled: bool,
-    #[serde(default = "default_monitoring_interval")] pub interval_sec: u64,
+    #[serde(default = "default_monitoring_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_monitoring_interval")]
+    pub interval_sec: u64,
 }
 impl Default for MonitoringConfig {
-    fn default() -> Self { Self { enabled: true, interval_sec: 30 } }
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_sec: 30,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PerformanceConfig {
     pub enabled: bool,
-    #[serde(default)] pub save_interval_sec: u64,
-    #[serde(default)] pub max_records: usize,
+    #[serde(default)]
+    pub save_interval_sec: u64,
+    #[serde(default)]
+    pub max_records: usize,
 }
 impl Default for PerformanceConfig {
     fn default() -> Self {
-        Self { enabled: false, save_interval_sec: 60, max_records: 10000 }
+        Self {
+            enabled: false,
+            save_interval_sec: 60,
+            max_records: 10000,
+        }
     }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PrometheusConfig {
     pub enabled: bool,
-    #[serde(default)] pub port: u16,
-    #[serde(default)] pub endpoint: String,
+    #[serde(default)]
+    pub port: u16,
+    #[serde(default)]
+    pub endpoint: String,
 }
 impl Default for PrometheusConfig {
-    fn default() -> Self { Self { enabled: false, port: 9090, endpoint: "/metrics".to_string() } }
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: 9090,
+            endpoint: "/metrics".to_string(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct MetricsConfig {
     pub enabled: bool,
-    #[serde(default)] pub port: u16,
-    #[serde(default)] pub endpoint: String,
+    #[serde(default)]
+    pub port: u16,
+    #[serde(default)]
+    pub endpoint: String,
 }
 impl Default for MetricsConfig {
-    fn default() -> Self { Self { enabled: false, port: 9100, endpoint: "/metrics".to_string() } }
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: 9100,
+            endpoint: "/metrics".to_string(),
+        }
+    }
 }
 
 // ===============================
@@ -1498,9 +2123,12 @@ impl Default for MetricsConfig {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DatabaseTablesConfig {
-    #[serde(default)] pub trades: String,
-    #[serde(default)] pub opportunities: String,
-    #[serde(default)] pub performance: String,
+    #[serde(default)]
+    pub trades: String,
+    #[serde(default)]
+    pub opportunities: String,
+    #[serde(default)]
+    pub performance: String,
 }
 impl Default for DatabaseTablesConfig {
     fn default() -> Self {
@@ -1515,10 +2143,14 @@ impl Default for DatabaseTablesConfig {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DatabaseConfig {
     pub enabled: bool,
-    #[serde(default)] pub url: String,
-    #[serde(default)] pub max_connections: u32,
-    #[serde(default)] pub connection_timeout: u32,
-    #[serde(default)] pub tables: DatabaseTablesConfig,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub max_connections: u32,
+    #[serde(default)]
+    pub connection_timeout: u32,
+    #[serde(default)]
+    pub tables: DatabaseTablesConfig,
 }
 impl Default for DatabaseConfig {
     fn default() -> Self {
@@ -1534,24 +2166,36 @@ impl Default for DatabaseConfig {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ExplorerMonitoringConfig {
-    #[serde(default)] pub track_transactions: bool,
-    #[serde(default)] pub verify_contracts: bool,
-    #[serde(default)] pub monitor_gas: bool,
+    #[serde(default)]
+    pub track_transactions: bool,
+    #[serde(default)]
+    pub verify_contracts: bool,
+    #[serde(default)]
+    pub monitor_gas: bool,
 }
 impl Default for ExplorerMonitoringConfig {
     fn default() -> Self {
-        Self { track_transactions: true, verify_contracts: false, monitor_gas: false }
+        Self {
+            track_transactions: true,
+            verify_contracts: false,
+            monitor_gas: false,
+        }
     }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ExplorerConfig {
     pub enabled: bool,
-    #[serde(default)] pub api_key: String,
-    #[serde(default)] pub base_url: String,
-    #[serde(default)] pub timeout_seconds: u32,
-    #[serde(default)] pub rate_limit_rpm: u32,
-    #[serde(default)] pub monitoring: ExplorerMonitoringConfig,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub timeout_seconds: u32,
+    #[serde(default)]
+    pub rate_limit_rpm: u32,
+    #[serde(default)]
+    pub monitoring: ExplorerMonitoringConfig,
 }
 impl Default for ExplorerConfig {
     fn default() -> Self {
@@ -1568,10 +2212,14 @@ impl Default for ExplorerConfig {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ApiEndpointsConfig {
-    #[serde(default)] pub health: String,
-    #[serde(default)] pub metrics: String,
-    #[serde(default)] pub control: String,
-    #[serde(default)] pub status: String,
+    #[serde(default)]
+    pub health: String,
+    #[serde(default)]
+    pub metrics: String,
+    #[serde(default)]
+    pub control: String,
+    #[serde(default)]
+    pub status: String,
 }
 impl Default for ApiEndpointsConfig {
     fn default() -> Self {
@@ -1587,12 +2235,18 @@ impl Default for ApiEndpointsConfig {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ApiConfig {
     pub enabled: bool,
-    #[serde(default)] pub host: String,
-    #[serde(default)] pub port: u16,
-    #[serde(default)] pub cors_origins: Vec<String>,
-    #[serde(default)] pub rate_limit: u32,
-    #[serde(default)] pub auth_required: bool,
-    #[serde(default)] pub endpoints: ApiEndpointsConfig,
+    #[serde(default)]
+    pub host: String,
+    #[serde(default)]
+    pub port: u16,
+    #[serde(default)]
+    pub cors_origins: Vec<String>,
+    #[serde(default)]
+    pub rate_limit: u32,
+    #[serde(default)]
+    pub auth_required: bool,
+    #[serde(default)]
+    pub endpoints: ApiEndpointsConfig,
 }
 impl Default for ApiConfig {
     fn default() -> Self {
@@ -1611,22 +2265,36 @@ impl Default for ApiConfig {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct EmergencyConfig {
     pub enabled: bool,
-    #[serde(default)] pub stop_on_error: bool,
+    #[serde(default)]
+    pub stop_on_error: bool,
 }
 impl Default for EmergencyConfig {
-    fn default() -> Self { Self { enabled: true, stop_on_error: false } }
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            stop_on_error: false,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct StrategyConfig {
-    #[serde(rename = "type")] pub type_str: String,
-    #[serde(default)] pub use_wrapper: bool,
-    #[serde(default)] pub fallback_enabled: bool,
-    #[serde(default)] pub max_complexity: u32,
-    #[serde(default)] pub profit_calculation: String,
-    #[serde(default)] pub name: String,
-    #[serde(default)] pub description: String,
-    #[serde(default)] pub max_positions: u32,
+    #[serde(rename = "type")]
+    pub type_str: String,
+    #[serde(default)]
+    pub use_wrapper: bool,
+    #[serde(default)]
+    pub fallback_enabled: bool,
+    #[serde(default)]
+    pub max_complexity: u32,
+    #[serde(default)]
+    pub profit_calculation: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub max_positions: u32,
 }
 impl Default for StrategyConfig {
     fn default() -> Self {
@@ -1646,32 +2314,53 @@ impl Default for StrategyConfig {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ComplianceConfig {
     pub enabled: bool,
-    #[serde(default)] pub auditor: String,
-    #[serde(default)] pub mode: String,
+    #[serde(default)]
+    pub auditor: String,
+    #[serde(default)]
+    pub mode: String,
 }
 impl Default for ComplianceConfig {
     fn default() -> Self {
-        Self { enabled: false, auditor: String::new(), mode: "passive".to_string() }
+        Self {
+            enabled: false,
+            auditor: String::new(),
+            mode: "passive".to_string(),
+        }
     }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SecurityConfig {
-    #[serde(default)] pub tls_enabled: bool,
-    #[serde(default)] pub cert_path: String,
+    #[serde(default)]
+    pub tls_enabled: bool,
+    #[serde(default)]
+    pub cert_path: String,
 }
 impl Default for SecurityConfig {
-    fn default() -> Self { Self { tls_enabled: false, cert_path: String::new() } }
+    fn default() -> Self {
+        Self {
+            tls_enabled: false,
+            cert_path: String::new(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct BacktestingConfig {
     pub enabled: bool,
-    #[serde(default)] pub start_date: String,
-    #[serde(default)] pub end_date: String,
+    #[serde(default)]
+    pub start_date: String,
+    #[serde(default)]
+    pub end_date: String,
 }
 impl Default for BacktestingConfig {
-    fn default() -> Self { Self { enabled: false, start_date: String::new(), end_date: String::new() } }
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            start_date: String::new(),
+            end_date: String::new(),
+        }
+    }
 }
 
 // ===============================
@@ -1680,27 +2369,43 @@ impl Default for BacktestingConfig {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CacheTypesConfig {
-    #[serde(default)] pub prices: u64,
-    #[serde(default)] pub pools: u64,
-    #[serde(default)] pub opportunities: u64,
-    #[serde(default)] pub gas: u64,
+    #[serde(default)]
+    pub prices: u64,
+    #[serde(default)]
+    pub pools: u64,
+    #[serde(default)]
+    pub opportunities: u64,
+    #[serde(default)]
+    pub gas: u64,
 }
 impl Default for CacheTypesConfig {
     fn default() -> Self {
-        Self { prices: 30, pools: 30, opportunities: 10, gas: 10 }
+        Self {
+            prices: 30,
+            pools: 30,
+            opportunities: 10,
+            gas: 10,
+        }
     }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct CacheConfig {
     pub enabled: bool,
-    #[serde(default)] pub max_size_mb: u32,
-    #[serde(default)] pub redis_url: String,
-    #[serde(default)] pub ttl_seconds: u64,
-    #[serde(default)] pub max_cache_size: usize,
-    #[serde(default)] pub cleanup_interval: u64,
-    #[serde(default)] pub adaptive_cache_cleanup: bool,
-    #[serde(default)] pub types: CacheTypesConfig,
+    #[serde(default)]
+    pub max_size_mb: u32,
+    #[serde(default)]
+    pub redis_url: String,
+    #[serde(default)]
+    pub ttl_seconds: u64,
+    #[serde(default)]
+    pub max_cache_size: usize,
+    #[serde(default)]
+    pub cleanup_interval: u64,
+    #[serde(default)]
+    pub adaptive_cache_cleanup: bool,
+    #[serde(default)]
+    pub types: CacheTypesConfig,
 }
 // Substitua/atualize a impl Default para CacheConfig (procure pelo bloco `impl Default for CacheConfig`)
 impl Default for CacheConfig {
@@ -1721,11 +2426,16 @@ impl Default for CacheConfig {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RateLimitingConfig {
-    #[serde(default)] pub rpc_requests_per_second: u64,
-    #[serde(default)] pub dex_requests_per_second: u64,
-    #[serde(default)] pub batch_size: u32,
-    #[serde(default)] pub max_concurrent_tasks: u32,
-    #[serde(default)] pub auto_backoff: bool,
+    #[serde(default)]
+    pub rpc_requests_per_second: u64,
+    #[serde(default)]
+    pub dex_requests_per_second: u64,
+    #[serde(default)]
+    pub batch_size: u32,
+    #[serde(default)]
+    pub max_concurrent_tasks: u32,
+    #[serde(default)]
+    pub auto_backoff: bool,
 }
 impl Default for RateLimitingConfig {
     fn default() -> Self {
@@ -1741,33 +2451,52 @@ impl Default for RateLimitingConfig {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PriceFeedOraclesConfig {
-    #[serde(default)] pub chainlink: String,
-    #[serde(default)] pub band_protocol: String,
+    #[serde(default)]
+    pub chainlink: String,
+    #[serde(default)]
+    pub band_protocol: String,
 }
 impl Default for PriceFeedOraclesConfig {
     fn default() -> Self {
-        Self { chainlink: String::new(), band_protocol: String::new() }
+        Self {
+            chainlink: String::new(),
+            band_protocol: String::new(),
+        }
     }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PriceFeedAggregatorsConfig {
-    #[serde(default)] pub coinmarketcap: bool,
-    #[serde(default)] pub coingecko: bool,
-    #[serde(default)] pub defillama: bool,
+    #[serde(default)]
+    pub coinmarketcap: bool,
+    #[serde(default)]
+    pub coingecko: bool,
+    #[serde(default)]
+    pub defillama: bool,
 }
 impl Default for PriceFeedAggregatorsConfig {
-    fn default() -> Self { Self { coinmarketcap: false, coingecko: true, defillama: false } }
+    fn default() -> Self {
+        Self {
+            coinmarketcap: false,
+            coingecko: true,
+            defillama: false,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PriceFeedConfig {
     pub enabled: bool,
-    #[serde(default)] pub update_interval: u32,
-    #[serde(default)] pub max_age_seconds: u32,
-    #[serde(default)] pub sources: Vec<String>,
-    #[serde(default)] pub oracles: PriceFeedOraclesConfig,
-    #[serde(default)] pub aggregators: PriceFeedAggregatorsConfig,
+    #[serde(default)]
+    pub update_interval: u32,
+    #[serde(default)]
+    pub max_age_seconds: u32,
+    #[serde(default)]
+    pub sources: Vec<String>,
+    #[serde(default)]
+    pub oracles: PriceFeedOraclesConfig,
+    #[serde(default)]
+    pub aggregators: PriceFeedAggregatorsConfig,
 }
 impl Default for PriceFeedConfig {
     fn default() -> Self {
@@ -1784,38 +2513,60 @@ impl Default for PriceFeedConfig {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DetectionFiltersConfig {
-    #[serde(default)] pub min_tvl: String,
-    #[serde(default)] pub min_volume_24h: String,
-    #[serde(default)] pub max_volatility: f64,
+    #[serde(default)]
+    pub min_tvl: String,
+    #[serde(default)]
+    pub min_volume_24h: String,
+    #[serde(default)]
+    pub max_volatility: f64,
 }
 impl Default for DetectionFiltersConfig {
     fn default() -> Self {
-        Self { min_tvl: "100000.0".to_string(), min_volume_24h: "100000.0".to_string(), max_volatility: 0.2 }
+        Self {
+            min_tvl: "100000.0".to_string(),
+            min_volume_24h: "100000.0".to_string(),
+            max_volatility: 0.2,
+        }
     }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DetectionAdvancedConfig {
-    #[serde(default)] pub path_discovery: bool,
-    #[serde(default)] pub cycle_detection: bool,
-    #[serde(default)] pub cross_dex_arbitrage: bool,
-    #[serde(default)] pub multi_hop_arbitrage: bool,
+    #[serde(default)]
+    pub path_discovery: bool,
+    #[serde(default)]
+    pub cycle_detection: bool,
+    #[serde(default)]
+    pub cross_dex_arbitrage: bool,
+    #[serde(default)]
+    pub multi_hop_arbitrage: bool,
 }
 impl Default for DetectionAdvancedConfig {
     fn default() -> Self {
-        Self { path_discovery: true, cycle_detection: true, cross_dex_arbitrage: true, multi_hop_arbitrage: true }
+        Self {
+            path_discovery: true,
+            cycle_detection: true,
+            cross_dex_arbitrage: true,
+            multi_hop_arbitrage: true,
+        }
     }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct DetectionConfig {
     pub enabled: bool,
-    #[serde(default)] pub scan_interval_ms: u64,
-    #[serde(default)] pub max_opportunities_per_cycle: u32,
-    #[serde(default)] pub min_profitability: String,
-    #[serde(default)] pub max_gas_cost: String,
-    #[serde(default)] pub filters: DetectionFiltersConfig,
-    #[serde(default)] pub advanced: DetectionAdvancedConfig,
+    #[serde(default)]
+    pub scan_interval_ms: u64,
+    #[serde(default)]
+    pub max_opportunities_per_cycle: u32,
+    #[serde(default)]
+    pub min_profitability: String,
+    #[serde(default)]
+    pub max_gas_cost: String,
+    #[serde(default)]
+    pub filters: DetectionFiltersConfig,
+    #[serde(default)]
+    pub advanced: DetectionAdvancedConfig,
 }
 impl Default for DetectionConfig {
     fn default() -> Self {
@@ -1833,26 +2584,41 @@ impl Default for DetectionConfig {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RadarDebugConfig {
-    #[serde(default)] pub show_price_updates: bool,
-    #[serde(default)] pub show_liquidity: bool,
-    #[serde(default)] pub show_path_discovery: bool,
+    #[serde(default)]
+    pub show_price_updates: bool,
+    #[serde(default)]
+    pub show_liquidity: bool,
+    #[serde(default)]
+    pub show_path_discovery: bool,
 }
 impl Default for RadarDebugConfig {
     fn default() -> Self {
-        Self { show_price_updates: false, show_liquidity: false, show_path_discovery: false }
+        Self {
+            show_price_updates: false,
+            show_liquidity: false,
+            show_path_discovery: false,
+        }
     }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct RadarConfig {
-    #[serde(default)] pub scan_interval_seconds: u32,
-    #[serde(default)] pub timeout_ms: u64,
-    #[serde(default)] pub ultrafast_enabled: bool,
-    #[serde(default)] pub max_dex_parallel: u32,
-    #[serde(default)] pub max_pair_parallel: u32,
-    #[serde(default)] pub adaptive_interval: bool,
-    #[serde(default)] pub priority_mode: bool,
-    #[serde(default)] pub debug: RadarDebugConfig,
+    #[serde(default)]
+    pub scan_interval_seconds: u32,
+    #[serde(default)]
+    pub timeout_ms: u64,
+    #[serde(default)]
+    pub ultrafast_enabled: bool,
+    #[serde(default)]
+    pub max_dex_parallel: u32,
+    #[serde(default)]
+    pub max_pair_parallel: u32,
+    #[serde(default)]
+    pub adaptive_interval: bool,
+    #[serde(default)]
+    pub priority_mode: bool,
+    #[serde(default)]
+    pub debug: RadarDebugConfig,
 }
 impl Default for RadarConfig {
     fn default() -> Self {
@@ -1900,40 +2666,67 @@ pub struct Config {
     pub executor: ExecutorConfig,
     pub dex: Vec<DexEntry>,
     pub pairs: PairsConfig,
-    #[serde(skip_deserializing, default)] pub addresses: HashMap<String, Address>,
+    #[serde(skip_deserializing, default)]
+    pub addresses: HashMap<String, Address>,
     pub flashloan: FlashloanConfig,
     pub gas: GasConfig,
     pub arbitrage: ArbitrageConfig,
     pub execution: ExecutionConfig,
-    #[serde(default)] pub mev: MevConfig,
+    #[serde(default)]
+    pub mev: MevConfig,
     pub optimization: OptimizationConfig,
     pub performance: PerformanceConfig,
     pub prometheus: PrometheusConfig,
     pub risk: RiskConfig,
     pub telegram: Option<TelegramConfig>,
-    #[serde(default)] pub monitoring: MonitoringConfig,
-    #[serde(default)] pub metrics: MetricsConfig,
-    #[serde(default)] pub database: DatabaseConfig,
-    #[serde(default)] pub explorer: ExplorerConfig,
-    #[serde(default)] pub api: ApiConfig,
-    #[serde(default)] pub emergency: EmergencyConfig,
-    #[serde(default)] pub strategy: StrategyConfig,
-    #[serde(default)] pub compliance: ComplianceConfig,
-    #[serde(default)] pub security: SecurityConfig,
-    #[serde(default)] pub backtesting: BacktestingConfig,
-    #[serde(default)] pub cache: CacheConfig,
-    #[serde(default)] pub rate_limiting: RateLimitingConfig,
-    #[serde(default)] pub price_feed: PriceFeedConfig,
-    #[serde(default)] pub detection: DetectionConfig,
-    #[serde(default)] pub radar: RadarConfig,
-    #[serde(default)] pub wrapper: WrapperConfig,
-    #[serde(default)] pub analytics: AnalyticsConfig,
-    #[serde(default)] pub validation: ValidationConfig,
-    #[serde(default)] pub alerts: AlertsConfig,
-    #[serde(default)] pub debug: DebugConfig,
-    #[serde(default)] pub summary: SummaryConfig,
-    #[serde(default)] pub min_profit_usd_threshold: f64,
-    #[serde(skip)] pub cooldown_manager: Option<Arc<CooldownManager>>,
+    #[serde(default)]
+    pub monitoring: MonitoringConfig,
+    #[serde(default)]
+    pub metrics: MetricsConfig,
+    #[serde(default)]
+    pub database: DatabaseConfig,
+    #[serde(default)]
+    pub explorer: ExplorerConfig,
+    #[serde(default)]
+    pub api: ApiConfig,
+    #[serde(default)]
+    pub emergency: EmergencyConfig,
+    #[serde(default)]
+    pub strategy: StrategyConfig,
+    #[serde(default)]
+    pub compliance: ComplianceConfig,
+    #[serde(default)]
+    pub security: SecurityConfig,
+    #[serde(default)]
+    pub backtesting: BacktestingConfig,
+    #[serde(default)]
+    pub cache: CacheConfig,
+    #[serde(default)]
+    pub rate_limiting: RateLimitingConfig,
+    #[serde(default)]
+    pub price_feed: PriceFeedConfig,
+    #[serde(default)]
+    pub detection: DetectionConfig,
+    #[serde(default)]
+    pub radar: RadarConfig,
+    #[serde(default)]
+    pub wrapper: WrapperConfig,
+    #[serde(default)]
+    pub c2b_shadow: C2bShadowConfig,
+    #[serde(default)]
+    pub analytics: AnalyticsConfig,
+    #[serde(default)]
+    pub validation: ValidationConfig,
+    #[serde(default)]
+    pub alerts: AlertsConfig,
+    #[serde(default)]
+    pub debug: DebugConfig,
+    #[serde(default)]
+    pub summary: SummaryConfig,
+    #[serde(default)]
+    pub min_profit_usd_threshold: f64,
+    #[serde(skip)]
+    pub cooldown_manager: Option<Arc<CooldownManager>>,
 }
 
 /// Impl config
@@ -1961,8 +2754,12 @@ impl Config {
     }
 
     fn apply_fallbacks(&mut self) {
-        if !self.monitoring.enabled { self.monitoring.enabled = true; }
-        if self.monitoring.interval_sec == 0 { self.monitoring.interval_sec = 30; }
+        if !self.monitoring.enabled {
+            self.monitoring.enabled = true;
+        }
+        if self.monitoring.interval_sec == 0 {
+            self.monitoring.interval_sec = 30;
+        }
 
         if self.network.rpc_endpoints.is_none() {
             self.network.rpc_endpoints = Some(vec![self.network.rpc_url.clone()]);
@@ -1976,7 +2773,8 @@ impl Config {
             self.flashloan.flashloan_asset = Some("WMATIC".to_string());
         }
         if self.flashloan.flashloan_asset_address.is_none() {
-            self.flashloan.flashloan_asset_address = Some("0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270".to_string());
+            self.flashloan.flashloan_asset_address =
+                Some("0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270".to_string());
         }
         if self.flashloan.max_amount_wmatic.is_none() {
             self.flashloan.max_amount_wmatic = Some(10.0);
@@ -2002,19 +2800,29 @@ impl Config {
         }
 
         if self.execution.cooldown.enabled {
-            self.cooldown_manager = Some(Arc::new(CooldownManager::new(self.execution.cooldown.clone())));
-            info!("Cooldown Manager ON: global={}ms, pair={}ms",
-                self.execution.cooldown.global_ms, self.execution.cooldown.pair_ms);
+            self.cooldown_manager = Some(Arc::new(CooldownManager::new(
+                self.execution.cooldown.clone(),
+            )));
+            info!(
+                "Cooldown Manager ON: global={}ms, pair={}ms",
+                self.execution.cooldown.global_ms, self.execution.cooldown.pair_ms
+            );
         } else {
             warn!("Cooldown Manager OFF");
         }
 
         if self.arbitrage.cooldown_seconds < 5 {
-            warn!("Cooldown too low ({}s) -> set to 10s", self.arbitrage.cooldown_seconds);
+            warn!(
+                "Cooldown too low ({}s) -> set to 10s",
+                self.arbitrage.cooldown_seconds
+            );
             self.arbitrage.cooldown_seconds = 10;
         }
         if self.execution.retry_delay_ms < 1000 {
-            warn!("retry_delay_ms too low ({} ms) -> set to 2000 ms", self.execution.retry_delay_ms);
+            warn!(
+                "retry_delay_ms too low ({} ms) -> set to 2000 ms",
+                self.execution.retry_delay_ms
+            );
             self.execution.retry_delay_ms = 2000;
         }
 
@@ -2031,7 +2839,6 @@ impl Config {
             if self.execution.use_flashloan {
                 warn!("⚠ MEV está ativo — ignorando use_flashloan=true e forçando MEV bundle");
             }
-
         } else {
             // Caso MEV NÃO esteja ativo → respeitar 100% o config.toml
             if self.execution.use_flashloan {
@@ -2051,7 +2858,6 @@ impl Config {
             self.execution.execution_mode
         );
     }
-
 
     /// A partir daqui está ok
 
@@ -2114,13 +2920,15 @@ impl Config {
     }
 
     pub fn from_file(path: PathBuf) -> Result<Arc<Mutex<Config>>> {
-        let raw = fs::read_to_string(&path).with_context(|| format!("failed to read: {:?}", path))?;
+        let raw =
+            fs::read_to_string(&path).with_context(|| format!("failed to read: {:?}", path))?;
         let cleaned = remove_bom(&raw);
         let expanded = {
             let re = Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")?;
             re.replace_all(&cleaned, |caps: &regex::Captures| {
                 std::env::var(&caps[1]).unwrap_or_else(|_| caps[0].to_string())
-            }).to_string()
+            })
+            .to_string()
         };
         let mut cfg: Config = toml::from_str(&expanded)
             .with_context(|| format!("failed to parse TOML: {:?}", path))?;
@@ -2181,16 +2989,18 @@ impl Config {
     }
 
     async fn reload_config(cfg: &Arc<Mutex<Config>>, path: &PathBuf) -> Result<bool> {
-        let raw = fs::read_to_string(path).with_context(|| format!("failed to read: {:?}", path))?;
+        let raw =
+            fs::read_to_string(path).with_context(|| format!("failed to read: {:?}", path))?;
         let cleaned = remove_bom(&raw);
         let expanded = {
             let re = Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")?;
             re.replace_all(&cleaned, |caps: &regex::Captures| {
                 std::env::var(&caps[1]).unwrap_or_else(|_| caps[0].to_string())
-            }).to_string()
+            })
+            .to_string()
         };
-        let mut new_cfg: Config = toml::from_str(&expanded)
-            .context("failed to parse new TOML on reload")?;
+        let mut new_cfg: Config =
+            toml::from_str(&expanded).context("failed to parse new TOML on reload")?;
         report_ignored_keys(&expanded, &new_cfg, path);
 
         for (symbol, addr_str) in &new_cfg.pairs.tokens {
@@ -2215,10 +3025,11 @@ impl Config {
             let re = Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")?;
             re.replace_all(&cleaned, |caps: &regex::Captures| {
                 std::env::var(&caps[1]).unwrap_or_else(|_| caps[0].to_string())
-            }).to_string()
+            })
+            .to_string()
         };
-        let mut new_cfg: Config = toml::from_str(&expanded)
-            .context("failed to parse new TOML on reload")?;
+        let mut new_cfg: Config =
+            toml::from_str(&expanded).context("failed to parse new TOML on reload")?;
         report_ignored_keys(&expanded, &new_cfg, path.as_ref());
 
         for (symbol, addr_str) in &new_cfg.pairs.tokens {
@@ -2238,17 +3049,31 @@ impl Config {
         info!("===================================================");
         info!("CONFIG SNAPSHOT v4.8.7-REAL-MICRO (Direct Execution)");
         info!("===================================================");
-        info!("Version: {}", self.general.version.as_deref().unwrap_or("unknown"));
-        info!("Monitoring: {} ({}s)", self.monitoring.enabled, self.monitoring.interval_sec);
+        info!(
+            "Version: {}",
+            self.general.version.as_deref().unwrap_or("unknown")
+        );
+        info!(
+            "Monitoring: {} ({}s)",
+            self.monitoring.enabled, self.monitoring.interval_sec
+        );
         info!("Dry Run: {}", self.execution.dry_run);
         info!("Auto Replace TX: {}", self.execution.auto_replace_tx);
         info!("Priority Gwei: {:.2}", self.gas.priority_gwei);
         info!("Max Gwei: {}", self.gas.max_gwei);
-        info!("Min Profit (arbitrage): ${:.6}",
-            self.arbitrage.min_profit_absolute.parse::<f64>().unwrap_or(0.0));
+        info!(
+            "Min Profit (arbitrage): ${:.6}",
+            self.arbitrage
+                .min_profit_absolute
+                .parse::<f64>()
+                .unwrap_or(0.0)
+        );
         info!("Global min profit: ${:.6}", self.min_profit_usd_threshold);
         info!("Executor: {}", self.executor.address);
-        info!("Active DEX count: {}", self.dex.iter().filter(|d| d.enabled).count());
+        info!(
+            "Active DEX count: {}",
+            self.dex.iter().filter(|d| d.enabled).count()
+        );
         info!("MEV Enabled: {}", self.mev.enabled);
         if self.mev.enabled {
             info!("MEV Relay: {}", self.mev.relay_url);
@@ -2259,9 +3084,18 @@ impl Config {
         }
         info!("Cooldown Global: {} ms", self.execution.cooldown.global_ms);
         info!("Cooldown Pair: {} ms", self.execution.cooldown.pair_ms);
-        info!("Cooldown Strategy: {} ms", self.execution.cooldown.strategy_ms);
-        info!("Revert Penalty: {} ms", self.execution.cooldown.revert_penalty_ms);
-        info!("Max concurrent executions: {}", self.execution.cooldown.max_concurrent_executions);
+        info!(
+            "Cooldown Strategy: {} ms",
+            self.execution.cooldown.strategy_ms
+        );
+        info!(
+            "Revert Penalty: {} ms",
+            self.execution.cooldown.revert_penalty_ms
+        );
+        info!(
+            "Max concurrent executions: {}",
+            self.execution.cooldown.max_concurrent_executions
+        );
         info!("Cooldown Enabled: {}", self.execution.cooldown.enabled);
         info!("===================================================");
     }
@@ -2276,7 +3110,11 @@ impl Config {
 // ===============================
 
 fn remove_bom(content: &str) -> &str {
-    if content.starts_with('\u{feff}') { &content[3..] } else { content }
+    if content.starts_with('\u{feff}') {
+        &content[3..]
+    } else {
+        content
+    }
 }
 
 // ===============================
@@ -2321,6 +3159,7 @@ impl Default for Config {
             detection: DetectionConfig::default(),
             radar: RadarConfig::default(),
             wrapper: WrapperConfig::default(),
+            c2b_shadow: C2bShadowConfig::default(),
             analytics: AnalyticsConfig::default(),
             validation: ValidationConfig::default(),
             alerts: AlertsConfig::default(),
@@ -2341,6 +3180,95 @@ mod config_parser_tests {
     /// TOML completo e válido, a partir do default do próprio código.
     fn base_toml() -> String {
         toml::to_string(&Config::default()).expect("serialize default")
+    }
+
+    #[test]
+    fn c2b_shadow_defaults_to_fully_disabled() {
+        let cfg = C2bShadowConfig::default();
+        assert!(!cfg.shadow_enabled);
+        assert!(!cfg.primary_enabled);
+        assert!(!cfg.broadcast_enabled);
+        assert_eq!(cfg.shadow_every_n_blocks, 32);
+        assert_eq!(cfg.round_timeout_secs, 900);
+    }
+
+    #[test]
+    fn c2b_shadow_refuses_primary_or_broadcast_configuration() {
+        let mut cfg = C2bShadowConfig {
+            shadow_enabled: true,
+            ..Default::default()
+        };
+        assert!(cfg.shadow_runtime_enabled());
+        cfg.primary_enabled = true;
+        assert!(!cfg.shadow_runtime_enabled());
+        cfg.primary_enabled = false;
+        cfg.broadcast_enabled = true;
+        assert!(!cfg.shadow_runtime_enabled());
+    }
+
+    #[test]
+    fn canonical_defaults_pass_startup_validation() {
+        let cfg = C2bShadowConfig::default();
+        assert!(cfg.validate_canonical_startup().is_ok());
+    }
+
+    #[test]
+    fn canonical_broadcast_enabled_fails_startup() {
+        let cfg = C2bShadowConfig {
+            broadcast_enabled: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.validate_canonical_startup(),
+            Err(CanonicalStartupError::BroadcastEnabled)
+        );
+    }
+
+    #[test]
+    fn canonical_max_concurrent_rounds_above_one_fails_startup() {
+        let cfg = C2bShadowConfig {
+            canonical_max_concurrent_rounds: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.validate_canonical_startup(),
+            Err(CanonicalStartupError::MaxConcurrentRounds(2))
+        );
+    }
+
+    #[test]
+    fn canonical_pending_anchors_max_above_one_fails_startup() {
+        let cfg = C2bShadowConfig {
+            canonical_pending_anchors_max: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.validate_canonical_startup(),
+            Err(CanonicalStartupError::PendingAnchorsMax(2))
+        );
+    }
+
+    #[test]
+    fn canonical_unknown_profile_fails_startup() {
+        let cfg = C2bShadowConfig {
+            canonical_discovery_profile: "exotic".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.validate_canonical_startup(),
+            Err(CanonicalStartupError::UnknownProfile("exotic".into()))
+        );
+    }
+
+    #[test]
+    fn legacy_engine_skips_canonical_startup_validation() {
+        let cfg = C2bShadowConfig {
+            discovery_engine: "legacy".into(),
+            broadcast_enabled: true,
+            canonical_max_concurrent_rounds: 99,
+            ..Default::default()
+        };
+        assert!(cfg.validate_canonical_startup().is_ok());
     }
 
     #[test]
@@ -2365,7 +3293,10 @@ mod config_parser_tests {
         let raw = base_toml();
         let cfg: Config = toml::from_str(&raw).expect("parse");
         let ignored = Config::ignored_toml_keys(&raw, &cfg);
-        assert!(ignored.is_empty(), "não deveria ignorar nada, veio {ignored:?}");
+        assert!(
+            ignored.is_empty(),
+            "não deveria ignorar nada, veio {ignored:?}"
+        );
     }
 
     /// `[[dex]].liquidity_threshold_usd` era descartado pelo parser — o valor no
@@ -2401,8 +3332,14 @@ mod config_parser_tests {
     fn shipped_configs_have_no_ignored_keys() {
         for (name, raw) in [
             ("config.toml", include_str!("../../config/config.toml")),
-            ("config.dryrun.toml", include_str!("../../config/config.dryrun.toml")),
-            ("config.midtier.toml", include_str!("../../config/config.midtier.toml")),
+            (
+                "config.dryrun.toml",
+                include_str!("../../config/config.dryrun.toml"),
+            ),
+            (
+                "config.midtier.toml",
+                include_str!("../../config/config.midtier.toml"),
+            ),
         ] {
             let cfg: Config = toml::from_str(raw).expect(name);
             let ignored = Config::ignored_toml_keys(raw, &cfg);

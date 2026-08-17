@@ -1,19 +1,59 @@
-﻿// ================================================================
+// ================================================================
 // src/core/mod.rs â€” Final (ProduÃ§Ã£o 2025)
 // ================================================================
 
 pub mod arbitrage;
+pub mod bf_graph;
 pub mod bot;
+pub mod c2b_fork_stages;
+pub mod c2b_orchestrator;
+pub mod c2b_round;
+pub mod c2b_shadow_service;
+pub mod canonical_adapters;
+pub mod canonical_discovery;
+pub mod canonical_execution_context;
+pub mod canonical_metadata_cache;
+pub mod canonical_simulation;
+pub mod diagnostic_graph;
+pub mod dual_run_comparator;
 pub mod economics;
+pub mod executable_call;
+pub mod executable_opportunity;
+pub mod executable_price_edge;
+pub mod executable_price_graph;
+pub mod executable_readonly;
+pub mod executable_route_materializer;
+pub mod execution_profile;
+pub mod execution_viability;
 pub mod fixed_usd;
 pub mod flashloan;
+pub mod fork_balance_accounting;
+pub mod fork_candidate_dedup;
+pub mod fork_economics_comparison;
+pub mod fork_execution_domain;
+pub mod fork_preflight;
+pub mod fork_route_executor;
+pub mod fork_trace_validation;
+pub mod fresh_discovery_gate;
+pub mod fresh_economics;
 pub mod gas;
+pub mod gas_oracle;
+pub mod gas_profile;
+pub mod last_route_cache;
+pub mod nonce_reaper;
 pub mod paper_validation;
+pub mod phase2d_anchor;
+pub mod pipeline_obs;
+pub mod pool_state_sim;
+pub mod profit_ledger;
+pub mod quantization;
+pub mod read_only;
 pub mod replay_cross_model;
 pub mod replay_scan;
 pub mod risk;
+pub mod round_artifacts;
+pub mod route_artifact;
+pub mod sequential_route_economics;
 pub mod smart_retry;
+pub mod stability;
 pub mod types;
-
-
-

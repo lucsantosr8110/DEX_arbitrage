@@ -1,0 +1,3330 @@
+[
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "0:12",
+    "classification": "BF_PRIMARY_WITNESS",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      0,
+      12
+    ],
+    "fee_tiers": [
+      500,
+      null
+    ],
+    "graph_stage": "post",
+    "hops": 2,
+    "matched_bf_witness": true,
+    "parallel_variant_of": "0:12",
+    "pool_path": [
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0007796911572981,
+    "profile": "base",
+    "protocol_path": [
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_001",
+    "snapshot_id": "1",
+    "spread_pct": 0.07796911572981458,
+    "structural_cycle_key": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|",
+    "token_ids": [
+      0,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "USDT"
+    ],
+    "total_weight": -0.0007793873560516022
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "0:12",
+    "classification": "BF_PRIMARY_WITNESS",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      0,
+      12
+    ],
+    "fee_tiers": [
+      500,
+      null
+    ],
+    "graph_stage": "post",
+    "hops": 2,
+    "matched_bf_witness": true,
+    "parallel_variant_of": "0:12",
+    "pool_path": [
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.000779750128566,
+    "profile": "base",
+    "protocol_path": [
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_002",
+    "snapshot_id": "1",
+    "spread_pct": 0.07797501285660147,
+    "structural_cycle_key": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|",
+    "token_ids": [
+      0,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "USDT"
+    ],
+    "total_weight": -0.0007794462813741807
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "0:12",
+    "classification": "BF_PRIMARY_WITNESS",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      0,
+      12
+    ],
+    "fee_tiers": [
+      500,
+      null
+    ],
+    "graph_stage": "post",
+    "hops": 2,
+    "matched_bf_witness": true,
+    "parallel_variant_of": "0:12",
+    "pool_path": [
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.000779750128566,
+    "profile": "base",
+    "protocol_path": [
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_003",
+    "snapshot_id": "1",
+    "spread_pct": 0.07797501285660147,
+    "structural_cycle_key": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|",
+    "token_ids": [
+      0,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "USDT"
+    ],
+    "total_weight": -0.0007794462813741807
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "12:6:37",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      6,
+      37,
+      12
+    ],
+    "fee_tiers": [
+      500,
+      500,
+      null
+    ],
+    "graph_stage": "post",
+    "hops": 3,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "0:12",
+    "pool_path": [
+      null,
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0002281269506759,
+    "profile": "base",
+    "protocol_path": [
+      "V3",
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_001",
+    "snapshot_id": "1",
+    "spread_pct": 0.022812695067586652,
+    "structural_cycle_key": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0x7ceb23fd6bc0add59e62ac25578270cff1b9f619|UniswapV3|V3||500||0x7ceb23fd6bc0add59e62ac25578270cff1b9f619>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|",
+    "token_ids": [
+      0,
+      3,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "WETH",
+      "USDT"
+    ],
+    "total_weight": -0.0002281009336797643
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "12:6:37",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      6,
+      37,
+      12
+    ],
+    "fee_tiers": [
+      500,
+      500,
+      null
+    ],
+    "graph_stage": "post",
+    "hops": 3,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "0:12",
+    "pool_path": [
+      null,
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0002255371939612,
+    "profile": "base",
+    "protocol_path": [
+      "V3",
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_002",
+    "snapshot_id": "1",
+    "spread_pct": 0.022553719396123384,
+    "structural_cycle_key": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0x7ceb23fd6bc0add59e62ac25578270cff1b9f619|UniswapV3|V3||500||0x7ceb23fd6bc0add59e62ac25578270cff1b9f619>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|",
+    "token_ids": [
+      0,
+      3,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "WETH",
+      "USDT"
+    ],
+    "total_weight": -0.00022551176427179257
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "12:6:37",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      6,
+      37,
+      12
+    ],
+    "fee_tiers": [
+      500,
+      500,
+      null
+    ],
+    "graph_stage": "post",
+    "hops": 3,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "0:12",
+    "pool_path": [
+      null,
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0002252934987481,
+    "profile": "base",
+    "protocol_path": [
+      "V3",
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_003",
+    "snapshot_id": "1",
+    "spread_pct": 0.022529349874811366,
+    "structural_cycle_key": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0x7ceb23fd6bc0add59e62ac25578270cff1b9f619|UniswapV3|V3||500||0x7ceb23fd6bc0add59e62ac25578270cff1b9f619>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|",
+    "token_ids": [
+      0,
+      3,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "WETH",
+      "USDT"
+    ],
+    "total_weight": -0.0002252681239789334
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "12:8:54:37",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "UniswapV3",
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      8,
+      54,
+      37,
+      12
+    ],
+    "fee_tiers": [
+      500,
+      500,
+      500,
+      null
+    ],
+    "graph_stage": "post",
+    "hops": 4,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "0:12",
+    "pool_path": [
+      null,
+      null,
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0004344335818556,
+    "profile": "base",
+    "protocol_path": [
+      "V3",
+      "V3",
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_001",
+    "snapshot_id": "1",
+    "spread_pct": 0.04344335818555756,
+    "structural_cycle_key": "0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6>0x7ceb23fd6bc0add59e62ac25578270cff1b9f619|UniswapV3|V3||500||0x7ceb23fd6bc0add59e62ac25578270cff1b9f619>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|||0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6|UniswapV3|V3||500",
+    "token_ids": [
+      0,
+      4,
+      3,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "WBTC",
+      "WETH",
+      "USDT"
+    ],
+    "total_weight": -0.00043433924290873577
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "12:8:54:37",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "UniswapV3",
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      8,
+      54,
+      37,
+      12
+    ],
+    "fee_tiers": [
+      500,
+      500,
+      500,
+      null
+    ],
+    "graph_stage": "post",
+    "hops": 4,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "0:12",
+    "pool_path": [
+      null,
+      null,
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0004340017952815,
+    "profile": "base",
+    "protocol_path": [
+      "V3",
+      "V3",
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_002",
+    "snapshot_id": "1",
+    "spread_pct": 0.04340017952815245,
+    "structural_cycle_key": "0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6>0x7ceb23fd6bc0add59e62ac25578270cff1b9f619|UniswapV3|V3||500||0x7ceb23fd6bc0add59e62ac25578270cff1b9f619>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|||0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6|UniswapV3|V3||500",
+    "token_ids": [
+      0,
+      4,
+      3,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "WBTC",
+      "WETH",
+      "USDT"
+    ],
+    "total_weight": -0.000433907643742677
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "12:8:54:37",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "UniswapV3",
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      8,
+      54,
+      37,
+      12
+    ],
+    "fee_tiers": [
+      500,
+      500,
+      500,
+      null
+    ],
+    "graph_stage": "post",
+    "hops": 4,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "0:12",
+    "pool_path": [
+      null,
+      null,
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0004337580492781,
+    "profile": "base",
+    "protocol_path": [
+      "V3",
+      "V3",
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_003",
+    "snapshot_id": "1",
+    "spread_pct": 0.04337580492781434,
+    "structural_cycle_key": "0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6>0x7ceb23fd6bc0add59e62ac25578270cff1b9f619|UniswapV3|V3||500||0x7ceb23fd6bc0add59e62ac25578270cff1b9f619>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|||0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6|UniswapV3|V3||500",
+    "token_ids": [
+      0,
+      4,
+      3,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "WBTC",
+      "WETH",
+      "USDT"
+    ],
+    "total_weight": -0.0004336640034499272
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "13:67:25",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      13,
+      67,
+      25
+    ],
+    "fee_tiers": [
+      500,
+      500,
+      null
+    ],
+    "graph_stage": "pre",
+    "hops": 3,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "25:2",
+    "pool_path": [
+      null,
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0002281269506759,
+    "profile": "base",
+    "protocol_path": [
+      "V3",
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_001",
+    "snapshot_id": "1",
+    "spread_pct": 0.022812695067586652,
+    "structural_cycle_key": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0x7ceb23fd6bc0add59e62ac25578270cff1b9f619|UniswapV3|V3||500||0x7ceb23fd6bc0add59e62ac25578270cff1b9f619>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|",
+    "token_ids": [
+      0,
+      3,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "WETH",
+      "USDT"
+    ],
+    "total_weight": -0.0002281009336797643
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "13:67:25",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      13,
+      67,
+      25
+    ],
+    "fee_tiers": [
+      500,
+      500,
+      null
+    ],
+    "graph_stage": "pre",
+    "hops": 3,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "25:2",
+    "pool_path": [
+      null,
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0002255371939612,
+    "profile": "base",
+    "protocol_path": [
+      "V3",
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_002",
+    "snapshot_id": "1",
+    "spread_pct": 0.022553719396123384,
+    "structural_cycle_key": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0x7ceb23fd6bc0add59e62ac25578270cff1b9f619|UniswapV3|V3||500||0x7ceb23fd6bc0add59e62ac25578270cff1b9f619>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|",
+    "token_ids": [
+      0,
+      3,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "WETH",
+      "USDT"
+    ],
+    "total_weight": -0.00022551176427179257
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "13:67:25",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      13,
+      67,
+      25
+    ],
+    "fee_tiers": [
+      500,
+      500,
+      null
+    ],
+    "graph_stage": "pre",
+    "hops": 3,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "25:2",
+    "pool_path": [
+      null,
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0002252934987481,
+    "profile": "base",
+    "protocol_path": [
+      "V3",
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_003",
+    "snapshot_id": "1",
+    "spread_pct": 0.022529349874811366,
+    "structural_cycle_key": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0x7ceb23fd6bc0add59e62ac25578270cff1b9f619|UniswapV3|V3||500||0x7ceb23fd6bc0add59e62ac25578270cff1b9f619>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|",
+    "token_ids": [
+      0,
+      3,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "WETH",
+      "USDT"
+    ],
+    "total_weight": -0.0002252681239789334
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "18:95:67:25",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "UniswapV3",
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      18,
+      95,
+      67,
+      25
+    ],
+    "fee_tiers": [
+      500,
+      500,
+      500,
+      null
+    ],
+    "graph_stage": "pre",
+    "hops": 4,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "25:2",
+    "pool_path": [
+      null,
+      null,
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0004344335818556,
+    "profile": "base",
+    "protocol_path": [
+      "V3",
+      "V3",
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_001",
+    "snapshot_id": "1",
+    "spread_pct": 0.04344335818555756,
+    "structural_cycle_key": "0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6>0x7ceb23fd6bc0add59e62ac25578270cff1b9f619|UniswapV3|V3||500||0x7ceb23fd6bc0add59e62ac25578270cff1b9f619>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|||0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6|UniswapV3|V3||500",
+    "token_ids": [
+      0,
+      4,
+      3,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "WBTC",
+      "WETH",
+      "USDT"
+    ],
+    "total_weight": -0.00043433924290873577
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "18:95:67:25",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "UniswapV3",
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      18,
+      95,
+      67,
+      25
+    ],
+    "fee_tiers": [
+      500,
+      500,
+      500,
+      null
+    ],
+    "graph_stage": "pre",
+    "hops": 4,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "25:2",
+    "pool_path": [
+      null,
+      null,
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0004340017952815,
+    "profile": "base",
+    "protocol_path": [
+      "V3",
+      "V3",
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_002",
+    "snapshot_id": "1",
+    "spread_pct": 0.04340017952815245,
+    "structural_cycle_key": "0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6>0x7ceb23fd6bc0add59e62ac25578270cff1b9f619|UniswapV3|V3||500||0x7ceb23fd6bc0add59e62ac25578270cff1b9f619>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|||0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6|UniswapV3|V3||500",
+    "token_ids": [
+      0,
+      4,
+      3,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "WBTC",
+      "WETH",
+      "USDT"
+    ],
+    "total_weight": -0.000433907643742677
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "18:95:67:25",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "UniswapV3",
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      18,
+      95,
+      67,
+      25
+    ],
+    "fee_tiers": [
+      500,
+      500,
+      500,
+      null
+    ],
+    "graph_stage": "pre",
+    "hops": 4,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "25:2",
+    "pool_path": [
+      null,
+      null,
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0004337580492781,
+    "profile": "base",
+    "protocol_path": [
+      "V3",
+      "V3",
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_003",
+    "snapshot_id": "1",
+    "spread_pct": 0.04337580492781434,
+    "structural_cycle_key": "0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6>0x7ceb23fd6bc0add59e62ac25578270cff1b9f619|UniswapV3|V3||500||0x7ceb23fd6bc0add59e62ac25578270cff1b9f619>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|||0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6|UniswapV3|V3||500",
+    "token_ids": [
+      0,
+      4,
+      3,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "WBTC",
+      "WETH",
+      "USDT"
+    ],
+    "total_weight": -0.0004336640034499272
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "25:2",
+    "classification": "BF_PRIMARY_WITNESS",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      2,
+      25
+    ],
+    "fee_tiers": [
+      500,
+      null
+    ],
+    "graph_stage": "pre",
+    "hops": 2,
+    "matched_bf_witness": true,
+    "parallel_variant_of": "25:2",
+    "pool_path": [
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0007796911572981,
+    "profile": "base",
+    "protocol_path": [
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_001",
+    "snapshot_id": "1",
+    "spread_pct": 0.07796911572981458,
+    "structural_cycle_key": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|",
+    "token_ids": [
+      0,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "USDT"
+    ],
+    "total_weight": -0.0007793873560516022
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "25:2",
+    "classification": "BF_PRIMARY_WITNESS",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      2,
+      25
+    ],
+    "fee_tiers": [
+      500,
+      null
+    ],
+    "graph_stage": "pre",
+    "hops": 2,
+    "matched_bf_witness": true,
+    "parallel_variant_of": "25:2",
+    "pool_path": [
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.000779750128566,
+    "profile": "base",
+    "protocol_path": [
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_002",
+    "snapshot_id": "1",
+    "spread_pct": 0.07797501285660147,
+    "structural_cycle_key": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|",
+    "token_ids": [
+      0,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "USDT"
+    ],
+    "total_weight": -0.0007794462813741807
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "25:2",
+    "classification": "BF_PRIMARY_WITNESS",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      2,
+      25
+    ],
+    "fee_tiers": [
+      500,
+      null
+    ],
+    "graph_stage": "pre",
+    "hops": 2,
+    "matched_bf_witness": true,
+    "parallel_variant_of": "25:2",
+    "pool_path": [
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.000779750128566,
+    "profile": "base",
+    "protocol_path": [
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_003",
+    "snapshot_id": "1",
+    "spread_pct": 0.07797501285660147,
+    "structural_cycle_key": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|",
+    "token_ids": [
+      0,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "USDT"
+    ],
+    "total_weight": -0.0007794462813741807
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "0:16",
+    "classification": "BF_PRIMARY_WITNESS",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      0,
+      16
+    ],
+    "fee_tiers": [
+      500,
+      null
+    ],
+    "graph_stage": "post",
+    "hops": 2,
+    "matched_bf_witness": true,
+    "parallel_variant_of": "0:16",
+    "pool_path": [
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0007796897568177,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_001",
+    "snapshot_id": "1",
+    "spread_pct": 0.07796897568177474,
+    "structural_cycle_key": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|",
+    "token_ids": [
+      0,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "USDT"
+    ],
+    "total_weight": -0.0007793859566622944
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "0:16",
+    "classification": "BF_PRIMARY_WITNESS",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      0,
+      16
+    ],
+    "fee_tiers": [
+      500,
+      null
+    ],
+    "graph_stage": "post",
+    "hops": 2,
+    "matched_bf_witness": true,
+    "parallel_variant_of": "0:16",
+    "pool_path": [
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.000779692592294,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_002",
+    "snapshot_id": "1",
+    "spread_pct": 0.07796925922940456,
+    "structural_cycle_key": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|",
+    "token_ids": [
+      0,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "USDT"
+    ],
+    "total_weight": -0.0007793887899295191
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "0:16",
+    "classification": "BF_PRIMARY_WITNESS",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      0,
+      16
+    ],
+    "fee_tiers": [
+      500,
+      null
+    ],
+    "graph_stage": "post",
+    "hops": 2,
+    "matched_bf_witness": true,
+    "parallel_variant_of": "0:16",
+    "pool_path": [
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0007796925947072,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_003",
+    "snapshot_id": "1",
+    "spread_pct": 0.07796925947072264,
+    "structural_cycle_key": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|",
+    "token_ids": [
+      0,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "USDT"
+    ],
+    "total_weight": -0.0007793887923408198
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "0:16",
+    "classification": "BF_PRIMARY_WITNESS",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      0,
+      16
+    ],
+    "fee_tiers": [
+      500,
+      null
+    ],
+    "graph_stage": "post",
+    "hops": 2,
+    "matched_bf_witness": true,
+    "parallel_variant_of": "0:16",
+    "pool_path": [
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0007797033110164,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_004",
+    "snapshot_id": "1",
+    "spread_pct": 0.07797033110163998,
+    "structural_cycle_key": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|",
+    "token_ids": [
+      0,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "USDT"
+    ],
+    "total_weight": -0.0007793995003010186
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "0:16",
+    "classification": "BF_PRIMARY_WITNESS",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      0,
+      16
+    ],
+    "fee_tiers": [
+      500,
+      null
+    ],
+    "graph_stage": "post",
+    "hops": 2,
+    "matched_bf_witness": true,
+    "parallel_variant_of": "0:16",
+    "pool_path": [
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0007797121507238,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_005",
+    "snapshot_id": "1",
+    "spread_pct": 0.07797121507238103,
+    "structural_cycle_key": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|",
+    "token_ids": [
+      0,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "USDT"
+    ],
+    "total_weight": -0.0007794083331214108
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "0:28:86",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "Curve",
+      "Curve"
+    ],
+    "edge_ids": [
+      0,
+      28,
+      86
+    ],
+    "fee_tiers": [
+      500,
+      null,
+      null
+    ],
+    "graph_stage": "post",
+    "hops": 3,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "0:16",
+    "pool_path": [
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351",
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0007695979714237,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "CurveStableSwap",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_001",
+    "snapshot_id": "1",
+    "spread_pct": 0.076959797142373,
+    "structural_cycle_key": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x8f3cf7ad23cd3cadbd9735aff958023239c6a063|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|||0x8f3cf7ad23cd3cadbd9735aff958023239c6a063>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|",
+    "token_ids": [
+      0,
+      1,
+      5,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "USDT",
+      "DAI"
+    ],
+    "total_weight": -0.0007693019827567033
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "0:28:86",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "Curve",
+      "Curve"
+    ],
+    "edge_ids": [
+      0,
+      28,
+      86
+    ],
+    "fee_tiers": [
+      500,
+      null,
+      null
+    ],
+    "graph_stage": "post",
+    "hops": 3,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "0:16",
+    "pool_path": [
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351",
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0007696001971937,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "CurveStableSwap",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_002",
+    "snapshot_id": "1",
+    "spread_pct": 0.07696001971937427,
+    "structural_cycle_key": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x8f3cf7ad23cd3cadbd9735aff958023239c6a063|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|||0x8f3cf7ad23cd3cadbd9735aff958023239c6a063>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|",
+    "token_ids": [
+      0,
+      1,
+      5,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "USDT",
+      "DAI"
+    ],
+    "total_weight": -0.0007693042068150828
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "0:28:86",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "Curve",
+      "Curve"
+    ],
+    "edge_ids": [
+      0,
+      28,
+      86
+    ],
+    "fee_tiers": [
+      500,
+      null,
+      null
+    ],
+    "graph_stage": "post",
+    "hops": 3,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "0:16",
+    "pool_path": [
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351",
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0007696004429867,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "CurveStableSwap",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_003",
+    "snapshot_id": "1",
+    "spread_pct": 0.07696004429866843,
+    "structural_cycle_key": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x8f3cf7ad23cd3cadbd9735aff958023239c6a063|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|||0x8f3cf7ad23cd3cadbd9735aff958023239c6a063>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|",
+    "token_ids": [
+      0,
+      1,
+      5,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "USDT",
+      "DAI"
+    ],
+    "total_weight": -0.0007693044524190075
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "0:28:86",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "Curve",
+      "Curve"
+    ],
+    "edge_ids": [
+      0,
+      28,
+      86
+    ],
+    "fee_tiers": [
+      500,
+      null,
+      null
+    ],
+    "graph_stage": "post",
+    "hops": 3,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "0:16",
+    "pool_path": [
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351",
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0007696144508518,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "CurveStableSwap",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_004",
+    "snapshot_id": "1",
+    "spread_pct": 0.07696144508517744,
+    "structural_cycle_key": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x8f3cf7ad23cd3cadbd9735aff958023239c6a063|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|||0x8f3cf7ad23cd3cadbd9735aff958023239c6a063>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|",
+    "token_ids": [
+      0,
+      1,
+      5,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "USDT",
+      "DAI"
+    ],
+    "total_weight": -0.0007693184495118307
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "0:28:86",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "Curve",
+      "Curve"
+    ],
+    "edge_ids": [
+      0,
+      28,
+      86
+    ],
+    "fee_tiers": [
+      500,
+      null,
+      null
+    ],
+    "graph_stage": "post",
+    "hops": 3,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "0:16",
+    "pool_path": [
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351",
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0007696234133683,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "CurveStableSwap",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_005",
+    "snapshot_id": "1",
+    "spread_pct": 0.07696234133682811,
+    "structural_cycle_key": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x8f3cf7ad23cd3cadbd9735aff958023239c6a063|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|||0x8f3cf7ad23cd3cadbd9735aff958023239c6a063>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|",
+    "token_ids": [
+      0,
+      1,
+      5,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "USDT",
+      "DAI"
+    ],
+    "total_weight": -0.0007693274051359196
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "16:3:37",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      3,
+      37,
+      16
+    ],
+    "fee_tiers": [
+      500,
+      500,
+      null
+    ],
+    "graph_stage": "post",
+    "hops": 3,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "0:16",
+    "pool_path": [
+      null,
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0001132981331098,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_002",
+    "snapshot_id": "1",
+    "spread_pct": 0.011329813310978487,
+    "structural_cycle_key": "0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|||0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270|UniswapV3|V3||500",
+    "token_ids": [
+      0,
+      2,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "WMATIC",
+      "USDT"
+    ],
+    "total_weight": -0.00011329171536104319
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "16:3:37",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      3,
+      37,
+      16
+    ],
+    "fee_tiers": [
+      500,
+      500,
+      null
+    ],
+    "graph_stage": "post",
+    "hops": 3,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "0:16",
+    "pool_path": [
+      null,
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.000290124385188,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_005",
+    "snapshot_id": "1",
+    "spread_pct": 0.029012438518805084,
+    "structural_cycle_key": "0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|||0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270|UniswapV3|V3||500",
+    "token_ids": [
+      0,
+      2,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "WMATIC",
+      "USDT"
+    ],
+    "total_weight": -0.00029008230724697156
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "16:3:39:54",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "QuickSwap",
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      3,
+      39,
+      54,
+      16
+    ],
+    "fee_tiers": [
+      500,
+      null,
+      500,
+      null
+    ],
+    "graph_stage": "post",
+    "hops": 4,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "0:16",
+    "pool_path": [
+      null,
+      null,
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0000403679248728,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "V2",
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_005",
+    "snapshot_id": "1",
+    "spread_pct": 0.0040367924872830585,
+    "structural_cycle_key": "0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270>0x7ceb23fd6bc0add59e62ac25578270cff1b9f619|QuickSwap|V2||||0x7ceb23fd6bc0add59e62ac25578270cff1b9f619>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|||0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270|UniswapV3|V3||500",
+    "token_ids": [
+      0,
+      2,
+      3,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "WMATIC",
+      "WETH",
+      "USDT"
+    ],
+    "total_weight": -4.0367110110078094e-05
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "16:6:54",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      6,
+      54,
+      16
+    ],
+    "fee_tiers": [
+      500,
+      500,
+      null
+    ],
+    "graph_stage": "post",
+    "hops": 3,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "0:16",
+    "pool_path": [
+      null,
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0002256847241247,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_001",
+    "snapshot_id": "1",
+    "spread_pct": 0.02256847241246529,
+    "structural_cycle_key": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0x7ceb23fd6bc0add59e62ac25578270cff1b9f619|UniswapV3|V3||500||0x7ceb23fd6bc0add59e62ac25578270cff1b9f619>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|",
+    "token_ids": [
+      0,
+      3,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "WETH",
+      "USDT"
+    ],
+    "total_weight": -0.0002256592611582976
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "16:6:54",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      6,
+      54,
+      16
+    ],
+    "fee_tiers": [
+      500,
+      500,
+      null
+    ],
+    "graph_stage": "post",
+    "hops": 3,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "0:16",
+    "pool_path": [
+      null,
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0000743192940722,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_005",
+    "snapshot_id": "1",
+    "spread_pct": 0.007431929407220039,
+    "structural_cycle_key": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0x7ceb23fd6bc0add59e62ac25578270cff1b9f619|UniswapV3|V3||500||0x7ceb23fd6bc0add59e62ac25578270cff1b9f619>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|",
+    "token_ids": [
+      0,
+      3,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "WETH",
+      "USDT"
+    ],
+    "total_weight": -7.431653253028774e-05
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "16:8:82:54",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "UniswapV3",
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      8,
+      82,
+      54,
+      16
+    ],
+    "fee_tiers": [
+      500,
+      500,
+      500,
+      null
+    ],
+    "graph_stage": "post",
+    "hops": 4,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "0:16",
+    "pool_path": [
+      null,
+      null,
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0004340859745273,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "V3",
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_001",
+    "snapshot_id": "1",
+    "spread_pct": 0.04340859745273207,
+    "structural_cycle_key": "0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6>0x7ceb23fd6bc0add59e62ac25578270cff1b9f619|UniswapV3|V3||500||0x7ceb23fd6bc0add59e62ac25578270cff1b9f619>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|||0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6|UniswapV3|V3||500",
+    "token_ids": [
+      0,
+      4,
+      3,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "WBTC",
+      "WETH",
+      "USDT"
+    ],
+    "total_weight": -0.00043399178646683827
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "16:8:82:54",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "UniswapV3",
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      8,
+      82,
+      54,
+      16
+    ],
+    "fee_tiers": [
+      500,
+      500,
+      500,
+      null
+    ],
+    "graph_stage": "post",
+    "hops": 4,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "0:16",
+    "pool_path": [
+      null,
+      null,
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0000417276876028,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "V3",
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_002",
+    "snapshot_id": "1",
+    "spread_pct": 0.0041727687602799435,
+    "structural_cycle_key": "0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6>0x7ceb23fd6bc0add59e62ac25578270cff1b9f619|UniswapV3|V3||500||0x7ceb23fd6bc0add59e62ac25578270cff1b9f619>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|||0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6|UniswapV3|V3||500",
+    "token_ids": [
+      0,
+      4,
+      3,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "WBTC",
+      "WETH",
+      "USDT"
+    ],
+    "total_weight": -4.1726817027061085e-05
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "16:8:82:54",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "UniswapV3",
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      8,
+      82,
+      54,
+      16
+    ],
+    "fee_tiers": [
+      500,
+      500,
+      500,
+      null
+    ],
+    "graph_stage": "post",
+    "hops": 4,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "0:16",
+    "pool_path": [
+      null,
+      null,
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0000685658124076,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "V3",
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_004",
+    "snapshot_id": "1",
+    "spread_pct": 0.006856581240755055,
+    "structural_cycle_key": "0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6>0x7ceb23fd6bc0add59e62ac25578270cff1b9f619|UniswapV3|V3||500||0x7ceb23fd6bc0add59e62ac25578270cff1b9f619>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|||0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6|UniswapV3|V3||500",
+    "token_ids": [
+      0,
+      4,
+      3,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "WBTC",
+      "WETH",
+      "USDT"
+    ],
+    "total_weight": -6.856346187967829e-05
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "28:86:3:37",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "UniswapV3",
+      "Curve",
+      "Curve"
+    ],
+    "edge_ids": [
+      3,
+      37,
+      28,
+      86
+    ],
+    "fee_tiers": [
+      500,
+      500,
+      null,
+      null
+    ],
+    "graph_stage": "post",
+    "hops": 4,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "0:16",
+    "pool_path": [
+      null,
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351",
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.000103212458286,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "V3",
+      "CurveStableSwap",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_002",
+    "snapshot_id": "1",
+    "spread_pct": 0.010321245828603942,
+    "structural_cycle_key": "0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x8f3cf7ad23cd3cadbd9735aff958023239c6a063|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|||0x8f3cf7ad23cd3cadbd9735aff958023239c6a063>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|||0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270|UniswapV3|V3||500",
+    "token_ids": [
+      0,
+      2,
+      1,
+      5,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "WMATIC",
+      "USDT",
+      "DAI"
+    ],
+    "total_weight": -0.00010320713224673928
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "28:86:3:37",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "UniswapV3",
+      "Curve",
+      "Curve"
+    ],
+    "edge_ids": [
+      3,
+      37,
+      28,
+      86
+    ],
+    "fee_tiers": [
+      500,
+      500,
+      null,
+      null
+    ],
+    "graph_stage": "post",
+    "hops": 4,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "0:16",
+    "pool_path": [
+      null,
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351",
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0002800405833066,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "V3",
+      "CurveStableSwap",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_005",
+    "snapshot_id": "1",
+    "spread_pct": 0.028004058330655113,
+    "structural_cycle_key": "0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x8f3cf7ad23cd3cadbd9735aff958023239c6a063|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|||0x8f3cf7ad23cd3cadbd9735aff958023239c6a063>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|||0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270|UniswapV3|V3||500",
+    "token_ids": [
+      0,
+      2,
+      1,
+      5,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "WMATIC",
+      "USDT",
+      "DAI"
+    ],
+    "total_weight": -0.0002800013792613801
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "28:86:6:54",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "UniswapV3",
+      "Curve",
+      "Curve"
+    ],
+    "edge_ids": [
+      6,
+      54,
+      28,
+      86
+    ],
+    "fee_tiers": [
+      500,
+      500,
+      null,
+      null
+    ],
+    "graph_stage": "post",
+    "hops": 4,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "0:16",
+    "pool_path": [
+      null,
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351",
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0002155985252748,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "V3",
+      "CurveStableSwap",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_001",
+    "snapshot_id": "1",
+    "spread_pct": 0.021559852527475165,
+    "structural_cycle_key": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0x7ceb23fd6bc0add59e62ac25578270cff1b9f619|UniswapV3|V3||500||0x7ceb23fd6bc0add59e62ac25578270cff1b9f619>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x8f3cf7ad23cd3cadbd9735aff958023239c6a063|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|||0x8f3cf7ad23cd3cadbd9735aff958023239c6a063>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|",
+    "token_ids": [
+      0,
+      3,
+      1,
+      5,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "WETH",
+      "USDT",
+      "DAI"
+    ],
+    "total_weight": -0.00021557528725269686
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "28:86:6:54",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "UniswapV3",
+      "Curve",
+      "Curve"
+    ],
+    "edge_ids": [
+      6,
+      54,
+      28,
+      86
+    ],
+    "fee_tiers": [
+      500,
+      500,
+      null,
+      null
+    ],
+    "graph_stage": "post",
+    "hops": 4,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "0:16",
+    "pool_path": [
+      null,
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351",
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0000642376676954,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "V3",
+      "CurveStableSwap",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_005",
+    "snapshot_id": "1",
+    "spread_pct": 0.0064237667695365985,
+    "structural_cycle_key": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0x7ceb23fd6bc0add59e62ac25578270cff1b9f619|UniswapV3|V3||500||0x7ceb23fd6bc0add59e62ac25578270cff1b9f619>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x8f3cf7ad23cd3cadbd9735aff958023239c6a063|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|||0x8f3cf7ad23cd3cadbd9735aff958023239c6a063>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|",
+    "token_ids": [
+      0,
+      3,
+      1,
+      5,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "WETH",
+      "USDT",
+      "DAI"
+    ],
+    "total_weight": -6.423560454474469e-05
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "117:36:13",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      13,
+      117,
+      36
+    ],
+    "fee_tiers": [
+      500,
+      500,
+      null
+    ],
+    "graph_stage": "pre",
+    "hops": 3,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "2:36",
+    "pool_path": [
+      null,
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0002256847241247,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_001",
+    "snapshot_id": "1",
+    "spread_pct": 0.02256847241246529,
+    "structural_cycle_key": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0x7ceb23fd6bc0add59e62ac25578270cff1b9f619|UniswapV3|V3||500||0x7ceb23fd6bc0add59e62ac25578270cff1b9f619>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|",
+    "token_ids": [
+      0,
+      3,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "WETH",
+      "USDT"
+    ],
+    "total_weight": -0.0002256592611582976
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "117:36:13",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      13,
+      117,
+      36
+    ],
+    "fee_tiers": [
+      500,
+      500,
+      null
+    ],
+    "graph_stage": "pre",
+    "hops": 3,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "2:36",
+    "pool_path": [
+      null,
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0000743192940722,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_005",
+    "snapshot_id": "1",
+    "spread_pct": 0.007431929407220039,
+    "structural_cycle_key": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0x7ceb23fd6bc0add59e62ac25578270cff1b9f619|UniswapV3|V3||500||0x7ceb23fd6bc0add59e62ac25578270cff1b9f619>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|",
+    "token_ids": [
+      0,
+      3,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "WETH",
+      "USDT"
+    ],
+    "total_weight": -7.431653253028774e-05
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "117:36:18:162",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "UniswapV3",
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      18,
+      162,
+      117,
+      36
+    ],
+    "fee_tiers": [
+      500,
+      500,
+      500,
+      null
+    ],
+    "graph_stage": "pre",
+    "hops": 4,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "2:36",
+    "pool_path": [
+      null,
+      null,
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0004340859745273,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "V3",
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_001",
+    "snapshot_id": "1",
+    "spread_pct": 0.04340859745273207,
+    "structural_cycle_key": "0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6>0x7ceb23fd6bc0add59e62ac25578270cff1b9f619|UniswapV3|V3||500||0x7ceb23fd6bc0add59e62ac25578270cff1b9f619>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|||0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6|UniswapV3|V3||500",
+    "token_ids": [
+      0,
+      4,
+      3,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "WBTC",
+      "WETH",
+      "USDT"
+    ],
+    "total_weight": -0.00043399178646683827
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "117:36:18:162",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "UniswapV3",
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      18,
+      162,
+      117,
+      36
+    ],
+    "fee_tiers": [
+      500,
+      500,
+      500,
+      null
+    ],
+    "graph_stage": "pre",
+    "hops": 4,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "2:36",
+    "pool_path": [
+      null,
+      null,
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0000417276876028,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "V3",
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_002",
+    "snapshot_id": "1",
+    "spread_pct": 0.0041727687602799435,
+    "structural_cycle_key": "0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6>0x7ceb23fd6bc0add59e62ac25578270cff1b9f619|UniswapV3|V3||500||0x7ceb23fd6bc0add59e62ac25578270cff1b9f619>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|||0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6|UniswapV3|V3||500",
+    "token_ids": [
+      0,
+      4,
+      3,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "WBTC",
+      "WETH",
+      "USDT"
+    ],
+    "total_weight": -4.1726817027061085e-05
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "117:36:18:162",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "UniswapV3",
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      18,
+      162,
+      117,
+      36
+    ],
+    "fee_tiers": [
+      500,
+      500,
+      500,
+      null
+    ],
+    "graph_stage": "pre",
+    "hops": 4,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "2:36",
+    "pool_path": [
+      null,
+      null,
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0000685658124076,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "V3",
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_004",
+    "snapshot_id": "1",
+    "spread_pct": 0.006856581240755055,
+    "structural_cycle_key": "0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6>0x7ceb23fd6bc0add59e62ac25578270cff1b9f619|UniswapV3|V3||500||0x7ceb23fd6bc0add59e62ac25578270cff1b9f619>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|||0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6|UniswapV3|V3||500",
+    "token_ids": [
+      0,
+      4,
+      3,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "WBTC",
+      "WETH",
+      "USDT"
+    ],
+    "total_weight": -6.856346187967829e-05
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "117:36:8:81",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "QuickSwap",
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      8,
+      81,
+      117,
+      36
+    ],
+    "fee_tiers": [
+      500,
+      null,
+      500,
+      null
+    ],
+    "graph_stage": "pre",
+    "hops": 4,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "2:36",
+    "pool_path": [
+      null,
+      null,
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0000403679248728,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "V2",
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_005",
+    "snapshot_id": "1",
+    "spread_pct": 0.0040367924872830585,
+    "structural_cycle_key": "0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270>0x7ceb23fd6bc0add59e62ac25578270cff1b9f619|QuickSwap|V2||||0x7ceb23fd6bc0add59e62ac25578270cff1b9f619>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|||0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270|UniswapV3|V3||500",
+    "token_ids": [
+      0,
+      2,
+      3,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "WMATIC",
+      "WETH",
+      "USDT"
+    ],
+    "total_weight": -4.0367110110078094e-05
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "117:56:179:13",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "UniswapV3",
+      "Curve",
+      "Curve"
+    ],
+    "edge_ids": [
+      13,
+      117,
+      56,
+      179
+    ],
+    "fee_tiers": [
+      500,
+      500,
+      null,
+      null
+    ],
+    "graph_stage": "pre",
+    "hops": 4,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "2:36",
+    "pool_path": [
+      null,
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351",
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0002155985252748,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "V3",
+      "CurveStableSwap",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_001",
+    "snapshot_id": "1",
+    "spread_pct": 0.021559852527475165,
+    "structural_cycle_key": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0x7ceb23fd6bc0add59e62ac25578270cff1b9f619|UniswapV3|V3||500||0x7ceb23fd6bc0add59e62ac25578270cff1b9f619>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x8f3cf7ad23cd3cadbd9735aff958023239c6a063|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|||0x8f3cf7ad23cd3cadbd9735aff958023239c6a063>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|",
+    "token_ids": [
+      0,
+      3,
+      1,
+      5,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "WETH",
+      "USDT",
+      "DAI"
+    ],
+    "total_weight": -0.00021557528725269686
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "117:56:179:13",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "UniswapV3",
+      "Curve",
+      "Curve"
+    ],
+    "edge_ids": [
+      13,
+      117,
+      56,
+      179
+    ],
+    "fee_tiers": [
+      500,
+      500,
+      null,
+      null
+    ],
+    "graph_stage": "pre",
+    "hops": 4,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "2:36",
+    "pool_path": [
+      null,
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351",
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0000642376676954,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "V3",
+      "CurveStableSwap",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_005",
+    "snapshot_id": "1",
+    "spread_pct": 0.0064237667695365985,
+    "structural_cycle_key": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0x7ceb23fd6bc0add59e62ac25578270cff1b9f619|UniswapV3|V3||500||0x7ceb23fd6bc0add59e62ac25578270cff1b9f619>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x8f3cf7ad23cd3cadbd9735aff958023239c6a063|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|||0x8f3cf7ad23cd3cadbd9735aff958023239c6a063>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|",
+    "token_ids": [
+      0,
+      3,
+      1,
+      5,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "WETH",
+      "USDT",
+      "DAI"
+    ],
+    "total_weight": -6.423560454474469e-05
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "179:2:56",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "Curve",
+      "Curve"
+    ],
+    "edge_ids": [
+      2,
+      56,
+      179
+    ],
+    "fee_tiers": [
+      500,
+      null,
+      null
+    ],
+    "graph_stage": "pre",
+    "hops": 3,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "2:36",
+    "pool_path": [
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351",
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0007695979714237,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "CurveStableSwap",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_001",
+    "snapshot_id": "1",
+    "spread_pct": 0.076959797142373,
+    "structural_cycle_key": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x8f3cf7ad23cd3cadbd9735aff958023239c6a063|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|||0x8f3cf7ad23cd3cadbd9735aff958023239c6a063>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|",
+    "token_ids": [
+      0,
+      1,
+      5,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "USDT",
+      "DAI"
+    ],
+    "total_weight": -0.0007693019827567033
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "179:2:56",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "Curve",
+      "Curve"
+    ],
+    "edge_ids": [
+      2,
+      56,
+      179
+    ],
+    "fee_tiers": [
+      500,
+      null,
+      null
+    ],
+    "graph_stage": "pre",
+    "hops": 3,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "2:36",
+    "pool_path": [
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351",
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0007696001971937,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "CurveStableSwap",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_002",
+    "snapshot_id": "1",
+    "spread_pct": 0.07696001971937427,
+    "structural_cycle_key": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x8f3cf7ad23cd3cadbd9735aff958023239c6a063|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|||0x8f3cf7ad23cd3cadbd9735aff958023239c6a063>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|",
+    "token_ids": [
+      0,
+      1,
+      5,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "USDT",
+      "DAI"
+    ],
+    "total_weight": -0.0007693042068150828
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "179:2:56",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "Curve",
+      "Curve"
+    ],
+    "edge_ids": [
+      2,
+      56,
+      179
+    ],
+    "fee_tiers": [
+      500,
+      null,
+      null
+    ],
+    "graph_stage": "pre",
+    "hops": 3,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "2:36",
+    "pool_path": [
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351",
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0007696004429867,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "CurveStableSwap",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_003",
+    "snapshot_id": "1",
+    "spread_pct": 0.07696004429866843,
+    "structural_cycle_key": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x8f3cf7ad23cd3cadbd9735aff958023239c6a063|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|||0x8f3cf7ad23cd3cadbd9735aff958023239c6a063>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|",
+    "token_ids": [
+      0,
+      1,
+      5,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "USDT",
+      "DAI"
+    ],
+    "total_weight": -0.0007693044524190075
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "179:2:56",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "Curve",
+      "Curve"
+    ],
+    "edge_ids": [
+      2,
+      56,
+      179
+    ],
+    "fee_tiers": [
+      500,
+      null,
+      null
+    ],
+    "graph_stage": "pre",
+    "hops": 3,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "2:36",
+    "pool_path": [
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351",
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0007696144508518,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "CurveStableSwap",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_004",
+    "snapshot_id": "1",
+    "spread_pct": 0.07696144508517744,
+    "structural_cycle_key": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x8f3cf7ad23cd3cadbd9735aff958023239c6a063|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|||0x8f3cf7ad23cd3cadbd9735aff958023239c6a063>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|",
+    "token_ids": [
+      0,
+      1,
+      5,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "USDT",
+      "DAI"
+    ],
+    "total_weight": -0.0007693184495118307
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "179:2:56",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "Curve",
+      "Curve"
+    ],
+    "edge_ids": [
+      2,
+      56,
+      179
+    ],
+    "fee_tiers": [
+      500,
+      null,
+      null
+    ],
+    "graph_stage": "pre",
+    "hops": 3,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "2:36",
+    "pool_path": [
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351",
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0007696234133683,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "CurveStableSwap",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_005",
+    "snapshot_id": "1",
+    "spread_pct": 0.07696234133682811,
+    "structural_cycle_key": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x8f3cf7ad23cd3cadbd9735aff958023239c6a063|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|||0x8f3cf7ad23cd3cadbd9735aff958023239c6a063>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|",
+    "token_ids": [
+      0,
+      1,
+      5,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "USDT",
+      "DAI"
+    ],
+    "total_weight": -0.0007693274051359196
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "179:8:78:56",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "UniswapV3",
+      "Curve",
+      "Curve"
+    ],
+    "edge_ids": [
+      8,
+      78,
+      56,
+      179
+    ],
+    "fee_tiers": [
+      500,
+      500,
+      null,
+      null
+    ],
+    "graph_stage": "pre",
+    "hops": 4,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "2:36",
+    "pool_path": [
+      null,
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351",
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.000103212458286,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "V3",
+      "CurveStableSwap",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_002",
+    "snapshot_id": "1",
+    "spread_pct": 0.010321245828603942,
+    "structural_cycle_key": "0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x8f3cf7ad23cd3cadbd9735aff958023239c6a063|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|||0x8f3cf7ad23cd3cadbd9735aff958023239c6a063>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|||0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270|UniswapV3|V3||500",
+    "token_ids": [
+      0,
+      2,
+      1,
+      5,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "WMATIC",
+      "USDT",
+      "DAI"
+    ],
+    "total_weight": -0.00010320713224673928
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "179:8:78:56",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "UniswapV3",
+      "Curve",
+      "Curve"
+    ],
+    "edge_ids": [
+      8,
+      78,
+      56,
+      179
+    ],
+    "fee_tiers": [
+      500,
+      500,
+      null,
+      null
+    ],
+    "graph_stage": "pre",
+    "hops": 4,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "2:36",
+    "pool_path": [
+      null,
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351",
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0002800405833066,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "V3",
+      "CurveStableSwap",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_005",
+    "snapshot_id": "1",
+    "spread_pct": 0.028004058330655113,
+    "structural_cycle_key": "0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x8f3cf7ad23cd3cadbd9735aff958023239c6a063|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|||0x8f3cf7ad23cd3cadbd9735aff958023239c6a063>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|||0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270|UniswapV3|V3||500",
+    "token_ids": [
+      0,
+      2,
+      1,
+      5,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "WMATIC",
+      "USDT",
+      "DAI"
+    ],
+    "total_weight": -0.0002800013792613801
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "2:36",
+    "classification": "BF_PRIMARY_WITNESS",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      2,
+      36
+    ],
+    "fee_tiers": [
+      500,
+      null
+    ],
+    "graph_stage": "pre",
+    "hops": 2,
+    "matched_bf_witness": true,
+    "parallel_variant_of": "2:36",
+    "pool_path": [
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0007796897568177,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_001",
+    "snapshot_id": "1",
+    "spread_pct": 0.07796897568177474,
+    "structural_cycle_key": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|",
+    "token_ids": [
+      0,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "USDT"
+    ],
+    "total_weight": -0.0007793859566622944
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "2:36",
+    "classification": "BF_PRIMARY_WITNESS",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      2,
+      36
+    ],
+    "fee_tiers": [
+      500,
+      null
+    ],
+    "graph_stage": "pre",
+    "hops": 2,
+    "matched_bf_witness": true,
+    "parallel_variant_of": "2:36",
+    "pool_path": [
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.000779692592294,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_002",
+    "snapshot_id": "1",
+    "spread_pct": 0.07796925922940456,
+    "structural_cycle_key": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|",
+    "token_ids": [
+      0,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "USDT"
+    ],
+    "total_weight": -0.0007793887899295191
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "2:36",
+    "classification": "BF_PRIMARY_WITNESS",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      2,
+      36
+    ],
+    "fee_tiers": [
+      500,
+      null
+    ],
+    "graph_stage": "pre",
+    "hops": 2,
+    "matched_bf_witness": true,
+    "parallel_variant_of": "2:36",
+    "pool_path": [
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0007796925947072,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_003",
+    "snapshot_id": "1",
+    "spread_pct": 0.07796925947072264,
+    "structural_cycle_key": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|",
+    "token_ids": [
+      0,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "USDT"
+    ],
+    "total_weight": -0.0007793887923408198
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "2:36",
+    "classification": "BF_PRIMARY_WITNESS",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      2,
+      36
+    ],
+    "fee_tiers": [
+      500,
+      null
+    ],
+    "graph_stage": "pre",
+    "hops": 2,
+    "matched_bf_witness": true,
+    "parallel_variant_of": "2:36",
+    "pool_path": [
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0007797033110164,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_004",
+    "snapshot_id": "1",
+    "spread_pct": 0.07797033110163998,
+    "structural_cycle_key": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|",
+    "token_ids": [
+      0,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "USDT"
+    ],
+    "total_weight": -0.0007793995003010186
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "2:36",
+    "classification": "BF_PRIMARY_WITNESS",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      2,
+      36
+    ],
+    "fee_tiers": [
+      500,
+      null
+    ],
+    "graph_stage": "pre",
+    "hops": 2,
+    "matched_bf_witness": true,
+    "parallel_variant_of": "2:36",
+    "pool_path": [
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0007797121507238,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_005",
+    "snapshot_id": "1",
+    "spread_pct": 0.07797121507238103,
+    "structural_cycle_key": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|",
+    "token_ids": [
+      0,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "USDT"
+    ],
+    "total_weight": -0.0007794083331214108
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "36:8:78",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      8,
+      78,
+      36
+    ],
+    "fee_tiers": [
+      500,
+      500,
+      null
+    ],
+    "graph_stage": "pre",
+    "hops": 3,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "2:36",
+    "pool_path": [
+      null,
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.0001132981331098,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_002",
+    "snapshot_id": "1",
+    "spread_pct": 0.011329813310978487,
+    "structural_cycle_key": "0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|||0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270|UniswapV3|V3||500",
+    "token_ids": [
+      0,
+      2,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "WMATIC",
+      "USDT"
+    ],
+    "total_weight": -0.00011329171536104319
+  },
+  {
+    "bf_region_id": "1",
+    "canonical_cycle_key": "36:8:78",
+    "classification": "PARALLEL_EDGE_VARIANT",
+    "curve_coin_indices": [],
+    "dex_path": [
+      "UniswapV3",
+      "UniswapV3",
+      "Curve"
+    ],
+    "edge_ids": [
+      8,
+      78,
+      36
+    ],
+    "fee_tiers": [
+      500,
+      500,
+      null
+    ],
+    "graph_stage": "pre",
+    "hops": 3,
+    "matched_bf_witness": false,
+    "parallel_variant_of": "2:36",
+    "pool_path": [
+      null,
+      null,
+      "0x445FE580eF8d70FF569aB36e80c647af338db351"
+    ],
+    "product": 1.000290124385188,
+    "profile": "liquid",
+    "protocol_path": [
+      "V3",
+      "V3",
+      "CurveStableSwap"
+    ],
+    "scan_id": "scan_005",
+    "snapshot_id": "1",
+    "spread_pct": 0.029012438518805084,
+    "structural_cycle_key": "0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270>0xc2132d05d31c914a87c6611c10748aeb04b58e8f|UniswapV3|V3||500||0xc2132d05d31c914a87c6611c10748aeb04b58e8f>0x3c499c542cef5e3811e1192ce70d8cc03d5c3359|Curve|CurveStableSwap|0x445fe580ef8d70ff569ab36e80c647af338db351|||0x3c499c542cef5e3811e1192ce70d8cc03d5c3359>0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270|UniswapV3|V3||500",
+    "token_ids": [
+      0,
+      2,
+      1,
+      0
+    ],
+    "token_path": [
+      "USDC",
+      "WMATIC",
+      "USDT"
+    ],
+    "total_weight": -0.00029008230724697156
+  }
+]

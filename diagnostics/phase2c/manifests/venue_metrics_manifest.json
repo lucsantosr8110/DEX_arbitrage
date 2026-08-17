@@ -1,0 +1,37 @@
+{
+  "expected_scans": 5,
+  "profile": "liquid",
+  "schema_version": 1,
+  "sources": [
+    {
+      "path": "diagnostics/phase2c/liquid_regenerated/snapshots/1_dex_metrics.json",
+      "profile": "liquid",
+      "scan_id": 1,
+      "scan_sequence": 1
+    },
+    {
+      "path": "diagnostics/phase2c/liquid_regenerated/snapshots/2_dex_metrics.json",
+      "profile": "liquid",
+      "scan_id": 2,
+      "scan_sequence": 2
+    },
+    {
+      "path": "diagnostics/phase2c/liquid_regenerated/snapshots/3_dex_metrics.json",
+      "profile": "liquid",
+      "scan_id": 3,
+      "scan_sequence": 3
+    },
+    {
+      "path": "diagnostics/phase2c/liquid_regenerated/snapshots/4_dex_metrics.json",
+      "profile": "liquid",
+      "scan_id": 4,
+      "scan_sequence": 4
+    },
+    {
+      "path": "diagnostics/phase2c/liquid_regenerated/snapshots/5_dex_metrics.json",
+      "profile": "liquid",
+      "scan_id": 5,
+      "scan_sequence": 5
+    }
+  ]
+}

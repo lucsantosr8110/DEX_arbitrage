@@ -16,15 +16,15 @@ use ethers::{
     providers::{Provider, Ws},
     signers::{LocalWallet, Signer},
 };
-use std::{
-    sync::Arc,
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 use tokio::time::{sleep, Instant};
 // ⚠️ 'error' removido pois não estava sendo usado
 use tracing::{info, warn};
 
-use crate::{config::NetworkConfig, infra::metrics, infra::rotating_http_client::RotatingHttpClient, AppMiddleware};
+use crate::{
+    config::NetworkConfig, infra::metrics, infra::rotating_http_client::RotatingHttpClient,
+    AppMiddleware,
+};
 
 pub struct RpcProvider;
 
@@ -41,7 +41,10 @@ impl RpcProvider {
     // ============================================================
     // 🌐 HTTP simples (um endpoint ou lista do config)
     // ============================================================
-    pub async fn connect_http(cfg: &NetworkConfig, private_key: &str) -> Result<Arc<AppMiddleware>> {
+    pub async fn connect_http(
+        cfg: &NetworkConfig,
+        private_key: &str,
+    ) -> Result<Arc<AppMiddleware>> {
         if let Err(e) = from_path(".env") {
             warn!("⚠️ .env não encontrado: {:?}", e);
         }
@@ -49,7 +52,10 @@ impl RpcProvider {
         let endpoints: Vec<String> = if is_usable_endpoint(&cfg.rpc_url) {
             vec![cfg.rpc_url.clone()]
         } else if let Some(list) = &cfg.rpc_endpoints {
-            list.iter().filter(|u| is_usable_endpoint(u)).cloned().collect()
+            list.iter()
+                .filter(|u| is_usable_endpoint(u))
+                .cloned()
+                .collect()
         } else {
             return Err(anyhow!("❌ Nenhum RPC configurado no bloco [network]"));
         };
@@ -69,7 +75,11 @@ impl RpcProvider {
         private_key: &str,
         endpoints: &[String],
     ) -> Result<Arc<AppMiddleware>> {
-        let usable: Vec<String> = endpoints.iter().filter(|u| is_usable_endpoint(u)).cloned().collect();
+        let usable: Vec<String> = endpoints
+            .iter()
+            .filter(|u| is_usable_endpoint(u))
+            .cloned()
+            .collect();
         if usable.is_empty() {
             return Err(anyhow!("❌ Nenhum endpoint RPC utilizável para fallback"));
         }
@@ -96,21 +106,20 @@ impl RpcProvider {
         let start = Instant::now();
         let rpc_timeout = Duration::from_millis(cfg.timeout_ms.max(1000));
 
-        let transport = RotatingHttpClient::from_strings(
-            &endpoints.to_vec(),
-            rpc_timeout,
-        )
-        .with_context(|| format!("❌ Falha ao construir RotatingHttpClient a partir de {}", source))?;
+        let transport = RotatingHttpClient::from_strings(&endpoints.to_vec(), rpc_timeout)
+            .with_context(|| {
+                format!(
+                    "❌ Falha ao construir RotatingHttpClient a partir de {}",
+                    source
+                )
+            })?;
 
-        let provider = Provider::new(transport)
-            .interval(Duration::from_millis(cfg.timeout_ms.max(1000)));
+        let provider =
+            Provider::new(transport).interval(Duration::from_millis(cfg.timeout_ms.max(1000)));
 
         // Sanity-check: pelo menos um endpoint deve responder chain_id.
-        let chain_id_res = tokio::time::timeout(
-            Duration::from_secs(5),
-            provider.get_chainid(),
-        )
-        .await;
+        let chain_id_res =
+            tokio::time::timeout(Duration::from_secs(5), provider.get_chainid()).await;
         let chain_id = match chain_id_res {
             Ok(Ok(id)) => id,
             Ok(Err(e)) => {
@@ -119,7 +128,11 @@ impl RpcProvider {
                     e
                 ))
             }
-            Err(_) => return Err(anyhow!("⏱️ Timeout ao obter chain_id do RotatingHttpClient")),
+            Err(_) => {
+                return Err(anyhow!(
+                    "⏱️ Timeout ao obter chain_id do RotatingHttpClient"
+                ))
+            }
         };
 
         let wallet: LocalWallet = private_key.parse()?;
@@ -143,9 +156,7 @@ impl RpcProvider {
     // ============================================================
     // 📡 WS (Wrapper Principal) - ESTA FUNÇÃO ESTAVA FALTANDO
     // ============================================================
-    pub async fn connect_ws(
-        cfg: &NetworkConfig,
-    ) -> Result<Arc<Provider<Ws>>> {
+    pub async fn connect_ws(cfg: &NetworkConfig) -> Result<Arc<Provider<Ws>>> {
         info!(
             target: "rpc_provider",
             "{} | 📡 Iniciando conexão WebSocket com fallback...",
@@ -153,7 +164,8 @@ impl RpcProvider {
         );
 
         // Pega os endpoints WS da configuração
-        let endpoints = cfg.ws_endpoints
+        let endpoints = cfg
+            .ws_endpoints
             .as_deref() // Converte Option<Vec<String>> para Option<&[String]>
             .unwrap_or_else(|| {
                 warn!("⚠️ Nenhum endpoint 'ws_endpoints' definido, usando array vazio.");
@@ -161,14 +173,15 @@ impl RpcProvider {
             });
 
         if endpoints.is_empty() {
-            return Err(anyhow!("❌ Nenhum endpoint WebSocket (ws_endpoints) configurado no config.toml"));
+            return Err(anyhow!(
+                "❌ Nenhum endpoint WebSocket (ws_endpoints) configurado no config.toml"
+            ));
         }
 
         // Chama a função de fallback existente com os endpoints
         // ⚠️ 'cfg' foi prefixado com '_' pois não estava sendo usado aqui
         Self::connect_ws_with_fallback(cfg, endpoints).await
     }
-
 
     // ============================================================
     // 📡 WS com fallback
@@ -205,34 +218,34 @@ impl RpcProvider {
                 url
             );
 
-            match tokio::time::timeout(handshake_timeout, Provider::<Ws>::connect(url.clone())).await {
+            match tokio::time::timeout(handshake_timeout, Provider::<Ws>::connect(url.clone()))
+                .await
+            {
                 Ok(Ok(provider)) => {
-                    let chain_id = match tokio::time::timeout(
-                        Duration::from_secs(5),
-                        provider.get_chainid(),
-                    )
-                    .await
-                    {
-                        Ok(Ok(id)) => id,
-                        Ok(Err(e)) => {
-                            warn!("⚠️ WS {} conectou mas chain_id falhou: {:?}", url, e);
-                            metrics::observe_exec_latency_ms(
-                                start_t.elapsed().as_millis() as f64,
-                                "rpc_ws_fallback_fail",
-                            );
-                            sleep(Duration::from_millis(300)).await;
-                            continue;
-                        }
-                        Err(_) => {
-                            warn!("⏱️ WS {} conectou mas chain_id timeout", url);
-                            metrics::observe_exec_latency_ms(
-                                start_t.elapsed().as_millis() as f64,
-                                "rpc_ws_fallback_fail",
-                            );
-                            sleep(Duration::from_millis(300)).await;
-                            continue;
-                        }
-                    };
+                    let chain_id =
+                        match tokio::time::timeout(Duration::from_secs(5), provider.get_chainid())
+                            .await
+                        {
+                            Ok(Ok(id)) => id,
+                            Ok(Err(e)) => {
+                                warn!("⚠️ WS {} conectou mas chain_id falhou: {:?}", url, e);
+                                metrics::observe_exec_latency_ms(
+                                    start_t.elapsed().as_millis() as f64,
+                                    "rpc_ws_fallback_fail",
+                                );
+                                sleep(Duration::from_millis(300)).await;
+                                continue;
+                            }
+                            Err(_) => {
+                                warn!("⏱️ WS {} conectou mas chain_id timeout", url);
+                                metrics::observe_exec_latency_ms(
+                                    start_t.elapsed().as_millis() as f64,
+                                    "rpc_ws_fallback_fail",
+                                );
+                                sleep(Duration::from_millis(300)).await;
+                                continue;
+                            }
+                        };
                     let elapsed = start_t.elapsed().as_millis();
                     info!(
                         target: "rpc_provider",
@@ -255,7 +268,8 @@ impl RpcProvider {
                 Err(_) => {
                     warn!(
                         "⏱️ Timeout ao conectar WS em {} (>{}ms) — próximo endpoint.",
-                        url, handshake_timeout.as_millis()
+                        url,
+                        handshake_timeout.as_millis()
                     );
                     metrics::observe_exec_latency_ms(
                         start_t.elapsed().as_millis() as f64,
