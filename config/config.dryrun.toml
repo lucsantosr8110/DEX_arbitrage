@@ -227,7 +227,14 @@ ws_endpoints = [
     "${ALCHEMY_WS_URL}",
     "${INFURA_WS_URL}",
 ]
-timeout_ms = 3000
+# 2026-08-17: 3000ms causava rotação em cascata pelos 7 endpoints do pool
+# sem backoff (RotatingHttpClient::request não pausa entre tentativas) toda
+# vez que a rede tinha um soluço momentâneo — visto em produção: 9687
+# WARN de rotação num único round, requote_ms chegando a 305s (vs ~14s
+# típico). Os outros profiles (config.toml/midtier) já usam 5000ms;
+# dryrun tinha o timeout MAIS curto dos três, ao contrário do esperado
+# (pool de endpoints públicos é menos confiável que single-paid-endpoint).
+timeout_ms = 8000
 max_reorg_depth = 64
 block_delay_max = 2
 chain_monitoring = true

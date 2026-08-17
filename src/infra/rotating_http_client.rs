@@ -235,6 +235,16 @@ impl JsonRpcClient for RotatingHttpClient {
         let mut last_err: Option<String> = None;
 
         for offset in 0..n {
+            // 2026-08-17: sem pausa aqui, uma rede instável (ou um bloqueio
+            // momentâneo compartilhado por vários provedores) martelava os
+            // N endpoints em sequência a toda velocidade — visto em
+            // produção: 9687 tentativas de rotação num único round,
+            // requote_ms chegando a 305s. Pequeno backoff antes de cada
+            // retentativa (não na primeira tentativa) dá chance de a rede
+            // se recuperar em vez de esgotar o pool instantaneamente.
+            if offset > 0 {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
             let idx = (start_idx + offset) % n;
             let url = &self.endpoints[idx];
 
@@ -359,5 +369,60 @@ impl JsonRpcClient for RotatingHttpClient {
         Err(RotatingClientError::Exhausted(
             last_err.unwrap_or_else(|| "nenhum endpoint respondeu".into()),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two unreachable endpoints (connection refused, not a real timeout —
+    /// keeps the test fast) must still rotate through both before giving
+    /// up, and the backoff between attempts (added 2026-08-17 after
+    /// production evidence of thundering-herd rotation with zero pause)
+    /// must actually elapse: total time should be at least one backoff
+    /// interval, not near-instant.
+    #[tokio::test]
+    async fn exhausts_all_endpoints_and_backs_off_between_attempts() {
+        let endpoints = vec![
+            "http://127.0.0.1:1".parse().unwrap(),
+            "http://127.0.0.1:2".parse().unwrap(),
+        ];
+        let client = RotatingHttpClient::new(endpoints, Duration::from_millis(500)).unwrap();
+        let start = std::time::Instant::now();
+        let result: Result<serde_json::Value, _> =
+            JsonRpcClient::request(&client, "eth_blockNumber", ()).await;
+        let elapsed = start.elapsed();
+        assert!(result.is_err(), "both endpoints unreachable, must fail");
+        assert!(
+            matches!(result.unwrap_err(), RotatingClientError::Exhausted(_)),
+            "must be Exhausted after trying every endpoint, not a hard-fail on the first"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(150),
+            "backoff between the 2 attempts should add up to >=150ms, got {elapsed:?}"
+        );
+    }
+
+    /// 3 endpoints, all unreachable: the elapsed time must reflect 2
+    /// backoff pauses (between attempts 1->2 and 2->3), not 1 — proving
+    /// every endpoint in the list was actually tried, not just the first
+    /// couple before giving up early.
+    #[tokio::test]
+    async fn backoff_scales_with_endpoint_count() {
+        let endpoints = vec![
+            "http://127.0.0.1:1".parse().unwrap(),
+            "http://127.0.0.1:2".parse().unwrap(),
+            "http://127.0.0.1:3".parse().unwrap(),
+        ];
+        let client = RotatingHttpClient::new(endpoints, Duration::from_millis(500)).unwrap();
+        let start = std::time::Instant::now();
+        let _: Result<serde_json::Value, _> =
+            JsonRpcClient::request(&client, "eth_blockNumber", ()).await;
+        assert!(
+            start.elapsed() >= Duration::from_millis(300),
+            "3 endpoints means 2 backoff pauses (~300ms), got {:?}",
+            start.elapsed()
+        );
     }
 }
